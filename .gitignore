@@ -1,77 +1,81 @@
-# Byte-compiled / optimized / DLL files
+# ==============================================================================
+# .gitignore for bookeeper
+# ==============================================================================
+
+# 1. Python Bytecode & Runtime
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
 
-# Distribution / packaging
-.Python
+# 2. Python Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+.env
+env.bak/
+venv.bak/
+
+# 3. Build Artifacts & Packaging
 build/
-develop-eggs/
 dist/
+*.egg-info/
+*.egg
+.eggs/
+develop-eggs/
 downloads/
 eggs/
-.eggs/
-lib/
-lib64/
 parts/
 sdist/
 var/
 wheels/
 share/python-wheels/
-*.egg-info/
 .installed.cfg
-*.egg
 MANIFEST
 
-# Virtual Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+# 4. Cache Directories
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
 
-# Unit test / coverage
+# 5. Testing & Coverage Artifacts
+.coverage
+.coverage.*
 htmlcov/
 .tox/
 .nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
 coverage.xml
-*.cover
-*.py.class
-.pytest_cache/
+nosetests.xml
 
-# Type checkers & linters
-.mypy_cache/
-.dmypy.json
-dmypy.json
-.pyre/
-.pytype/
-.ruff_cache/
-
-# IDE & Editor files
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
-
-# Calibre & Bookeeper Local Runtime
-config.yaml
+# 6. Calibre Test Database & Storage Artifacts
+metadata.db
+metadata_db_prefs_backup.json
+calibre_test_library/
+calibre_test_db/
 *.db
 *.sqlite
 *.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
+
+# 7. Local Runtime, Logs & Export Output
+config.yaml
 data/
 output/
 obsidian_vault/
 graph_exports/
 logs/
 *.log
+
+# 8. OS & Editor Metadata
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

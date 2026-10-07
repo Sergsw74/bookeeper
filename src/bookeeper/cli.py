@@ -1,11 +1,12 @@
 """
-Production-quality Typer CLI interface for bookeeper with rich progress bars and formatting.
+Production-quality Typer CLI interface for bookeeper with rich progress bars and configurable Ollama / Calibre paths.
 """
 
 from pathlib import Path
 from typing import Optional
 
 import typer
+from langchain_ollama import OllamaEmbeddings
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
@@ -13,7 +14,7 @@ from rich.table import Table
 
 from bookeeper.calibre.client import CalibreClient
 from bookeeper.calibre.parser import BookParser
-from bookeeper.config import get_settings
+from bookeeper.config import Settings, get_settings
 from bookeeper.graph.exporters import GraphMLExporter, ObsidianExporter
 from bookeeper.graph.store import ConceptGraphStore
 from bookeeper.processing.chunker import HierarchicalChunker
@@ -22,23 +23,61 @@ from bookeeper.processing.extractor import KnowledgeExtractor
 
 app = typer.Typer(
     name="bookeeper",
-    help="Connects Calibre libraries to local Ollama LLMs and extracts Concept Knowledge Graphs.",
+    help="Connects Calibre libraries to local/remote Ollama LLMs and extracts Concept Knowledge Graphs.",
     add_completion=False,
 )
 console = Console()
+
+
+def _get_effective_settings(
+    config_path: Optional[str] = None,
+    calibre_path: Optional[str] = None,
+    ollama_url: Optional[str] = None,
+    model: Optional[str] = None,
+    embedding_model: Optional[str] = None,
+) -> Settings:
+    """Retrieve settings and merge explicit CLI arguments with highest precedence."""
+    cfg = get_settings(config_path)
+    overrides = {}
+    if calibre_path:
+        overrides["calibre_library_path"] = calibre_path
+    if ollama_url:
+        overrides["ollama_base_url"] = ollama_url
+    if model:
+        overrides["llm_model"] = model
+    if embedding_model:
+        overrides["embedding_model"] = embedding_model
+
+    if overrides:
+        data = cfg.model_dump()
+        data.update(overrides)
+        return Settings(**data)
+    return cfg
 
 
 @app.command()
 def config(
     config_path: Optional[str] = typer.Option(
         None, "--config", "-c", help="Path to custom config.yaml file."
-    )
+    ),
+    calibre_path: Optional[str] = typer.Option(
+        None, "--calibre-path", help="Override Calibre library path or SMB share mount."
+    ),
+    ollama_url: Optional[str] = typer.Option(
+        None, "--ollama-url", "-u", help="Override Ollama base URL (e.g. http://192.168.50.15:11434)."
+    ),
+    model: Optional[str] = typer.Option(
+        None, "--model", "-m", help="Override Ollama LLM model name (e.g. llama3.1:8b)."
+    ),
+    embedding_model: Optional[str] = typer.Option(
+        None, "--embedding-model", help="Override Ollama embedding model (e.g. nomic-embed-text)."
+    ),
 ):
     """Display the active bookeeper configuration settings."""
-    cfg = get_settings(config_path)
+    cfg = _get_effective_settings(config_path, calibre_path, ollama_url, model, embedding_model)
     console.print(
         Panel.fit(
-            f"[bold green]Calibre Library:[/bold green] {cfg.calibre_library_path}\n"
+            f"[bold green]Calibre Library / SMB Share:[/bold green] {cfg.calibre_library_path}\n"
             f"[bold green]Calibre Auth:[/bold green] user={cfg.calibre_user or '[dim]none[/dim]'}\n"
             f"[bold green]Ollama Endpoint:[/bold green] {cfg.ollama_base_url}\n"
             f"[bold green]LLM Model:[/bold green] {cfg.llm_model}\n"
@@ -58,15 +97,24 @@ def clean_metadata(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Inspect and display cleaned metadata without writing back."
     ),
+    calibre_path: Optional[str] = typer.Option(
+        None, "--calibre-path", help="Calibre library path or SMB mount (e.g. /Volumes/share/calibre)."
+    ),
+    ollama_url: Optional[str] = typer.Option(
+        None, "--ollama-url", "-u", help="Ollama server URL (e.g. http://192.168.50.15:11434)."
+    ),
+    model: Optional[str] = typer.Option(
+        None, "--model", "-m", help="Ollama LLM model name (e.g. llama3.1:8b, qwen2.5:7b-instruct)."
+    ),
     config_path: Optional[str] = typer.Option(
         None, "--config", "-c", help="Path to config.yaml file."
     ),
 ):
     """
-    Query Calibre, inspect dirty/missing titles, authors, and summaries,
-    prompt Ollama to normalize, and write clean metadata back to Calibre.
+    Query Calibre (local, SMB share, or server), inspect titles/authors/summaries,
+    prompt Ollama to normalize, and write clean metadata back.
     """
-    cfg = get_settings(config_path)
+    cfg = _get_effective_settings(config_path, calibre_path, ollama_url, model)
     client = CalibreClient(
         library_path=cfg.calibre_library_path,
         user=cfg.calibre_user,
@@ -75,11 +123,19 @@ def clean_metadata(
 
     if not client.is_available():
         console.print(
-            f"[bold red]Error:[/bold red] calibredb command not found or library '{cfg.calibre_library_path}' unavailable."
+            f"[bold red]Error:[/bold red] Cannot access Calibre library at '{cfg.calibre_library_path}'.\n"
+            f"Ensure the SMB share is mounted or calibredb is in PATH."
         )
         raise typer.Exit(1)
 
-    extractor = KnowledgeExtractor.from_settings(cfg)
+    extractor = KnowledgeExtractor(
+        base_url=cfg.ollama_base_url,
+        model=cfg.llm_model,
+    )
+
+    console.print(
+        f"[dim]Connecting to Ollama at [bold cyan]{cfg.ollama_base_url}[/bold cyan] (model: [bold cyan]{cfg.llm_model}[/bold cyan])...[/dim]"
+    )
 
     with console.status("[bold blue]Querying Calibre library...[/bold blue]"):
         try:
@@ -162,6 +218,18 @@ def build_graph(
     all_books: bool = typer.Option(
         False, "--all", "-a", help="Process all books in the Calibre library."
     ),
+    calibre_path: Optional[str] = typer.Option(
+        None, "--calibre-path", help="Calibre library path or SMB mount (e.g. /Volumes/share/calibre)."
+    ),
+    ollama_url: Optional[str] = typer.Option(
+        None, "--ollama-url", "-u", help="Ollama server URL (e.g. http://192.168.50.15:11434)."
+    ),
+    model: Optional[str] = typer.Option(
+        None, "--model", "-m", help="Ollama LLM model name (e.g. llama3.1:8b, qwen2.5:7b-instruct)."
+    ),
+    embedding_model: Optional[str] = typer.Option(
+        None, "--embedding-model", help="Ollama embedding model name (e.g. nomic-embed-text)."
+    ),
     export_obsidian: Optional[str] = typer.Option(
         None, "--export-obsidian", help="Custom destination directory for Obsidian Markdown vault."
     ),
@@ -173,7 +241,7 @@ def build_graph(
     Ingest sections, perform semantic chunking, extract concepts via Ollama,
     deduplicate entities, and export the Concept Knowledge Graph.
     """
-    cfg = get_settings(config_path)
+    cfg = _get_effective_settings(config_path, calibre_path, ollama_url, model, embedding_model)
     output_dir = cfg.resolved_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     graph_file = output_dir / "knowledge_graph.json"
@@ -192,9 +260,34 @@ def build_graph(
         password=cfg.calibre_password,
     )
 
-    extractor = KnowledgeExtractor.from_settings(cfg)
-    deduplicator = EntityDeduplicator.from_settings(cfg)
-    chunker = HierarchicalChunker()
+    console.print(
+        f"[dim]Configured Ollama: [bold cyan]{cfg.ollama_base_url}[/bold cyan] | "
+        f"LLM: [bold cyan]{cfg.llm_model}[/bold cyan] | "
+        f"Embeddings: [bold cyan]{cfg.embedding_model}[/bold cyan][/dim]"
+    )
+
+    extractor = KnowledgeExtractor(
+        base_url=cfg.ollama_base_url,
+        model=cfg.llm_model,
+    )
+
+    deduplicator = EntityDeduplicator.from_settings(
+        cfg,
+        base_url=cfg.ollama_base_url,
+        embedding_model=cfg.embedding_model,
+        similarity_threshold=cfg.similarity_threshold,
+    )
+
+    # Initialize HierarchicalChunker with Ollama embeddings if reachable
+    try:
+        embeddings = OllamaEmbeddings(
+            base_url=cfg.ollama_base_url.rstrip("/"),
+            model=cfg.embedding_model,
+        )
+        chunker = HierarchicalChunker(embeddings=embeddings)
+    except Exception as e:
+        console.print(f"[dim yellow]Warning: Remote Ollama embeddings init skipped ({e}); using paragraph chunker.[/dim yellow]")
+        chunker = HierarchicalChunker()
 
     books_to_process = []
 
@@ -206,7 +299,7 @@ def build_graph(
             raise typer.Exit(1)
         books_to_process.append({"id": 1, "title": p.stem, "author": "Unknown", "path": p})
 
-    # Case 2: From Calibre
+    # Case 2: From Calibre / SMB share
     elif client.is_available():
         with console.status("[bold blue]Querying Calibre library...[/bold blue]"):
             all_calibre_books = client.list_books(fields=["id", "title", "authors", "formats"])
@@ -242,7 +335,8 @@ def build_graph(
                 console.print(f"[yellow]Skipping book #{bid}: No EPUB format available.[/yellow]")
     else:
         console.print(
-            "[bold red]Calibre not available. Pass an explicit book file via --file <path.epub>.[/bold red]"
+            "[bold red]Calibre not available. Pass an explicit book file via --file <path.epub> "
+            "or mount the SMB share and pass --calibre-path <path>.[/bold red]"
         )
         raise typer.Exit(1)
 

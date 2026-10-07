@@ -74,7 +74,7 @@ class KnowledgeExtractor:
         model: str = "llama3.1:8b",
         temperature: float = 0.0,
     ):
-        self.base_url = base_url
+        self.base_url = base_url.rstrip("/")
         self.model_name = model
         self.temperature = temperature
 
@@ -89,10 +89,15 @@ class KnowledgeExtractor:
         self.section_chain = self.llm.with_structured_output(SectionExtraction)
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "KnowledgeExtractor":
+    def from_settings(
+        cls,
+        settings: Settings,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> "KnowledgeExtractor":
         return cls(
-            base_url=settings.ollama_base_url,
-            model=settings.llm_model,
+            base_url=base_url or settings.ollama_base_url,
+            model=model or settings.llm_model,
         )
 
     def clean_metadata(

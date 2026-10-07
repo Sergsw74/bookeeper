@@ -2,13 +2,18 @@
 # bookeeper - Configuration File
 # ==============================================================================
 
-# Calibre Library Integration (local path or http://host:port/#library)
-calibre_library_path: "~/Calibre Library"
+# Calibre Library Integration
+# Supports:
+# 1. Mounted SMB share: e.g. "/Volumes/Calibre Library" or "/Volumes/share/books"
+# 2. Local folder path: e.g. "~/Calibre Library"
+# 3. Remote Calibre Content Server: e.g. "http://192.168.50.20:8080/#library"
+calibre_library_path: "/Volumes/Calibre Library"
 calibre_user: null
 calibre_password: null
 
-# Local Ollama LLM & Embeddings Configuration
-ollama_base_url: "http://localhost:11434"
+# Remote or Local Ollama LLM & Embeddings Configuration
+# Point to your local daemon or remote network instance (e.g. node-laptop at 192.168.50.15)
+ollama_base_url: "http://192.168.50.15:11434"
 llm_model: "llama3.1:8b"
 embedding_model: "nomic-embed-text"
 

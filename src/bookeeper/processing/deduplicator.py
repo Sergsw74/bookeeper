@@ -34,19 +34,32 @@ class EntityDeduplicator:
         self._cache: Dict[str, Tuple[Optional[np.ndarray], Concept]] = {}
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "EntityDeduplicator":
+    def from_settings(
+        cls,
+        settings: Settings,
+        base_url: Optional[str] = None,
+        embedding_model: Optional[str] = None,
+        similarity_threshold: Optional[float] = None,
+    ) -> "EntityDeduplicator":
+        b_url = (base_url or settings.ollama_base_url).rstrip("/")
+        e_model = embedding_model or settings.embedding_model
+        s_thresh = (
+            similarity_threshold
+            if similarity_threshold is not None
+            else settings.similarity_threshold
+        )
         try:
             embeddings = OllamaEmbeddings(
-                base_url=settings.ollama_base_url,
-                model=settings.embedding_model,
+                base_url=b_url,
+                model=e_model,
             )
         except Exception as e:
-            logger.warning(f"Could not connect to OllamaEmbeddings: {e}")
+            logger.warning(f"Could not connect to OllamaEmbeddings at {b_url}: {e}")
             embeddings = None
 
         return cls(
             embeddings=embeddings,
-            similarity_threshold=settings.similarity_threshold,
+            similarity_threshold=s_thresh,
         )
 
     @staticmethod

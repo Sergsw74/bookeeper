@@ -11,6 +11,11 @@ calibre_library_path: "/Volumes/Calibre Library"
 calibre_user: null
 calibre_password: null
 
+# Database Staging & Safety
+# Download/stage metadata.db locally for microsecond SSD transactions and sync back on completion
+stage_metadata_db: true
+backup_metadata_db: true
+
 # Remote or Local Ollama LLM & Embeddings Configuration
 # For single-server setups, set ollama_base_url:
 ollama_base_url: "http://192.168.50.15:11434"

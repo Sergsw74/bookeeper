@@ -48,6 +48,18 @@ class Settings(BaseSettings):
         default=None,
         description="Optional password for remote Calibre content server.",
     )
+    stage_metadata_db: bool = Field(
+        default=True,
+        description="Download metadata.db locally for microsecond SSD transactions and sync back on completion.",
+    )
+    backup_metadata_db: bool = Field(
+        default=True,
+        description="Create remote metadata.db.bak backup before syncing staged DB.",
+    )
+    staged_db_path: Optional[str] = Field(
+        default=None,
+        description="Optional custom local path for staged metadata.db (default: output_dir/.staged_metadata.db).",
+    )
 
     # Local / Remote Ollama LLM & Embeddings
     ollama_base_url: str = Field(
@@ -132,6 +144,16 @@ class Settings(BaseSettings):
             p = Path(self.state_file).expanduser().resolve()
         else:
             p = self.resolved_output_dir / ".bookeeper_state.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def resolved_staged_db_path(self) -> Path:
+        """Return expanded Path for staged metadata.db."""
+        if self.staged_db_path:
+            p = Path(self.staged_db_path).expanduser().resolve()
+        else:
+            p = self.resolved_output_dir / ".staged_metadata.db"
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
 

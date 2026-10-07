@@ -2,8 +2,10 @@
 Calibre client wrapping calibredb CLI and providing direct SQLite fallback for SMB shares and local paths.
 """
 
+from contextlib import contextmanager
 import json
 import logging
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -73,20 +75,145 @@ class CalibreClient:
             self.local_path = None
             self.db_path = None
 
+        # Staging support for high-speed local transactions
+        self.staged_db_path: Optional[Path] = None
+        self.is_staged: bool = False
+
     @property
     def is_remote_url(self) -> bool:
         """Check if library_path is an HTTP/HTTPS remote URL."""
         p = self.library_path.strip().lower()
         return p.startswith("http://") or p.startswith("https://")
 
+    @property
+    def active_db_path(self) -> Optional[Path]:
+        """Return staged DB path if database is staged, otherwise original db_path."""
+        if self.is_staged and self.staged_db_path and self.staged_db_path.is_file():
+            return self.staged_db_path
+        return self.db_path
+
+    @staticmethod
+    def _verify_sqlite_integrity(path: Path) -> bool:
+        """Verify SQLite database integrity."""
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA integrity_check;")
+            res = cursor.fetchone()
+            if not res or res[0] != "ok":
+                raise ValueError(f"SQLite integrity check failed on {path}: {res}")
+            return True
+        finally:
+            conn.close()
+
+    def stage_database(self, staged_path: Optional[Path | str] = None) -> Path:
+        """
+        Copy remote/mounted metadata.db to local disk for high-speed SSD transactions.
+        Switches active_db_path to staged_path and sets is_staged=True.
+        """
+        if self.is_remote_url:
+            raise RuntimeError("Cannot stage database for remote HTTP/HTTPS Calibre Content Server.")
+        if not self.db_path or not self.db_path.is_file():
+            raise FileNotFoundError(f"Source metadata.db not found at {self.db_path}")
+
+        if staged_path:
+            target = Path(staged_path).expanduser().resolve()
+        else:
+            import tempfile
+            target = Path(tempfile.gettempdir()) / "bookeeper_staged_metadata.db"
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Staging Calibre database from {self.db_path} to {target}...")
+        shutil.copy2(self.db_path, target)
+
+        # Verify integrity of staged copy
+        self._verify_sqlite_integrity(target)
+
+        self.staged_db_path = target
+        self.is_staged = True
+        return target
+
+    def sync_database(self, create_backup: bool = True) -> bool:
+        """
+        Sync staged metadata.db back to original library path.
+        Optionally creates a backup (e.g. metadata.db.bak) on the remote share first.
+        """
+        if not self.is_staged or not self.staged_db_path or not self.staged_db_path.is_file():
+            logger.debug("No staged database to sync.")
+            return False
+
+        if not self.db_path:
+            raise RuntimeError("Original database path is not defined.")
+
+        # 1. Verify staged DB integrity before uploading
+        self._verify_sqlite_integrity(self.staged_db_path)
+
+        # 2. Create backup of original db if requested
+        if create_backup and self.db_path.is_file():
+            backup_path = self.db_path.with_name("metadata.db.bak")
+            logger.info(f"Creating backup of original database at {backup_path}...")
+            shutil.copy2(self.db_path, backup_path)
+
+        # 3. Copy staged DB back to remote/original destination
+        logger.info(f"Uploading staged database from {self.staged_db_path} to {self.db_path}...")
+        tmp_target = self.db_path.with_name(f".metadata.db.tmp_{os.getpid()}")
+        try:
+            shutil.copy2(self.staged_db_path, tmp_target)
+            tmp_target.replace(self.db_path)
+        except OSError:
+            # Fallback if filesystem doesn't support atomic replace across temporary files
+            if tmp_target.exists():
+                try:
+                    tmp_target.unlink()
+                except Exception:
+                    pass
+            shutil.copy2(self.staged_db_path, self.db_path)
+
+        return True
+
+    def cleanup_staged(self, delete_file: bool = True) -> None:
+        """Reset staging state and optionally delete the staged copy."""
+        if delete_file and self.staged_db_path and self.staged_db_path.is_file():
+            try:
+                self.staged_db_path.unlink()
+            except Exception as e:
+                logger.warning(f"Could not remove staged db file {self.staged_db_path}: {e}")
+        self.staged_db_path = None
+        self.is_staged = False
+
+    @contextmanager
+    def staged_session(
+        self,
+        staged_path: Optional[Path | str] = None,
+        create_backup: bool = True,
+        auto_sync: bool = True,
+        cleanup_on_finish: bool = True,
+    ):
+        """
+        Context manager for staging metadata.db locally during a session.
+        Automatically syncs back upon exiting context if auto_sync=True.
+        """
+        staged = False
+        if not self.is_remote_url and self.db_path and self.db_path.is_file():
+            self.stage_database(staged_path)
+            staged = True
+
+        try:
+            yield self
+            if staged and auto_sync:
+                self.sync_database(create_backup=create_backup)
+        finally:
+            if staged and cleanup_on_finish:
+                self.cleanup_staged(delete_file=True)
+
     def is_available(self) -> bool:
         """
         Verify if library is accessible.
         Returns True if:
-        - metadata.db exists on filesystem / mounted SMB share, OR
+        - active_db_path exists on filesystem / mounted SMB share, OR
         - calibredb binary is available.
         """
-        if self.db_path and self.db_path.is_file():
+        if self.active_db_path and self.active_db_path.is_file():
             return True
         return shutil.which(self.calibredb_bin) is not None
 
@@ -110,9 +237,13 @@ class CalibreClient:
 
     def list_books(self, fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
-        List books from Calibre library. Prefers calibredb CLI if available;
-        falls back to direct SQLite reading on SMB share or local directory.
+        List books from Calibre library. Prefers local staged SQLite if active,
+        then calibredb CLI if available, and falls back to direct SQLite reading.
         """
+        # 0. Local staged DB priority
+        if self.is_staged and self.staged_db_path and self.staged_db_path.is_file():
+            return self._list_books_from_sqlite()
+
         # 1. If calibredb is installed, use calibredb list
         if shutil.which(self.calibredb_bin):
             try:
@@ -131,7 +262,7 @@ class CalibreClient:
                 logger.debug(f"calibredb execution failed: {e}")
 
         # 2. Fallback: Direct SQLite query on metadata.db (ideal for SMB shares)
-        if self.db_path and self.db_path.is_file():
+        if self.active_db_path and self.active_db_path.is_file():
             return self._list_books_from_sqlite()
 
         raise RuntimeError(
@@ -141,7 +272,11 @@ class CalibreClient:
 
     def _list_books_from_sqlite(self) -> List[Dict[str, Any]]:
         """Query metadata.db directly in read-only mode over local or SMB filesystem."""
-        uri = f"file:{self.db_path}?mode=ro"
+        db_to_use = self.active_db_path
+        if not db_to_use or not db_to_use.is_file():
+            raise FileNotFoundError(f"Database file not found at {db_to_use}")
+
+        uri = f"file:{db_to_use}?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
         _register_sqlite_functions(conn)
         conn.row_factory = sqlite3.Row
@@ -200,7 +335,11 @@ class CalibreClient:
         authors: Optional[List[str]] = None,
         comments: Optional[str] = None,
     ) -> bool:
-        """Update metadata using calibredb CLI or direct SQLite on SMB share."""
+        """Update metadata using staged SQLite, calibredb CLI, or direct SQLite on SMB share."""
+        # 0. Local staged DB priority for fast microsecond updates
+        if self.is_staged and self.staged_db_path and self.staged_db_path.is_file():
+            return self._update_metadata_sqlite(book_id, title, authors, comments)
+
         # 1. Try calibredb CLI
         if shutil.which(self.calibredb_bin):
             try:
@@ -221,7 +360,7 @@ class CalibreClient:
                 logger.debug(f"calibredb set_metadata error: {e}")
 
         # 2. Direct SQLite fallback
-        if self.db_path and self.db_path.is_file():
+        if self.active_db_path and self.active_db_path.is_file():
             return self._update_metadata_sqlite(book_id, title, authors, comments)
 
         raise RuntimeError(f"Cannot update metadata: calibredb failed and metadata.db not writable.")
@@ -234,7 +373,11 @@ class CalibreClient:
         comments: Optional[str] = None,
     ) -> bool:
         """Perform direct SQLite update on title, authors, and comments in metadata.db."""
-        conn = sqlite3.connect(str(self.db_path))
+        db_to_use = self.active_db_path
+        if not db_to_use or not db_to_use.is_file():
+            raise FileNotFoundError(f"Database file not found at {db_to_use}")
+
+        conn = sqlite3.connect(str(db_to_use))
         _register_sqlite_functions(conn)
         cursor = conn.cursor()
         try:
@@ -299,8 +442,9 @@ class CalibreClient:
         out_path.mkdir(parents=True, exist_ok=True)
 
         # 1. Direct file resolution if on SMB share or local directory
-        if self.local_path and self.db_path and self.db_path.is_file():
-            conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        db_to_use = self.active_db_path
+        if self.local_path and db_to_use and db_to_use.is_file():
+            conn = sqlite3.connect(f"file:{db_to_use}?mode=ro", uri=True)
             cursor = conn.cursor()
             cursor.execute(
                 """

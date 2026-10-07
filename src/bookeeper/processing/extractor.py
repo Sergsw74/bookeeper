@@ -9,7 +9,7 @@ import subprocess
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 from pydantic import BaseModel, Field
 
@@ -171,15 +171,13 @@ class KnowledgeExtractor:
         if content_sample:
             user_content += f"\nBook Content Excerpt (Title page / Preface / Beginning):\n\"\"\"\n{content_sample[:3500]}\n\"\"\"\n"
 
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", system_instruction),
-                ("human", user_content),
-            ]
-        )
+        messages = [
+            SystemMessage(content=system_instruction),
+            HumanMessage(content=user_content),
+        ]
 
         try:
-            result = self._execute_structured_invoke(BookMetadata, prompt.format_messages())
+            result = self._execute_structured_invoke(BookMetadata, messages)
             if isinstance(result, BookMetadata):
                 return result
             return BookMetadata(**dict(result))
@@ -198,32 +196,24 @@ class KnowledgeExtractor:
         section_title: str,
     ) -> SectionExtraction:
         """Extract atomic concepts and their relationships from a section chunk with multi-server failover."""
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    "You are an expert technical knowledge graph extractor. "
-                    "Extract canonical, specific technical concepts, patterns, algorithms, and design tradeoffs. "
-                    "Ensure concept names are concise (2-4 words, e.g. 'Read-Copy-Update', 'Consistent Hashing'). "
-                    "Identify how these concepts relate to one another.",
-                ),
-                (
-                    "human",
-                    "Book: '{book_title}'\n"
-                    "Section: '{section_title}'\n\n"
-                    "Text excerpt:\n\"\"\"\n{text}\n\"\"\"\n",
-                ),
-            ]
+        system_text = (
+            "You are an expert technical knowledge graph extractor. "
+            "Extract canonical, specific technical concepts, patterns, algorithms, and design tradeoffs. "
+            "Ensure concept names are concise (2-4 words, e.g. 'Read-Copy-Update', 'Consistent Hashing'). "
+            "Identify how these concepts relate to one another."
         )
-
-        formatted_messages = prompt.format_messages(
-            book_title=book_title,
-            section_title=section_title,
-            text=text[:4000],  # Ensure token safety
+        human_text = (
+            f"Book: '{book_title}'\n"
+            f"Section: '{section_title}'\n\n"
+            f"Text excerpt:\n\"\"\"\n{text[:4000]}\n\"\"\"\n"
         )
+        messages = [
+            SystemMessage(content=system_text),
+            HumanMessage(content=human_text),
+        ]
 
         try:
-            result = self._execute_structured_invoke(SectionExtraction, formatted_messages)
+            result = self._execute_structured_invoke(SectionExtraction, messages)
             if isinstance(result, SectionExtraction):
                 return result
             return SectionExtraction(**dict(result))

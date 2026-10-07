@@ -21,6 +21,7 @@ from bookeeper.processing.chunker import HierarchicalChunker
 from bookeeper.processing.deduplicator import EntityDeduplicator
 from bookeeper.processing.extractor import KnowledgeExtractor
 from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings
+from bookeeper.processing.state import ProgressTracker
 
 app = typer.Typer(
     name="bookeeper",
@@ -261,6 +262,18 @@ def clean_metadata(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Inspect and display cleaned metadata without writing back."
     ),
+    resume: bool = typer.Option(
+        True, "--resume/--no-resume", help="Resume from previous checkpoint, skipping already cleaned books."
+    ),
+    reset_progress: bool = typer.Option(
+        False, "--reset-progress", help="Reset saved progress checkpoint and start from scratch."
+    ),
+    start_from_id: Optional[int] = typer.Option(
+        None, "--start-from-id", help="Only process books with ID >= this value (useful for manual restart)."
+    ),
+    state_file: Optional[str] = typer.Option(
+        None, "--state-file", help="Custom path for progress checkpoint JSON file."
+    ),
     calibre_path: Optional[str] = typer.Option(
         None, "--calibre-path", help="Calibre library path or SMB mount (e.g. /Volumes/share/calibre)."
     ),
@@ -280,6 +293,7 @@ def clean_metadata(
     """
     Query Calibre (local, SMB share, or server), inspect titles/authors/summaries,
     prompt Ollama to normalize, and write clean metadata back.
+    Supports persistent checkpointing to resume from interrupted or failed points.
     """
     cfg = _get_effective_settings(config_path, calibre_path, ollama_url, model)
     client = CalibreClient(
@@ -294,6 +308,13 @@ def clean_metadata(
             f"Ensure the SMB share is mounted or calibredb is in PATH."
         )
         raise typer.Exit(1)
+
+    tracker_path = Path(state_file) if state_file else cfg.resolved_state_file
+    tracker = ProgressTracker(tracker_path)
+
+    if reset_progress:
+        tracker.clear("clean_metadata")
+        console.print("[dim yellow]Reset progress checkpoint for clean_metadata.[/dim yellow]")
 
     extractor = KnowledgeExtractor.from_settings(cfg)
 
@@ -312,8 +333,31 @@ def clean_metadata(
         if not books:
             console.print(f"[bold yellow]Book ID {book_id} not found in Calibre library.[/bold yellow]")
             raise typer.Exit(1)
+    else:
+        # Filter by start_from_id if requested
+        if start_from_id is not None:
+            books = [b for b in books if b.get("id", 0) >= start_from_id]
+
+        # Resume from checkpoint
+        if resume:
+            completed_ids = tracker.get_completed_ids("clean_metadata")
+            orig_len = len(books)
+            books = [b for b in books if b.get("id") not in completed_ids]
+            skipped = orig_len - len(books)
+            if skipped > 0:
+                console.print(
+                    f"[dim cyan]Checkpoint Resume: Skipped {skipped} already-cleaned book(s). "
+                    f"({len(books)} remaining. Use --no-resume to reprocess all).[/dim cyan]"
+                )
+
+    if not books:
+        console.print("[bold green]All books are already cleaned! Nothing to process.[/bold green]")
+        raise typer.Exit(0)
 
     console.print(f"[bold green]Found {len(books)} book(s) to process.[/bold green]")
+
+    success_count = 0
+    failed_count = 0
 
     with Progress(
         SpinnerColumn(),
@@ -333,43 +377,43 @@ def clean_metadata(
 
             progress.update(task, description=f"Cleaning: [bold cyan]{raw_title[:30]}[/bold cyan]")
 
-            # Sample book content and file hint from filesystem / SMB share
-            content_sample = None
-            file_hint = None
-            if book_path_str:
-                book_dir = Path(book_path_str)
-                if book_dir.exists():
-                    content_sample, file_hint = BookParser.sample_content(book_dir)
+            try:
+                # Sample book content and file hint from filesystem / SMB share
+                content_sample = None
+                file_hint = None
+                if book_path_str:
+                    book_dir = Path(book_path_str)
+                    if book_dir.exists():
+                        content_sample, file_hint = BookParser.sample_content(book_dir)
 
-            # Run Ollama structured normalization with content sample
-            cleaned = extractor.clean_metadata(
-                raw_title=raw_title,
-                raw_authors=raw_authors,
-                raw_comments=raw_comments,
-                content_sample=content_sample,
-                file_hint=file_hint,
-            )
+                # Run Ollama structured normalization with content sample
+                cleaned = extractor.clean_metadata(
+                    raw_title=raw_title,
+                    raw_authors=raw_authors,
+                    raw_comments=raw_comments,
+                    content_sample=content_sample,
+                    file_hint=file_hint,
+                )
 
-            # Display diff panel
-            table = Table(show_header=True, header_style="bold magenta", expand=True)
-            table.add_column("Field", style="dim", width=12)
-            table.add_column("Original Calibre Value")
-            table.add_column("Cleaned LLM Value", style="bold green")
+                # Display diff panel
+                table = Table(show_header=True, header_style="bold magenta", expand=True)
+                table.add_column("Field", style="dim", width=12)
+                table.add_column("Original Calibre Value")
+                table.add_column("Cleaned LLM Value", style="bold green")
 
-            table.add_row("Title", raw_title, cleaned.title)
-            table.add_row("Authors", ", ".join(raw_authors), cleaned.author)
-            table.add_row(
-                "Summary",
-                (raw_comments[:120] + "...") if raw_comments else "[dim]None[/dim]",
-                cleaned.summary,
-            )
-            if file_hint:
-                table.add_row("Source File", file_hint, "[dim green]Content sampled[/dim green]" if content_sample else "[dim]Inspected[/dim]")
+                table.add_row("Title", raw_title, cleaned.title)
+                table.add_row("Authors", ", ".join(raw_authors), cleaned.author)
+                table.add_row(
+                    "Summary",
+                    (raw_comments[:120] + "...") if raw_comments else "[dim]None[/dim]",
+                    cleaned.summary,
+                )
+                if file_hint:
+                    table.add_row("Source File", file_hint, "[dim green]Content sampled[/dim green]" if content_sample else "[dim]Inspected[/dim]")
 
-            console.print(Panel(table, title=f"Book #{bid} Metadata Diff"))
+                console.print(Panel(table, title=f"Book #{bid} Metadata Diff"))
 
-            if not dry_run:
-                try:
+                if not dry_run:
                     client.update_metadata(
                         book_id=bid,
                         title=cleaned.title,
@@ -377,14 +421,34 @@ def clean_metadata(
                         comments=cleaned.summary,
                     )
                     console.print(f"[green]✓ Successfully updated book #{bid} in Calibre.[/green]")
-                except Exception as e:
-                    console.print(f"[red]✗ Failed to update book #{bid}: {e}[/red]")
-            else:
-                console.print(f"[yellow]⚡ [Dry-Run] Skipped writing back to Calibre.[/yellow]")
+                    tracker.mark_completed(
+                        "clean_metadata",
+                        bid,
+                        title=cleaned.title,
+                        metadata={"author": cleaned.author, "dry_run": False},
+                    )
+                    success_count += 1
+                else:
+                    console.print(f"[yellow]⚡ [Dry-Run] Skipped writing back to Calibre.[/yellow]")
+                    tracker.mark_completed(
+                        "clean_metadata",
+                        bid,
+                        title=cleaned.title,
+                        metadata={"author": cleaned.author, "dry_run": True},
+                    )
+                    success_count += 1
 
-            progress.advance(task)
+            except Exception as e:
+                console.print(f"[bold red]✗ Failed to process book #{bid} ('{raw_title}'):[/bold red] {e}")
+                tracker.mark_failed("clean_metadata", bid, title=raw_title, error=str(e))
+                failed_count += 1
+            finally:
+                progress.advance(task)
 
-    console.print("[bold green]Metadata cleaning process completed.[/bold green]")
+    summary_text = f"[bold green]Metadata cleaning finished.[/bold green] Completed: [bold green]{success_count}[/bold green]"
+    if failed_count > 0:
+        summary_text += f" | Failed: [bold red]{failed_count}[/bold red] [dim](failed books will be retried on next run)[/dim]"
+    console.print(summary_text)
 
 
 @app.command("build-graph")
@@ -413,6 +477,18 @@ def build_graph(
     export_obsidian: Optional[str] = typer.Option(
         None, "--export-obsidian", help="Custom destination directory for Obsidian Markdown vault."
     ),
+    resume: bool = typer.Option(
+        True, "--resume/--no-resume", help="Resume from previous checkpoint, skipping already processed books."
+    ),
+    reset_progress: bool = typer.Option(
+        False, "--reset-progress", help="Reset saved progress checkpoint and start from scratch."
+    ),
+    start_from_id: Optional[int] = typer.Option(
+        None, "--start-from-id", help="Only process books with ID >= this value."
+    ),
+    state_file: Optional[str] = typer.Option(
+        None, "--state-file", help="Custom path for progress checkpoint JSON file."
+    ),
     config_path: Optional[str] = typer.Option(
         None, "--config", "-c", help="Path to config.yaml file."
     ),
@@ -423,6 +499,7 @@ def build_graph(
     """
     Ingest sections, perform semantic chunking, extract concepts via Ollama,
     deduplicate entities, and export the Concept Knowledge Graph.
+    Supports persistent checkpointing to resume from interrupted or failed runs.
     """
     cfg = _get_effective_settings(config_path, calibre_path, ollama_url, model, embedding_model)
     output_dir = cfg.resolved_output_dir
@@ -471,6 +548,13 @@ def build_graph(
     except Exception as e:
         console.print(f"[dim yellow]Warning: Remote Ollama embeddings init skipped ({e}); using paragraph chunker.[/dim yellow]")
         chunker = HierarchicalChunker()
+
+    tracker_path = Path(state_file) if state_file else cfg.resolved_state_file
+    tracker = ProgressTracker(tracker_path)
+
+    if reset_progress:
+        tracker.clear("build_graph")
+        console.print("[dim yellow]Reset progress checkpoint for build_graph.[/dim yellow]")
 
     books_to_process = []
 
@@ -523,6 +607,20 @@ def build_graph(
         )
         raise typer.Exit(1)
 
+    if start_from_id is not None:
+        books_to_process = [b for b in books_to_process if b.get("id", 0) >= start_from_id]
+
+    if resume and not file_path:
+        completed_ids = tracker.get_completed_ids("build_graph")
+        orig_len = len(books_to_process)
+        books_to_process = [b for b in books_to_process if b.get("id") not in completed_ids]
+        skipped = orig_len - len(books_to_process)
+        if skipped > 0:
+            console.print(
+                f"[dim cyan]Checkpoint Resume: Skipped {skipped} already indexed book(s). "
+                f"({len(books_to_process)} remaining. Use --no-resume to reprocess all).[/dim cyan]"
+            )
+
     if not books_to_process:
         console.print("[bold yellow]No books available to process.[/bold yellow]")
         raise typer.Exit(0)
@@ -536,66 +634,73 @@ def build_graph(
         bpath: Path = binfo["path"]
 
         console.print(f"\n[bold blue]► Ingesting Book #{bid}: {btitle}[/bold blue] ({bpath.name})")
-        store.add_book(bid, title=btitle, author=bauthor)
 
-        # Parse sections
-        sections = BookParser.parse(bpath)
-        console.print(f"  Extracted [green]{len(sections)} sections/chapters[/green].")
+        try:
+            store.add_book(bid, title=btitle, author=bauthor)
 
-        # Chunk sections
-        chunks = chunker.chunk_book(sections, book_id=bid, book_title=btitle)
-        console.print(f"  Created [green]{len(chunks)} atomic thematic chunks[/green].")
+            # Parse sections
+            sections = BookParser.parse(bpath)
+            console.print(f"  Extracted [green]{len(sections)} sections/chapters[/green].")
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task(f"Extracting concepts from '{btitle[:25]}'...", total=len(chunks))
+            # Chunk sections
+            chunks = chunker.chunk_book(sections, book_id=bid, book_title=btitle)
+            console.print(f"  Created [green]{len(chunks)} atomic thematic chunks[/green].")
 
-            for chk in chunks:
-                progress.update(
-                    task,
-                    description=f"Processing: [cyan]{chk.section_title[:20]} [p{chk.chunk_idx}][/cyan]",
-                )
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task(f"Extracting concepts from '{btitle[:25]}'...", total=len(chunks))
 
-                # Ensure section exists in graph
-                sec_node_id = store.add_section(
-                    book_id=bid,
-                    chapter_idx=chk.chapter_idx,
-                    title=chk.section_title,
-                    text=chk.text,
-                )
-
-                # Run Ollama Concept Extraction
-                extraction = extractor.extract_section(
-                    text=chk.text,
-                    book_title=btitle,
-                    section_title=chk.section_title,
-                )
-
-                # Deduplicate and register concepts
-                for concept in extraction.concepts:
-                    canonical_concept = deduplicator.resolve_concept(concept)
-                    store.add_concept(canonical_concept)
-
-                    # Link Section -> DISCUSSES -> Concept
-                    store.add_section_concept_link(
-                        section_node_id=sec_node_id,
-                        concept_name=canonical_concept.name,
-                        summary=canonical_concept.summary,
+                for chk in chunks:
+                    progress.update(
+                        task,
+                        description=f"Processing: [cyan]{chk.section_title[:20]} [p{chk.chunk_idx}][/cyan]",
                     )
 
-                    # Link related concepts
-                    for rel_name in canonical_concept.related_concepts:
-                        store.add_concept_relation(
-                            src_concept_name=canonical_concept.name,
-                            tgt_concept_name=rel_name,
+                    # Ensure section exists in graph
+                    sec_node_id = store.add_section(
+                        book_id=bid,
+                        chapter_idx=chk.chapter_idx,
+                        title=chk.section_title,
+                        text=chk.text,
+                    )
+
+                    # Run Ollama Concept Extraction
+                    extraction = extractor.extract_section(
+                        text=chk.text,
+                        book_title=btitle,
+                        section_title=chk.section_title,
+                    )
+
+                    # Deduplicate and register concepts
+                    for concept in extraction.concepts:
+                        canonical_concept = deduplicator.resolve_concept(concept)
+                        store.add_concept(canonical_concept)
+
+                        # Link Section -> DISCUSSES -> Concept
+                        store.add_section_concept_link(
+                            section_node_id=sec_node_id,
+                            concept_name=canonical_concept.name,
+                            summary=canonical_concept.summary,
                         )
 
-                progress.advance(task)
+                        # Link related concepts
+                        for rel_name in canonical_concept.related_concepts:
+                            store.add_concept_relation(
+                                src_concept_name=canonical_concept.name,
+                                tgt_concept_name=rel_name,
+                            )
+
+                    progress.advance(task)
+
+            tracker.mark_completed("build_graph", bid, btitle)
+        except Exception as e:
+            console.print(f"[bold red]✗ Failed to build graph for book #{bid} ('{btitle}'):[/bold red] {e}")
+            tracker.mark_failed("build_graph", bid, title=btitle, error=str(e))
 
     # Persist graph to JSON
     store.save(graph_file)
@@ -626,6 +731,40 @@ def build_graph(
             title="Knowledge Graph Build Complete",
         )
     )
+
+
+@app.command("status")
+def show_status(
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml."),
+    state_file: Optional[str] = typer.Option(None, "--state-file", help="Custom path for progress checkpoint JSON file."),
+):
+    """Display progress and checkpoint summary for batch operations."""
+    cfg = get_settings(config_path)
+    tracker_path = Path(state_file) if state_file else cfg.resolved_state_file
+    tracker = ProgressTracker(tracker_path)
+    clean_summary = tracker.summary("clean_metadata")
+    graph_summary = tracker.summary("build_graph")
+
+    table = Table(title=f"Bookeeper Checkpoint State ({tracker_path.name})", show_header=True)
+    table.add_column("Operation", style="bold cyan")
+    table.add_column("Completed", style="bold green", justify="right")
+    table.add_column("Failed", style="bold red", justify="right")
+    table.add_column("Total Recorded", style="white", justify="right")
+
+    table.add_row(
+        "clean_metadata",
+        str(clean_summary["completed"]),
+        str(clean_summary["failed"]),
+        str(clean_summary["total_recorded"]),
+    )
+    table.add_row(
+        "build_graph",
+        str(graph_summary["completed"]),
+        str(graph_summary["failed"]),
+        str(graph_summary["total_recorded"]),
+    )
+    console.print(table)
+    console.print(f"[dim]Full state location: {tracker_path}[/dim]")
 
 
 @app.command()

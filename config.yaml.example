@@ -36,3 +36,6 @@ similarity_threshold: 0.85
 
 # Destination directory for Knowledge Graph exports and Obsidian vaults
 output_dir: "./output"
+
+# Optional path for progress checkpoint state file (defaults to output_dir/.bookeeper_state.json)
+state_file: null

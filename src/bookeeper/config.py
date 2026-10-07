@@ -71,6 +71,10 @@ class Settings(BaseSettings):
         default="nomic-embed-text",
         description="Embedding model for semantic chunking and entity deduplication.",
     )
+    state_file: Optional[str] = Field(
+        default=None,
+        description="Optional custom path for progress checkpoint state file (default: output_dir/.bookeeper_state.json).",
+    )
 
     @field_validator("ollama_servers", mode="before")
     @classmethod
@@ -120,6 +124,16 @@ class Settings(BaseSettings):
     def resolved_output_dir(self) -> Path:
         """Return expanded Path for output_dir."""
         return Path(self.output_dir).expanduser().resolve()
+
+    @property
+    def resolved_state_file(self) -> Path:
+        """Return expanded Path for state checkpoint file."""
+        if self.state_file:
+            p = Path(self.state_file).expanduser().resolve()
+        else:
+            p = self.resolved_output_dir / ".bookeeper_state.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
 
     @property
     def is_remote_calibre(self) -> bool:

@@ -10,9 +10,33 @@ import shutil
 import sqlite3
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _copy_file_with_progress(
+    src: Path,
+    dst: Path,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    chunk_size: int = 256 * 1024,
+) -> None:
+    """Copy a file in chunks with optional progress callback (copied_bytes, total_bytes)."""
+    total_bytes = src.stat().st_size
+    copied = 0
+    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+        while True:
+            chunk = fsrc.read(chunk_size)
+            if not chunk:
+                break
+            fdst.write(chunk)
+            copied += len(chunk)
+            if progress_callback:
+                progress_callback(copied, total_bytes)
+    try:
+        shutil.copystat(src, dst)
+    except Exception:
+        pass
 
 
 def _sqlite_title_sort(title: Optional[str]) -> str:
@@ -106,7 +130,11 @@ class CalibreClient:
         finally:
             conn.close()
 
-    def stage_database(self, staged_path: Optional[Path | str] = None) -> Path:
+    def stage_database(
+        self,
+        staged_path: Optional[Path | str] = None,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> Path:
         """
         Copy remote/mounted metadata.db to local disk for high-speed SSD transactions.
         Switches active_db_path to staged_path and sets is_staged=True.
@@ -124,7 +152,7 @@ class CalibreClient:
 
         target.parent.mkdir(parents=True, exist_ok=True)
         logger.info(f"Staging Calibre database from {self.db_path} to {target}...")
-        shutil.copy2(self.db_path, target)
+        _copy_file_with_progress(self.db_path, target, progress_callback=progress_callback)
 
         # Verify integrity of staged copy
         self._verify_sqlite_integrity(target)
@@ -133,7 +161,11 @@ class CalibreClient:
         self.is_staged = True
         return target
 
-    def sync_database(self, create_backup: bool = True) -> bool:
+    def sync_database(
+        self,
+        create_backup: bool = True,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> bool:
         """
         Sync staged metadata.db back to original library path.
         Optionally creates a backup (e.g. metadata.db.bak) on the remote share first.
@@ -158,7 +190,7 @@ class CalibreClient:
         logger.info(f"Uploading staged database from {self.staged_db_path} to {self.db_path}...")
         tmp_target = self.db_path.with_name(f".metadata.db.tmp_{os.getpid()}")
         try:
-            shutil.copy2(self.staged_db_path, tmp_target)
+            _copy_file_with_progress(self.staged_db_path, tmp_target, progress_callback=progress_callback)
             tmp_target.replace(self.db_path)
         except OSError:
             # Fallback if filesystem doesn't support atomic replace across temporary files
@@ -167,7 +199,7 @@ class CalibreClient:
                     tmp_target.unlink()
                 except Exception:
                     pass
-            shutil.copy2(self.staged_db_path, self.db_path)
+            _copy_file_with_progress(self.staged_db_path, self.db_path, progress_callback=progress_callback)
 
         return True
 
@@ -282,6 +314,16 @@ class CalibreClient:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
+        # 1. Preload all book formats in ONE bulk query (avoids N individual queries)
+        cursor.execute("SELECT book, format FROM data")
+        book_formats: Dict[int, List[str]] = {}
+        for d_row in cursor.fetchall():
+            b_id = d_row[0]
+            fmt = d_row[1]
+            if fmt:
+                book_formats.setdefault(b_id, []).append(fmt.upper())
+
+        # 2. Bulk query all books with authors and comments
         query = """
         SELECT
             b.id,
@@ -306,13 +348,7 @@ class CalibreClient:
             book_dir = self.local_path / rel_folder if self.local_path else Path(rel_folder)
 
             authors = [a.strip() for a in (r["authors"] or "").split("&") if a.strip()]
-
-            # Format lookup
-            cursor.execute("SELECT format, name FROM data WHERE book = ?", (book_id,))
-            formats = []
-            for d in cursor.fetchall():
-                fmt = d["format"].upper()
-                formats.append(fmt)
+            formats = book_formats.get(book_id, [])
 
             books.append(
                 {

@@ -3,9 +3,10 @@ Production-quality Typer CLI interface for bookeeper with rich progress bars and
 """
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import typer
 from langchain_ollama import OllamaEmbeddings
@@ -336,12 +337,30 @@ def clean_metadata(
 
     if should_stage:
         try:
-            size_mb = client.db_path.stat().st_size / (1024 * 1024)
-            console.print(
-                f"[bold cyan]Local DB Staging:[/bold cyan] Copying metadata.db ({size_mb:.1f} MB) locally for microsecond SSD transactions..."
-            )
-            staged_file = client.stage_database(cfg.resolved_staged_db_path)
-            console.print(f"[dim green]✓ Staged database at {staged_file}[/dim green]")
+            total_bytes = client.db_path.stat().st_size
+            size_mb = total_bytes / (1024 * 1024)
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TextColumn("• {task.completed:.1f}/{task.total:.1f} MB"),
+                console=console,
+            ) as stage_progress:
+                stage_task = stage_progress.add_task(
+                    f"Downloading metadata.db ({size_mb:.1f} MB) locally for fast SSD transactions...",
+                    total=size_mb,
+                )
+
+                def _on_stage_progress(copied_bytes: int, total_b: int):
+                    stage_progress.update(stage_task, completed=copied_bytes / (1024 * 1024))
+
+                staged_file = client.stage_database(
+                    cfg.resolved_staged_db_path,
+                    progress_callback=_on_stage_progress,
+                )
+
+            console.print(f"[dim green]✓ Staged database at {staged_file} (integrity check ok).[/dim green]")
         except Exception as e:
             console.print(
                 f"[bold yellow]Warning:[/bold yellow] Failed to stage metadata.db locally ({e}). "
@@ -362,7 +381,8 @@ def clean_metadata(
     if not skip_warmup:
         _perform_ollama_warmup(extractor, console)
 
-    with console.status("[bold blue]Querying Calibre library...[/bold blue]"):
+    query_msg = "Reading book catalog from staged local SQLite..." if client.is_staged else "Querying Calibre library over network/calibredb..."
+    with console.status(f"[bold blue]{query_msg}[/bold blue]"):
         try:
             books = client.list_books(fields=["id", "title", "authors", "comments", "formats"])
         except Exception as e:
@@ -423,6 +443,22 @@ def clean_metadata(
 
     db_lock = threading.Lock()
     display_lock = threading.Lock()
+    stats_lock = threading.Lock()
+
+    active_tasks_count = 0
+    durations: List[float] = []
+
+    def _calc_stats() -> Tuple[float, float, float]:
+        """Return (avg, p80, fastest) in seconds."""
+        with stats_lock:
+            if not durations:
+                return (0.0, 0.0, 0.0)
+            avg_val = sum(durations) / len(durations)
+            fastest_val = min(durations)
+            sorted_d = sorted(durations)
+            p80_idx = int(0.80 * (len(sorted_d) - 1))
+            p80_val = sorted_d[p80_idx]
+            return (avg_val, p80_val, fastest_val)
 
     def _process_single_book(b_item: Dict[str, Any]) -> Dict[str, Any]:
         bid = b_item["id"]
@@ -456,14 +492,30 @@ def clean_metadata(
             if book_dir and book_dir.exists():
                 content_sample, file_hint = BookParser.sample_content(book_dir)
 
-        # Run Ollama structured normalization with content sample (load-balanced across servers)
-        cleaned = extractor.clean_metadata(
-            raw_title=raw_title,
-            raw_authors=raw_authors,
-            raw_comments=raw_comments,
-            content_sample=content_sample,
-            file_hint=file_hint,
-        )
+        # Track active in-flight task and timing
+        nonlocal active_tasks_count
+        with stats_lock:
+            active_tasks_count += 1
+
+        t0 = time.time()
+        duration = 0.0
+        server_used = "ollama"
+        try:
+            # Run Ollama structured normalization with content sample (load-balanced across servers)
+            cleaned = extractor.clean_metadata(
+                raw_title=raw_title,
+                raw_authors=raw_authors,
+                raw_comments=raw_comments,
+                content_sample=content_sample,
+                file_hint=file_hint,
+            )
+            duration = time.time() - t0
+            server_used = extractor.pool.get_last_used_server() or "ollama"
+            with stats_lock:
+                durations.append(duration)
+        finally:
+            with stats_lock:
+                active_tasks_count = max(0, active_tasks_count - 1)
 
         return {
             "id": bid,
@@ -474,6 +526,8 @@ def clean_metadata(
             "cleaned": cleaned,
             "content_sample": content_sample,
             "file_hint": file_hint,
+            "duration": duration,
+            "server_used": server_used,
         }
 
     try:
@@ -488,6 +542,24 @@ def clean_metadata(
                 f"Normalizing metadata across {num_servers} Ollama server(s)...",
                 total=len(books),
             )
+
+            def _update_progress_description():
+                avg_s, p80_s, fastest_s = _calc_stats()
+                with stats_lock:
+                    cur_active = active_tasks_count
+                desc = (
+                    f"Normalizing across {num_servers} server(s) | "
+                    f"Active: [bold cyan]{cur_active}[/bold cyan]"
+                )
+                if durations:
+                    desc += (
+                        f" | avg: [bold green]{avg_s:.1f}s[/bold green] | "
+                        f"p80: [bold yellow]{p80_s:.1f}s[/bold yellow] | "
+                        f"fastest: [bold magenta]{fastest_s:.1f}s[/bold magenta]"
+                    )
+                progress.update(task, description=desc)
+
+            _update_progress_description()
 
             with ThreadPoolExecutor(max_workers=pool_concurrency) as executor:
                 future_to_book = {
@@ -519,6 +591,8 @@ def clean_metadata(
                                 raw_comments = res["raw_comments"]
                                 content_sample = res["content_sample"]
                                 file_hint = res["file_hint"]
+                                dur = res.get("duration", 0.0)
+                                srv = res.get("server_used", "ollama")
 
                                 # Display diff panel
                                 table = Table(show_header=True, header_style="bold magenta", expand=True)
@@ -557,7 +631,10 @@ def clean_metadata(
                                                 title=cleaned.title,
                                                 metadata={"author": cleaned.author, "dry_run": False},
                                             )
-                                        console.print(f"[green]✓ Successfully updated book #{bid} in Calibre.[/green]")
+                                        console.print(
+                                            f"[green]✓ Successfully updated book #{bid} in Calibre[/green] "
+                                            f"[dim]({dur:.1f}s via {srv})[/dim]"
+                                        )
                                         success_count += 1
                                     else:
                                         console.print(f"[yellow]⚡ [Dry-Run] Skipped writing back to Calibre.[/yellow]")
@@ -578,6 +655,7 @@ def clean_metadata(
                             failed_count += 1
                         finally:
                             progress.advance(task)
+                            _update_progress_description()
 
                 except KeyboardInterrupt:
                     console.print("\n[bold yellow]Cancelled by user. Terminating pending pool tasks...[/bold yellow]")
@@ -589,16 +667,47 @@ def clean_metadata(
             summary_text += f" | Skipped (graphical): [yellow]{skipped_graphical_count}[/yellow]"
         if failed_count > 0:
             summary_text += f" | Failed: [bold red]{failed_count}[/bold red] [dim](run with --retry-failed to re-attempt)[/dim]"
+        if durations:
+            avg_s, p80_s, fastest_s = _calc_stats()
+            summary_text += (
+                f"\n[bold cyan]Processing Performance:[/bold cyan] "
+                f"Avg: [bold green]{avg_s:.2f}s[/bold green] | "
+                f"80th Percentile (p80): [bold yellow]{p80_s:.2f}s[/bold yellow] | "
+                f"Fastest: [bold magenta]{fastest_s:.2f}s[/bold magenta] "
+                f"[dim](across {len(durations)} normalized books)[/dim]"
+            )
         console.print(summary_text)
 
     finally:
         if should_stage and client.is_staged:
             if not dry_run and success_count > 0:
                 try:
+                    total_bytes = client.staged_db_path.stat().st_size
+                    size_mb = total_bytes / (1024 * 1024)
                     console.print(
                         f"[bold blue]Syncing updated database ({success_count} modified book(s)) back to Calibre library...[/bold blue]"
                     )
-                    client.sync_database(create_backup=effective_backup_db)
+                    with Progress(
+                        SpinnerColumn(),
+                        TextColumn("[progress.description]{task.description}"),
+                        BarColumn(),
+                        TaskProgressColumn(),
+                        TextColumn("• {task.completed:.1f}/{task.total:.1f} MB"),
+                        console=console,
+                    ) as sync_progress:
+                        sync_task = sync_progress.add_task(
+                            "Uploading updated metadata.db to Calibre share...",
+                            total=size_mb,
+                        )
+
+                        def _on_sync_progress(copied_bytes: int, total_b: int):
+                            sync_progress.update(sync_task, completed=copied_bytes / (1024 * 1024))
+
+                        client.sync_database(
+                            create_backup=effective_backup_db,
+                            progress_callback=_on_sync_progress,
+                        )
+
                     backup_info = " (remote backup created: metadata.db.bak)" if effective_backup_db else ""
                     console.print(
                         f"[bold green]✓ Successfully synced staged metadata.db to Calibre library{backup_info}.[/bold green]"

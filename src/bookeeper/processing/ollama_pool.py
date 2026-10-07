@@ -66,6 +66,9 @@ class OllamaServerNode:
         self.last_error = None
 
 
+_thread_local = threading.local()
+
+
 class OllamaPool:
     """
     Manages N Ollama servers with priority-based routing, automated failover,
@@ -171,6 +174,7 @@ class OllamaPool:
             with self._lock:
                 node.active_tasks += 1
             try:
+                _thread_local.last_used_server = node.label
                 result = operation(node.url)
                 with self._lock:
                     node.mark_success()
@@ -200,6 +204,11 @@ class OllamaPool:
         raise RuntimeError(
             f"All {len(self.nodes)} Ollama server(s) failed. Attempts: [{err_summary}]"
         ) from last_exception
+
+    @classmethod
+    def get_last_used_server(cls) -> Optional[str]:
+        """Return the label of the last Ollama server used by the calling thread."""
+        return getattr(_thread_local, "last_used_server", None)
 
     def get_status(self) -> List[Dict[str, Any]]:
         """Return status snapshot of all pool nodes."""

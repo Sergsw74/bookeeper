@@ -252,11 +252,26 @@ def clean_metadata(
             raw_title = b.get("title", "Untitled")
             raw_authors = b.get("authors", [])
             raw_comments = b.get("comments", "")
+            book_path_str = b.get("path")
 
             progress.update(task, description=f"Cleaning: [bold cyan]{raw_title[:30]}[/bold cyan]")
 
-            # Run Ollama structured normalization
-            cleaned = extractor.clean_metadata(raw_title, raw_authors, raw_comments)
+            # Sample book content and file hint from filesystem / SMB share
+            content_sample = None
+            file_hint = None
+            if book_path_str:
+                book_dir = Path(book_path_str)
+                if book_dir.exists():
+                    content_sample, file_hint = BookParser.sample_content(book_dir)
+
+            # Run Ollama structured normalization with content sample
+            cleaned = extractor.clean_metadata(
+                raw_title=raw_title,
+                raw_authors=raw_authors,
+                raw_comments=raw_comments,
+                content_sample=content_sample,
+                file_hint=file_hint,
+            )
 
             # Display diff panel
             table = Table(show_header=True, header_style="bold magenta", expand=True)
@@ -271,6 +286,8 @@ def clean_metadata(
                 (raw_comments[:120] + "...") if raw_comments else "[dim]None[/dim]",
                 cleaned.summary,
             )
+            if file_hint:
+                table.add_row("Source File", file_hint, "[dim green]Content sampled[/dim green]" if content_sample else "[dim]Inspected[/dim]")
 
             console.print(Panel(table, title=f"Book #{bid} Metadata Diff"))
 

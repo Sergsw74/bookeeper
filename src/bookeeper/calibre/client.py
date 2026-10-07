@@ -13,6 +13,38 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _sqlite_title_sort(title: Optional[str]) -> str:
+    """Calibre-compatible title sort calculation."""
+    if not title:
+        return ""
+    t = title.strip()
+    for prefix in ("the ", "a ", "an "):
+        if t.lower().startswith(prefix):
+            orig_prefix = t[: len(prefix)].strip()
+            return t[len(prefix) :].strip() + ", " + orig_prefix
+    return t
+
+
+def _sqlite_author_sort(author: Optional[str]) -> str:
+    """Calibre-compatible author sort calculation (e.g. 'John Smith' -> 'Smith, John')."""
+    if not author:
+        return ""
+    parts = author.strip().split()
+    if len(parts) > 1:
+        return f"{parts[-1]}, {' '.join(parts[:-1])}"
+    return author.strip()
+
+
+def _register_sqlite_functions(conn: sqlite3.Connection) -> None:
+    """Register custom SQLite functions expected by Calibre's schema triggers."""
+    import uuid
+
+    conn.create_function("title_sort", 1, _sqlite_title_sort)
+    conn.create_function("author_sort", 1, _sqlite_author_sort)
+    conn.create_function("sort_author", 1, _sqlite_author_sort)
+    conn.create_function("uuid4", 0, lambda: str(uuid.uuid4()))
+
+
 class CalibreClient:
     """
     Client for interacting with a Calibre library. Supports:
@@ -111,6 +143,7 @@ class CalibreClient:
         """Query metadata.db directly in read-only mode over local or SMB filesystem."""
         uri = f"file:{self.db_path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
+        _register_sqlite_functions(conn)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
@@ -189,7 +222,7 @@ class CalibreClient:
 
         # 2. Direct SQLite fallback
         if self.db_path and self.db_path.is_file():
-            return self._update_metadata_sqlite(book_id, title, comments)
+            return self._update_metadata_sqlite(book_id, title, authors, comments)
 
         raise RuntimeError(f"Cannot update metadata: calibredb failed and metadata.db not writable.")
 
@@ -197,22 +230,52 @@ class CalibreClient:
         self,
         book_id: int,
         title: Optional[str] = None,
+        authors: Optional[List[str]] = None,
         comments: Optional[str] = None,
     ) -> bool:
-        """Perform direct SQLite update on title/comments in metadata.db."""
+        """Perform direct SQLite update on title, authors, and comments in metadata.db."""
         conn = sqlite3.connect(str(self.db_path))
+        _register_sqlite_functions(conn)
         cursor = conn.cursor()
         try:
             if title:
-                cursor.execute("UPDATE books SET title = ? WHERE id = ?", (title, book_id))
-            if comments:
+                cursor.execute("UPDATE books SET title = ? WHERE id = ?", (title.strip(), book_id))
+
+            if comments is not None:
                 cursor.execute(
                     """
                     INSERT INTO comments (book, text) VALUES (?, ?)
                     ON CONFLICT(book) DO UPDATE SET text = excluded.text
                     """,
-                    (book_id, comments),
+                    (book_id, comments.strip()),
                 )
+
+            if authors:
+                author_ids = []
+                for a in authors:
+                    a_clean = a.strip()
+                    if not a_clean:
+                        continue
+                    cursor.execute("SELECT id FROM authors WHERE name = ? COLLATE NOCASE", (a_clean,))
+                    row = cursor.fetchone()
+                    if row:
+                        author_ids.append(row[0])
+                    else:
+                        sort_val = _sqlite_author_sort(a_clean)
+                        cursor.execute("INSERT INTO authors (name, sort) VALUES (?, ?)", (a_clean, sort_val))
+                        author_ids.append(cursor.lastrowid)
+
+                if author_ids:
+                    cursor.execute("DELETE FROM books_authors_link WHERE book = ?", (book_id,))
+                    for aid in author_ids:
+                        cursor.execute(
+                            "INSERT OR IGNORE INTO books_authors_link (book, author) VALUES (?, ?)",
+                            (book_id, aid),
+                        )
+                    primary_sort = " & ".join(_sqlite_author_sort(a.strip()) for a in authors if a.strip())
+                    cursor.execute("UPDATE books SET author_sort = ? WHERE id = ?", (primary_sort, book_id))
+
+            cursor.execute("UPDATE books SET last_modified = CURRENT_TIMESTAMP WHERE id = ?", (book_id,))
             conn.commit()
             return True
         except Exception as e:

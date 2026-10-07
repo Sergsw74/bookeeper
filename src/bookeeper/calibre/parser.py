@@ -213,3 +213,196 @@ class BookParser:
         text = re.sub(r"[ \t]+", " ", text)
         text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
         return text.strip()
+
+    @classmethod
+    def sample_content(
+        cls,
+        target: Union[Path, str],
+        max_chars: int = 4000,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Sample the beginning text, title page, or annotation of a book for metadata cleaning.
+        Target can be a directory containing book files or a direct book file path.
+        Returns a tuple of (extracted_text_sample, file_hint).
+        """
+        p = Path(target).expanduser().resolve()
+        if not p.exists():
+            return None, None
+
+        if p.is_dir():
+            files = [
+                f for f in p.iterdir()
+                if f.is_file() and f.suffix.lower() not in (".opf", ".jpg", ".jpeg", ".png", ".json")
+            ]
+            ext_order = {
+                ".epub": 1,
+                ".fb2": 2,
+                ".rtf": 3,
+                ".pdf": 4,
+                ".txt": 5,
+                ".mobi": 6,
+                ".azw3": 7,
+                ".zip": 8,
+                ".djvu": 9,
+            }
+            files.sort(key=lambda f: ext_order.get(f.suffix.lower(), 99))
+            if not files:
+                return None, None
+            target_file = files[0]
+        else:
+            target_file = p
+
+        ext = target_file.suffix.lower()
+        file_hint = target_file.name
+
+        # 1. EPUB sampling
+        if ext == ".epub":
+            try:
+                import zipfile
+                with zipfile.ZipFile(target_file) as z:
+                    sample_texts = []
+                    html_files = [
+                        n for n in z.namelist()
+                        if n.lower().endswith((".html", ".xhtml", ".htm"))
+                    ]
+                    for name in html_files[:4]:
+                        soup = BeautifulSoup(z.read(name), "html.parser")
+                        for tag in soup(["script", "style", "nav", "aside"]):
+                            tag.decompose()
+                        t = cls._clean_whitespace(soup.get_text(separator=" "))
+                        if len(t) > 30:
+                            sample_texts.append(t)
+                    if sample_texts:
+                        return "\n\n".join(sample_texts)[:max_chars], file_hint
+            except Exception as e:
+                logger.debug(f"EPUB sampling error for {target_file}: {e}")
+
+        # 2. RTF sampling
+        elif ext == ".rtf":
+            try:
+                with open(target_file, "rb") as f:
+                    raw = f.read(100000)
+                enc = "cp1251" if b"ansicpg1251" in raw else "utf-8"
+                # Strip embedded pict / jpeg hex blobs
+                raw = re.sub(rb"\{[^{}]*\\\\pict[\s\S]*?\}", b"", raw)
+                raw = re.sub(rb"\\\'([0-9a-fA-F]{2})", lambda m: bytes([int(m.group(1), 16)]), raw)
+                text = raw.decode(enc, errors="replace")
+
+                header_bits = []
+                t = re.search(r"\\title\s+([^}\\\r\n]+)", text)
+                if t and t.group(1).strip():
+                    header_bits.append(f"Title: {t.group(1).strip()}")
+                a = re.search(r"\\author\s+([^}\\\r\n]+)", text)
+                if a and a.group(1).strip():
+                    header_bits.append(f"Author: {a.group(1).strip()}")
+
+                clean = re.sub(r"\\\*?[a-zA-Z]+(?:-?\d+)? ?", " ", text)
+                clean = re.sub(r"[{}]", " ", clean)
+                clean = re.sub(
+                    r"\b(fonttbl|colortbl|stylesheet|fname|fswiss|froman|fmodern|Normal|heading|Annotation|FootNote|Paperw|margl|headery|footery|fcharset\d+)\b",
+                    " ",
+                    clean,
+                    flags=re.I,
+                )
+                clean = re.sub(r"\s+", " ", clean).strip()
+
+                first_coherent = re.search(r"[А-Яа-яЁёA-Za-z]{3,}", clean)
+                if first_coherent:
+                    clean = clean[first_coherent.start():]
+
+                prefix = (" | ".join(header_bits) + "\n\n") if header_bits else ""
+                final = (prefix + clean)[:max_chars]
+                if len(final.strip()) > 5:
+                    return final, file_hint
+            except Exception as e:
+                logger.debug(f"RTF sampling error for {target_file}: {e}")
+
+        # 3. PDF sampling
+        elif ext == ".pdf":
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(str(target_file))
+                pages_text = []
+                for page in reader.pages[:3]:
+                    txt = page.extract_text()
+                    if txt:
+                        pages_text.append(cls._clean_whitespace(txt))
+                if pages_text:
+                    return "\n\n".join(pages_text)[:max_chars], file_hint
+            except Exception as e:
+                logger.debug(f"PDF sampling error for {target_file}: {e}")
+
+        # 4. FB2 sampling
+        elif ext == ".fb2":
+            try:
+                with open(target_file, "rb") as f:
+                    raw = f.read(50000)
+                enc = "windows-1251" if b"windows-1251" in raw.lower() else "utf-8"
+                soup = BeautifulSoup(raw.decode(enc, errors="replace"), "html.parser")
+                fb2_texts = []
+                bt = soup.find("book-title")
+                if bt and bt.text:
+                    fb2_texts.append(f"Title: {bt.text.strip()}")
+                auth = soup.find("author")
+                if auth and auth.text:
+                    fb2_texts.append(f"Author: {auth.text.strip()}")
+                ann = soup.find("annotation")
+                if ann and ann.text:
+                    fb2_texts.append(f"Annotation: {ann.text.strip()}")
+                body = soup.find("body")
+                if body and body.text:
+                    fb2_texts.append(cls._clean_whitespace(body.text[:2000]))
+                if fb2_texts:
+                    return "\n\n".join(fb2_texts)[:max_chars], file_hint
+            except Exception as e:
+                logger.debug(f"FB2 sampling error for {target_file}: {e}")
+
+        # 5. TXT sampling
+        elif ext == ".txt":
+            try:
+                with open(target_file, "rb") as f:
+                    raw = f.read(10000)
+                for enc in ("utf-8", "cp1251", "latin-1"):
+                    try:
+                        text = raw.decode(enc)
+                        return cls._clean_whitespace(text)[:max_chars], file_hint
+                    except UnicodeDecodeError:
+                        continue
+            except Exception as e:
+                logger.debug(f"TXT sampling error for {target_file}: {e}")
+
+        # 6. ZIP archive inspection
+        elif ext == ".zip":
+            try:
+                import zipfile
+                with zipfile.ZipFile(target_file) as z:
+                    names = z.namelist()
+                    # Check if there is an inner readable text file
+                    inner_candidates = [
+                        n for n in names
+                        if n.lower().endswith((".txt", ".fb2", ".rtf", ".html", ".htm"))
+                    ]
+                    if inner_candidates:
+                        inner_name = inner_candidates[0]
+                        inner_data = z.read(inner_name)[:10000]
+                        for enc in ("utf-8", "cp1251", "latin-1"):
+                            try:
+                                return (
+                                    cls._clean_whitespace(inner_data.decode(enc))[:max_chars],
+                                    f"{file_hint} ({inner_name})",
+                                )
+                            except UnicodeDecodeError:
+                                pass
+                    inner_str = names[0] if names else ""
+                    return (
+                        f"ZIP archive containing: {', '.join(names[:10])}",
+                        f"{file_hint} (contains {inner_str})",
+                    )
+            except Exception as e:
+                logger.debug(f"ZIP sampling error for {target_file}: {e}")
+
+        # 7. DJVU / other binary
+        elif ext == ".djvu":
+            return f"DjVu technical document: {file_hint}", file_hint
+
+        return None, file_hint

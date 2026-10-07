@@ -1,167 +1,170 @@
 """
-Semantic and TOC-based text chunking engine.
+Hierarchical and semantic text chunking preserving chapter and section metadata.
 """
 
 import hashlib
+import logging
 import re
 from typing import List, Optional
 
+from langchain_core.embeddings import Embeddings
 from pydantic import BaseModel, Field
 
-from bookeeper.calibre.parser import ChapterSection
-from bookeeper.config import ProcessingSettings
+from bookeeper.calibre.parser import Section
+
+logger = logging.getLogger(__name__)
 
 
-class TextChunk(BaseModel):
-    """Normalized text chunk with full chapter and book breadcrumb metadata."""
+class HierarchicalChunk(BaseModel):
+    """Atomic thematic chunk containing complete parent book and section metadata."""
 
     chunk_id: str
     book_id: int
     book_title: str
-    chapter_title: str
-    chapter_sequence: int
-    chunk_index: int
+    section_title: str
+    chapter_idx: int
+    chunk_idx: int
     text: str
-    character_count: int
-    word_count: int
+    char_count: int = 0
+    word_count: int = 0
+
+    def model_post_init(self, __context) -> None:
+        if not self.char_count and self.text:
+            self.char_count = len(self.text)
+        if not self.word_count and self.text:
+            self.word_count = len(self.text.split())
 
     @property
-    def source_ref(self) -> str:
-        return f"{self.book_title} > {self.chapter_title} (part {self.chunk_index + 1})"
+    def breadcrumb(self) -> str:
+        return f"{self.book_title} > {self.section_title} [part {self.chapter_idx}.{self.chunk_idx}]"
 
 
-class SemanticChunker:
-    """Chunker that preserves TOC structure and paragraph boundaries."""
+class HierarchicalChunker:
+    """
+    Splits document sections into atomic thematic chunks using SemanticChunker
+    (via OllamaEmbeddings) with graceful heuristic fallback when embeddings are unavailable.
+    """
 
-    def __init__(self, settings: Optional[ProcessingSettings] = None):
-        self.settings = settings or ProcessingSettings()
-
-    def chunk_sections(
+    def __init__(
         self,
-        sections: List[ChapterSection],
+        embeddings: Optional[Embeddings] = None,
+        breakpoint_threshold_type: str = "percentile",
+        breakpoint_threshold_amount: float = 85.0,
+        max_chunk_chars: int = 2500,
+        min_chunk_chars: int = 150,
+    ):
+        self.embeddings = embeddings
+        self.breakpoint_threshold_type = breakpoint_threshold_type
+        self.breakpoint_threshold_amount = breakpoint_threshold_amount
+        self.max_chunk_chars = max_chunk_chars
+        self.min_chunk_chars = min_chunk_chars
+
+        self._semantic_splitter = None
+        if self.embeddings is not None:
+            try:
+                from langchain_experimental.text_splitter import SemanticChunker
+
+                self._semantic_splitter = SemanticChunker(
+                    embeddings=self.embeddings,
+                    breakpoint_threshold_type=self.breakpoint_threshold_type,
+                    breakpoint_threshold_amount=self.breakpoint_threshold_amount,
+                )
+            except Exception as e:
+                logger.warning(f"Could not initialize SemanticChunker with embeddings: {e}")
+
+    def chunk_section(
+        self,
+        section: Section,
         book_id: int,
         book_title: str,
-    ) -> List[TextChunk]:
-        """Split a list of chapter sections into structured text chunks."""
-        all_chunks: List[TextChunk] = []
+    ) -> List[HierarchicalChunk]:
+        """Split a single section into thematic chunks preserving section metadata."""
+        text = section.text.strip()
+        if not text or len(text) < self.min_chunk_chars:
+            return []
 
-        for sec in sections:
-            sec_text = sec.text.strip()
-            if not sec_text or len(sec_text) < self.settings.min_chunk_size:
-                continue
+        raw_chunks: List[str] = []
 
-            raw_chunks = self._split_text(
-                sec_text,
-                target_size=self.settings.chunk_size,
-                overlap=self.settings.chunk_overlap,
-            )
-
-            for idx, chunk_str in enumerate(raw_chunks):
-                if len(chunk_str) < self.settings.min_chunk_size and raw_chunks:
-                    # Skip tiny residual fragments unless it's the only one
-                    if len(raw_chunks) > 1:
-                        continue
-
-                # Unique deterministic chunk id based on book, section, and text hash
-                h = hashlib.sha256(chunk_str.encode("utf-8")).hexdigest()[:8]
-                cid = f"b{book_id}_s{sec.sequence}_c{idx}_{h}"
-
-                all_chunks.append(
-                    TextChunk(
-                        chunk_id=cid,
-                        book_id=book_id,
-                        book_title=book_title,
-                        chapter_title=sec.title,
-                        chapter_sequence=sec.sequence,
-                        chunk_index=idx,
-                        text=chunk_str,
-                        character_count=len(chunk_str),
-                        word_count=len(chunk_str.split()),
-                    )
+        # 1. Attempt semantic chunking via embeddings
+        if self._semantic_splitter is not None:
+            try:
+                docs = self._semantic_splitter.create_documents([text])
+                raw_chunks = [d.page_content.strip() for d in docs if d.page_content.strip()]
+            except Exception as e:
+                logger.warning(
+                    f"Semantic chunking failed on '{section.title}', falling back to paragraph chunker: {e}"
                 )
+                raw_chunks = []
 
-        return all_chunks
+        # 2. Fallback: Paragraph and sentence boundary chunking
+        if not raw_chunks:
+            raw_chunks = self._fallback_split(text, self.max_chunk_chars)
 
-    def _split_text(self, text: str, target_size: int, overlap: int) -> List[str]:
-        """Split text along paragraph or sentence boundaries with overlapping windows."""
-        if len(text) <= target_size:
-            return [text]
-
-        # Break text into paragraphs
-        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-        chunks: List[str] = []
-        current_chunk: List[str] = []
-        current_length = 0
-
-        for para in paragraphs:
-            para_len = len(para)
-
-            # If a single paragraph is enormous, break it by sentences
-            if para_len > target_size:
-                if current_chunk:
-                    joined = "\n\n".join(current_chunk)
-                    chunks.append(joined)
-                    current_chunk = []
-                    current_length = 0
-
-                sentence_chunks = self._split_by_sentences(para, target_size, overlap)
-                chunks.extend(sentence_chunks)
+        chunks: List[HierarchicalChunk] = []
+        for idx, chunk_text in enumerate(raw_chunks):
+            if len(chunk_text) < self.min_chunk_chars and raw_chunks and len(raw_chunks) > 1:
                 continue
 
-            if current_length + para_len + 2 > target_size and current_chunk:
-                joined = "\n\n".join(current_chunk)
-                chunks.append(joined)
+            h = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()[:8]
+            cid = f"b{book_id}_c{section.chapter_idx}_p{idx}_{h}"
 
-                # Keep overlap from the end of the previous chunk
-                overlap_chunk: List[str] = []
-                overlap_len = 0
-                for item in reversed(current_chunk):
-                    if overlap_len + len(item) <= overlap:
-                        overlap_chunk.insert(0, item)
-                        overlap_len += len(item) + 2
-                    else:
-                        break
-
-                current_chunk = overlap_chunk
-                current_length = overlap_len
-
-            current_chunk.append(para)
-            current_length += para_len + 2
-
-        if current_chunk:
-            joined = "\n\n".join(current_chunk)
-            chunks.append(joined)
+            chunks.append(
+                HierarchicalChunk(
+                    chunk_id=cid,
+                    book_id=book_id,
+                    book_title=book_title,
+                    section_title=section.title,
+                    chapter_idx=section.chapter_idx,
+                    chunk_idx=idx + 1,
+                    text=chunk_text,
+                )
+            )
 
         return chunks
 
-    @staticmethod
-    def _split_by_sentences(text: str, target_size: int, overlap: int) -> List[str]:
-        """Fallback split for huge paragraphs using sentence boundaries."""
-        sentences = re.split(r"(?<=[.!?])\s+", text)
+    def chunk_book(
+        self,
+        sections: List[Section],
+        book_id: int,
+        book_title: str,
+    ) -> List[HierarchicalChunk]:
+        """Process all sections of a book sequentially."""
+        all_chunks: List[HierarchicalChunk] = []
+        for sec in sections:
+            all_chunks.extend(self.chunk_section(sec, book_id, book_title))
+        return all_chunks
+
+    def _fallback_split(self, text: str, max_chars: int) -> List[str]:
+        """Split text along natural paragraph boundaries."""
+        if len(text) <= max_chars:
+            return [text]
+
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
         chunks: List[str] = []
         current: List[str] = []
-        length = 0
+        curr_len = 0
 
-        for s in sentences:
-            s_len = len(s)
-            if length + s_len + 1 > target_size and current:
-                chunks.append(" ".join(current))
-                # Build overlap
-                overlap_items: List[str] = []
-                overlap_len = 0
-                for item in reversed(current):
-                    if overlap_len + len(item) <= overlap:
-                        overlap_items.insert(0, item)
-                        overlap_len += len(item) + 1
-                    else:
-                        break
-                current = overlap_items
-                length = overlap_len
+        for p in paragraphs:
+            if curr_len + len(p) + 2 > max_chars and current:
+                chunks.append("\n\n".join(current))
+                current = []
+                curr_len = 0
 
-            current.append(s)
-            length += s_len + 1
+            # If a single paragraph is longer than max_chars, split by sentence
+            if len(p) > max_chars:
+                sentences = re.split(r"(?<=[.!?])\s+", p)
+                for s in sentences:
+                    if curr_len + len(s) + 1 > max_chars and current:
+                        chunks.append(" ".join(current))
+                        current = []
+                        curr_len = 0
+                    current.append(s)
+                    curr_len += len(s) + 1
+            else:
+                current.append(p)
+                curr_len += len(p) + 2
 
         if current:
-            chunks.append(" ".join(current))
+            chunks.append("\n\n".join(current))
 
         return chunks

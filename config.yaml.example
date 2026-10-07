@@ -2,59 +2,18 @@
 # bookeeper - Configuration File
 # ==============================================================================
 
-# Calibre Library Integration
-calibre:
-  # Path to the Calibre library directory (containing metadata.db)
-  library_path: "~/Calibre Library"
-  # Optional explicit path to calibredb executable (default: found in PATH)
-  calibredb_path: null
-  # Preferred formats in priority order
-  preferred_formats:
-    - "EPUB"
-    - "PDF"
+# Calibre Library Integration (local path or http://host:port/#library)
+calibre_library_path: "~/Calibre Library"
+calibre_user: null
+calibre_password: null
 
 # Local Ollama LLM & Embeddings Configuration
-ollama:
-  # Ollama server base URL
-  base_url: "http://localhost:11434"
-  # Model for metadata cleaning and concept extraction
-  model: "llama3:8b"
-  # Embedding model for semantic chunking and entity resolution
-  embedding_model: "nomic-embed-text"
-  # Temperature for structured extraction (0.0 for deterministic outputs)
-  temperature: 0.0
-  # Request timeout in seconds
-  timeout: 120.0
+ollama_base_url: "http://localhost:11434"
+llm_model: "llama3.1:8b"
+embedding_model: "nomic-embed-text"
 
-# Document Ingestion & Chunking Pipeline
-processing:
-  # Chunk size target in characters (~500-800 tokens)
-  chunk_size: 2000
-  # Chunk overlap in characters
-  chunk_overlap: 300
-  # Minimum chunk size to process (skip negligible snippets)
-  min_chunk_size: 200
-  # Respect Table of Contents / chapter boundaries when chunking
-  toc_aware: true
-  # Similarity threshold for embedding-based entity resolution (0.0 - 1.0)
-  dedup_similarity_threshold: 0.85
+# Entity resolution cosine similarity threshold (0.0 - 1.0)
+similarity_threshold: 0.85
 
-# Concept Knowledge Graph & Exporters
-graph:
-  # Backend storage type: "networkx" (in-memory/file), "sqlite", or "neo4j"
-  backend: "networkx"
-  # SQLite graph database file path (if backend is sqlite or networkx persistence)
-  storage_path: "./data/bookeeper_graph.json"
-  # Exporters configuration
-  exports:
-    obsidian:
-      enabled: true
-      vault_path: "./obsidian_vault"
-      create_moc: true       # Create Map of Content root notes
-      embed_metadata: true   # Include YAML frontmatter with sources
-    graphml:
-      enabled: true
-      output_path: "./graph_exports/knowledge_graph.graphml"
-    cytoscape:
-      enabled: true
-      output_path: "./graph_exports/cytoscape_elements.json"
+# Destination directory for Knowledge Graph exports and Obsidian vaults
+output_dir: "./output"

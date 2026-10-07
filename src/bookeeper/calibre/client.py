@@ -1,207 +1,178 @@
 """
-Calibre database client and wrapper supporting direct SQLite metadata.db access
-and optional calibredb CLI execution.
+Calibre client wrapping the calibredb command-line interface via subprocess.
 """
 
 import json
 import logging
-import sqlite3
+import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional
-
-from pydantic import BaseModel, Field
-
-from bookeeper.config import CalibreSettings
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 
-class BookRecord(BaseModel):
-    """Normalized book record from Calibre library."""
-
-    id: int
-    title: str
-    authors: List[str] = Field(default_factory=list)
-    tags: List[str] = Field(default_factory=list)
-    pubdate: Optional[str] = None
-    series: Optional[str] = None
-    series_index: Optional[float] = None
-    comments: Optional[str] = None
-    formats: Dict[str, Path] = Field(default_factory=dict)  # e.g. {"EPUB": Path(...)}
-
-    @property
-    def author_display(self) -> str:
-        return ", ".join(self.authors) if self.authors else "Unknown Author"
-
-    def get_preferred_file(self, preferred_formats: List[str]) -> Optional[Path]:
-        """Return the path of the highest-priority format present."""
-        for fmt in preferred_formats:
-            fmt_upper = fmt.upper()
-            if fmt_upper in self.formats:
-                return self.formats[fmt_upper]
-        # Fallback to any format available
-        if self.formats:
-            return next(iter(self.formats.values()))
-        return None
-
-
 class CalibreClient:
-    """Client for reading books and metadata from a Calibre library."""
+    """Wrapper around the calibredb CLI for querying and updating library metadata."""
 
-    def __init__(self, settings: CalibreSettings):
-        self.settings = settings
-        self.library_path = Path(settings.library_path).expanduser().resolve()
-        self.db_path = self.library_path / "metadata.db"
+    def __init__(
+        self,
+        library_path: str,
+        user: Optional[str] = None,
+        password: Optional[str] = None,
+        calibredb_bin: Optional[str] = None,
+    ):
+        self.library_path = library_path
+        self.user = user
+        self.password = password
+        self.calibredb_bin = calibredb_bin or shutil.which("calibredb") or "calibredb"
+
+    def _build_base_args(self) -> List[str]:
+        """Construct common CLI parameters including library path and auth."""
+        args = [self.calibredb_bin]
+        if self.library_path:
+            expanded = (
+                self.library_path
+                if self.library_path.startswith("http://") or self.library_path.startswith("https://")
+                else str(Path(self.library_path).expanduser().resolve())
+            )
+            args.extend(["--with-library", expanded])
+
+        if self.user:
+            args.extend(["--username", self.user])
+        if self.password:
+            args.extend(["--password", self.password])
+
+        return args
 
     def is_available(self) -> bool:
-        """Check if Calibre library metadata.db exists and is accessible."""
-        return self.db_path.is_file()
+        """Verify whether calibredb CLI binary exists and is executable."""
+        return shutil.which(self.calibredb_bin) is not None
 
-    def list_books(self, limit: Optional[int] = None) -> List[BookRecord]:
-        """List all books from the library with their associated format files."""
-        if not self.is_available():
-            raise FileNotFoundError(f"Calibre metadata.db not found at {self.db_path}")
-
-        # Connect to metadata.db in read-only URI mode to avoid locks
-        uri = f"file:{self.db_path}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-
-        query = """
-        SELECT
-            b.id,
-            b.title,
-            b.path,
-            b.pubdate,
-            (SELECT GROUP_CONCAT(a.name, ' & ')
-             FROM books_authors_link bal
-             JOIN authors a ON bal.author = a.id
-             WHERE bal.book = b.id) AS authors,
-            (SELECT GROUP_CONCAT(t.name, ',')
-             FROM books_tags_link btl
-             JOIN tags t ON btl.tag = t.id
-             WHERE btl.book = b.id) AS tags,
-            (SELECT text FROM comments WHERE book = b.id) AS comments
-        FROM books b
-        ORDER BY b.id ASC
+    def list_books(self, fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
-        if limit:
-            query += f" LIMIT {int(limit)}"
+        Query books from Calibre library via calibredb list.
 
-        cursor.execute(query)
-        rows = cursor.fetchall()
+        Args:
+            fields: List of metadata field names (e.g. ['id', 'title', 'authors', 'comments', 'formats'])
 
-        books: List[BookRecord] = []
-        for r in rows:
-            book_id = r["id"]
-            rel_folder = r["path"]
-            book_dir = self.library_path / rel_folder
-
-            authors = [a.strip() for a in (r["authors"] or "").split("&") if a.strip()]
-            tags = [t.strip() for t in (r["tags"] or "").split(",") if t.strip()]
-
-            # Fetch file formats for this book
-            cursor.execute(
-                "SELECT format, name FROM data WHERE book = ?",
-                (book_id,),
-            )
-            data_rows = cursor.fetchall()
-            formats: Dict[str, Path] = {}
-            for d in data_rows:
-                fmt = d["format"].upper()
-                file_name = f"{d['name']}.{fmt.lower()}"
-                full_path = book_dir / file_name
-                if full_path.is_file():
-                    formats[fmt] = full_path
-
-            books.append(
-                BookRecord(
-                    id=book_id,
-                    title=r["title"] or "Untitled",
-                    authors=authors,
-                    tags=tags,
-                    pubdate=r["pubdate"],
-                    comments=r["comments"],
-                    formats=formats,
-                )
+        Returns:
+            List of book metadata dictionaries.
+        """
+        if not self.is_available():
+            raise FileNotFoundError(
+                f"calibredb binary '{self.calibredb_bin}' not found in system PATH."
             )
 
-        conn.close()
-        return books
+        cmd = self._build_base_args() + ["list", "--for-machine"]
+        if fields:
+            cmd.extend(["--fields", ",".join(fields)])
 
-    def get_book(self, book_id: int) -> Optional[BookRecord]:
-        """Fetch a specific book record by its Calibre ID."""
-        if not self.is_available():
-            raise FileNotFoundError(f"Calibre metadata.db not found at {self.db_path}")
+        logger.debug(f"Running calibredb command: {' '.join(cmd)}")
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
-        uri = f"file:{self.db_path}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
+        if result.returncode != 0:
+            error_msg = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(f"calibredb list failed (code {result.returncode}): {error_msg}")
 
-        query = """
-        SELECT
-            b.id,
-            b.title,
-            b.path,
-            b.pubdate,
-            (SELECT GROUP_CONCAT(a.name, ' & ')
-             FROM books_authors_link bal
-             JOIN authors a ON bal.author = a.id
-             WHERE bal.book = b.id) AS authors,
-            (SELECT GROUP_CONCAT(t.name, ',')
-             FROM books_tags_link btl
-             JOIN tags t ON btl.tag = t.id
-             WHERE btl.book = b.id) AS tags,
-            (SELECT text FROM comments WHERE book = b.id) AS comments
-        FROM books b
-        WHERE b.id = ?
+        try:
+            books_data: List[Dict[str, Any]] = json.loads(result.stdout)
+            return books_data
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Failed to parse calibredb JSON output: {e}\nRaw output: {result.stdout[:500]}") from e
+
+    def update_metadata(
+        self,
+        book_id: int,
+        title: Optional[str] = None,
+        authors: Optional[List[str]] = None,
+        comments: Optional[str] = None,
+    ) -> bool:
         """
-        cursor.execute(query, (book_id,))
-        row = cursor.fetchone()
-        if not row:
-            conn.close()
+        Update book metadata fields in Calibre via calibredb set_metadata.
+
+        Args:
+            book_id: Calibre book ID.
+            title: New title string.
+            authors: List of author names (formatted into '&' delimited string for calibredb).
+            comments: Summary/description/comments text.
+
+        Returns:
+            True if metadata was successfully updated.
+        """
+        if not self.is_available():
+            raise FileNotFoundError(
+                f"calibredb binary '{self.calibredb_bin}' not found in system PATH."
+            )
+
+        cmd = self._build_base_args() + ["set_metadata", str(book_id)]
+
+        if title:
+            cmd.extend(["--field", f"title:{title}"])
+        if authors:
+            authors_str = " & ".join(authors)
+            cmd.extend(["--field", f"authors:{authors_str}"])
+        if comments:
+            cmd.extend(["--field", f"comments:{comments}"])
+
+        logger.debug(f"Updating metadata for book {book_id}: {' '.join(cmd)}")
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        if result.returncode != 0:
+            error_msg = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(
+                f"calibredb set_metadata failed for book {book_id} (code {result.returncode}): {error_msg}"
+            )
+
+        return True
+
+    def export_book(
+        self,
+        book_id: int,
+        target_dir: Path | str,
+        fmt: str = "EPUB",
+    ) -> Optional[Path]:
+        """
+        Export a specific book format to target directory via calibredb export.
+        """
+        if not self.is_available():
+            raise FileNotFoundError(f"calibredb binary '{self.calibredb_bin}' not found in system PATH.")
+
+        out_path = Path(target_dir).expanduser().resolve()
+        out_path.mkdir(parents=True, exist_ok=True)
+
+        cmd = self._build_base_args() + [
+            "export",
+            str(book_id),
+            "--to-dir",
+            str(out_path),
+            "--formats",
+            fmt.upper(),
+            "--dont-save-cover",
+            "--dont-write-opf",
+            "--template",
+            f"{{id}}_{{title}}",
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            logger.warning(f"calibredb export failed: {result.stderr.strip()}")
             return None
 
-        rel_folder = row["path"]
-        book_dir = self.library_path / rel_folder
-        authors = [a.strip() for a in (row["authors"] or "").split("&") if a.strip()]
-        tags = [t.strip() for t in (row["tags"] or "").split(",") if t.strip()]
+        # Locate the exported file
+        candidates = list(out_path.glob(f"{book_id}_*.{fmt.lower()}"))
+        if candidates:
+            return candidates[0]
 
-        cursor.execute(
-            "SELECT format, name FROM data WHERE book = ?",
-            (book_id,),
-        )
-        data_rows = cursor.fetchall()
-        formats: Dict[str, Path] = {}
-        for d in data_rows:
-            fmt = d["format"].upper()
-            file_name = f"{d['name']}.{fmt.lower()}"
-            full_path = book_dir / file_name
-            if full_path.is_file():
-                formats[fmt] = full_path
-
-        conn.close()
-        return BookRecord(
-            id=book_id,
-            title=row["title"] or "Untitled",
-            authors=authors,
-            tags=tags,
-            pubdate=row["pubdate"],
-            comments=row["comments"],
-            formats=formats,
-        )
-
-    def search_books(self, query: str) -> List[BookRecord]:
-        """Simple text search matching title or authors."""
-        all_books = self.list_books()
-        q = query.lower()
-        return [
-            b
-            for b in all_books
-            if q in b.title.lower()
-            or any(q in a.lower() for a in b.authors)
-            or any(q in t.lower() for t in b.tags)
-        ]
+        all_matches = list(out_path.glob(f"*.{fmt.lower()}"))
+        return all_matches[0] if all_matches else None

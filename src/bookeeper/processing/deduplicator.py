@@ -1,129 +1,123 @@
 """
-Embedding-based entity resolution and concept deduplication.
+Embedding-based entity resolution and concept deduplication using OllamaEmbeddings.
 """
 
 import logging
 import re
 from typing import Dict, List, Optional, Tuple
 
-import httpx
 import numpy as np
+from langchain_core.embeddings import Embeddings
+from langchain_ollama import OllamaEmbeddings
 
-from bookeeper.config import OllamaSettings, ProcessingSettings
-from bookeeper.processing.extractor import ConceptNode
+from bookeeper.config import Settings
+from bookeeper.processing.extractor import Concept
 
 logger = logging.getLogger(__name__)
 
 
 class EntityDeduplicator:
-    """Resolves and merges semantically equivalent concepts across books and sections."""
+    """
+    Deduplicates and canonicalizes concept names across books and sections
+    using vector embeddings and rolling cosine similarity cache.
+    """
 
     def __init__(
         self,
-        ollama_settings: Optional[OllamaSettings] = None,
-        processing_settings: Optional[ProcessingSettings] = None,
+        embeddings: Optional[Embeddings] = None,
+        similarity_threshold: float = 0.85,
     ):
-        self.ollama_settings = ollama_settings or OllamaSettings()
-        self.processing_settings = processing_settings or ProcessingSettings()
-        self.embeddings_url = f"{self.ollama_settings.base_url.rstrip('/')}/api/embeddings"
+        self.embeddings = embeddings
+        self.similarity_threshold = similarity_threshold
 
-        # Canonical name -> (embedding_vector, ConceptNode)
-        self.known_concepts: Dict[str, Tuple[Optional[np.ndarray], ConceptNode]] = {}
-        # Alias / alternative name -> Canonical name
-        self.alias_map: Dict[str, str] = {}
+        # Canonical name -> (Normalized unit vector, Concept instance)
+        self._cache: Dict[str, Tuple[Optional[np.ndarray], Concept]] = {}
 
-    def normalize_name(self, name: str) -> str:
-        """Strip punctuation and redundant whitespace for base key matching."""
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "EntityDeduplicator":
+        try:
+            embeddings = OllamaEmbeddings(
+                base_url=settings.ollama_base_url,
+                model=settings.embedding_model,
+            )
+        except Exception as e:
+            logger.warning(f"Could not connect to OllamaEmbeddings: {e}")
+            embeddings = None
+
+        return cls(
+            embeddings=embeddings,
+            similarity_threshold=settings.similarity_threshold,
+        )
+
+    @staticmethod
+    def _normalize_name(name: str) -> str:
+        """Strip punctuation and redundant whitespace for basic equality matching."""
         cleaned = re.sub(r"[^\w\s-]", "", name).strip().lower()
         return re.sub(r"\s+", " ", cleaned)
 
-    def resolve(self, concept: ConceptNode) -> ConceptNode:
+    def resolve_concept(self, concept: Concept) -> Concept:
         """
-        Check if concept exists in registry; if semantically similar entity is found,
-        merge and return canonical ConceptNode. Otherwise register new node.
+        Compare incoming concept against existing graph concepts.
+        If similarity exceeds similarity_threshold, merge and return the canonical Concept.
+        Otherwise, register and return the new Concept.
         """
         raw_name = concept.name.strip()
-        norm_key = self.normalize_name(raw_name)
+        norm_name = self._normalize_name(raw_name)
 
-        # 1. Exact alias / normalized match
-        if norm_key in self.alias_map:
-            canonical_name = self.alias_map[norm_key]
-            _, existing_node = self.known_concepts[canonical_name]
-            self._merge_into(existing_node, concept)
-            return existing_node
+        # 1. Exact or case-insensitive string match
+        for canon_name, (_, existing) in self._cache.items():
+            if self._normalize_name(canon_name) == norm_name:
+                self._merge_into(existing, concept)
+                return existing
 
-        # Check existing known concepts by exact case-insensitive match
-        for canon_name, (_, node) in self.known_concepts.items():
-            if self.normalize_name(canon_name) == norm_key:
-                self.alias_map[norm_key] = canon_name
-                self._merge_into(node, concept)
-                return node
-
-        # 2. Embedding similarity matching
-        concept_vec = self._get_embedding(concept.name)
-        if concept_vec is not None and self.known_concepts:
-            best_match_name = None
+        # 2. Embedding-based semantic cosine similarity
+        concept_vec = self._embed(raw_name)
+        if concept_vec is not None and self._cache:
             best_sim = -1.0
+            best_match: Optional[Concept] = None
 
-            for canon_name, (existing_vec, _) in self.known_concepts.items():
-                if existing_vec is not None:
-                    sim = self._cosine_similarity(concept_vec, existing_vec)
+            for canon_name, (cached_vec, existing_concept) in self._cache.items():
+                if cached_vec is not None:
+                    sim = float(np.dot(concept_vec, cached_vec))
                     if sim > best_sim:
                         best_sim = sim
-                        best_match_name = canon_name
+                        best_match = existing_concept
 
-            if (
-                best_match_name is not None
-                and best_sim >= self.processing_settings.dedup_similarity_threshold
-            ):
+            if best_match is not None and best_sim >= self.similarity_threshold:
                 logger.debug(
-                    f"Resolved '{concept.name}' -> '{best_match_name}' (sim: {best_sim:.3f})"
+                    f"Merged concept '{raw_name}' -> '{best_match.name}' (similarity: {best_sim:.3f})"
                 )
-                _, existing_node = self.known_concepts[best_match_name]
-                self.alias_map[norm_key] = best_match_name
-                self._merge_into(existing_node, concept)
-                return existing_node
+                self._merge_into(best_match, concept)
+                return best_match
 
-        # 3. New concept registration
-        self.known_concepts[concept.name] = (concept_vec, concept)
-        self.alias_map[norm_key] = concept.name
-        for alias in concept.aliases:
-            self.alias_map[self.normalize_name(alias)] = concept.name
-
+        # 3. Register as new canonical node
+        self._cache[raw_name] = (concept_vec, concept)
         return concept
 
-    def _merge_into(self, target: ConceptNode, source: ConceptNode) -> None:
-        """Merge aliases and supplementary metadata into the canonical node."""
-        if source.name != target.name and source.name not in target.aliases:
-            target.aliases.append(source.name)
-        for a in source.aliases:
-            if a != target.name and a not in target.aliases:
-                target.aliases.append(a)
-        # Keep richer description if source has more detail
-        if len(source.description) > len(target.description) and len(target.description) < 40:
-            target.description = source.description
+    def _merge_into(self, canonical: Concept, incoming: Concept) -> None:
+        """Merge incoming concept's related concepts and details into canonical node."""
+        for rel in incoming.related_concepts:
+            if rel not in canonical.related_concepts and rel != canonical.name:
+                canonical.related_concepts.append(rel)
 
-    def _get_embedding(self, text: str) -> Optional[np.ndarray]:
-        """Fetch embedding from local Ollama instance."""
-        payload = {
-            "model": self.ollama_settings.embedding_model,
-            "prompt": text,
-        }
+        # If incoming has a significantly richer summary, update canonical summary
+        if len(incoming.summary) > len(canonical.summary) + 30:
+            canonical.summary = incoming.summary
+
+    def _embed(self, text: str) -> Optional[np.ndarray]:
+        """Compute normalized unit vector for input text."""
+        if self.embeddings is None:
+            return None
+
         try:
-            with httpx.Client(timeout=10.0) as client:
-                resp = client.post(self.embeddings_url, json=payload)
-                if resp.status_code == 200:
-                    vec = resp.json().get("embedding")
-                    if vec:
-                        arr = np.array(vec, dtype=np.float32)
-                        norm = np.linalg.norm(arr)
-                        return arr / norm if norm > 0 else arr
+            vec = self.embeddings.embed_query(text)
+            arr = np.array(vec, dtype=np.float32)
+            norm = np.linalg.norm(arr)
+            return (arr / norm) if norm > 0 else arr
         except Exception as e:
-            logger.debug(f"Ollama embedding unavailable for '{text}': {e}")
-        return None
+            logger.debug(f"Failed to generate embedding for '{text}': {e}")
+            return None
 
-    @staticmethod
-    def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-        """Compute cosine similarity between normalized vectors."""
-        dot = np.dot(a, b)
-        return float(dot)
+    def get_canonical_concepts(self) -> List[Concept]:
+        """Return all unique canonical concepts registered so far."""
+        return [c for _, c in self._cache.values()]

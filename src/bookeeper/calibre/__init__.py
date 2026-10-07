@@ -2,7 +2,7 @@
 Calibre integration and ebook parsing modules.
 """
 
-from bookeeper.calibre.client import CalibreClient, BookRecord
-from bookeeper.calibre.parser import BookParser, ChapterSection
+from bookeeper.calibre.client import CalibreClient
+from bookeeper.calibre.parser import BookParser, Section
 
-__all__ = ["CalibreClient", "BookRecord", "BookParser", "ChapterSection"]
+__all__ = ["CalibreClient", "BookParser", "Section"]

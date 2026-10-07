@@ -1,153 +1,183 @@
 """
-LangChain structured output schemas and Ollama-based Concept Knowledge Graph extractor.
+LangChain structured output schemas and Ollama extraction chains for book metadata and concepts.
 """
 
-import json
 import logging
-from typing import Any, Dict, List, Literal, Optional
+from typing import List, Optional
 
-import httpx
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_ollama import ChatOllama
 from pydantic import BaseModel, Field
 
-from bookeeper.config import OllamaSettings
-from bookeeper.processing.chunker import TextChunk
+from bookeeper.config import Settings
 
 logger = logging.getLogger(__name__)
 
 
-class ConceptNode(BaseModel):
-    """An extracted domain entity, theme, idea, or architectural pattern."""
+# ==============================================================================
+# Strict Pydantic Output Schemas
+# ==============================================================================
 
-    name: str = Field(description="Canonical concise title of the concept (e.g. 'Event Sourcing').")
-    category: Literal[
-        "Concept",
-        "Architectural Pattern",
-        "Theme",
-        "Methodology",
-        "Tradeoff",
-        "Technology",
-    ] = Field(
-        default="Concept",
-        description="Category classification for the node.",
+
+class BookMetadata(BaseModel):
+    """Cleaned and normalized book catalog metadata."""
+
+    title: str = Field(
+        description="Clean, canonical book title (free of subtitles, file noise, or publisher tags)."
     )
-    description: str = Field(
-        description="Clear, 1-2 sentence description explaining the concept based on the text."
+    author: str = Field(
+        description="Canonical primary author or comma-separated authors (e.g. 'Martin Kleppmann')."
     )
-    aliases: List[str] = Field(
-        default_factory=list,
-        description="Alternate names or synonyms mentioned.",
-    )
-
-
-class RelationshipEdge(BaseModel):
-    """A directed semantic relationship connecting two concepts."""
-
-    source: str = Field(description="Exact name of the source concept.")
-    target: str = Field(description="Exact name of the target concept.")
-    relation_type: Literal[
-        "IMPLEMENTS",
-        "EXTENDS",
-        "CONTRASTS_WITH",
-        "PART_OF",
-        "REQUIRES",
-        "INFLUENCES",
-        "MITIGATES",
-    ] = Field(
-        default="INFLUENCES",
-        description="Type of directed relationship connecting source -> target.",
-    )
-    explanation: str = Field(
-        default="",
-        description="Brief justification or context for why this relationship exists.",
-    )
-
-
-class ExtractedGraph(BaseModel):
-    """Container for concepts and relationships extracted from a text chunk."""
-
-    concepts: List[ConceptNode] = Field(default_factory=list)
-    relationships: List[RelationshipEdge] = Field(default_factory=list)
     summary: str = Field(
-        default="",
-        description="High-level 1-sentence synopsis of this section.",
+        description="Concise catalog blurb (2-4 sentences) summarizing the book's core subject and value proposition."
     )
 
 
-EXTRACTION_PROMPT = """You are an expert technical knowledge graph extractor.
-Analyze the following book excerpt from '{book_title}' (Chapter: '{chapter_title}').
+class Concept(BaseModel):
+    """Canonical domain idea, architectural pattern, or technical theme."""
 
-Identify the core ideas, architectural patterns, methodologies, and concepts discussed.
-Formulate relationships between these concepts.
+    name: str = Field(
+        description="Canonical concise 2-4 word concept name (e.g. 'Event Sourcing', 'Circuit Breaker', 'Two-Phase Commit')."
+    )
+    category: str = Field(
+        description="Category classification (e.g. 'Architectural Pattern', 'Data Structure', 'System Design Principle', 'Tradeoff', 'Theme')."
+    )
+    summary: str = Field(
+        description="Clear, 1-2 sentence explanation defining what this concept is and how it functions."
+    )
+    related_concepts: List[str] = Field(
+        default_factory=list,
+        description="List of related concept names (2-4 words each) discussed in connection with this concept.",
+    )
 
-Respond ONLY with valid JSON matching the following schema:
-{{
-  "summary": "1-sentence overview of the section",
-  "concepts": [
-    {{
-      "name": "Canonical Concept Name",
-      "category": "Concept" | "Architectural Pattern" | "Theme" | "Methodology" | "Tradeoff" | "Technology",
-      "description": "Short concise description of what this concept is and how it is used.",
-      "aliases": ["synonym1", "synonym2"]
-    }}
-  ],
-  "relationships": [
-    {{
-      "source": "Exact source concept name",
-      "target": "Exact target concept name",
-      "relation_type": "IMPLEMENTS" | "EXTENDS" | "CONTRASTS_WITH" | "PART_OF" | "REQUIRES" | "INFLUENCES" | "MITIGATES",
-      "explanation": "Why these concepts are related"
-    }}
-  ]
-}}
 
-Excerpt text:
-\"\"\"
-{chunk_text}
-\"\"\"
-"""
+class SectionExtraction(BaseModel):
+    """Extraction output containing all concepts discovered in a section."""
+
+    concepts: List[Concept] = Field(
+        default_factory=list,
+        description="List of technical concepts and architectural patterns discussed.",
+    )
+
+
+# ==============================================================================
+# KnowledgeExtractor Chain
+# ==============================================================================
 
 
 class KnowledgeExtractor:
-    """Extractor communicating with local Ollama instance for structured entity extraction."""
+    """Extracts structured metadata and concept graphs using ChatOllama with structured output."""
 
-    def __init__(self, settings: Optional[OllamaSettings] = None):
-        self.settings = settings or OllamaSettings()
-        self.api_url = f"{self.settings.base_url.rstrip('/')}/api/chat"
+    def __init__(
+        self,
+        base_url: str = "http://localhost:11434",
+        model: str = "llama3.1:8b",
+        temperature: float = 0.0,
+    ):
+        self.base_url = base_url
+        self.model_name = model
+        self.temperature = temperature
 
-    def extract_from_chunk(self, chunk: TextChunk) -> ExtractedGraph:
-        """Extract concepts and edges from a single text chunk via Ollama."""
-        prompt = EXTRACTION_PROMPT.format(
-            book_title=chunk.book_title,
-            chapter_title=chunk.chapter_title,
-            chunk_text=chunk.text,
+        self.llm = ChatOllama(
+            base_url=self.base_url,
+            model=self.model_name,
+            temperature=self.temperature,
         )
 
-        payload = {
-            "model": self.settings.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a precise JSON-only structured data extraction assistant.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "format": "json",
-            "stream": False,
-            "options": {
-                "temperature": self.settings.temperature,
-            },
-        }
+        # Create typed structured chains using with_structured_output
+        self.metadata_chain = self.llm.with_structured_output(BookMetadata)
+        self.section_chain = self.llm.with_structured_output(SectionExtraction)
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "KnowledgeExtractor":
+        return cls(
+            base_url=settings.ollama_base_url,
+            model=settings.llm_model,
+        )
+
+    def clean_metadata(
+        self,
+        raw_title: str,
+        raw_authors: List[str],
+        raw_comments: Optional[str] = None,
+    ) -> BookMetadata:
+        """Clean and normalize title, authors, and summary blurb."""
+        authors_str = ", ".join(raw_authors) if raw_authors else "Unknown"
+        comments_str = (raw_comments or "").strip()
+
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "You are a master library cataloguer and metadata cleaning specialist. "
+                    "Normalize the given book title, author, and description. Produce clean, formal "
+                    "catalog metadata and an executive summary blurb without advertising fluff.",
+                ),
+                (
+                    "human",
+                    "Please clean and standardize the following book metadata:\n\n"
+                    "Raw Title: {raw_title}\n"
+                    "Raw Authors: {raw_authors}\n"
+                    "Raw Comments / Blurb:\n{raw_comments}\n",
+                ),
+            ]
+        )
+
+        formatted_messages = prompt.format_messages(
+            raw_title=raw_title,
+            raw_authors=authors_str,
+            raw_comments=comments_str or "(No comments provided)",
+        )
 
         try:
-            with httpx.Client(timeout=self.settings.timeout) as client:
-                resp = client.post(self.api_url, json=payload)
-                resp.raise_for_status()
-                data = resp.json()
-
-            raw_content = data.get("message", {}).get("content", "{}")
-            parsed_json = json.loads(raw_content)
-            return ExtractedGraph(**parsed_json)
+            result = self.metadata_chain.invoke(formatted_messages)
+            if isinstance(result, BookMetadata):
+                return result
+            return BookMetadata(**dict(result))
         except Exception as e:
-            logger.warning(f"Failed extraction on chunk {chunk.chunk_id}: {e}")
-            # Fallback to empty graph on failure
-            return ExtractedGraph()
+            logger.warning(f"Metadata cleaning LLM call failed: {e}. Falling back to raw.")
+            return BookMetadata(
+                title=raw_title,
+                author=authors_str,
+                summary=comments_str[:300] if comments_str else "No summary available.",
+            )
+
+    def extract_section(
+        self,
+        text: str,
+        book_title: str,
+        section_title: str,
+    ) -> SectionExtraction:
+        """Extract atomic concepts and their relationships from a section chunk."""
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "You are an expert technical knowledge graph extractor. "
+                    "Extract canonical, specific technical concepts, patterns, algorithms, and design tradeoffs. "
+                    "Ensure concept names are concise (2-4 words, e.g. 'Read-Copy-Update', 'Consistent Hashing'). "
+                    "Identify how these concepts relate to one another.",
+                ),
+                (
+                    "human",
+                    "Book: '{book_title}'\n"
+                    "Section: '{section_title}'\n\n"
+                    "Text excerpt:\n\"\"\"\n{text}\n\"\"\"\n",
+                ),
+            ]
+        )
+
+        formatted_messages = prompt.format_messages(
+            book_title=book_title,
+            section_title=section_title,
+            text=text[:4000],  # Ensure token safety
+        )
+
+        try:
+            result = self.section_chain.invoke(formatted_messages)
+            if isinstance(result, SectionExtraction):
+                return result
+            return SectionExtraction(**dict(result))
+        except Exception as e:
+            logger.warning(f"Section extraction LLM call failed for '{section_title}': {e}")
+            return SectionExtraction(concepts=[])

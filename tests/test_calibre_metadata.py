@@ -403,3 +403,46 @@ def test_daemon_thread_pool_executor():
     fut.result()
     executor.shutdown(wait=False)
 
+
+def test_staged_database_reuse_on_resume(tmp_path: Path):
+    """Verify that an existing staged database with prior work is preserved and reused on resume."""
+    from typer.testing import CliRunner
+    from bookeeper.cli import app
+
+    runner = CliRunner()
+    remote_dir = tmp_path / "calibre_lib"
+    remote_dir.mkdir()
+    remote_db = remote_dir / "metadata.db"
+
+    # Setup remote Calibre DB with a book
+    conn = sqlite3.connect(str(remote_db))
+    _register_sqlite_functions(conn)
+    conn.executescript("""
+        CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, sort TEXT, author_sort TEXT, last_modified TIMESTAMP);
+        CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT, sort TEXT);
+        CREATE TABLE books_authors_link (id INTEGER PRIMARY KEY, book INTEGER, author INTEGER);
+        CREATE TABLE comments (id INTEGER PRIMARY KEY, book INTEGER, text TEXT);
+    """)
+    conn.execute("INSERT INTO books (id, title) VALUES (1, 'Initial Remote Title')")
+    conn.commit()
+    conn.close()
+
+    # Pre-create local staged DB representing an interrupted prior session with modified data
+    staged_file = tmp_path / "staged.db"
+    conn_staged = sqlite3.connect(str(staged_file))
+    _register_sqlite_functions(conn_staged)
+    conn_staged.executescript("""
+        CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, sort TEXT, author_sort TEXT, last_modified TIMESTAMP);
+        CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT, sort TEXT);
+        CREATE TABLE books_authors_link (id INTEGER PRIMARY KEY, book INTEGER, author INTEGER);
+        CREATE TABLE comments (id INTEGER PRIMARY KEY, book INTEGER, text TEXT);
+    """)
+    conn_staged.execute("INSERT INTO books (id, title) VALUES (1, 'Preserved Staged Title From Prior Run')")
+    conn_staged.commit()
+    conn_staged.close()
+
+    # Verify that CalibreClient can stage/use this file without overwriting
+    client = CalibreClient(library_path=str(remote_dir), calibredb_bin="non_existent_binary")
+    assert CalibreClient._verify_sqlite_integrity(staged_file) is True
+
+

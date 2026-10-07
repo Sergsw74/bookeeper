@@ -321,6 +321,9 @@ def clean_metadata(
     max_tasks: Optional[int] = typer.Option(
         None, "--max-tasks", "-t", help="Max concurrent active tasks across Ollama servers (default: auto: 3x alive servers, up to 10)."
     ),
+    fresh_db: bool = typer.Option(
+        False, "--fresh-db", help="Force downloading a fresh copy of metadata.db from Calibre, discarding any existing local staged database."
+    ),
 ):
     """
     Query Calibre (local, SMB share, or server), inspect titles/authors/summaries,
@@ -352,39 +355,67 @@ def clean_metadata(
         and client.db_path.is_file()
     )
 
+    reused_staged = False
     if should_stage:
-        try:
-            total_bytes = client.db_path.stat().st_size
-            size_mb = total_bytes / (1024 * 1024)
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                TextColumn("• {task.completed:.1f}/{task.total:.1f} MB"),
-                console=console,
-            ) as stage_progress:
-                stage_task = stage_progress.add_task(
-                    f"Downloading metadata.db ({size_mb:.1f} MB) locally for fast SSD transactions...",
-                    total=size_mb,
+        staged_target = cfg.resolved_staged_db_path
+
+        if reset_progress or fresh_db:
+            if staged_target.is_file():
+                try:
+                    staged_target.unlink()
+                except Exception:
+                    pass
+
+        # Check if an existing staged database already exists locally from a previous session
+        if resume and not reset_progress and not fresh_db and staged_target.is_file() and staged_target.stat().st_size > 0:
+            try:
+                CalibreClient._verify_sqlite_integrity(staged_target, allow_index_warnings=True)
+                client.staged_db_path = staged_target
+                client.is_staged = True
+                reused_staged = True
+                console.print(
+                    f"[bold cyan]Found existing local staged database at {staged_target}.[/bold cyan] "
+                    f"[dim]Reusing local SSD database to preserve previous progress and avoid re-downloading.[/dim]"
                 )
-
-                def _on_stage_progress(copied_bytes: int, total_b: int):
-                    stage_progress.update(stage_task, completed=copied_bytes / (1024 * 1024))
-
-                staged_file = client.stage_database(
-                    cfg.resolved_staged_db_path,
-                    progress_callback=_on_stage_progress,
+            except Exception as e:
+                console.print(
+                    f"[dim yellow]Existing local staged database could not be reused ({e}). Re-staging fresh copy from Calibre share...[/dim yellow]"
                 )
+                client.cleanup_staged(delete_file=True)
 
-            console.print(f"[dim green]✓ Staged database at {staged_file} (integrity check ok).[/dim green]")
-        except Exception as e:
-            console.print(
-                f"[bold yellow]Warning:[/bold yellow] Failed to stage metadata.db locally ({e}). "
-                f"Falling back to direct database access."
-            )
-            client.cleanup_staged(delete_file=False)
-            should_stage = False
+        if not client.is_staged:
+            try:
+                total_bytes = client.db_path.stat().st_size
+                size_mb = total_bytes / (1024 * 1024)
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    TextColumn("• {task.completed:.1f}/{task.total:.1f} MB"),
+                    console=console,
+                ) as stage_progress:
+                    stage_task = stage_progress.add_task(
+                        f"Downloading metadata.db ({size_mb:.1f} MB) locally for fast SSD transactions...",
+                        total=size_mb,
+                    )
+
+                    def _on_stage_progress(copied_bytes: int, total_b: int):
+                        stage_progress.update(stage_task, completed=copied_bytes / (1024 * 1024))
+
+                    staged_file = client.stage_database(
+                        staged_target,
+                        progress_callback=_on_stage_progress,
+                    )
+
+                console.print(f"[dim green]✓ Staged database at {staged_file} (integrity check ok).[/dim green]")
+            except Exception as e:
+                console.print(
+                    f"[bold yellow]Warning:[/bold yellow] Failed to stage metadata.db locally ({e}). "
+                    f"Falling back to direct database access."
+                )
+                client.cleanup_staged(delete_file=False)
+                should_stage = False
 
     tracker_path = Path(state_file) if state_file else cfg.resolved_state_file
     tracker = ProgressTracker(tracker_path)
@@ -728,12 +759,14 @@ def clean_metadata(
 
     finally:
         if should_stage and client.is_staged:
-            if not dry_run and success_count > 0:
+            sync_succeeded = False
+            has_modifications = (success_count > 0) or reused_staged
+            if not dry_run and has_modifications:
                 try:
                     total_bytes = client.staged_db_path.stat().st_size
                     size_mb = total_bytes / (1024 * 1024)
                     console.print(
-                        f"[bold blue]Syncing updated database ({success_count} modified book(s)) back to Calibre library...[/bold blue]"
+                        f"[bold blue]Syncing updated database ({success_count} newly modified book(s)) back to Calibre library...[/bold blue]"
                     )
                     with Progress(
                         SpinnerColumn(),
@@ -755,6 +788,7 @@ def clean_metadata(
                             create_backup=effective_backup_db,
                             progress_callback=_on_sync_progress,
                         )
+                        sync_succeeded = True
 
                     backup_info = " (remote backup created: metadata.db.bak)" if effective_backup_db else ""
                     console.print(
@@ -765,11 +799,17 @@ def clean_metadata(
                         f"[bold red]Error syncing database back to Calibre:[/bold red] {sync_err}\n"
                         f"[yellow]Your local staged database with updates is preserved at: {client.staged_db_path}[/yellow]"
                     )
-            elif dry_run and success_count > 0:
-                console.print("[dim yellow]⚡ [Dry-Run] Discarded staged database changes (no remote modifications made).[/dim yellow]")
+            elif dry_run:
+                sync_succeeded = True
+                if success_count > 0:
+                    console.print("[dim yellow]⚡ [Dry-Run] Discarded staged database changes (no remote modifications made).[/dim yellow]")
+            else:
+                # 0 modifications and not reused
+                sync_succeeded = True
 
             if client.is_staged:
-                client.cleanup_staged(delete_file=True)
+                # Only delete local staged file if sync succeeded or was a discardable run
+                client.cleanup_staged(delete_file=sync_succeeded)
 
         if interrupted:
             raise typer.Exit(code=130)

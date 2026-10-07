@@ -32,23 +32,96 @@ def test_progress_tracker_lifecycle():
         assert not tracker.is_completed("clean_metadata", 2)
         assert tracker.get_failed_ids("clean_metadata") == {2}
 
+        # Mark book 3 as skipped (graphical format)
+        tracker.mark_skipped("clean_metadata", 3, title="Comic Book 3", reason="graphical: CBR")
+        assert tracker.is_completed("clean_metadata", 3)
+        assert tracker.get_skipped_ids("clean_metadata") == {3}
+        assert 3 in tracker.get_completed_ids("clean_metadata")  # completed_ids includes skipped for resume
+
         # Verify summary
         summary = tracker.summary("clean_metadata")
         assert summary["completed"] == 1
         assert summary["failed"] == 1
-        assert summary["total_recorded"] == 2
+        assert summary["skipped"] == 1
+        assert summary["total_recorded"] == 3
 
         # Verify persistence across instances
         tracker2 = ProgressTracker(state_file)
         assert tracker2.is_completed("clean_metadata", 1)
-        assert tracker2.get_completed_ids("clean_metadata") == {1}
+        assert tracker2.is_completed("clean_metadata", 3)
+        assert tracker2.get_completed_ids("clean_metadata") == {1, 3}
         assert tracker2.get_failed_ids("clean_metadata") == {2}
+        assert tracker2.get_skipped_ids("clean_metadata") == {3}
 
         # Clear operation
         tracker2.clear("clean_metadata")
         assert not tracker2.is_completed("clean_metadata", 1)
         assert tracker2.get_completed_ids("clean_metadata") == set()
         assert tracker2.get_failed_ids("clean_metadata") == set()
+        assert tracker2.get_skipped_ids("clean_metadata") == set()
+
+
+def test_book_parser_graphical_formats_detection():
+    """Verify detection of graphical formats (CBR, CBZ, DJVU, CBT, CB7)."""
+    from bookeeper.calibre.parser import BookParser
+
+    assert BookParser.is_graphical_format("cbr")
+    assert BookParser.is_graphical_format("CBR")
+    assert BookParser.is_graphical_format(".cbz")
+    assert BookParser.is_graphical_format("DJVU")
+    assert BookParser.is_graphical_format(Path("comic.cbr"))
+    assert BookParser.is_graphical_format(Path("scanned_book.djvu"))
+    assert not BookParser.is_graphical_format("epub")
+    assert not BookParser.is_graphical_format(Path("book.pdf"))
+
+    # only_has_graphical_formats
+    assert BookParser.only_has_graphical_formats(["CBR"])
+    assert BookParser.only_has_graphical_formats(["cbz", "djvu"])
+    assert not BookParser.only_has_graphical_formats(["EPUB", "CBR"])
+    assert not BookParser.only_has_graphical_formats(["PDF"])
+    assert not BookParser.only_has_graphical_formats([])
+    assert not BookParser.only_has_graphical_formats(None)
+
+
+def test_mojibake_repair():
+    """Verify repairing of Latin-1 decoded Cyrillic text (CP1251 and UTF-8 mojibake)."""
+    from bookeeper.calibre.parser import BookParser
+
+    raw_title = "Ñóïåðìåí Ïðèêëþ÷åíèÿ 002"
+    repaired_title = BookParser.repair_mojibake(raw_title)
+    assert repaired_title == "Супермен Приключения 002"
+
+    raw_author = "Ð.Ð.Ð."
+    repaired_author = BookParser.repair_mojibake(raw_author)
+    assert repaired_author == "Р.Р.Р."
+
+    # Normal text should remain untouched
+    clean_text = "Clean English Title"
+    assert BookParser.repair_mojibake(clean_text) == clean_text
+
+    cyrillic_text = "Чистый русский текст"
+    assert BookParser.repair_mojibake(cyrillic_text) == cyrillic_text
+
+
+def test_retry_failed_selection():
+    """Verify that get_failed_ids isolates only failed books for retry."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        state_file = Path(tmpdir) / "state.json"
+        tracker = ProgressTracker(state_file)
+
+        tracker.mark_completed("clean_metadata", 10, title="Success 1")
+        tracker.mark_failed("clean_metadata", 20, title="Failed 1", error="Ollama timeout")
+        tracker.mark_skipped("clean_metadata", 30, title="Skipped 1", reason="graphical: CBR")
+        tracker.mark_failed("clean_metadata", 40, title="Failed 2", error="Connection error")
+
+        failed = tracker.get_failed_ids("clean_metadata")
+        assert failed == {20, 40}
+
+        # Simulating retry: book 20 succeeds on retry
+        tracker.mark_completed("clean_metadata", 20, title="Success 2")
+        failed_after = tracker.get_failed_ids("clean_metadata")
+        assert failed_after == {40}
+        assert tracker.is_completed("clean_metadata", 20)
 
 
 def test_extractor_brace_safety_in_clean_metadata():

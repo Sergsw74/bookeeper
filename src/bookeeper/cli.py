@@ -265,6 +265,9 @@ def clean_metadata(
     resume: bool = typer.Option(
         True, "--resume/--no-resume", help="Resume from previous checkpoint, skipping already cleaned books."
     ),
+    retry_failed: bool = typer.Option(
+        False, "--retry-failed", help="Only retry books that previously failed in the checkpoint state."
+    ),
     reset_progress: bool = typer.Option(
         False, "--reset-progress", help="Reset saved progress checkpoint and start from scratch."
     ),
@@ -293,7 +296,7 @@ def clean_metadata(
     """
     Query Calibre (local, SMB share, or server), inspect titles/authors/summaries,
     prompt Ollama to normalize, and write clean metadata back.
-    Supports persistent checkpointing to resume from interrupted or failed points.
+    Supports persistent checkpointing to resume from interrupted points or retry only failed books.
     """
     cfg = _get_effective_settings(config_path, calibre_path, ollama_url, model)
     client = CalibreClient(
@@ -323,7 +326,7 @@ def clean_metadata(
 
     with console.status("[bold blue]Querying Calibre library...[/bold blue]"):
         try:
-            books = client.list_books(fields=["id", "title", "authors", "comments"])
+            books = client.list_books(fields=["id", "title", "authors", "comments", "formats"])
         except Exception as e:
             console.print(f"[bold red]Failed to query Calibre library:[/bold red] {e}")
             raise typer.Exit(1)
@@ -333,6 +336,15 @@ def clean_metadata(
         if not books:
             console.print(f"[bold yellow]Book ID {book_id} not found in Calibre library.[/bold yellow]")
             raise typer.Exit(1)
+    elif retry_failed:
+        failed_ids = tracker.get_failed_ids("clean_metadata")
+        if not failed_ids:
+            console.print("[bold green]No failed books found in checkpoint to retry.[/bold green]")
+            raise typer.Exit(0)
+        books = [b for b in books if b.get("id") in failed_ids]
+        console.print(
+            f"[bold cyan]Retrying {len(books)} previously failed book(s) (IDs: {sorted(failed_ids)})...[/bold cyan]"
+        )
     else:
         # Filter by start_from_id if requested
         if start_from_id is not None:
@@ -346,7 +358,7 @@ def clean_metadata(
             skipped = orig_len - len(books)
             if skipped > 0:
                 console.print(
-                    f"[dim cyan]Checkpoint Resume: Skipped {skipped} already-cleaned book(s). "
+                    f"[dim cyan]Checkpoint Resume: Skipped {skipped} already processed or skipped book(s). "
                     f"({len(books)} remaining. Use --no-resume to reprocess all).[/dim cyan]"
                 )
 
@@ -358,6 +370,7 @@ def clean_metadata(
 
     success_count = 0
     failed_count = 0
+    skipped_graphical_count = 0
 
     with Progress(
         SpinnerColumn(),
@@ -370,12 +383,31 @@ def clean_metadata(
 
         for b in books:
             bid = b["id"]
-            raw_title = b.get("title", "Untitled")
-            raw_authors = b.get("authors", [])
-            raw_comments = b.get("comments", "")
+            raw_title = BookParser.repair_mojibake(b.get("title", "Untitled"))
+            raw_authors = [BookParser.repair_mojibake(a) for a in b.get("authors", [])]
+            raw_comments = BookParser.repair_mojibake(b.get("comments", ""))
+            formats = b.get("formats", [])
             book_path_str = b.get("path")
+            book_dir = Path(book_path_str) if book_path_str else None
 
             progress.update(task, description=f"Cleaning: [bold cyan]{raw_title[:30]}[/bold cyan]")
+
+            # Check if book only contains graphical formats (CBR, CBZ, DJVU)
+            is_graphical = False
+            if formats and BookParser.only_has_graphical_formats(formats):
+                is_graphical = True
+            elif book_dir and book_dir.exists() and BookParser.directory_only_has_graphical_formats(book_dir):
+                is_graphical = True
+
+            if is_graphical:
+                fmts_label = ", ".join(formats) if formats else "graphical"
+                console.print(
+                    f"[dim yellow]⚡ Skipping book #{bid} ('{raw_title}'): graphical format ({fmts_label}).[/dim yellow]"
+                )
+                tracker.mark_skipped("clean_metadata", bid, title=raw_title, reason=f"graphical: {fmts_label}")
+                skipped_graphical_count += 1
+                progress.advance(task)
+                continue
 
             try:
                 # Sample book content and file hint from filesystem / SMB share
@@ -446,8 +478,10 @@ def clean_metadata(
                 progress.advance(task)
 
     summary_text = f"[bold green]Metadata cleaning finished.[/bold green] Completed: [bold green]{success_count}[/bold green]"
+    if skipped_graphical_count > 0:
+        summary_text += f" | Skipped (graphical): [yellow]{skipped_graphical_count}[/yellow]"
     if failed_count > 0:
-        summary_text += f" | Failed: [bold red]{failed_count}[/bold red] [dim](failed books will be retried on next run)[/dim]"
+        summary_text += f" | Failed: [bold red]{failed_count}[/bold red] [dim](run with --retry-failed to re-attempt)[/dim]"
     console.print(summary_text)
 
 
@@ -480,6 +514,9 @@ def build_graph(
     resume: bool = typer.Option(
         True, "--resume/--no-resume", help="Resume from previous checkpoint, skipping already processed books."
     ),
+    retry_failed: bool = typer.Option(
+        False, "--retry-failed", help="Only retry books that previously failed in the checkpoint state."
+    ),
     reset_progress: bool = typer.Option(
         False, "--reset-progress", help="Reset saved progress checkpoint and start from scratch."
     ),
@@ -499,7 +536,7 @@ def build_graph(
     """
     Ingest sections, perform semantic chunking, extract concepts via Ollama,
     deduplicate entities, and export the Concept Knowledge Graph.
-    Supports persistent checkpointing to resume from interrupted or failed runs.
+    Supports persistent checkpointing to resume from interrupted runs or retry failed books.
     """
     cfg = _get_effective_settings(config_path, calibre_path, ollama_url, model, embedding_model)
     output_dir = cfg.resolved_output_dir
@@ -564,6 +601,9 @@ def build_graph(
         if not p.is_file():
             console.print(f"[bold red]File not found:[/bold red] {p}")
             raise typer.Exit(1)
+        if BookParser.is_graphical_format(p):
+            console.print(f"[yellow]Skipping graphical file '{p.name}': contains image-based content ({p.suffix}).[/yellow]")
+            raise typer.Exit(0)
         books_to_process.append({"id": 1, "title": p.stem, "author": "Unknown", "path": p})
 
     # Case 2: From Calibre / SMB share
@@ -577,16 +617,33 @@ def build_graph(
                 console.print(f"[bold red]Book ID {book_id} not found in Calibre library.[/bold red]")
                 raise typer.Exit(1)
             target_list = matches
+        elif retry_failed:
+            failed_ids = tracker.get_failed_ids("build_graph")
+            if not failed_ids:
+                console.print("[bold green]No failed books found in checkpoint to retry.[/bold green]")
+                raise typer.Exit(0)
+            target_list = [b for b in all_calibre_books if b["id"] in failed_ids]
+            console.print(
+                f"[bold cyan]Retrying {len(target_list)} previously failed book(s) (IDs: {sorted(failed_ids)})...[/bold cyan]"
+            )
         elif all_books:
             target_list = all_calibre_books
         else:
             console.print(
-                "[bold yellow]Please specify --book-id <ID>, --file <path>, or --all to build graph.[/bold yellow]"
+                "[bold yellow]Please specify --book-id <ID>, --file <path>, --retry-failed, or --all to build graph.[/bold yellow]"
             )
             raise typer.Exit(1)
 
         for b in target_list:
             bid = b["id"]
+            formats = b.get("formats", [])
+            # Check if book only has graphical formats (CBR, CBZ, DJVU)
+            if formats and BookParser.only_has_graphical_formats(formats):
+                fmts_label = ", ".join(formats)
+                console.print(f"[dim yellow]⚡ Skipping book #{bid}: graphical format ({fmts_label}).[/dim yellow]")
+                tracker.mark_skipped("build_graph", bid, title=b.get("title", f"Book {bid}"), reason=f"graphical: {fmts_label}")
+                continue
+
             export_dir = output_dir / "calibre_ingest"
             epub_path = client.export_book(bid, target_dir=export_dir, fmt="EPUB")
             if epub_path and epub_path.is_file():
@@ -610,14 +667,14 @@ def build_graph(
     if start_from_id is not None:
         books_to_process = [b for b in books_to_process if b.get("id", 0) >= start_from_id]
 
-    if resume and not file_path:
+    if resume and not file_path and not retry_failed:
         completed_ids = tracker.get_completed_ids("build_graph")
         orig_len = len(books_to_process)
         books_to_process = [b for b in books_to_process if b.get("id") not in completed_ids]
         skipped = orig_len - len(books_to_process)
         if skipped > 0:
             console.print(
-                f"[dim cyan]Checkpoint Resume: Skipped {skipped} already indexed book(s). "
+                f"[dim cyan]Checkpoint Resume: Skipped {skipped} already indexed or skipped book(s). "
                 f"({len(books_to_process)} remaining. Use --no-resume to reprocess all).[/dim cyan]"
             )
 
@@ -748,18 +805,21 @@ def show_status(
     table = Table(title=f"Bookeeper Checkpoint State ({tracker_path.name})", show_header=True)
     table.add_column("Operation", style="bold cyan")
     table.add_column("Completed", style="bold green", justify="right")
+    table.add_column("Skipped (Graphical)", style="yellow", justify="right")
     table.add_column("Failed", style="bold red", justify="right")
     table.add_column("Total Recorded", style="white", justify="right")
 
     table.add_row(
         "clean_metadata",
         str(clean_summary["completed"]),
+        str(clean_summary.get("skipped", 0)),
         str(clean_summary["failed"]),
         str(clean_summary["total_recorded"]),
     )
     table.add_row(
         "build_graph",
         str(graph_summary["completed"]),
+        str(graph_summary.get("skipped", 0)),
         str(graph_summary["failed"]),
         str(graph_summary["total_recorded"]),
     )

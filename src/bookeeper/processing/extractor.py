@@ -138,6 +138,15 @@ class KnowledgeExtractor:
         file_hint: Optional[str] = None,
     ) -> BookMetadata:
         """Clean and normalize title, authors, and summary blurb using content sampling."""
+        from bookeeper.calibre.parser import BookParser
+
+        raw_title = BookParser.repair_mojibake(raw_title)
+        raw_authors = [BookParser.repair_mojibake(a) for a in raw_authors]
+        if raw_comments:
+            raw_comments = BookParser.repair_mojibake(raw_comments)
+        if content_sample:
+            content_sample = BookParser.repair_mojibake(content_sample)
+
         authors_str = ", ".join(raw_authors) if raw_authors else "Unknown"
         comments_str = (raw_comments or "").strip()
 
@@ -149,9 +158,10 @@ class KnowledgeExtractor:
             "1. Multilingual Support: Preserve the book's canonical language and script (e.g. Russian Cyrillic, "
             "English, French, etc.). If the book is in Russian, produce the title, author, and summary in Russian.\n"
             "2. Identify Corrupted or Missing Metadata: If the raw Calibre title/author has encoding errors "
-            "(e.g., mojibake/question marks like ' 2033'), missing data, generic placeholders ('Unknown'), or is "
-            "just a filename ('zubkov'), identify the actual canonical title and author from the content excerpt, "
-            "RTF/OPF headers, and file hints.\n"
+            "(e.g., mojibake like 'Ñóïåðìåí Ïðèêëþ÷åíèÿ' which is Windows-1251 decoded as Latin-1 for 'Супермен Приключения', "
+            "or ' 2033'), missing data, generic placeholders ('Unknown'), or is just a filename ('zubkov'), identify "
+            "the actual canonical title and author from the content excerpt, RTF/OPF headers, and file hints.\n"
+            "   - ALWAYS output clean, natural UTF-8 text in the book's proper script. NEVER echo garbled mojibake characters like 'Ñóïåðìåí' or 'Ð.Ð.Ð.'.\n"
             "   - E.g. ' 2033' / '2033 - .rtf' is 'Метро 2033' by 'Дмитрий Глуховский'.\n"
             "   - E.g. 'zubkov' / 'zubkov.djvu' in Russian computer science refers to 'Сергей Зубков' (С. В. Зубков), "
             "author of 'Ассемблер. Для DOS, Windows и UNIX'.\n"
@@ -179,8 +189,16 @@ class KnowledgeExtractor:
         try:
             result = self._execute_structured_invoke(BookMetadata, messages)
             if isinstance(result, BookMetadata):
+                result.title = BookParser.repair_mojibake(result.title)
+                result.author = BookParser.repair_mojibake(result.author)
+                result.summary = BookParser.repair_mojibake(result.summary)
                 return result
-            return BookMetadata(**dict(result))
+            data = dict(result)
+            return BookMetadata(
+                title=BookParser.repair_mojibake(data.get("title", raw_title)),
+                author=BookParser.repair_mojibake(data.get("author", authors_str)),
+                summary=BookParser.repair_mojibake(data.get("summary", "No summary available.")),
+            )
         except Exception as e:
             logger.warning(f"Metadata cleaning LLM call failed across all pool servers: {e}. Falling back to raw.")
             return BookMetadata(

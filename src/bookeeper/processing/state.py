@@ -60,17 +60,17 @@ class ProgressTracker:
         return ops.setdefault(operation, {})
 
     def is_completed(self, operation: str, book_id: int | str) -> bool:
-        """Check if a specific book has already completed successfully."""
+        """Check if a specific book has already completed successfully or was skipped."""
         records = self._get_op_records(operation)
         entry = records.get(str(book_id))
-        return bool(entry and entry.get("status") == "completed")
+        return bool(entry and entry.get("status") in ("completed", "skipped"))
 
     def get_completed_ids(self, operation: str) -> Set[int]:
-        """Return the set of integer book IDs that completed successfully."""
+        """Return the set of integer book IDs that completed successfully or were skipped."""
         records = self._get_op_records(operation)
         completed = set()
         for bid_str, rec in records.items():
-            if rec.get("status") == "completed":
+            if rec.get("status") in ("completed", "skipped"):
                 try:
                     completed.add(int(bid_str))
                 except ValueError:
@@ -89,6 +89,18 @@ class ProgressTracker:
                     pass
         return failed
 
+    def get_skipped_ids(self, operation: str) -> Set[int]:
+        """Return the set of integer book IDs that were marked skipped (e.g. graphical formats)."""
+        records = self._get_op_records(operation)
+        skipped = set()
+        for bid_str, rec in records.items():
+            if rec.get("status") == "skipped":
+                try:
+                    skipped.add(int(bid_str))
+                except ValueError:
+                    pass
+        return skipped
+
     def mark_completed(
         self,
         operation: str,
@@ -103,6 +115,23 @@ class ProgressTracker:
             "title": title,
             "timestamp": time.time(),
             "metadata": metadata or {},
+        }
+        self.save()
+
+    def mark_skipped(
+        self,
+        operation: str,
+        book_id: int | str,
+        title: str = "",
+        reason: str = "graphical_format",
+    ) -> None:
+        """Mark a book ID as skipped (e.g. graphical formats like CBR/CBZ/DJVU)."""
+        records = self._get_op_records(operation)
+        records[str(book_id)] = {
+            "status": "skipped",
+            "title": title,
+            "reason": reason,
+            "timestamp": time.time(),
         }
         self.save()
 
@@ -133,13 +162,15 @@ class ProgressTracker:
         self.save()
 
     def summary(self, operation: str) -> Dict[str, Any]:
-        """Return counts of completed and failed items for an operation."""
+        """Return counts of completed, failed, and skipped items for an operation."""
         records = self._get_op_records(operation)
         completed = sum(1 for r in records.values() if r.get("status") == "completed")
         failed = sum(1 for r in records.values() if r.get("status") == "failed")
+        skipped = sum(1 for r in records.values() if r.get("status") == "skipped")
         return {
             "operation": operation,
             "total_recorded": len(records),
             "completed": completed,
             "failed": failed,
+            "skipped": skipped,
         }

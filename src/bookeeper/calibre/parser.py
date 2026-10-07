@@ -24,6 +24,83 @@ class Section(BaseModel):
 class BookParser:
     """Parser extracting structured sections from EPUB (and PDF) files."""
 
+    GRAPHICAL_FORMATS = {"cbr", "cbz", "cbt", "cb7", "djvu"}
+
+    @classmethod
+    def is_graphical_format(cls, fmt_or_path: str | Path) -> bool:
+        """Check if format or file extension represents image-based graphical content (CBR, CBZ, DJVU)."""
+        if isinstance(fmt_or_path, Path):
+            ext = fmt_or_path.suffix.lstrip(".").lower()
+        else:
+            ext = str(fmt_or_path).strip().lstrip(".").lower()
+        return ext in cls.GRAPHICAL_FORMATS
+
+    @classmethod
+    def only_has_graphical_formats(cls, formats: Optional[List[str]]) -> bool:
+        """Return True if formats is non-empty and all formats are graphical (e.g. CBR, CBZ, DJVU)."""
+        if not formats:
+            return False
+        return all(cls.is_graphical_format(f) for f in formats)
+
+    @classmethod
+    def directory_only_has_graphical_formats(cls, book_dir: Path | str) -> bool:
+        """Check if all content files inside the book directory are graphical/comic formats."""
+        p = Path(book_dir).expanduser().resolve()
+        if not p.is_dir():
+            return False
+        content_files = [
+            f for f in p.iterdir()
+            if f.is_file() and f.suffix.lower() not in (".opf", ".jpg", ".jpeg", ".png", ".json")
+        ]
+        if not content_files:
+            return False
+        return all(cls.is_graphical_format(f) for f in content_files)
+
+    @classmethod
+    def repair_mojibake(cls, text: Optional[str]) -> str:
+        """
+        Detect and repair common character encoding corruption / mojibake:
+        - Windows-1251 decoded as Latin-1 / ISO-8859-1 (e.g. 'Ñóïåðìåí' -> 'Супермен')
+        - UTF-8 decoded as Latin-1 (e.g. 'Ð¡ÑƒÐ¿ÐµÑ€Ð¼ÐµÐ½' -> 'Супермен')
+        - UTF-8 decoded as CP1251 (e.g. 'Р .Р .Р .' -> 'Р.Р.Р.')
+        """
+        if not text or not isinstance(text, str):
+            return text or ""
+
+        s = text.strip()
+        if not s:
+            return text
+
+        # 1. Check for Latin-1 -> CP1251 mojibake (e.g. 'Ñóïåðìåí' -> 'Супермен')
+        try:
+            cand = s.encode("latin1").decode("cp1251")
+            cyrillic_cand = sum(1 for c in cand if "\u0400" <= c <= "\u04FF")
+            cyrillic_orig = sum(1 for c in s if "\u0400" <= c <= "\u04FF")
+            if cyrillic_cand > cyrillic_orig and cyrillic_cand > 0:
+                s = cand
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+
+        # 2. Check for Latin-1 -> UTF-8 mojibake (e.g. 'Ð¡ÑƒÐ¿ÐµÑ€Ð¼ÐµÐ½')
+        try:
+            cand = s.encode("latin1").decode("utf-8")
+            cyrillic_cand = sum(1 for c in cand if "\u0400" <= c <= "\u04FF")
+            cyrillic_orig = sum(1 for c in s if "\u0400" <= c <= "\u04FF")
+            if cyrillic_cand > cyrillic_orig and cyrillic_cand > 0:
+                s = cand
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+
+        # 3. Check for CP1251 -> UTF-8 mojibake
+        try:
+            cand = s.encode("cp1251").decode("utf-8")
+            if len(cand) < len(s) and sum(1 for c in cand if "\u0400" <= c <= "\u04FF") > 0:
+                s = cand
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+
+        return s
+
     @classmethod
     def parse(cls, file_path: Path | str) -> List[Section]:
         """Dispatch to appropriate parser by file extension."""
@@ -232,7 +309,9 @@ class BookParser:
         if p.is_dir():
             files = [
                 f for f in p.iterdir()
-                if f.is_file() and f.suffix.lower() not in (".opf", ".jpg", ".jpeg", ".png", ".json")
+                if f.is_file()
+                and f.suffix.lower() not in (".opf", ".jpg", ".jpeg", ".png", ".json")
+                and not cls.is_graphical_format(f)
             ]
             ext_order = {
                 ".epub": 1,
@@ -243,13 +322,14 @@ class BookParser:
                 ".mobi": 6,
                 ".azw3": 7,
                 ".zip": 8,
-                ".djvu": 9,
             }
             files.sort(key=lambda f: ext_order.get(f.suffix.lower(), 99))
             if not files:
                 return None, None
             target_file = files[0]
         else:
+            if cls.is_graphical_format(p):
+                return None, None
             target_file = p
 
         ext = target_file.suffix.lower()

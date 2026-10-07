@@ -34,6 +34,23 @@ app = typer.Typer(
 console = Console()
 
 
+class DaemonThreadPoolExecutor(ThreadPoolExecutor):
+    """ThreadPoolExecutor that creates daemon threads so cancellation terminates immediately without hanging."""
+
+    def _adjust_thread_count(self):
+        orig_thread = threading.Thread
+
+        def _daemon_thread(*args, **kwargs):
+            kwargs["daemon"] = True
+            return orig_thread(*args, **kwargs)
+
+        threading.Thread = _daemon_thread
+        try:
+            super()._adjust_thread_count()
+        finally:
+            threading.Thread = orig_thread
+
+
 def _get_effective_settings(
     config_path: Optional[str] = None,
     calibre_path: Optional[str] = None,
@@ -447,6 +464,8 @@ def clean_metadata(
 
     active_tasks_count = 0
     durations: List[float] = []
+    abort_event = threading.Event()
+    interrupted = False
 
     def _calc_stats() -> Tuple[float, float, float]:
         """Return (avg, p80, fastest) in seconds."""
@@ -462,6 +481,9 @@ def clean_metadata(
 
     def _process_single_book(b_item: Dict[str, Any]) -> Dict[str, Any]:
         bid = b_item["id"]
+        if abort_event.is_set():
+            return {"id": bid, "status": "aborted"}
+
         raw_title = BookParser.repair_mojibake(b_item.get("title", "Untitled"))
         raw_authors = [BookParser.repair_mojibake(a) for a in b_item.get("authors", [])]
         raw_comments = BookParser.repair_mojibake(b_item.get("comments", ""))
@@ -491,6 +513,9 @@ def clean_metadata(
         if book_path_str:
             if book_dir and book_dir.exists():
                 content_sample, file_hint = BookParser.sample_content(book_dir)
+
+        if abort_event.is_set():
+            return {"id": bid, "status": "aborted"}
 
         # Track active in-flight task and timing
         nonlocal active_tasks_count
@@ -561,20 +586,26 @@ def clean_metadata(
 
             _update_progress_description()
 
-            with ThreadPoolExecutor(max_workers=pool_concurrency) as executor:
+            executor = DaemonThreadPoolExecutor(max_workers=pool_concurrency)
+            try:
                 future_to_book = {
                     executor.submit(_process_single_book, b): b for b in books
                 }
 
                 try:
                     for future in as_completed(future_to_book):
+                        if abort_event.is_set():
+                            break
+
                         b_orig = future_to_book[future]
                         bid = b_orig["id"]
                         raw_title = BookParser.repair_mojibake(b_orig.get("title", "Untitled"))
 
                         try:
                             res = future.result()
-                            if res["status"] == "skipped_graphical":
+                            if res.get("status") == "aborted":
+                                continue
+                            elif res["status"] == "skipped_graphical":
                                 with display_lock:
                                     console.print(
                                         f"[dim yellow]⚡ Skipping book #{bid} ('{raw_title}'): {res['reason']}.[/dim yellow]"
@@ -658,25 +689,42 @@ def clean_metadata(
                             _update_progress_description()
 
                 except KeyboardInterrupt:
+                    interrupted = True
+                    abort_event.set()
+                    progress.stop()
                     console.print("\n[bold yellow]Cancelled by user. Terminating pending pool tasks...[/bold yellow]")
+                    for f in future_to_book:
+                        f.cancel()
                     executor.shutdown(wait=False, cancel_futures=True)
-                    raise
+                    # Unregister daemon threads from Python's atexit handler so exit is instant
+                    import concurrent.futures.thread
+                    with concurrent.futures.thread._global_shutdown_lock:
+                        for t in list(executor._threads):
+                            concurrent.futures.thread._threads_queues.pop(t, None)
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
-        summary_text = f"[bold green]Metadata cleaning finished.[/bold green] Completed: [bold green]{success_count}[/bold green]"
-        if skipped_graphical_count > 0:
-            summary_text += f" | Skipped (graphical): [yellow]{skipped_graphical_count}[/yellow]"
-        if failed_count > 0:
-            summary_text += f" | Failed: [bold red]{failed_count}[/bold red] [dim](run with --retry-failed to re-attempt)[/dim]"
-        if durations:
-            avg_s, p80_s, fastest_s = _calc_stats()
-            summary_text += (
-                f"\n[bold cyan]Processing Performance:[/bold cyan] "
-                f"Avg: [bold green]{avg_s:.2f}s[/bold green] | "
-                f"80th Percentile (p80): [bold yellow]{p80_s:.2f}s[/bold yellow] | "
-                f"Fastest: [bold magenta]{fastest_s:.2f}s[/bold magenta] "
-                f"[dim](across {len(durations)} normalized books)[/dim]"
+        if interrupted:
+            console.print(
+                f"[bold yellow]Metadata cleaning stopped by user.[/bold yellow] "
+                f"Successfully completed before cancel: [bold green]{success_count}[/bold green] book(s)."
             )
-        console.print(summary_text)
+        else:
+            summary_text = f"[bold green]Metadata cleaning finished.[/bold green] Completed: [bold green]{success_count}[/bold green]"
+            if skipped_graphical_count > 0:
+                summary_text += f" | Skipped (graphical): [yellow]{skipped_graphical_count}[/yellow]"
+            if failed_count > 0:
+                summary_text += f" | Failed: [bold red]{failed_count}[/bold red] [dim](run with --retry-failed to re-attempt)[/dim]"
+            if durations:
+                avg_s, p80_s, fastest_s = _calc_stats()
+                summary_text += (
+                    f"\n[bold cyan]Processing Performance:[/bold cyan] "
+                    f"Avg: [bold green]{avg_s:.2f}s[/bold green] | "
+                    f"80th Percentile (p80): [bold yellow]{p80_s:.2f}s[/bold yellow] | "
+                    f"Fastest: [bold magenta]{fastest_s:.2f}s[/bold magenta] "
+                    f"[dim](across {len(durations)} normalized books)[/dim]"
+                )
+            console.print(summary_text)
 
     finally:
         if should_stage and client.is_staged:
@@ -722,6 +770,9 @@ def clean_metadata(
 
             if client.is_staged:
                 client.cleanup_staged(delete_file=True)
+
+        if interrupted:
+            raise typer.Exit(code=130)
 
 
 @app.command("build-graph")

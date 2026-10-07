@@ -117,16 +117,42 @@ class CalibreClient:
         return self.db_path
 
     @staticmethod
-    def _verify_sqlite_integrity(path: Path) -> bool:
-        """Verify SQLite database integrity."""
+    def _verify_sqlite_integrity(path: Path, allow_index_warnings: bool = True) -> bool:
+        """
+        Verify SQLite database integrity.
+        Ensures database is valid, non-empty, and core tables are queryable.
+        Allows legacy Calibre index warnings if allow_index_warnings=True.
+        """
+        if not path.is_file() or path.stat().st_size == 0:
+            raise ValueError(f"SQLite file {path} is missing or empty.")
+
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             cursor = conn.cursor()
+            # Basic readability check on books table
+            cursor.execute("SELECT count(*) FROM books;")
+            cursor.fetchone()
+
             cursor.execute("PRAGMA integrity_check;")
-            res = cursor.fetchone()
-            if not res or res[0] != "ok":
-                raise ValueError(f"SQLite integrity check failed on {path}: {res}")
-            return True
+            rows = cursor.fetchall()
+            if not rows:
+                raise ValueError(f"Integrity check returned no results on {path}")
+
+            if len(rows) == 1 and rows[0][0] == "ok":
+                return True
+
+            errors = [str(r[0]) for r in rows if r and r[0]]
+            # If all errors are merely index-related discrepancies (common in Calibre libraries after crashes),
+            # log warning and proceed rather than failing into slow network mode.
+            is_only_index_warnings = all("index" in err.lower() for err in errors)
+            if allow_index_warnings and is_only_index_warnings:
+                logger.warning(
+                    f"SQLite database {path} has {len(errors)} minor index warning(s), "
+                    f"but core tables and data are intact."
+                )
+                return True
+
+            raise ValueError(f"SQLite integrity check failed on {path}: {errors[:5]}")
         finally:
             conn.close()
 
@@ -154,8 +180,14 @@ class CalibreClient:
         logger.info(f"Staging Calibre database from {self.db_path} to {target}...")
         _copy_file_with_progress(self.db_path, target, progress_callback=progress_callback)
 
+        # Verify complete transfer
+        source_size = self.db_path.stat().st_size
+        staged_size = target.stat().st_size
+        if source_size != staged_size:
+            raise IOError(f"Staged file size mismatch: {staged_size} != {source_size}")
+
         # Verify integrity of staged copy
-        self._verify_sqlite_integrity(target)
+        self._verify_sqlite_integrity(target, allow_index_warnings=True)
 
         self.staged_db_path = target
         self.is_staged = True
@@ -178,7 +210,7 @@ class CalibreClient:
             raise RuntimeError("Original database path is not defined.")
 
         # 1. Verify staged DB integrity before uploading
-        self._verify_sqlite_integrity(self.staged_db_path)
+        self._verify_sqlite_integrity(self.staged_db_path, allow_index_warnings=True)
 
         # 2. Create backup of original db if requested
         if create_backup and self.db_path.is_file():

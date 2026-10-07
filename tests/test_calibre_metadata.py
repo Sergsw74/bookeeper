@@ -351,3 +351,55 @@ def test_config_staging_settings():
     assert s.stage_metadata_db is True
     assert s.backup_metadata_db is True
     assert s.resolved_staged_db_path.name == ".staged_metadata.db"
+
+
+def test_sqlite_integrity_check_with_index_warnings(tmp_path: Path, monkeypatch):
+    """Verify _verify_sqlite_integrity tolerates index warnings when enabled."""
+    db_file = tmp_path / "index_warn.db"
+    conn = sqlite3.connect(str(db_file))
+    conn.execute("CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT);")
+    conn.execute("INSERT INTO books VALUES (1, 'Book');")
+    conn.commit()
+    conn.close()
+
+    # Normal check passes
+    assert CalibreClient._verify_sqlite_integrity(db_file) is True
+
+    # Monkeypatch cursor to simulate Calibre index discrepancies
+    orig_connect = sqlite3.connect
+    class FakeCursor:
+        def execute(self, sql):
+            pass
+        def fetchone(self):
+            return (1,)
+        def fetchall(self):
+            return [("wrong # of entries in index sqlite_autoindex_authors_1",)]
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sqlite3, "connect", lambda *args, **kwargs: FakeConn())
+
+    # With allow_index_warnings=True, it should succeed
+    assert CalibreClient._verify_sqlite_integrity(db_file, allow_index_warnings=True) is True
+
+    # With allow_index_warnings=False, it should raise ValueError
+    with pytest.raises(ValueError, match="SQLite integrity check failed"):
+        CalibreClient._verify_sqlite_integrity(db_file, allow_index_warnings=False)
+
+
+def test_daemon_thread_pool_executor():
+    """Verify DaemonThreadPoolExecutor creates daemon threads."""
+    from bookeeper.cli import DaemonThreadPoolExecutor
+    import time
+
+    executor = DaemonThreadPoolExecutor(max_workers=2)
+    fut = executor.submit(time.sleep, 0.05)
+    for t in executor._threads:
+        assert t.daemon is True
+    fut.result()
+    executor.shutdown(wait=False)
+

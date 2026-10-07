@@ -2,6 +2,8 @@
 Production-quality Typer CLI interface for bookeeper with rich progress bars and configurable Ollama / Calibre paths.
 """
 
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -298,6 +300,9 @@ def clean_metadata(
     backup_db: Optional[bool] = typer.Option(
         None, "--backup-db/--no-backup-db", help="Create metadata.db.bak on remote library before uploading updated staged database (default: true)."
     ),
+    max_tasks: Optional[int] = typer.Option(
+        None, "--max-tasks", "-t", help="Max concurrent active tasks across Ollama servers (default: auto: 3x alive servers, up to 10)."
+    ),
 ):
     """
     Query Calibre (local, SMB share, or server), inspect titles/authors/summaries,
@@ -403,11 +408,73 @@ def clean_metadata(
         console.print("[bold green]All books are already cleaned! Nothing to process.[/bold green]")
         raise typer.Exit(0)
 
+    num_servers = len(extractor.pool.alive_nodes) or len(extractor.pool.nodes)
+    pool_concurrency = max_tasks if max_tasks is not None else cfg.calculate_pool_concurrency(num_servers)
+
     console.print(f"[bold green]Found {len(books)} book(s) to process.[/bold green]")
+    console.print(
+        f"[bold cyan]Parallel Task Pool:[/bold cyan] Running up to {pool_concurrency} active task(s) "
+        f"across {num_servers} Ollama server(s) (low: {num_servers}, max default: {min(cfg.max_active_tasks_cap, 3 * num_servers)})."
+    )
 
     success_count = 0
     failed_count = 0
     skipped_graphical_count = 0
+
+    db_lock = threading.Lock()
+    display_lock = threading.Lock()
+
+    def _process_single_book(b_item: Dict[str, Any]) -> Dict[str, Any]:
+        bid = b_item["id"]
+        raw_title = BookParser.repair_mojibake(b_item.get("title", "Untitled"))
+        raw_authors = [BookParser.repair_mojibake(a) for a in b_item.get("authors", [])]
+        raw_comments = BookParser.repair_mojibake(b_item.get("comments", ""))
+        formats = b_item.get("formats", [])
+        book_path_str = b_item.get("path")
+        book_dir = Path(book_path_str) if book_path_str else None
+
+        # Check if book only contains graphical formats (CBR, CBZ, DJVU)
+        is_graphical = False
+        if formats and BookParser.only_has_graphical_formats(formats):
+            is_graphical = True
+        elif book_dir and book_dir.exists() and BookParser.directory_only_has_graphical_formats(book_dir):
+            is_graphical = True
+
+        if is_graphical:
+            fmts_label = ", ".join(formats) if formats else "graphical"
+            return {
+                "id": bid,
+                "status": "skipped_graphical",
+                "raw_title": raw_title,
+                "reason": f"graphical format ({fmts_label})",
+            }
+
+        # Sample book content and file hint from filesystem / SMB share
+        content_sample = None
+        file_hint = None
+        if book_path_str:
+            if book_dir and book_dir.exists():
+                content_sample, file_hint = BookParser.sample_content(book_dir)
+
+        # Run Ollama structured normalization with content sample (load-balanced across servers)
+        cleaned = extractor.clean_metadata(
+            raw_title=raw_title,
+            raw_authors=raw_authors,
+            raw_comments=raw_comments,
+            content_sample=content_sample,
+            file_hint=file_hint,
+        )
+
+        return {
+            "id": bid,
+            "status": "cleaned",
+            "raw_title": raw_title,
+            "raw_authors": raw_authors,
+            "raw_comments": raw_comments,
+            "cleaned": cleaned,
+            "content_sample": content_sample,
+            "file_hint": file_hint,
+        }
 
     try:
         with Progress(
@@ -417,103 +484,105 @@ def clean_metadata(
             TaskProgressColumn(),
             console=console,
         ) as progress:
-            task = progress.add_task("Normalizing metadata with Ollama...", total=len(books))
+            task = progress.add_task(
+                f"Normalizing metadata across {num_servers} Ollama server(s)...",
+                total=len(books),
+            )
 
-            for b in books:
-                bid = b["id"]
-                raw_title = BookParser.repair_mojibake(b.get("title", "Untitled"))
-                raw_authors = [BookParser.repair_mojibake(a) for a in b.get("authors", [])]
-                raw_comments = BookParser.repair_mojibake(b.get("comments", ""))
-                formats = b.get("formats", [])
-                book_path_str = b.get("path")
-                book_dir = Path(book_path_str) if book_path_str else None
-
-                progress.update(task, description=f"Cleaning: [bold cyan]{raw_title[:30]}[/bold cyan]")
-
-                # Check if book only contains graphical formats (CBR, CBZ, DJVU)
-                is_graphical = False
-                if formats and BookParser.only_has_graphical_formats(formats):
-                    is_graphical = True
-                elif book_dir and book_dir.exists() and BookParser.directory_only_has_graphical_formats(book_dir):
-                    is_graphical = True
-
-                if is_graphical:
-                    fmts_label = ", ".join(formats) if formats else "graphical"
-                    console.print(
-                        f"[dim yellow]⚡ Skipping book #{bid} ('{raw_title}'): graphical format ({fmts_label}).[/dim yellow]"
-                    )
-                    tracker.mark_skipped("clean_metadata", bid, title=raw_title, reason=f"graphical: {fmts_label}")
-                    skipped_graphical_count += 1
-                    progress.advance(task)
-                    continue
+            with ThreadPoolExecutor(max_workers=pool_concurrency) as executor:
+                future_to_book = {
+                    executor.submit(_process_single_book, b): b for b in books
+                }
 
                 try:
-                    # Sample book content and file hint from filesystem / SMB share
-                    content_sample = None
-                    file_hint = None
-                    if book_path_str:
-                        book_dir = Path(book_path_str)
-                        if book_dir.exists():
-                            content_sample, file_hint = BookParser.sample_content(book_dir)
+                    for future in as_completed(future_to_book):
+                        b_orig = future_to_book[future]
+                        bid = b_orig["id"]
+                        raw_title = BookParser.repair_mojibake(b_orig.get("title", "Untitled"))
 
-                    # Run Ollama structured normalization with content sample
-                    cleaned = extractor.clean_metadata(
-                        raw_title=raw_title,
-                        raw_authors=raw_authors,
-                        raw_comments=raw_comments,
-                        content_sample=content_sample,
-                        file_hint=file_hint,
-                    )
+                        try:
+                            res = future.result()
+                            if res["status"] == "skipped_graphical":
+                                with display_lock:
+                                    console.print(
+                                        f"[dim yellow]⚡ Skipping book #{bid} ('{raw_title}'): {res['reason']}.[/dim yellow]"
+                                    )
+                                with db_lock:
+                                    tracker.mark_skipped(
+                                        "clean_metadata", bid, title=raw_title, reason=res["reason"]
+                                    )
+                                skipped_graphical_count += 1
 
-                    # Display diff panel
-                    table = Table(show_header=True, header_style="bold magenta", expand=True)
-                    table.add_column("Field", style="dim", width=12)
-                    table.add_column("Original Calibre Value")
-                    table.add_column("Cleaned LLM Value", style="bold green")
+                            elif res["status"] == "cleaned":
+                                cleaned = res["cleaned"]
+                                raw_authors = res["raw_authors"]
+                                raw_comments = res["raw_comments"]
+                                content_sample = res["content_sample"]
+                                file_hint = res["file_hint"]
 
-                    table.add_row("Title", raw_title, cleaned.title)
-                    table.add_row("Authors", ", ".join(raw_authors), cleaned.author)
-                    table.add_row(
-                        "Summary",
-                        (raw_comments[:120] + "...") if raw_comments else "[dim]None[/dim]",
-                        cleaned.summary,
-                    )
-                    if file_hint:
-                        table.add_row("Source File", file_hint, "[dim green]Content sampled[/dim green]" if content_sample else "[dim]Inspected[/dim]")
+                                # Display diff panel
+                                table = Table(show_header=True, header_style="bold magenta", expand=True)
+                                table.add_column("Field", style="dim", width=12)
+                                table.add_column("Original Calibre Value")
+                                table.add_column("Cleaned LLM Value", style="bold green")
 
-                    console.print(Panel(table, title=f"Book #{bid} Metadata Diff"))
+                                table.add_row("Title", raw_title, cleaned.title)
+                                table.add_row("Authors", ", ".join(raw_authors), cleaned.author)
+                                table.add_row(
+                                    "Summary",
+                                    (raw_comments[:120] + "...") if raw_comments else "[dim]None[/dim]",
+                                    cleaned.summary,
+                                )
+                                if file_hint:
+                                    table.add_row(
+                                        "Source File",
+                                        file_hint,
+                                        "[dim green]Content sampled[/dim green]" if content_sample else "[dim]Inspected[/dim]",
+                                    )
 
-                    if not dry_run:
-                        client.update_metadata(
-                            book_id=bid,
-                            title=cleaned.title,
-                            authors=[cleaned.author],
-                            comments=cleaned.summary,
-                        )
-                        console.print(f"[green]✓ Successfully updated book #{bid} in Calibre.[/green]")
-                        tracker.mark_completed(
-                            "clean_metadata",
-                            bid,
-                            title=cleaned.title,
-                            metadata={"author": cleaned.author, "dry_run": False},
-                        )
-                        success_count += 1
-                    else:
-                        console.print(f"[yellow]⚡ [Dry-Run] Skipped writing back to Calibre.[/yellow]")
-                        tracker.mark_completed(
-                            "clean_metadata",
-                            bid,
-                            title=cleaned.title,
-                            metadata={"author": cleaned.author, "dry_run": True},
-                        )
-                        success_count += 1
+                                with display_lock:
+                                    console.print(Panel(table, title=f"Book #{bid} Metadata Diff"))
 
-                except Exception as e:
-                    console.print(f"[bold red]✗ Failed to process book #{bid} ('{raw_title}'):[/bold red] {e}")
-                    tracker.mark_failed("clean_metadata", bid, title=raw_title, error=str(e))
-                    failed_count += 1
-                finally:
-                    progress.advance(task)
+                                    if not dry_run:
+                                        with db_lock:
+                                            client.update_metadata(
+                                                book_id=bid,
+                                                title=cleaned.title,
+                                                authors=[cleaned.author],
+                                                comments=cleaned.summary,
+                                            )
+                                            tracker.mark_completed(
+                                                "clean_metadata",
+                                                bid,
+                                                title=cleaned.title,
+                                                metadata={"author": cleaned.author, "dry_run": False},
+                                            )
+                                        console.print(f"[green]✓ Successfully updated book #{bid} in Calibre.[/green]")
+                                        success_count += 1
+                                    else:
+                                        console.print(f"[yellow]⚡ [Dry-Run] Skipped writing back to Calibre.[/yellow]")
+                                        with db_lock:
+                                            tracker.mark_completed(
+                                                "clean_metadata",
+                                                bid,
+                                                title=cleaned.title,
+                                                metadata={"author": cleaned.author, "dry_run": True},
+                                            )
+                                        success_count += 1
+
+                        except Exception as e:
+                            with display_lock:
+                                console.print(f"[bold red]✗ Failed to process book #{bid} ('{raw_title}'):[/bold red] {e}")
+                            with db_lock:
+                                tracker.mark_failed("clean_metadata", bid, title=raw_title, error=str(e))
+                            failed_count += 1
+                        finally:
+                            progress.advance(task)
+
+                except KeyboardInterrupt:
+                    console.print("\n[bold yellow]Cancelled by user. Terminating pending pool tasks...[/bold yellow]")
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
 
         summary_text = f"[bold green]Metadata cleaning finished.[/bold green] Completed: [bold green]{success_count}[/bold green]"
         if skipped_graphical_count > 0:

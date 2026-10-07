@@ -74,6 +74,18 @@ class Settings(BaseSettings):
         default=600,
         description="Cooldown duration in seconds (default 600s = 10 min) before retrying a failed server.",
     )
+    max_active_tasks: Optional[int] = Field(
+        default=None,
+        description="Max concurrent active tasks across Ollama servers. If None, auto-calculated from alive servers.",
+    )
+    tasks_per_server: int = Field(
+        default=3,
+        description="Default multiplier of active tasks per alive Ollama server (default: 3x).",
+    )
+    max_active_tasks_cap: int = Field(
+        default=10,
+        description="Upper ceiling for auto-calculated active tasks across pool (default: 10).",
+    )
 
     llm_model: str = Field(
         default="llama3.1:8b",
@@ -119,6 +131,18 @@ class Settings(BaseSettings):
         if self.ollama_servers:
             return sorted(self.ollama_servers, key=lambda s: s.priority)
         return [OllamaServerConfig(url=self.ollama_base_url, priority=1, name="default")]
+
+    def calculate_pool_concurrency(self, num_servers: int) -> int:
+        """
+        Calculate active concurrent tasks limit:
+        - low: num_servers
+        - default: 3 * num_servers, capped at max_active_tasks_cap (default 10)
+        - custom override: max_active_tasks if explicitly configured
+        """
+        if self.max_active_tasks is not None:
+            return max(1, self.max_active_tasks)
+        n = max(1, num_servers)
+        return min(self.max_active_tasks_cap, max(n, self.tasks_per_server * n))
 
     # Processing & Deduplication
     similarity_threshold: float = Field(

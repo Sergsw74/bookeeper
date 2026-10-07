@@ -255,3 +255,86 @@ def test_knowledge_extractor_with_failover_pool():
         # Node faulty was marked failed
         assert extractor.pool.nodes[0].consecutive_failures == 1
         assert extractor.pool.nodes[0].failed_at is not None
+
+
+def test_pool_concurrency_calculation():
+    """Verify concurrency calculation: low = num_servers, default = 3x servers, cap = 10."""
+    s = Settings()
+    # 1 server -> 3 active tasks
+    assert s.calculate_pool_concurrency(num_servers=1) == 3
+    # 2 servers -> 6 active tasks
+    assert s.calculate_pool_concurrency(num_servers=2) == 6
+    # 3 servers -> 9 active tasks
+    assert s.calculate_pool_concurrency(num_servers=3) == 9
+    # 4 servers -> capped at 10
+    assert s.calculate_pool_concurrency(num_servers=4) == 10
+
+    # Custom override
+    s_custom = Settings(max_active_tasks=5)
+    assert s_custom.calculate_pool_concurrency(num_servers=2) == 5
+    assert s_custom.calculate_pool_concurrency(num_servers=4) == 5
+
+
+def test_concurrent_load_balancing_across_servers():
+    """Verify tasks running in parallel are distributed across all available/alive servers."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    servers = [
+        OllamaServerConfig(url="http://node-a:11434", priority=1, name="node-a"),
+        OllamaServerConfig(url="http://node-b:11434", priority=2, name="node-b"),
+    ]
+    pool = OllamaPool(servers=servers, cooldown_seconds=600)
+
+    started_events = {
+        "http://node-a:11434": False,
+        "http://node-b:11434": False,
+    }
+    server_calls = []
+
+    import threading
+    lock = threading.Lock()
+    barrier = threading.Barrier(2)
+
+    def slow_task(url: str):
+        with lock:
+            server_calls.append(url)
+            started_events[url] = True
+        # Wait until both tasks are in flight concurrently
+        barrier.wait(timeout=2.0)
+        return f"done-{url}"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(pool.execute_with_failover, slow_task)
+        f2 = executor.submit(pool.execute_with_failover, slow_task)
+        res1 = f1.result(timeout=3.0)
+        res2 = f2.result(timeout=3.0)
+
+    # Both servers should have been utilized concurrently!
+    assert "done-http://node-a:11434" in (res1, res2)
+    assert "done-http://node-b:11434" in (res1, res2)
+    assert set(server_calls) == {"http://node-a:11434", "http://node-b:11434"}
+
+    # After completion, active_tasks on both nodes must return to 0
+    assert pool.nodes[0].active_tasks == 0
+    assert pool.nodes[1].active_tasks == 0
+
+
+def test_active_tasks_tracking_with_error_and_failover():
+    """Verify active_tasks resets to 0 even when an exception occurs or failover triggers."""
+    servers = [
+        OllamaServerConfig(url="http://node-fail:11434", priority=1, name="fail"),
+        OllamaServerConfig(url="http://node-ok:11434", priority=2, name="ok"),
+    ]
+    pool = OllamaPool(servers=servers, cooldown_seconds=600)
+
+    def op(url: str):
+        if "fail" in url:
+            raise ConnectionError("node down")
+        return "success"
+
+    res = pool.execute_with_failover(op)
+    assert res == "success"
+    # Both nodes must have 0 active_tasks
+    assert pool.nodes[0].active_tasks == 0
+    assert pool.nodes[1].active_tasks == 0
+    assert pool.nodes[0].consecutive_failures == 1

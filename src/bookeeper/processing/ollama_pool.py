@@ -3,6 +3,7 @@ Multi-server smart proxy and failover client for Ollama with priority routing an
 """
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -17,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class OllamaServerNode:
-    """Tracks dynamic health, priority, and cooldown for an individual Ollama endpoint."""
+    """Tracks dynamic health, priority, active tasks, and cooldown for an individual Ollama endpoint."""
 
     url: str
     priority: int = 1
@@ -25,6 +26,7 @@ class OllamaServerNode:
     failed_at: Optional[float] = None
     failure_count: int = 0
     last_error: Optional[str] = None
+    active_tasks: int = 0
 
     @property
     def label(self) -> str:
@@ -66,9 +68,8 @@ class OllamaServerNode:
 
 class OllamaPool:
     """
-    Manages N Ollama servers with priority-based routing and automated failover.
-    If a higher-priority server fails, requests immediately fail over to the next server.
-    After cooldown_seconds (default 10 min), previously failed servers are re-probed.
+    Manages N Ollama servers with priority-based routing, automated failover,
+    and concurrent load balancing across all available/alive servers.
     """
 
     def __init__(
@@ -80,6 +81,7 @@ class OllamaPool:
             raise ValueError("OllamaPool requires at least one server configuration.")
 
         self.cooldown_seconds = cooldown_seconds
+        self._lock = threading.RLock()
         self.nodes: List[OllamaServerNode] = [
             OllamaServerNode(
                 url=s.url.rstrip("/"),
@@ -102,22 +104,48 @@ class OllamaPool:
         ]
         return cls(servers=configs, cooldown_seconds=cooldown_seconds)
 
+    @property
+    def alive_nodes(self) -> List[OllamaServerNode]:
+        """Return list of currently healthy/eligible server nodes."""
+        with self._lock:
+            return [n for n in self.nodes if n.is_eligible(self.cooldown_seconds)]
+
     def get_ordered_servers(self) -> List[OllamaServerNode]:
         """
         Return servers ordered by priority for execution.
         Eligible servers (healthy or cooldown expired) are prioritized.
         If all servers are in cooldown, falls back to the server that failed longest ago.
         """
-        eligible = [n for n in self.nodes if n.is_eligible(self.cooldown_seconds)]
-        if eligible:
-            # Sort ascending: priority 1 comes before priority 2
-            return sorted(eligible, key=lambda n: n.priority)
+        with self._lock:
+            eligible = [n for n in self.nodes if n.is_eligible(self.cooldown_seconds)]
+            if eligible:
+                return sorted(eligible, key=lambda n: n.priority)
 
-        # Fallback: all servers cooling down; try server whose failure was longest ago
-        logger.warning(
-            f"All {len(self.nodes)} Ollama server(s) are in cooldown; probing oldest failed server."
-        )
-        return sorted(self.nodes, key=lambda n: n.failed_at or 0.0)
+            # Fallback: all servers cooling down; try server whose failure was longest ago
+            logger.warning(
+                f"All {len(self.nodes)} Ollama server(s) are in cooldown; probing oldest failed server."
+            )
+            return sorted(self.nodes, key=lambda n: n.failed_at or 0.0)
+
+    def get_candidate_servers(self) -> List[OllamaServerNode]:
+        """
+        Return servers ordered for execution:
+        1. Eligible (healthy) servers ordered primarily by least active tasks (load balancing),
+           and secondarily by priority ascending.
+        2. Cooling down servers as fallback ordered by oldest failure.
+        """
+        with self._lock:
+            eligible = [n for n in self.nodes if n.is_eligible(self.cooldown_seconds)]
+            if eligible:
+                sorted_eligible = sorted(
+                    eligible,
+                    key=lambda n: (n.active_tasks, n.priority),
+                )
+                cooling = [n for n in self.nodes if not n.is_eligible(self.cooldown_seconds)]
+                sorted_cooling = sorted(cooling, key=lambda n: n.failed_at or 0.0)
+                return sorted_eligible + sorted_cooling
+            else:
+                return sorted(self.nodes, key=lambda n: n.failed_at or 0.0)
 
     @property
     def primary_server(self) -> OllamaServerNode:
@@ -132,32 +160,41 @@ class OllamaPool:
     ) -> Any:
         """
         Execute an operation passing base_url.
-        If the primary server fails, marks it failed and retries on the next server in priority.
+        Balances concurrent tasks across least-loaded alive servers,
+        and automatically retries on the next candidate if any server fails.
         """
-        candidates = self.get_ordered_servers()
+        candidates = self.get_candidate_servers()
         last_exception: Optional[Exception] = None
-
         errors = []
+
         for idx, node in enumerate(candidates):
+            with self._lock:
+                node.active_tasks += 1
             try:
                 result = operation(node.url)
-                node.mark_success()
+                with self._lock:
+                    node.mark_success()
                 return result
             except Exception as e:
                 last_exception = e
                 errors.append(f"{node.url}: {e}")
-                node.mark_failure(str(e))
+                with self._lock:
+                    node.mark_failure(str(e))
                 logger.warning(
-                    f"Ollama server '{node.url}' (Priority {node.priority}) failed: {e}. "
+                    f"Ollama server '{node.url}' ({node.label}, Priority {node.priority}) failed: {e}. "
                     f"Marked cooling down for {self.cooldown_seconds}s."
                 )
 
-                # If there is a next candidate, notify/log failover
                 if idx + 1 < len(candidates):
                     next_node = candidates[idx + 1]
-                    logger.warning(f"Failing over to server '{next_node.url}' (Priority {next_node.priority})...")
+                    logger.warning(
+                        f"Failing over to server '{next_node.url}' ({next_node.label}, Priority {next_node.priority})..."
+                    )
                     if on_failover:
                         on_failover(node, e, next_node)
+            finally:
+                with self._lock:
+                    node.active_tasks = max(0, node.active_tasks - 1)
 
         err_summary = "; ".join(errors)
         raise RuntimeError(
@@ -166,22 +203,24 @@ class OllamaPool:
 
     def get_status(self) -> List[Dict[str, Any]]:
         """Return status snapshot of all pool nodes."""
-        status_list = []
-        for n in sorted(self.nodes, key=lambda x: x.priority):
-            eligible = n.is_eligible(self.cooldown_seconds)
-            rem = n.cooldown_remaining(self.cooldown_seconds)
-            status_list.append(
-                {
-                    "url": n.url,
-                    "priority": n.priority,
-                    "name": n.label,
-                    "status": "active" if eligible else "cooling_down",
-                    "cooldown_remaining_sec": round(rem, 1),
-                    "failure_count": n.failure_count,
-                    "last_error": n.last_error,
-                }
-            )
-        return status_list
+        with self._lock:
+            status_list = []
+            for n in sorted(self.nodes, key=lambda x: x.priority):
+                eligible = n.is_eligible(self.cooldown_seconds)
+                rem = n.cooldown_remaining(self.cooldown_seconds)
+                status_list.append(
+                    {
+                        "url": n.url,
+                        "priority": n.priority,
+                        "name": n.label,
+                        "status": "active" if eligible else "cooling_down",
+                        "active_tasks": n.active_tasks,
+                        "cooldown_remaining_sec": round(rem, 1),
+                        "failure_count": n.failure_count,
+                        "last_error": n.last_error,
+                    }
+                )
+            return status_list
 
 
 class FailoverOllamaEmbeddings(Embeddings):

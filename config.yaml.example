@@ -36,6 +36,15 @@ ollama_servers:
 
 failover_cooldown_seconds: 600
 
+# Parallel Task Pool across available Ollama servers
+# Concurrency auto-scales across all alive servers simultaneously:
+#   low active tasks = number of alive servers (1x per server)
+#   max active tasks by default = 3x alive servers (up to 10 active tasks)
+# Set max_active_tasks to an integer to fix concurrency, or leave null for auto-scaling
+max_active_tasks: null
+tasks_per_server: 3
+max_active_tasks_cap: 10
+
 # Entity resolution cosine similarity threshold (0.0 - 1.0)
 similarity_threshold: 0.85
 

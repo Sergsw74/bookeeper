@@ -89,6 +89,92 @@ def config(
     )
 
 
+@app.command("list-books")
+def list_books(
+    limit: Optional[int] = typer.Option(
+        25, "--limit", "-n", help="Maximum number of books to display (use 0 for all)."
+    ),
+    search: Optional[str] = typer.Option(
+        None, "--search", "-s", help="Filter books by title or author query."
+    ),
+    calibre_path: Optional[str] = typer.Option(
+        None, "--calibre-path", help="Calibre library path or SMB mount (e.g. /Volumes/share/calibre)."
+    ),
+    config_path: Optional[str] = typer.Option(
+        None, "--config", "-c", help="Path to config.yaml file."
+    ),
+):
+    """
+    List and search books in the configured Calibre library or mounted SMB share.
+    Useful for testing database connectivity and discovering book IDs.
+    """
+    cfg = _get_effective_settings(config_path, calibre_path=calibre_path)
+    client = CalibreClient(
+        library_path=cfg.calibre_library_path,
+        user=cfg.calibre_user,
+        password=cfg.calibre_password,
+    )
+
+    if not client.is_available():
+        console.print(
+            f"[bold red]Error:[/bold red] Cannot access Calibre library at '[bold cyan]{cfg.calibre_library_path}[/bold cyan]'.\n"
+            f"If this is on a remote SMB share, ensure the share is mounted (e.g. /Volumes/...) or that calibredb is installed."
+        )
+        raise typer.Exit(1)
+
+    with console.status(f"[bold blue]Connecting to Calibre library at {cfg.calibre_library_path}...[/bold blue]"):
+        try:
+            books = client.list_books(fields=["id", "title", "authors", "formats"])
+        except Exception as e:
+            console.print(f"[bold red]Failed to read Calibre library:[/bold red] {e}")
+            raise typer.Exit(1)
+
+    if search:
+        q = search.lower()
+        books = [
+            b
+            for b in books
+            if q in b.get("title", "").lower()
+            or any(q in a.lower() for a in b.get("authors", []))
+        ]
+
+    total_count = len(books)
+    if limit and limit > 0:
+        books = books[:limit]
+
+    table = Table(
+        title=f"Calibre Library: {cfg.calibre_library_path} (Showing {len(books)} of {total_count})",
+        show_lines=False,
+    )
+    table.add_column("ID", justify="right", style="cyan", width=6)
+    table.add_column("Title", style="bold white", min_width=30)
+    table.add_column("Authors", style="green", width=24)
+    table.add_column("Formats", style="magenta", width=16)
+
+    for b in books:
+        authors = b.get("authors", [])
+        authors_str = ", ".join(authors) if isinstance(authors, list) else str(authors)
+        formats = b.get("formats", [])
+        formats_str = ", ".join(formats) if isinstance(formats, list) else str(formats)
+
+        title = b.get("title", "Untitled")
+        if len(title) > 50:
+            title = title[:47] + "..."
+
+        table.add_row(
+            str(b.get("id", "")),
+            title,
+            authors_str[:24],
+            formats_str or "[dim]None[/dim]",
+        )
+
+    console.print(table)
+    if limit and total_count > limit:
+        console.print(
+            f"[dim]Showing first {limit} books. Use --limit 0 to view all {total_count} books, or --search <term>.[/dim]"
+        )
+
+
 @app.command("clean-metadata")
 def clean_metadata(
     book_id: Optional[int] = typer.Option(

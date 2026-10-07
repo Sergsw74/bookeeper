@@ -12,10 +12,24 @@ calibre_user: null
 calibre_password: null
 
 # Remote or Local Ollama LLM & Embeddings Configuration
-# Point to your local daemon or remote network instance (e.g. node-laptop at 192.168.50.15)
+# For single-server setups, set ollama_base_url:
 ollama_base_url: "http://192.168.50.15:11434"
 llm_model: "llama3.1:8b"
 embedding_model: "nomic-embed-text"
+
+# Multi-server failover pool (N servers with priority ordering)
+# If defined, requests route to the highest priority available server (lowest number = highest priority).
+# If a server request fails, execution immediately fails over to the next priority server.
+# After failover_cooldown_seconds (default 600s / 10 min), bookeeper probes the previously failed server again.
+ollama_servers:
+  - url: "http://192.168.50.15:11434"
+    priority: 1
+    name: "primary-gpu-node"
+  - url: "http://192.168.50.20:11434"
+    priority: 2
+    name: "secondary-backup-node"
+
+failover_cooldown_seconds: 600
 
 # Entity resolution cosine similarity threshold (0.0 - 1.0)
 similarity_threshold: 0.85

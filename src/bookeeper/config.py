@@ -4,11 +4,24 @@ Configuration management for bookeeper using pydantic-settings.
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Any, List, Optional
 
 import yaml
-from pydantic import Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class OllamaServerConfig(BaseModel):
+    """Configuration for an individual Ollama server node."""
+
+    url: str = Field(description="Base URL for the Ollama server (e.g. http://192.168.50.15:11434).")
+    priority: int = Field(default=1, description="Priority integer (1 is highest priority, 2, 3...).")
+    name: Optional[str] = Field(default=None, description="Optional label for the server.")
+
+    @field_validator("url")
+    @classmethod
+    def clean_url(cls, v: str) -> str:
+        return v.strip().rstrip("/")
 
 
 class Settings(BaseSettings):
@@ -36,11 +49,20 @@ class Settings(BaseSettings):
         description="Optional password for remote Calibre content server.",
     )
 
-    # Local Ollama LLM & Embeddings
+    # Local / Remote Ollama LLM & Embeddings
     ollama_base_url: str = Field(
         default="http://localhost:11434",
-        description="Ollama server endpoint URL.",
+        description="Primary or default Ollama server endpoint URL.",
     )
+    ollama_servers: List[OllamaServerConfig] = Field(
+        default_factory=list,
+        description="Prioritized list of Ollama servers for multi-server failover client.",
+    )
+    failover_cooldown_seconds: int = Field(
+        default=600,
+        description="Cooldown duration in seconds (default 600s = 10 min) before retrying a failed server.",
+    )
+
     llm_model: str = Field(
         default="llama3.1:8b",
         description="Ollama model name for metadata cleaning and concept extraction.",
@@ -49,6 +71,38 @@ class Settings(BaseSettings):
         default="nomic-embed-text",
         description="Embedding model for semantic chunking and entity deduplication.",
     )
+
+    @field_validator("ollama_servers", mode="before")
+    @classmethod
+    def parse_servers(cls, v: Any) -> List[Any]:
+        if not v:
+            return []
+        if isinstance(v, str):
+            return [
+                {"url": u.strip(), "priority": idx + 1}
+                for idx, u in enumerate(v.split(","))
+                if u.strip()
+            ]
+        if isinstance(v, list):
+            res = []
+            for idx, item in enumerate(v):
+                if isinstance(item, str):
+                    res.append({"url": item.strip(), "priority": idx + 1})
+                elif isinstance(item, dict):
+                    if "priority" not in item:
+                        item["priority"] = idx + 1
+                    res.append(item)
+                else:
+                    res.append(item)
+            return res
+        return v
+
+    @property
+    def resolved_ollama_servers(self) -> List[OllamaServerConfig]:
+        """Return list of servers sorted by priority ascending (1 = highest priority)."""
+        if self.ollama_servers:
+            return sorted(self.ollama_servers, key=lambda s: s.priority)
+        return [OllamaServerConfig(url=self.ollama_base_url, priority=1, name="default")]
 
     # Processing & Deduplication
     similarity_threshold: float = Field(

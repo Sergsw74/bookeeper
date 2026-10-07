@@ -41,7 +41,8 @@ class EntityDeduplicator:
         embedding_model: Optional[str] = None,
         similarity_threshold: Optional[float] = None,
     ) -> "EntityDeduplicator":
-        b_url = (base_url or settings.ollama_base_url).rstrip("/")
+        from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings, OllamaPool
+
         e_model = embedding_model or settings.embedding_model
         s_thresh = (
             similarity_threshold
@@ -49,12 +50,17 @@ class EntityDeduplicator:
             else settings.similarity_threshold
         )
         try:
-            embeddings = OllamaEmbeddings(
-                base_url=b_url,
-                model=e_model,
-            )
+            if base_url:
+                urls = [u.strip() for u in base_url.split(",") if u.strip()]
+                pool = OllamaPool.from_urls(urls, cooldown_seconds=settings.failover_cooldown_seconds)
+            else:
+                pool = OllamaPool(
+                    servers=settings.resolved_ollama_servers,
+                    cooldown_seconds=settings.failover_cooldown_seconds,
+                )
+            embeddings = FailoverOllamaEmbeddings(pool=pool, model=e_model)
         except Exception as e:
-            logger.warning(f"Could not connect to OllamaEmbeddings at {b_url}: {e}")
+            logger.warning(f"Could not initialize FailoverOllamaEmbeddings: {e}")
             embeddings = None
 
         return cls(

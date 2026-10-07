@@ -14,6 +14,7 @@ from langchain_ollama import ChatOllama
 from pydantic import BaseModel, Field
 
 from bookeeper.config import Settings
+from bookeeper.processing.ollama_pool import OllamaPool
 
 logger = logging.getLogger(__name__)
 
@@ -65,32 +66,34 @@ class SectionExtraction(BaseModel):
 
 
 # ==============================================================================
-# KnowledgeExtractor Chain
+# KnowledgeExtractor Chain with Multi-Server Failover
 # ==============================================================================
 
 
 class KnowledgeExtractor:
-    """Extracts structured metadata and concept graphs using ChatOllama with structured output."""
+    """Extracts structured metadata and concept graphs using Ollama with multi-server failover."""
 
     def __init__(
         self,
-        base_url: str = "http://localhost:11434",
+        base_url: Optional[str] = None,
         model: str = "llama3.1:8b",
         temperature: float = 0.0,
+        pool: Optional[OllamaPool] = None,
+        cooldown_seconds: int = 600,
     ):
-        self.base_url = base_url.rstrip("/")
         self.model_name = model
         self.temperature = temperature
+        self.cooldown_seconds = cooldown_seconds
 
-        self.llm = ChatOllama(
-            base_url=self.base_url,
-            model=self.model_name,
-            temperature=self.temperature,
-        )
+        if pool is not None:
+            self.pool = pool
+        elif base_url:
+            urls = [u.strip() for u in base_url.split(",") if u.strip()]
+            self.pool = OllamaPool.from_urls(urls, cooldown_seconds=cooldown_seconds)
+        else:
+            self.pool = OllamaPool.from_urls(["http://localhost:11434"], cooldown_seconds=cooldown_seconds)
 
-        # Create typed structured chains using with_structured_output
-        self.metadata_chain = self.llm.with_structured_output(BookMetadata)
-        self.section_chain = self.llm.with_structured_output(SectionExtraction)
+        self.base_url = self.pool.primary_server.url
 
     @classmethod
     def from_settings(
@@ -99,10 +102,32 @@ class KnowledgeExtractor:
         base_url: Optional[str] = None,
         model: Optional[str] = None,
     ) -> "KnowledgeExtractor":
+        if base_url:
+            urls = [u.strip() for u in base_url.split(",") if u.strip()]
+            pool = OllamaPool.from_urls(urls, cooldown_seconds=settings.failover_cooldown_seconds)
+        else:
+            pool = OllamaPool(
+                servers=settings.resolved_ollama_servers,
+                cooldown_seconds=settings.failover_cooldown_seconds,
+            )
         return cls(
-            base_url=base_url or settings.ollama_base_url,
+            pool=pool,
             model=model or settings.llm_model,
+            cooldown_seconds=settings.failover_cooldown_seconds,
         )
+
+    def _execute_structured_invoke(self, schema_cls: Any, messages: Any) -> Any:
+        """Execute structured output invocation with multi-server failover."""
+        def _invoke(url: str):
+            llm = ChatOllama(
+                base_url=url,
+                model=self.model_name,
+                temperature=self.temperature,
+            )
+            chain = llm.with_structured_output(schema_cls)
+            return chain.invoke(messages)
+
+        return self.pool.execute_with_failover(_invoke)
 
     def clean_metadata(
         self,
@@ -154,12 +179,12 @@ class KnowledgeExtractor:
         )
 
         try:
-            result = self.metadata_chain.invoke(prompt.format_messages())
+            result = self._execute_structured_invoke(BookMetadata, prompt.format_messages())
             if isinstance(result, BookMetadata):
                 return result
             return BookMetadata(**dict(result))
         except Exception as e:
-            logger.warning(f"Metadata cleaning LLM call failed: {e}. Falling back to raw.")
+            logger.warning(f"Metadata cleaning LLM call failed across all pool servers: {e}. Falling back to raw.")
             return BookMetadata(
                 title=raw_title,
                 author=authors_str,
@@ -172,7 +197,7 @@ class KnowledgeExtractor:
         book_title: str,
         section_title: str,
     ) -> SectionExtraction:
-        """Extract atomic concepts and their relationships from a section chunk."""
+        """Extract atomic concepts and their relationships from a section chunk with multi-server failover."""
         prompt = ChatPromptTemplate.from_messages(
             [
                 (
@@ -198,22 +223,21 @@ class KnowledgeExtractor:
         )
 
         try:
-            result = self.section_chain.invoke(formatted_messages)
+            result = self._execute_structured_invoke(SectionExtraction, formatted_messages)
             if isinstance(result, SectionExtraction):
                 return result
             return SectionExtraction(**dict(result))
         except Exception as e:
-            logger.warning(f"Section extraction LLM call failed for '{section_title}': {e}")
+            logger.warning(f"Section extraction LLM call failed across all pool servers for '{section_title}': {e}")
             return SectionExtraction(concepts=[])
 
-    def warmup_and_check_device(self, timeout: int = 30) -> Dict[str, Any]:
+    def warmup_and_check_device(self, timeout: int = 15) -> Dict[str, Any]:
         """
-        Trigger a lightweight warmup request to ensure the model is loaded in Ollama,
-        and query /api/ps to verify whether Ollama is executing on GPU (VRAM) or CPU.
-        Returns a dict containing execution device, VRAM metrics, and warning if CPU-bound.
+        Trigger warmup requests and query /api/ps across all configured Ollama servers in the pool.
+        Returns metrics for each server, identifying GPU (VRAM) vs CPU execution and failover priority.
         """
-        def _fetch_json(endpoint: str, post_body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-            url = f"{self.base_url}{endpoint}"
+        def _fetch_server_json(base_url: str, endpoint: str, post_body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            url = f"{base_url.rstrip('/')}{endpoint}"
             try:
                 req = urllib.request.Request(
                     url,
@@ -223,7 +247,6 @@ class KnowledgeExtractor:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     return json.loads(resp.read().decode("utf-8"))
             except Exception:
-                # Graceful fallback to curl (handles macOS non-interactive subshell socket sandboxing)
                 if shutil.which("curl"):
                     cmd = ["curl", "-s", "--max-time", str(timeout)]
                     if post_body:
@@ -234,99 +257,135 @@ class KnowledgeExtractor:
                         return json.loads(res.stdout)
                 raise
 
-        # 1. Warmup ping to ensure the model is loaded into memory / VRAM
-        try:
-            _fetch_json(
-                "/api/generate",
-                {"model": self.model_name, "prompt": "warmup ping", "options": {"num_predict": 1}, "stream": False},
-            )
-        except Exception as e:
-            logger.warning(f"Ollama warmup ping failed for {self.model_name}: {e}")
+        def _inspect_node(node) -> Dict[str, Any]:
+            # 1. Warmup ping
+            try:
+                _fetch_server_json(
+                    node.url,
+                    "/api/generate",
+                    {"model": self.model_name, "prompt": "warmup ping", "options": {"num_predict": 1}, "stream": False},
+                )
+            except Exception as e:
+                logger.debug(f"Warmup ping error for {node.url}: {e}")
 
-        # 2. Query /api/ps to inspect running model allocation
-        try:
-            ps_data = _fetch_json("/api/ps")
-            models = ps_data.get("models", [])
+            # 2. Query /api/ps
+            try:
+                ps_data = _fetch_server_json(node.url, "/api/ps")
+                models = ps_data.get("models", [])
 
-            matched = None
-            target_norm = self.model_name.lower()
-            for m in models:
-                m_name = (m.get("name") or m.get("model") or "").lower()
-                if m_name == target_norm or m_name.startswith(target_norm) or target_norm.startswith(m_name.split(":")[0]):
-                    matched = m
-                    break
+                matched = None
+                target_norm = self.model_name.lower()
+                for m in models:
+                    m_name = (m.get("name") or m.get("model") or "").lower()
+                    if m_name == target_norm or m_name.startswith(target_norm) or target_norm.startswith(m_name.split(":")[0]):
+                        matched = m
+                        break
 
-            if not matched and models:
-                matched = models[0]
+                if not matched and models:
+                    matched = models[0]
 
-            if matched:
-                size = matched.get("size", 0)
-                size_vram = matched.get("size_vram", 0)
-                runner = matched.get("runner", "llamacpp")
-                model_active = matched.get("name") or self.model_name
+                if matched:
+                    size = matched.get("size", 0)
+                    size_vram = matched.get("size_vram", 0)
+                    runner = matched.get("runner", "llamacpp")
+                    model_active = matched.get("name") or self.model_name
+                    node.mark_success()
 
-                if size_vram == 0:
-                    return {
-                        "status": "ok",
-                        "is_gpu": False,
-                        "device": "CPU",
-                        "size": size,
-                        "size_vram": 0,
-                        "vram_pct": 0.0,
-                        "runner": runner,
-                        "model": model_active,
-                        "warning": (
-                            f"Ollama model '{model_active}' is running on CPU (0% VRAM offloaded). "
-                            "Extraction speed may be significantly slower without GPU acceleration."
-                        ),
-                    }
-                elif size_vram >= size:
-                    return {
-                        "status": "ok",
-                        "is_gpu": True,
-                        "device": "GPU (100% VRAM offload)",
-                        "size": size,
-                        "size_vram": size_vram,
-                        "vram_pct": 100.0,
-                        "runner": runner,
-                        "model": model_active,
-                        "warning": None,
-                    }
-                else:
-                    pct = round((size_vram / size) * 100, 1)
-                    return {
-                        "status": "ok",
-                        "is_gpu": True,
-                        "device": f"Partial GPU ({pct}% VRAM offload)",
-                        "size": size,
-                        "size_vram": size_vram,
-                        "vram_pct": pct,
-                        "runner": runner,
-                        "model": model_active,
-                        "warning": f"Ollama model '{model_active}' is partially offloaded ({pct}% VRAM, remainder on CPU).",
-                    }
+                    if size_vram == 0:
+                        return {
+                            "url": node.url,
+                            "priority": node.priority,
+                            "name": node.label,
+                            "status": "ok",
+                            "is_gpu": False,
+                            "device": "CPU",
+                            "size": size,
+                            "size_vram": 0,
+                            "vram_pct": 0.0,
+                            "runner": runner,
+                            "model": model_active,
+                            "warning": f"Running on CPU (0% VRAM offload).",
+                        }
+                    elif size_vram >= size:
+                        return {
+                            "url": node.url,
+                            "priority": node.priority,
+                            "name": node.label,
+                            "status": "ok",
+                            "is_gpu": True,
+                            "device": "GPU (100% VRAM offload)",
+                            "size": size,
+                            "size_vram": size_vram,
+                            "vram_pct": 100.0,
+                            "runner": runner,
+                            "model": model_active,
+                            "warning": None,
+                        }
+                    else:
+                        pct = round((size_vram / size) * 100, 1)
+                        return {
+                            "url": node.url,
+                            "priority": node.priority,
+                            "name": node.label,
+                            "status": "ok",
+                            "is_gpu": True,
+                            "device": f"Partial GPU ({pct}% VRAM offload)",
+                            "size": size,
+                            "size_vram": size_vram,
+                            "vram_pct": pct,
+                            "runner": runner,
+                            "model": model_active,
+                            "warning": f"Partially offloaded ({pct}% VRAM, remainder on CPU).",
+                        }
 
-            return {
-                "status": "unknown",
-                "is_gpu": False,
-                "device": "Unknown",
-                "size": 0,
-                "size_vram": 0,
-                "vram_pct": 0.0,
-                "runner": "unknown",
-                "model": self.model_name,
-                "warning": None,
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "is_gpu": False,
-                "device": "Unknown",
-                "size": 0,
-                "size_vram": 0,
-                "vram_pct": 0.0,
-                "runner": "unknown",
-                "model": self.model_name,
-                "warning": f"Unable to reach Ollama process metrics at {self.base_url}: {e}",
-                "error": str(e),
-            }
+                node.mark_success()
+                return {
+                    "url": node.url,
+                    "priority": node.priority,
+                    "name": node.label,
+                    "status": "idle",
+                    "is_gpu": False,
+                    "device": "Idle/Ready",
+                    "size": 0,
+                    "size_vram": 0,
+                    "vram_pct": 0.0,
+                    "runner": "unknown",
+                    "model": self.model_name,
+                    "warning": None,
+                }
+            except Exception as e:
+                node.mark_failure(str(e))
+                return {
+                    "url": node.url,
+                    "priority": node.priority,
+                    "name": node.label,
+                    "status": "unreachable",
+                    "is_gpu": False,
+                    "device": "Unreachable",
+                    "size": 0,
+                    "size_vram": 0,
+                    "vram_pct": 0.0,
+                    "runner": "unknown",
+                    "model": self.model_name,
+                    "warning": f"Unreachable: {e}",
+                    "error": str(e),
+                }
+
+        server_reports = [_inspect_node(n) for n in self.pool.nodes]
+        primary_node = self.pool.primary_server
+        primary_report = next((r for r in server_reports if r["url"] == primary_node.url), server_reports[0])
+
+        return {
+            "status": "ok",
+            "model": self.model_name,
+            "servers": server_reports,
+            "primary": primary_report,
+            "pool_status": self.pool.get_status(),
+            "device": primary_report.get("device", "Unknown"),
+            "is_gpu": primary_report.get("is_gpu", False),
+            "size": primary_report.get("size", 0),
+            "size_vram": primary_report.get("size_vram", 0),
+            "vram_pct": primary_report.get("vram_pct", 0.0),
+            "runner": primary_report.get("runner", "llamacpp"),
+            "warning": primary_report.get("warning"),
+        }

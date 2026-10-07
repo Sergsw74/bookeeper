@@ -20,6 +20,7 @@ from bookeeper.graph.store import ConceptGraphStore
 from bookeeper.processing.chunker import HierarchicalChunker
 from bookeeper.processing.deduplicator import EntityDeduplicator
 from bookeeper.processing.extractor import KnowledgeExtractor
+from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings
 
 app = typer.Typer(
     name="bookeeper",
@@ -56,22 +57,57 @@ def _get_effective_settings(
 
 
 def _perform_ollama_warmup(extractor: KnowledgeExtractor, console: Console) -> Dict[str, Any]:
-    """Execute warmup ping to load model and report CPU vs GPU acceleration status with warnings."""
-    with console.status(f"[bold blue]Checking Ollama acceleration for '{extractor.model_name}'...[/bold blue]"):
+    """Execute warmup ping to load model and report CPU vs GPU acceleration status across server pool."""
+    pool_nodes = extractor.pool.nodes
+    with console.status(
+        f"[bold blue]Checking Ollama acceleration across server pool ({len(pool_nodes)} node(s))...[/bold blue]"
+    ):
         status = extractor.warmup_and_check_device()
 
-    device = status.get("device", "Unknown")
-    is_gpu = status.get("is_gpu", False)
-    vram_mb = status.get("size_vram", 0) / (1024 * 1024)
-    size_mb = status.get("size", 0) / (1024 * 1024)
+    servers = status.get("servers", [])
+    primary = status.get("primary", {})
+
+    # Display multi-server pool table if more than one server configured
+    if len(servers) > 1:
+        table = Table(
+            title=f"Ollama Multi-Server Pool ({len(servers)} servers, {extractor.cooldown_seconds // 60}m failover cooldown)",
+            show_header=True,
+            header_style="bold cyan",
+        )
+        table.add_column("Priority", justify="center", width=8)
+        table.add_column("Endpoint", style="bold white", min_width=25)
+        table.add_column("Device / Mode", style="magenta")
+        table.add_column("VRAM Offload", justify="right")
+        table.add_column("Pool State", style="green")
+
+        for s in sorted(servers, key=lambda x: x.get("priority", 99)):
+            pri = str(s.get("priority", 1))
+            url = s.get("url", "")
+            dev = s.get("device", "Unknown")
+            st = s.get("status", "ok")
+            vram_mb = s.get("size_vram", 0) / (1024 * 1024)
+            size_mb = s.get("size", 0) / (1024 * 1024)
+            pct = s.get("vram_pct", 0.0)
+            vram_str = f"{vram_mb:.0f} / {size_mb:.0f} MB ({pct}%)" if size_mb > 0 else "N/A"
+            pool_state = "[bold green]Primary / Active[/bold green]" if s["url"] == primary.get("url") else "[cyan]Standby / Backup[/cyan]"
+            if st != "ok":
+                pool_state = f"[red]{st}[/red]"
+            table.add_row(pri, url, dev, vram_str, pool_state)
+
+        console.print(table)
+
+    is_gpu = primary.get("is_gpu", False)
+    size_mb = primary.get("size", 0) / (1024 * 1024)
+    vram_mb = primary.get("size_vram", 0) / (1024 * 1024)
+    dev = primary.get("device", "Unknown")
 
     if not is_gpu:
         warning_msg = (
-            f"[bold yellow]⚠️ Ollama is executing model '[cyan]{status.get('model')}[/cyan]' entirely on [bold red]CPU[/bold red][/bold yellow]\n\n"
+            f"[bold yellow]⚠️ Active Ollama server '[cyan]{primary.get('url')}[/cyan]' is executing model '[cyan]{primary.get('model', extractor.model_name)}[/cyan]' on [bold red]CPU[/bold red][/bold yellow]\n\n"
             f"• [bold]VRAM Allocated:[/bold] 0 MB / {size_mb:.0f} MB (0% offloaded)\n"
-            f"• [bold]Inference Runner:[/bold] {status.get('runner', 'llamacpp')}\n\n"
-            f"[dim]Note: Extraction will be noticeably slower on CPU than with GPU acceleration (CUDA, ROCm, or Metal).\n"
-            f"If your Ollama server has a dedicated GPU, verify NVIDIA drivers / Container Toolkit or Ollama GPU permissions.[/dim]"
+            f"• [bold]Inference Runner:[/bold] {primary.get('runner', 'llamacpp')}\n"
+            f"• [bold]Multi-Server Pool:[/bold] {len(servers)} server(s) configured (auto-retry cooldown: {extractor.cooldown_seconds // 60}m)\n\n"
+            f"[dim]Note: Extraction will be slower on CPU. If this server fails, requests will automatically fail over to next server.[/dim]"
         )
         console.print(
             Panel(
@@ -81,10 +117,10 @@ def _perform_ollama_warmup(extractor: KnowledgeExtractor, console: Console) -> D
             )
         )
     else:
-        vram_pct = status.get("vram_pct", 100.0)
+        vram_pct = primary.get("vram_pct", 100.0)
         console.print(
-            f"[bold green]✓ Ollama GPU acceleration active:[/bold green] [bold cyan]{device}[/bold cyan] "
-            f"({vram_mb:.0f} MB / {size_mb:.0f} MB VRAM, {vram_pct}% offloaded)"
+            f"[bold green]✓ Active Ollama GPU acceleration:[/bold green] [bold cyan]{dev}[/bold cyan] "
+            f"({vram_mb:.0f} MB / {size_mb:.0f} MB VRAM, {vram_pct}% offloaded) at {primary.get('url')}"
         )
 
     return status
@@ -110,11 +146,18 @@ def config(
 ):
     """Display the active bookeeper configuration settings."""
     cfg = _get_effective_settings(config_path, calibre_path, ollama_url, model, embedding_model)
+    servers_desc = []
+    for s in cfg.resolved_ollama_servers:
+        name_tag = f" ({s.name})" if s.name else ""
+        servers_desc.append(f"    • [cyan]{s.url}[/cyan]{name_tag} [dim](priority: {s.priority})[/dim]")
+    servers_block = "\n".join(servers_desc)
+
     console.print(
         Panel.fit(
             f"[bold green]Calibre Library / SMB Share:[/bold green] {cfg.calibre_library_path}\n"
             f"[bold green]Calibre Auth:[/bold green] user={cfg.calibre_user or '[dim]none[/dim]'}\n"
-            f"[bold green]Ollama Endpoint:[/bold green] {cfg.ollama_base_url}\n"
+            f"[bold green]Ollama Failover Pool ({len(cfg.resolved_ollama_servers)} server(s)):[/bold green]\n{servers_block}\n"
+            f"[bold green]Failover Cooldown:[/bold green] {cfg.failover_cooldown_seconds}s\n"
             f"[bold green]LLM Model:[/bold green] {cfg.llm_model}\n"
             f"[bold green]Embedding Model:[/bold green] {cfg.embedding_model}\n"
             f"[bold green]Similarity Threshold:[/bold green] {cfg.similarity_threshold}\n"
@@ -252,10 +295,7 @@ def clean_metadata(
         )
         raise typer.Exit(1)
 
-    extractor = KnowledgeExtractor(
-        base_url=cfg.ollama_base_url,
-        model=cfg.llm_model,
-    )
+    extractor = KnowledgeExtractor.from_settings(cfg)
 
     if not skip_warmup:
         _perform_ollama_warmup(extractor, console)
@@ -409,10 +449,7 @@ def build_graph(
         f"Embeddings: [bold cyan]{cfg.embedding_model}[/bold cyan][/dim]"
     )
 
-    extractor = KnowledgeExtractor(
-        base_url=cfg.ollama_base_url,
-        model=cfg.llm_model,
-    )
+    extractor = KnowledgeExtractor.from_settings(cfg)
 
     if not skip_warmup:
         _perform_ollama_warmup(extractor, console)
@@ -424,10 +461,10 @@ def build_graph(
         similarity_threshold=cfg.similarity_threshold,
     )
 
-    # Initialize HierarchicalChunker with Ollama embeddings if reachable
+    # Initialize HierarchicalChunker with Ollama embeddings using failover pool
     try:
-        embeddings = OllamaEmbeddings(
-            base_url=cfg.ollama_base_url.rstrip("/"),
+        embeddings = FailoverOllamaEmbeddings(
+            pool=extractor.pool,
             model=cfg.embedding_model,
         )
         chunker = HierarchicalChunker(embeddings=embeddings)

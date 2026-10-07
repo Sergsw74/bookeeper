@@ -2,8 +2,12 @@
 LangChain structured output schemas and Ollama extraction chains for book metadata and concepts.
 """
 
+import json
 import logging
-from typing import List, Optional
+import shutil
+import subprocess
+import urllib.request
+from typing import Any, Dict, List, Optional
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
@@ -201,3 +205,128 @@ class KnowledgeExtractor:
         except Exception as e:
             logger.warning(f"Section extraction LLM call failed for '{section_title}': {e}")
             return SectionExtraction(concepts=[])
+
+    def warmup_and_check_device(self, timeout: int = 30) -> Dict[str, Any]:
+        """
+        Trigger a lightweight warmup request to ensure the model is loaded in Ollama,
+        and query /api/ps to verify whether Ollama is executing on GPU (VRAM) or CPU.
+        Returns a dict containing execution device, VRAM metrics, and warning if CPU-bound.
+        """
+        def _fetch_json(endpoint: str, post_body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            url = f"{self.base_url}{endpoint}"
+            try:
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(post_body).encode("utf-8") if post_body else None,
+                    headers={"Content-Type": "application/json"} if post_body else {},
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except Exception:
+                # Graceful fallback to curl (handles macOS non-interactive subshell socket sandboxing)
+                if shutil.which("curl"):
+                    cmd = ["curl", "-s", "--max-time", str(timeout)]
+                    if post_body:
+                        cmd.extend(["-X", "POST", "-H", "Content-Type: application/json", "-d", json.dumps(post_body)])
+                    cmd.append(url)
+                    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                    if res.returncode == 0 and res.stdout.strip():
+                        return json.loads(res.stdout)
+                raise
+
+        # 1. Warmup ping to ensure the model is loaded into memory / VRAM
+        try:
+            _fetch_json(
+                "/api/generate",
+                {"model": self.model_name, "prompt": "warmup ping", "options": {"num_predict": 1}, "stream": False},
+            )
+        except Exception as e:
+            logger.warning(f"Ollama warmup ping failed for {self.model_name}: {e}")
+
+        # 2. Query /api/ps to inspect running model allocation
+        try:
+            ps_data = _fetch_json("/api/ps")
+            models = ps_data.get("models", [])
+
+            matched = None
+            target_norm = self.model_name.lower()
+            for m in models:
+                m_name = (m.get("name") or m.get("model") or "").lower()
+                if m_name == target_norm or m_name.startswith(target_norm) or target_norm.startswith(m_name.split(":")[0]):
+                    matched = m
+                    break
+
+            if not matched and models:
+                matched = models[0]
+
+            if matched:
+                size = matched.get("size", 0)
+                size_vram = matched.get("size_vram", 0)
+                runner = matched.get("runner", "llamacpp")
+                model_active = matched.get("name") or self.model_name
+
+                if size_vram == 0:
+                    return {
+                        "status": "ok",
+                        "is_gpu": False,
+                        "device": "CPU",
+                        "size": size,
+                        "size_vram": 0,
+                        "vram_pct": 0.0,
+                        "runner": runner,
+                        "model": model_active,
+                        "warning": (
+                            f"Ollama model '{model_active}' is running on CPU (0% VRAM offloaded). "
+                            "Extraction speed may be significantly slower without GPU acceleration."
+                        ),
+                    }
+                elif size_vram >= size:
+                    return {
+                        "status": "ok",
+                        "is_gpu": True,
+                        "device": "GPU (100% VRAM offload)",
+                        "size": size,
+                        "size_vram": size_vram,
+                        "vram_pct": 100.0,
+                        "runner": runner,
+                        "model": model_active,
+                        "warning": None,
+                    }
+                else:
+                    pct = round((size_vram / size) * 100, 1)
+                    return {
+                        "status": "ok",
+                        "is_gpu": True,
+                        "device": f"Partial GPU ({pct}% VRAM offload)",
+                        "size": size,
+                        "size_vram": size_vram,
+                        "vram_pct": pct,
+                        "runner": runner,
+                        "model": model_active,
+                        "warning": f"Ollama model '{model_active}' is partially offloaded ({pct}% VRAM, remainder on CPU).",
+                    }
+
+            return {
+                "status": "unknown",
+                "is_gpu": False,
+                "device": "Unknown",
+                "size": 0,
+                "size_vram": 0,
+                "vram_pct": 0.0,
+                "runner": "unknown",
+                "model": self.model_name,
+                "warning": None,
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "is_gpu": False,
+                "device": "Unknown",
+                "size": 0,
+                "size_vram": 0,
+                "vram_pct": 0.0,
+                "runner": "unknown",
+                "model": self.model_name,
+                "warning": f"Unable to reach Ollama process metrics at {self.base_url}: {e}",
+                "error": str(e),
+            }

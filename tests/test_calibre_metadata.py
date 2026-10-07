@@ -140,3 +140,66 @@ def test_zip_sample_content_extraction(tmp_path: Path):
     assert "zubkov - Unknown.zip" in hint
     assert "zubkov.djvu" in hint
     assert "zubkov.djvu" in sample
+
+
+def test_warmup_check_device_cpu(monkeypatch):
+    """Verify that warmup_and_check_device correctly identifies CPU execution and warns."""
+    from bookeeper.processing.extractor import KnowledgeExtractor
+    extractor = KnowledgeExtractor(base_url="http://localhost:11434", model="llama3.1:8b")
+
+    mock_ps = {
+        "models": [
+            {
+                "name": "llama3.1:8b",
+                "size": 5000000000,
+                "size_vram": 0,
+                "runner": "llamacpp",
+            }
+        ]
+    }
+
+    def mock_fetch(url, *args, **kwargs):
+        class MockResp:
+            def read(self):
+                return b'{"models": [{"name": "llama3.1:8b", "size": 5000000000, "size_vram": 0, "runner": "llamacpp"}]}'
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+        return MockResp()
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", mock_fetch)
+
+    result = extractor.warmup_and_check_device()
+    assert result["status"] == "ok"
+    assert result["is_gpu"] is False
+    assert result["device"] == "CPU"
+    assert result["size_vram"] == 0
+    assert "CPU" in result["warning"]
+
+
+def test_warmup_check_device_gpu(monkeypatch):
+    """Verify that warmup_and_check_device correctly identifies GPU execution."""
+    from bookeeper.processing.extractor import KnowledgeExtractor
+    extractor = KnowledgeExtractor(base_url="http://localhost:11434", model="llama3.1:8b")
+
+    def mock_fetch(url, *args, **kwargs):
+        class MockResp:
+            def read(self):
+                return b'{"models": [{"name": "llama3.1:8b", "size": 5000000000, "size_vram": 5000000000, "runner": "cuda"}]}'
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+        return MockResp()
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", mock_fetch)
+
+    result = extractor.warmup_and_check_device()
+    assert result["status"] == "ok"
+    assert result["is_gpu"] is True
+    assert "GPU" in result["device"]
+    assert result["vram_pct"] == 100.0
+    assert result["warning"] is None

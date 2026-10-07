@@ -3,7 +3,7 @@ Production-quality Typer CLI interface for bookeeper with rich progress bars and
 """
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import typer
 from langchain_ollama import OllamaEmbeddings
@@ -53,6 +53,41 @@ def _get_effective_settings(
         data.update(overrides)
         return Settings(**data)
     return cfg
+
+
+def _perform_ollama_warmup(extractor: KnowledgeExtractor, console: Console) -> Dict[str, Any]:
+    """Execute warmup ping to load model and report CPU vs GPU acceleration status with warnings."""
+    with console.status(f"[bold blue]Checking Ollama acceleration for '{extractor.model_name}'...[/bold blue]"):
+        status = extractor.warmup_and_check_device()
+
+    device = status.get("device", "Unknown")
+    is_gpu = status.get("is_gpu", False)
+    vram_mb = status.get("size_vram", 0) / (1024 * 1024)
+    size_mb = status.get("size", 0) / (1024 * 1024)
+
+    if not is_gpu:
+        warning_msg = (
+            f"[bold yellow]⚠️ Ollama is executing model '[cyan]{status.get('model')}[/cyan]' entirely on [bold red]CPU[/bold red][/bold yellow]\n\n"
+            f"• [bold]VRAM Allocated:[/bold] 0 MB / {size_mb:.0f} MB (0% offloaded)\n"
+            f"• [bold]Inference Runner:[/bold] {status.get('runner', 'llamacpp')}\n\n"
+            f"[dim]Note: Extraction will be noticeably slower on CPU than with GPU acceleration (CUDA, ROCm, or Metal).\n"
+            f"If your Ollama server has a dedicated GPU, verify NVIDIA drivers / Container Toolkit or Ollama GPU permissions.[/dim]"
+        )
+        console.print(
+            Panel(
+                warning_msg,
+                title="[bold yellow]Hardware Acceleration Notice[/bold yellow]",
+                border_style="yellow",
+            )
+        )
+    else:
+        vram_pct = status.get("vram_pct", 100.0)
+        console.print(
+            f"[bold green]✓ Ollama GPU acceleration active:[/bold green] [bold cyan]{device}[/bold cyan] "
+            f"({vram_mb:.0f} MB / {size_mb:.0f} MB VRAM, {vram_pct}% offloaded)"
+        )
+
+    return status
 
 
 @app.command()
@@ -195,6 +230,9 @@ def clean_metadata(
     config_path: Optional[str] = typer.Option(
         None, "--config", "-c", help="Path to config.yaml file."
     ),
+    skip_warmup: bool = typer.Option(
+        False, "--skip-warmup", help="Skip Ollama warmup and GPU acceleration check."
+    ),
 ):
     """
     Query Calibre (local, SMB share, or server), inspect titles/authors/summaries,
@@ -219,9 +257,8 @@ def clean_metadata(
         model=cfg.llm_model,
     )
 
-    console.print(
-        f"[dim]Connecting to Ollama at [bold cyan]{cfg.ollama_base_url}[/bold cyan] (model: [bold cyan]{cfg.llm_model}[/bold cyan])...[/dim]"
-    )
+    if not skip_warmup:
+        _perform_ollama_warmup(extractor, console)
 
     with console.status("[bold blue]Querying Calibre library...[/bold blue]"):
         try:
@@ -339,6 +376,9 @@ def build_graph(
     config_path: Optional[str] = typer.Option(
         None, "--config", "-c", help="Path to config.yaml file."
     ),
+    skip_warmup: bool = typer.Option(
+        False, "--skip-warmup", help="Skip Ollama warmup and GPU acceleration check."
+    ),
 ):
     """
     Ingest sections, perform semantic chunking, extract concepts via Ollama,
@@ -373,6 +413,9 @@ def build_graph(
         base_url=cfg.ollama_base_url,
         model=cfg.llm_model,
     )
+
+    if not skip_warmup:
+        _perform_ollama_warmup(extractor, console)
 
     deduplicator = EntityDeduplicator.from_settings(
         cfg,

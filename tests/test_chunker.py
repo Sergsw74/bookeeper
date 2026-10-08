@@ -240,3 +240,58 @@ def test_concept_graph_store_hierarchy_and_export():
         gml = GraphMLExporter(graphml_file)
         gml.export(new_store)
         assert graphml_file.is_file()
+
+
+def test_chunk_store_persistence(tmp_path: Path):
+    """Verify ChunkStore saves, retrieves, and checks existence of book chunks."""
+    from bookeeper.processing.chunker import ChunkStore, HierarchicalChunk
+
+    store_dir = tmp_path / "chunks"
+    chunk_store = ChunkStore(store_dir)
+
+    assert chunk_store.has_chunks(42) is False
+    assert chunk_store.load_chunks(42) is None
+
+    chunks = [
+        HierarchicalChunk(
+            chunk_id="chk_1",
+            book_id=42,
+            book_title="Test Book",
+            section_title="Chapter 1",
+            chapter_idx=1,
+            chunk_idx=1,
+            text="This is the first chunk of chapter 1.",
+        ),
+        HierarchicalChunk(
+            chunk_id="chk_2",
+            book_id=42,
+            book_title="Test Book",
+            section_title="Chapter 1",
+            chapter_idx=1,
+            chunk_idx=2,
+            text="This is the second chunk of chapter 1.",
+        ),
+    ]
+
+    saved_file = chunk_store.save_chunks(42, "Test Book", chunks)
+    assert saved_file.is_file()
+    assert chunk_store.has_chunks(42) is True
+
+    # Load back
+    loaded = chunk_store.load_chunks(42)
+    assert loaded is not None
+    assert len(loaded) == 2
+    assert loaded[0].chunk_id == "chk_1"
+    assert loaded[0].book_title == "Test Book"
+    assert loaded[1].text == "This is the second chunk of chapter 1."
+
+    # Stats and listing
+    assert chunk_store.list_stored_book_ids() == [42]
+    stats = chunk_store.stats()
+    assert stats["total_books"] == 1
+    assert stats["total_bytes"] > 0
+
+    # Delete
+    assert chunk_store.delete_chunks(42) is True
+    assert chunk_store.has_chunks(42) is False
+

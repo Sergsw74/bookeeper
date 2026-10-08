@@ -20,7 +20,7 @@ from bookeeper.calibre.parser import BookParser
 from bookeeper.config import Settings, get_settings
 from bookeeper.graph.exporters import GraphMLExporter, ObsidianExporter
 from bookeeper.graph.store import ConceptGraphStore
-from bookeeper.processing.chunker import HierarchicalChunker
+from bookeeper.processing.chunker import ChunkStore, HierarchicalChunker
 from bookeeper.processing.deduplicator import EntityDeduplicator
 from bookeeper.processing.extractor import KnowledgeExtractor
 from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings
@@ -862,6 +862,12 @@ def build_graph(
     skip_warmup: bool = typer.Option(
         False, "--skip-warmup", help="Skip Ollama warmup and GPU acceleration check."
     ),
+    chunks_dir: Optional[str] = typer.Option(
+        None, "--chunks-dir", help="Custom directory for persistent chunks storage (default: output_dir/chunks)."
+    ),
+    rechunk: bool = typer.Option(
+        False, "--rechunk", help="Force re-chunking from EPUB source even if chunks already exist in local storage."
+    ),
 ):
     """
     Ingest sections, perform semantic chunking, extract concepts via Ollama,
@@ -904,6 +910,11 @@ def build_graph(
         embedding_model=cfg.embedding_model,
         similarity_threshold=cfg.similarity_threshold,
     )
+
+    # Initialize ChunkStore for local persistence and fast reuse of book chunks
+    resolved_chunks_path = Path(chunks_dir).expanduser().resolve() if chunks_dir else cfg.resolved_chunks_dir
+    chunk_store = ChunkStore(resolved_chunks_path)
+    console.print(f"[dim]Persistent Chunks Directory: [bold cyan]{chunk_store.storage_dir}[/bold cyan][/dim]")
 
     # Initialize HierarchicalChunker with Ollama embeddings using failover pool
     try:
@@ -964,6 +975,23 @@ def build_graph(
             )
             raise typer.Exit(1)
 
+        # Pre-filter by start_from_id
+        if start_from_id is not None:
+            target_list = [b for b in target_list if b.get("id", 0) >= start_from_id]
+
+        # Pre-filter by resume checkpoint BEFORE touching network or exporting EPUBs
+        if resume and not retry_failed:
+            completed_ids = tracker.get_completed_ids("build_graph")
+            orig_len = len(target_list)
+            target_list = [b for b in target_list if b.get("id") not in completed_ids]
+            skipped = orig_len - len(target_list)
+            if skipped > 0:
+                console.print(
+                    f"[dim cyan]Checkpoint Resume: Skipped {skipped} already indexed or skipped book(s). "
+                    f"({len(target_list)} remaining. Use --no-resume to reprocess all).[/dim cyan]"
+                )
+
+        export_dir = output_dir / "calibre_ingest"
         for b in target_list:
             bid = b["id"]
             formats = b.get("formats", [])
@@ -974,19 +1002,30 @@ def build_graph(
                 tracker.mark_skipped("build_graph", bid, title=b.get("title", f"Book {bid}"), reason=f"graphical: {fmts_label}")
                 continue
 
-            export_dir = output_dir / "calibre_ingest"
-            epub_path = client.export_book(bid, target_dir=export_dir, fmt="EPUB")
-            if epub_path and epub_path.is_file():
+            # If cached chunks exist locally, skip exporting or downloading EPUB from SMB share
+            if chunk_store.has_chunks(bid) and not rechunk:
                 books_to_process.append(
                     {
                         "id": bid,
                         "title": b.get("title", f"Book {bid}"),
                         "author": ", ".join(b.get("authors", [])) or "Unknown",
-                        "path": epub_path,
+                        "path": None,
                     }
                 )
             else:
-                console.print(f"[yellow]Skipping book #{bid}: No EPUB format available.[/yellow]")
+                epub_path = client.export_book(bid, target_dir=export_dir, fmt="EPUB")
+                if epub_path and epub_path.is_file():
+                    books_to_process.append(
+                        {
+                            "id": bid,
+                            "title": b.get("title", f"Book {bid}"),
+                            "author": ", ".join(b.get("authors", [])) or "Unknown",
+                            "path": epub_path,
+                        }
+                    )
+                else:
+                    console.print(f"[yellow]Skipping book #{bid}: No EPUB format available.[/yellow]")
+                    tracker.mark_skipped("build_graph", bid, title=b.get("title", f"Book {bid}"), reason="No EPUB format available")
     else:
         console.print(
             "[bold red]Calibre not available. Pass an explicit book file via --file <path.epub> "
@@ -994,115 +1033,133 @@ def build_graph(
         )
         raise typer.Exit(1)
 
-    if start_from_id is not None:
-        books_to_process = [b for b in books_to_process if b.get("id", 0) >= start_from_id]
-
-    if resume and not file_path and not retry_failed:
-        completed_ids = tracker.get_completed_ids("build_graph")
-        orig_len = len(books_to_process)
-        books_to_process = [b for b in books_to_process if b.get("id") not in completed_ids]
-        skipped = orig_len - len(books_to_process)
-        if skipped > 0:
-            console.print(
-                f"[dim cyan]Checkpoint Resume: Skipped {skipped} already indexed or skipped book(s). "
-                f"({len(books_to_process)} remaining. Use --no-resume to reprocess all).[/dim cyan]"
-            )
-
     if not books_to_process:
         console.print("[bold yellow]No books available to process.[/bold yellow]")
         raise typer.Exit(0)
 
     console.print(f"[bold green]Starting pipeline for {len(books_to_process)} book(s)...[/bold green]")
 
-    for binfo in books_to_process:
-        bid = binfo["id"]
-        btitle = binfo["title"]
-        bauthor = binfo["author"]
-        bpath: Path = binfo["path"]
+    completed_in_session = 0
+    interrupted = False
 
-        console.print(f"\n[bold blue]► Ingesting Book #{bid}: {btitle}[/bold blue] ({bpath.name})")
+    try:
+        for binfo in books_to_process:
+            bid = binfo["id"]
+            btitle = binfo["title"]
+            bauthor = binfo["author"]
+            bpath: Optional[Path] = binfo.get("path")
 
-        try:
-            store.add_book(bid, title=btitle, author=bauthor)
+            console.print(f"\n[bold blue]► Ingesting Book #{bid}: {btitle}[/bold blue]")
 
-            # Parse sections
-            sections = BookParser.parse(bpath)
-            console.print(f"  Extracted [green]{len(sections)} sections/chapters[/green].")
+            try:
+                store.add_book(bid, title=btitle, author=bauthor)
 
-            # Chunk sections
-            chunks = chunker.chunk_book(sections, book_id=bid, book_title=btitle)
-            console.print(f"  Created [green]{len(chunks)} atomic thematic chunks[/green].")
+                # Check if chunks already exist in local ChunkStore
+                if chunk_store.has_chunks(bid) and not rechunk:
+                    chunks = chunk_store.load_chunks(bid)
+                    console.print(f"  Loaded [bold green]{len(chunks)} cached atomic chunks[/bold green] from local storage.")
+                else:
+                    if not bpath or not bpath.is_file():
+                        raise FileNotFoundError(f"Book file not available for #{bid}")
+                    # Parse sections
+                    sections = BookParser.parse(bpath)
+                    console.print(f"  Extracted [green]{len(sections)} sections/chapters[/green].")
 
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
-                console=console,
-            ) as progress:
-                task = progress.add_task(f"Extracting concepts from '{btitle[:25]}'...", total=len(chunks))
+                    # Chunk sections
+                    chunks = chunker.chunk_book(sections, book_id=bid, book_title=btitle)
+                    console.print(f"  Created [green]{len(chunks)} atomic thematic chunks[/green].")
 
-                for chk in chunks:
-                    progress.update(
-                        task,
-                        description=f"Processing: [cyan]{chk.section_title[:20]} [p{chk.chunk_idx}][/cyan]",
-                    )
+                    # Persist chunks to local storage immediately
+                    chunk_store.save_chunks(bid, btitle, chunks)
+                    console.print(f"  [dim]Saved chunks to local storage: {chunk_store._chunk_file(bid).name}[/dim]")
 
-                    # Ensure section exists in graph
-                    sec_node_id = store.add_section(
-                        book_id=bid,
-                        chapter_idx=chk.chapter_idx,
-                        title=chk.section_title,
-                        text=chk.text,
-                    )
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    console=console,
+                ) as progress:
+                    task = progress.add_task(f"Extracting concepts from '{btitle[:25]}'...", total=len(chunks))
 
-                    # Run Ollama Concept Extraction
-                    extraction = extractor.extract_section(
-                        text=chk.text,
-                        book_title=btitle,
-                        section_title=chk.section_title,
-                    )
-
-                    # Deduplicate and register concepts
-                    for concept in extraction.concepts:
-                        canonical_concept = deduplicator.resolve_concept(concept)
-                        store.add_concept(canonical_concept)
-
-                        # Link Section -> DISCUSSES -> Concept
-                        store.add_section_concept_link(
-                            section_node_id=sec_node_id,
-                            concept_name=canonical_concept.name,
-                            summary=canonical_concept.summary,
+                    for chk in chunks:
+                        progress.update(
+                            task,
+                            description=f"Processing: [cyan]{chk.section_title[:20]} [p{chk.chunk_idx}][/cyan]",
                         )
 
-                        # Link related concepts
-                        for rel_name in canonical_concept.related_concepts:
-                            store.add_concept_relation(
-                                src_concept_name=canonical_concept.name,
-                                tgt_concept_name=rel_name,
+                        # Ensure section exists in graph
+                        sec_node_id = store.add_section(
+                            book_id=bid,
+                            chapter_idx=chk.chapter_idx,
+                            title=chk.section_title,
+                            text=chk.text,
+                        )
+
+                        # Run Ollama Concept Extraction
+                        extraction = extractor.extract_section(
+                            text=chk.text,
+                            book_title=btitle,
+                            section_title=chk.section_title,
+                        )
+
+                        # Deduplicate and register concepts
+                        for concept in extraction.concepts:
+                            canonical_concept = deduplicator.resolve_concept(concept)
+                            store.add_concept(canonical_concept)
+
+                            # Link Section -> DISCUSSES -> Concept
+                            store.add_section_concept_link(
+                                section_node_id=sec_node_id,
+                                concept_name=canonical_concept.name,
+                                summary=canonical_concept.summary,
                             )
 
-                    progress.advance(task)
+                            # Link related concepts
+                            for rel_name in canonical_concept.related_concepts:
+                                store.add_concept_relation(
+                                    src_concept_name=canonical_concept.name,
+                                    tgt_concept_name=rel_name,
+                                )
 
-            tracker.mark_completed("build_graph", bid, btitle)
-        except Exception as e:
-            console.print(f"[bold red]✗ Failed to build graph for book #{bid} ('{btitle}'):[/bold red] {e}")
-            tracker.mark_failed("build_graph", bid, title=btitle, error=str(e))
+                        progress.advance(task)
 
-    # Persist graph to JSON
-    store.save(graph_file)
+                tracker.mark_completed("build_graph", bid, btitle)
+                # Incremental persistence: save graph checkpoint after every processed book
+                store.save(graph_file)
+                completed_in_session += 1
+                console.print(f"  [dim green]✓ Book #{bid} concepts integrated and graph checkpoint saved.[/dim green]")
+
+            except Exception as e:
+                console.print(f"[bold red]✗ Failed to build graph for book #{bid} ('{btitle}'):[/bold red] {e}")
+                tracker.mark_failed("build_graph", bid, title=btitle, error=str(e))
+
+    except KeyboardInterrupt:
+        interrupted = True
+        console.print("\n[bold yellow]Cancelled by user. Saving current Knowledge Graph state...[/bold yellow]")
+
+    finally:
+        vault_dest = Path(export_obsidian) if export_obsidian else output_dir / "obsidian_vault"
+        graphml_dest = output_dir / "knowledge_graph.graphml"
+
+        if store.graph.number_of_nodes() > 0:
+            store.save(graph_file)
+            obs = ObsidianExporter(vault_dest)
+            obs.export(store)
+            gml = GraphMLExporter(graphml_dest)
+            gml.export(store)
+
+        if interrupted:
+            console.print(
+                f"[bold yellow]Graph build stopped by user.[/bold yellow] "
+                f"Completed in this session: [bold green]{completed_in_session}[/bold green] book(s). "
+                f"Knowledge graph checkpoint and Obsidian vault preserved."
+            )
+            raise typer.Exit(code=130)
+
+    # Persist graph to JSON and exports
     console.print(f"\n[bold green]✓ Knowledge Graph persisted to:[/bold green] {graph_file}")
-
-    # Export to Obsidian Vault
-    vault_dest = Path(export_obsidian) if export_obsidian else output_dir / "obsidian_vault"
-    obs = ObsidianExporter(vault_dest)
-    obs.export(store)
     console.print(f"[bold green]✓ Obsidian Markdown Vault exported to:[/bold green] {vault_dest}")
-
-    # Export GraphML
-    graphml_dest = output_dir / "knowledge_graph.graphml"
-    gml = GraphMLExporter(graphml_dest)
-    gml.export(store)
     console.print(f"[bold green]✓ GraphML exported to:[/bold green] {graphml_dest}")
 
     # Display final graph statistics

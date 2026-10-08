@@ -3,8 +3,13 @@ Hierarchical and semantic text chunking preserving chapter and section metadata.
 """
 
 import hashlib
+import json
 import logging
+import os
 import re
+import tempfile
+import time
+from pathlib import Path
 from typing import List, Optional
 
 from langchain_core.embeddings import Embeddings
@@ -168,3 +173,85 @@ class HierarchicalChunker:
             chunks.append("\n\n".join(current))
 
         return chunks
+
+
+class ChunkStore:
+    """
+    Manages persistent local storage and retrieval of atomic book chunks.
+    Allows re-using pre-computed chunks without re-parsing books or repeating embeddings.
+    """
+
+    def __init__(self, storage_dir: Path | str):
+        self.storage_dir = Path(storage_dir).expanduser().resolve()
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+
+    def _chunk_file(self, book_id: int) -> Path:
+        return self.storage_dir / f"book_{book_id}_chunks.json"
+
+    def has_chunks(self, book_id: int) -> bool:
+        """Check if valid cached chunks exist for a book."""
+        p = self._chunk_file(book_id)
+        return p.is_file() and p.stat().st_size > 0
+
+    def load_chunks(self, book_id: int) -> Optional[List[HierarchicalChunk]]:
+        """Load cached chunks for a book from disk."""
+        p = self._chunk_file(book_id)
+        if not p.is_file() or p.stat().st_size == 0:
+            return None
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            raw_chunks = data.get("chunks", [])
+            return [HierarchicalChunk.model_validate(c) for c in raw_chunks]
+        except Exception as e:
+            logger.warning(f"Failed to load cached chunks from {p}: {e}")
+            return None
+
+    def save_chunks(self, book_id: int, book_title: str, chunks: List[HierarchicalChunk]) -> Path:
+        """Atomically persist chunks for a book to disk."""
+        p = self._chunk_file(book_id)
+        data = {
+            "book_id": book_id,
+            "book_title": book_title,
+            "total_chunks": len(chunks),
+            "created_at": time.time(),
+            "chunks": [c.model_dump() for c in chunks],
+        }
+        with tempfile.NamedTemporaryFile("w", dir=self.storage_dir, delete=False, encoding="utf-8") as tf:
+            json.dump(data, tf, indent=2, ensure_ascii=False)
+            tmp_name = tf.name
+        os.replace(tmp_name, p)
+        return p
+
+    def delete_chunks(self, book_id: int) -> bool:
+        """Remove cached chunks for a book."""
+        p = self._chunk_file(book_id)
+        if p.is_file():
+            try:
+                p.unlink()
+                return True
+            except Exception:
+                pass
+        return False
+
+    def list_stored_book_ids(self) -> List[int]:
+        """Return sorted list of book IDs currently stored."""
+        ids = []
+        for f in self.storage_dir.glob("book_*_chunks.json"):
+            try:
+                bid_str = f.stem.split("_")[1]
+                ids.append(int(bid_str))
+            except Exception:
+                pass
+        return sorted(ids)
+
+    def stats(self) -> dict:
+        """Return summary statistics of the chunk store."""
+        book_ids = self.list_stored_book_ids()
+        total_size = sum(self._chunk_file(b).stat().st_size for b in book_ids if self._chunk_file(b).is_file())
+        return {
+            "total_books": len(book_ids),
+            "storage_dir": str(self.storage_dir),
+            "total_bytes": total_size,
+        }
+

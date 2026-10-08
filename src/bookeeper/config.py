@@ -181,6 +181,21 @@ class Settings(BaseSettings):
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
 
+    chunks_dir: Optional[str] = Field(
+        default=None,
+        description="Optional custom directory for persistent book chunks storage (default: output_dir/chunks).",
+    )
+
+    @property
+    def resolved_chunks_dir(self) -> Path:
+        """Return expanded Path for persistent book chunks storage."""
+        if self.chunks_dir:
+            p = Path(self.chunks_dir).expanduser().resolve()
+        else:
+            p = self.resolved_output_dir / "chunks"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
     @property
     def is_remote_calibre(self) -> bool:
         """Check if calibre_library_path is an HTTP/HTTPS URL."""

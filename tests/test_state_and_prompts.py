@@ -188,3 +188,64 @@ def test_extractor_brace_safety_in_extract_section():
         )
 
         assert isinstance(res, SectionExtraction)
+
+
+def test_build_graph_cli_pool_and_chunks(tmp_path: Path):
+    """Verify build-graph CLI executes parallel chunk tasks, saves chunks, and persists graph."""
+    from typer.testing import CliRunner
+    from bookeeper.cli import app
+    from bookeeper.processing.extractor import Concept
+
+    runner = CliRunner()
+    out_dir = tmp_path / "output"
+    chunks_dir = tmp_path / "custom_chunks"
+
+    # Create dummy text file
+    book_file = tmp_path / "sample.epub"
+    book_file.write_text("Chapter 1: The Beginning\n\nThis is a sample book discussing Distributed Systems and Consensus.", encoding="utf-8")
+
+    mock_concept = Concept(
+        name="Distributed Systems",
+        category="Architecture",
+        summary="A system whose components are located on different networked computers.",
+        related_concepts=["Consensus"],
+    )
+
+    with patch("bookeeper.processing.extractor.ChatOllama") as mock_chat_cls, \
+         patch("bookeeper.calibre.parser.BookParser.parse") as mock_parse, \
+         patch("bookeeper.calibre.parser.BookParser.is_graphical_format", return_value=False):
+
+        from bookeeper.calibre.parser import Section
+        mock_parse.return_value = [
+            Section(title="Chapter 1", chapter_idx=1, text="Distributed Systems text for chunking.")
+        ]
+
+        mock_instance = MagicMock()
+        mock_instance.with_structured_output.return_value.invoke.return_value = SectionExtraction(
+            concepts=[mock_concept]
+        )
+        mock_chat_cls.return_value = mock_instance
+
+        result = runner.invoke(
+            app,
+            [
+                "build-graph",
+                "--file", str(book_file),
+                "--config", "/dev/null",
+                "--skip-warmup",
+                "--chunks-dir", str(chunks_dir),
+                "--max-tasks", "2",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert result.exit_code == 0
+        assert "Parallel Task Pool:" in result.stdout
+        assert "Persistent Chunks Directory:" in result.stdout
+        assert "Extracted" in result.stdout
+        assert "Knowledge Graph Build Complete" in result.stdout
+
+        # Verify chunk store persisted chunks
+        chunk_files = list(chunks_dir.glob("book_*_chunks.json"))
+        assert len(chunk_files) == 1
+

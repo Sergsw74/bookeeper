@@ -868,6 +868,9 @@ def build_graph(
     rechunk: bool = typer.Option(
         False, "--rechunk", help="Force re-chunking from EPUB source even if chunks already exist in local storage."
     ),
+    max_tasks: Optional[int] = typer.Option(
+        None, "--max-tasks", "-t", help="Max concurrent active tasks across Ollama servers (default: auto: 3x alive servers, up to 10)."
+    ),
 ):
     """
     Ingest sections, perform semantic chunking, extract concepts via Ollama,
@@ -1039,8 +1042,36 @@ def build_graph(
 
     console.print(f"[bold green]Starting pipeline for {len(books_to_process)} book(s)...[/bold green]")
 
+    num_servers = len(extractor.pool.alive_nodes) or len(extractor.pool.nodes)
+    pool_concurrency = max_tasks if max_tasks is not None else cfg.calculate_pool_concurrency(num_servers)
+
+    console.print(
+        f"[bold cyan]Parallel Task Pool:[/bold cyan] Running up to {pool_concurrency} active chunk task(s) "
+        f"across {num_servers} Ollama server(s) (low: {num_servers}, max default: {min(cfg.max_active_tasks_cap, 3 * num_servers)})."
+    )
+
     completed_in_session = 0
     interrupted = False
+
+    stats_lock = threading.Lock()
+    display_lock = threading.Lock()
+    active_tasks_count = 0
+    durations: List[float] = []
+    abort_event = threading.Event()
+
+    def _calc_stats() -> Tuple[float, float, float, float]:
+        """Return (avg, p80, p18, fastest) in seconds."""
+        with stats_lock:
+            if not durations:
+                return (0.0, 0.0, 0.0, 0.0)
+            avg_val = sum(durations) / len(durations)
+            fastest_val = min(durations)
+            sorted_d = sorted(durations)
+            p80_idx = int(0.80 * (len(sorted_d) - 1))
+            p80_val = sorted_d[p80_idx]
+            p18_idx = int(0.18 * (len(sorted_d) - 1))
+            p18_val = sorted_d[p18_idx]
+            return (avg_val, p80_val, p18_val, fastest_val)
 
     try:
         for binfo in books_to_process:
@@ -1073,6 +1104,41 @@ def build_graph(
                     chunk_store.save_chunks(bid, btitle, chunks)
                     console.print(f"  [dim]Saved chunks to local storage: {chunk_store._chunk_file(bid).name}[/dim]")
 
+                def _process_single_chunk(chk_item: HierarchicalChunk) -> Dict[str, Any]:
+                    nonlocal active_tasks_count
+                    if abort_event.is_set():
+                        return {"status": "aborted", "chunk": chk_item}
+
+                    with stats_lock:
+                        active_tasks_count += 1
+                    t0 = time.time()
+                    dur = 0.0
+                    srv = "ollama"
+                    try:
+                        if abort_event.is_set():
+                            return {"status": "aborted", "chunk": chk_item}
+
+                        extraction = extractor.extract_section(
+                            text=chk_item.text,
+                            book_title=btitle,
+                            section_title=chk_item.section_title,
+                        )
+                        dur = time.time() - t0
+                        srv = extractor.pool.get_last_used_server() or "ollama"
+                        with stats_lock:
+                            durations.append(dur)
+
+                        return {
+                            "status": "extracted",
+                            "chunk": chk_item,
+                            "extraction": extraction,
+                            "duration": dur,
+                            "server_used": srv,
+                        }
+                    finally:
+                        with stats_lock:
+                            active_tasks_count = max(0, active_tasks_count - 1)
+
                 with Progress(
                     SpinnerColumn(),
                     TextColumn("[progress.description]{task.description}"),
@@ -1080,49 +1146,96 @@ def build_graph(
                     TaskProgressColumn(),
                     console=console,
                 ) as progress:
-                    task = progress.add_task(f"Extracting concepts from '{btitle[:25]}'...", total=len(chunks))
+                    task = progress.add_task(f"Extracting '{btitle[:22]}'...", total=len(chunks))
 
-                    for chk in chunks:
-                        progress.update(
-                            task,
-                            description=f"Processing: [cyan]{chk.section_title[:20]} [p{chk.chunk_idx}][/cyan]",
+                    def _update_progress_description():
+                        avg_s, p80_s, p18_s, fastest_s = _calc_stats()
+                        with stats_lock:
+                            cur_active = active_tasks_count
+                        desc = (
+                            f"Extracting '{btitle[:18]}' across {num_servers} server(s) | "
+                            f"Active: [bold cyan]{cur_active}[/bold cyan]"
                         )
+                        if durations:
+                            desc += (
+                                f" | avg: [bold green]{avg_s:.1f}s[/bold green] | "
+                                f"p80: [bold yellow]{p80_s:.1f}s[/bold yellow] | "
+                                f"p18: [bold blue]{p18_s:.1f}s[/bold blue] | "
+                                f"fastest: [bold magenta]{fastest_s:.1f}s[/bold magenta]"
+                            )
+                        progress.update(task, description=desc)
 
-                        # Ensure section exists in graph
-                        sec_node_id = store.add_section(
-                            book_id=bid,
-                            chapter_idx=chk.chapter_idx,
-                            title=chk.section_title,
-                            text=chk.text,
-                        )
+                    _update_progress_description()
 
-                        # Run Ollama Concept Extraction
-                        extraction = extractor.extract_section(
-                            text=chk.text,
-                            book_title=btitle,
-                            section_title=chk.section_title,
-                        )
+                    chunk_executor = DaemonThreadPoolExecutor(max_workers=pool_concurrency)
+                    try:
+                        future_to_chunk = {
+                            chunk_executor.submit(_process_single_chunk, chk): chk for chk in chunks
+                        }
 
-                        # Deduplicate and register concepts
-                        for concept in extraction.concepts:
-                            canonical_concept = deduplicator.resolve_concept(concept)
-                            store.add_concept(canonical_concept)
+                        for future in as_completed(future_to_chunk):
+                            if abort_event.is_set():
+                                break
 
-                            # Link Section -> DISCUSSES -> Concept
-                            store.add_section_concept_link(
-                                section_node_id=sec_node_id,
-                                concept_name=canonical_concept.name,
-                                summary=canonical_concept.summary,
+                            res = future.result()
+                            if res.get("status") == "aborted":
+                                continue
+
+                            chk = res["chunk"]
+                            extraction = res["extraction"]
+                            dur = res["duration"]
+                            srv = res["server_used"]
+
+                            # Ensure section exists in graph
+                            sec_node_id = store.add_section(
+                                book_id=bid,
+                                chapter_idx=chk.chapter_idx,
+                                title=chk.section_title,
+                                text=chk.text,
                             )
 
-                            # Link related concepts
-                            for rel_name in canonical_concept.related_concepts:
-                                store.add_concept_relation(
-                                    src_concept_name=canonical_concept.name,
-                                    tgt_concept_name=rel_name,
+                            # Deduplicate and register concepts
+                            for concept in extraction.concepts:
+                                canonical_concept = deduplicator.resolve_concept(concept)
+                                store.add_concept(canonical_concept)
+
+                                # Link Section -> DISCUSSES -> Concept
+                                store.add_section_concept_link(
+                                    section_node_id=sec_node_id,
+                                    concept_name=canonical_concept.name,
+                                    summary=canonical_concept.summary,
                                 )
 
-                        progress.advance(task)
+                                # Link related concepts
+                                for rel_name in canonical_concept.related_concepts:
+                                    store.add_concept_relation(
+                                        src_concept_name=canonical_concept.name,
+                                        tgt_concept_name=rel_name,
+                                    )
+
+                            with display_lock:
+                                console.print(
+                                    f"  [dim green]✓ [{chk.section_title[:24]} p{chk.chunk_idx}][/dim green] "
+                                    f"Extracted [bold cyan]{len(extraction.concepts)} concept(s)[/bold cyan] "
+                                    f"[dim]({dur:.1f}s via [bold green]{srv}[/bold green])[/dim]"
+                                )
+
+                            progress.advance(task)
+                            _update_progress_description()
+
+                    except KeyboardInterrupt:
+                        abort_event.set()
+                        progress.stop()
+                        for f in future_to_chunk:
+                            f.cancel()
+                        chunk_executor.shutdown(wait=False, cancel_futures=True)
+                        import concurrent.futures.thread
+                        with concurrent.futures.thread._global_shutdown_lock:
+                            for t in list(chunk_executor._threads):
+                                concurrent.futures.thread._threads_queues.pop(t, None)
+                        raise
+                    finally:
+                        chunk_executor.shutdown(wait=False, cancel_futures=True)
 
                 tracker.mark_completed("build_graph", bid, btitle)
                 # Incremental persistence: save graph checkpoint after every processed book
@@ -1130,6 +1243,8 @@ def build_graph(
                 completed_in_session += 1
                 console.print(f"  [dim green]✓ Book #{bid} concepts integrated and graph checkpoint saved.[/dim green]")
 
+            except KeyboardInterrupt:
+                raise
             except Exception as e:
                 console.print(f"[bold red]✗ Failed to build graph for book #{bid} ('{btitle}'):[/bold red] {e}")
                 tracker.mark_failed("build_graph", bid, title=btitle, error=str(e))
@@ -1148,6 +1263,17 @@ def build_graph(
             obs.export(store)
             gml = GraphMLExporter(graphml_dest)
             gml.export(store)
+
+        if durations:
+            avg_s, p80_s, p18_s, fastest_s = _calc_stats()
+            console.print(
+                f"\n[bold cyan]Concept Extraction Performance:[/bold cyan] "
+                f"Avg: [bold green]{avg_s:.2f}s[/bold green] | "
+                f"80th Percentile (p80): [bold yellow]{p80_s:.2f}s[/bold yellow] | "
+                f"18th Percentile (p18): [bold blue]{p18_s:.2f}s[/bold blue] | "
+                f"Fastest: [bold magenta]{fastest_s:.2f}s[/bold magenta] "
+                f"[dim](across {len(durations)} extracted chunk tasks)[/dim]"
+            )
 
         if interrupted:
             console.print(

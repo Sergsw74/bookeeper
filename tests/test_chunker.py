@@ -232,7 +232,7 @@ def test_concept_graph_store_hierarchy_and_export():
         # Check content and wikilinks
         circuit_content = (vault_dir / "Concepts" / "Circuit Breaker.md").read_text(encoding="utf-8")
         assert "[[Bulkhead Pattern]]" in circuit_content
-        assert "type: concept" in circuit_content
+        assert "type: idea" in circuit_content
         assert "Building Microservices > Chapter 2: The Evolutionary Architect" in circuit_content
 
         # 9. Test GraphML Exporter
@@ -294,4 +294,110 @@ def test_chunk_store_persistence(tmp_path: Path):
     # Delete
     assert chunk_store.delete_chunks(42) is True
     assert chunk_store.has_chunks(42) is False
+
+
+def test_hierarchical_smart_rag_and_idea_provenance(tmp_path: Path):
+    """Verify smart structural chunking, parent-child linkages, idea explanations, and chunk provenance."""
+    # 1. Test smart markdown AST parsing and parent chunk linkage
+    raw_markdown = """
+# Chapter 5: Distributed Consensus
+
+In distributed systems, achieving agreement across unreliable networks is a fundamental problem.
+
+## Raft Leader Election
+
+Raft decomposes consensus into leader election, log replication, and safety.
+A leader is elected when it receives votes from a quorum of servers.
+Servers start in follower state, transition to candidate upon election timeout, and become leader if a majority votes yes.
+
+## Log Compaction
+
+Snapshots are the simplest approach to log compaction.
+In snapshotting, the entire current system state is written to stable storage.
+"""
+
+    section = Section(
+        title="Chapter 5: Distributed Consensus",
+        chapter_idx=5,
+        text=raw_markdown,
+    )
+
+    chunker = HierarchicalChunker(max_chunk_chars=350, min_chunk_chars=40)
+    chunks = chunker.chunk_section(section, book_id=7, book_title="Distributed Systems")
+
+    assert len(chunks) >= 2
+    # Check subtitle detection
+    subtitles = {c.subtitle for c in chunks}
+    assert "Raft Leader Election" in subtitles
+    assert "Log Compaction" in subtitles
+
+    # Check parent chunk linkage and sequential pointers
+    for c in chunks:
+        assert c.parent_chunk_id is not None
+        assert c.parent_text is not None
+        assert "Distributed Systems > Chapter 5: Distributed Consensus" in c.breadcrumb
+
+    # Check prev/next links
+    assert chunks[0].prev_chunk_id is None
+    assert chunks[0].next_chunk_id == chunks[1].chunk_id
+    assert chunks[1].prev_chunk_id == chunks[0].chunk_id
+
+    # 2. Test Idea node creation with detailed explanations
+    store = ConceptGraphStore()
+    b_id = store.add_book(7, "Distributed Systems", "Tanenbaum")
+    sec_id = store.add_section(7, 5, "Chapter 5: Distributed Consensus")
+
+    idea = Concept(
+        name="Raft Consensus",
+        brief_description="A consensus algorithm designed to be understandable and equivalent to Paxos in fault-tolerance.",
+        detailed_explanation="Raft separates leader election, log replication, and safety. A single elected leader manages the replicated log, reducing state-space complexity.",
+        category="Distributed Systems Algorithm",
+        supporting_quote="Raft decomposes consensus into leader election, log replication, and safety.",
+        related_concepts=["Paxos", "State Machine Replication"],
+    )
+
+    store.add_concept(idea)
+
+    # 3. Test Idea-to-Chunk provenance link
+    target_chunk = next(c for c in chunks if c.subtitle == "Raft Leader Election")
+    store.add_idea_support_link(
+        concept_name=idea.name,
+        chunk=target_chunk,
+        quote=idea.supporting_quote,
+        brief_description=idea.brief_description,
+        detailed_explanation=idea.detailed_explanation,
+    )
+
+    # Verify graph node properties
+    idea_node = store.graph.nodes[f"concept:{idea.name}"]
+    assert idea_node["is_idea"] is True
+    assert idea_node["tag"] == "idea"
+    assert "understandable" in idea_node["brief_description"]
+    assert "leader election" in idea_node["detailed_explanation"]
+
+    # Verify edge connectivity
+    assert store.graph.has_edge(f"concept:{idea.name}", f"chunk:{target_chunk.chunk_id}")
+    edge = store.graph[f"concept:{idea.name}"][f"chunk:{target_chunk.chunk_id}"]
+    assert edge["relation"] == "SUPPORTED_BY"
+    assert "Raft decomposes consensus" in edge["quote"]
+    assert "Raft Leader Election" in edge["subtitle"]
+    assert edge["chunk_id"] == target_chunk.chunk_id
+
+    # 4. Verify Obsidian export formatting with detailed explanation and chunk provenance
+    vault_dir = tmp_path / "obsidian_vault"
+    exporter = ObsidianExporter(vault_dir)
+    exporter.export(store)
+
+    idea_file = vault_dir / "Concepts" / "Raft Consensus.md"
+    assert idea_file.is_file()
+    idea_content = idea_file.read_text(encoding="utf-8")
+
+    assert "type: idea" in idea_content
+    assert "## Summary" in idea_content
+    assert "## Detailed Explanation" in idea_content
+    assert "## Supporting Evidence & Book Locations" in idea_content
+    assert f"Chunk {target_chunk.chunk_id}" in idea_content
+    assert "Raft Leader Election" in idea_content
+    assert "Raft decomposes consensus into leader election" in idea_content
+
 

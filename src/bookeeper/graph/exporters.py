@@ -145,21 +145,44 @@ class ObsidianExporter:
             with open(sections_dir / filename, "w", encoding="utf-8") as f:
                 f.write("\n".join(sec_content))
 
-        # 3. Export Concept notes
+        # 3. Export Concept / Idea notes
         categories: Dict[str, List[str]] = {}
         for node_id, attrs in g.nodes(data=True):
-            if attrs.get("type") != "Concept":
+            if attrs.get("type") not in ["Concept", "Idea"]:
                 continue
 
             name = attrs.get("name", node_id.replace("concept:", ""))
-            category = attrs.get("category", "Concept")
-            summary = attrs.get("summary", "")
+            category = attrs.get("category", "Idea")
+            brief_desc = attrs.get("brief_description", "")
+            detailed_exp = attrs.get("detailed_explanation", "")
+            summary = attrs.get("summary", "") or brief_desc or detailed_exp
             occurrences = attrs.get("occurrences", 1)
 
             categories.setdefault(category, []).append(name)
             filename = sanitize_filename(name) + ".md"
 
-            # Mentioned in sections
+            # 3a. Supporting chunks & book locations (SUPPORTED_BY edges)
+            supporting_evidence = []
+            for _, chunk_id, edge in g.out_edges(node_id, data=True):
+                if edge.get("relation") == "SUPPORTED_BY":
+                    quote = edge.get("quote", "")
+                    breadcrumb = edge.get("breadcrumb", "")
+                    cid = edge.get("chunk_id", chunk_id.replace("chunk:", ""))
+                    sec_attrs = g.nodes.get(chunk_id, {})
+                    stitle = sec_attrs.get("section_title", "Section")
+                    bid = sec_attrs.get("book_id")
+                    btitle = "Book"
+                    if bid and g.has_node(f"book:{bid}"):
+                        btitle = g.nodes[f"book:{bid}"].get("title", btitle)
+                    sec_note = sanitize_filename(f"{btitle} - {stitle}")
+
+                    display_loc = breadcrumb if breadcrumb else f"{btitle} > {stitle}"
+                    line = f"- **[[{sec_note}|{display_loc}]]** `[Chunk {cid}]`"
+                    if quote:
+                        line += f"\n  > \"{quote}\""
+                    supporting_evidence.append(line)
+
+            # 3b. Mentioned in sections (DISCUSSES in-edges)
             mentioned_in = []
             for src_id, _, edge in g.in_edges(node_id, data=True):
                 if edge.get("relation") == "DISCUSSES":
@@ -169,29 +192,37 @@ class ObsidianExporter:
                     btitle = "Book"
                     if bid and g.has_node(f"book:{bid}"):
                         btitle = g.nodes[f"book:{bid}"].get("title", btitle)
-                    sec_note = f"{btitle} - {stitle}"
-                    mentioned_in.append(f"- [[{sec_note}|{btitle} > {stitle}]]")
+                    sec_note = sanitize_filename(f"{btitle} - {stitle}")
+                    quote = edge.get("quote", "")
+                    entry = f"- [[{sec_note}|{btitle} > {stitle}]]"
+                    if quote:
+                        entry += f"\n  > \"{quote}\""
+                    mentioned_in.append(entry)
 
-            # Outgoing relations to other concepts
+            # 3c. Outgoing relations to other concepts
             related_out = []
             for _, tgt_id, edge in g.out_edges(node_id, data=True):
-                if edge.get("relation") != "DISCUSSES":
+                if edge.get("relation") not in ["DISCUSSES", "SUPPORTED_BY", "HAS_SECTION", "HAS_CHUNK"]:
                     tgt_name = g.nodes.get(tgt_id, {}).get("name", tgt_id.replace("concept:", ""))
                     rel = edge.get("relation", "RELATES_TO")
                     related_out.append(f"- **{rel}** -> [[{tgt_name}]]")
 
-            # Incoming relations from other concepts
+            # 3d. Incoming relations from other concepts
             related_in = []
             for src_id, _, edge in g.in_edges(node_id, data=True):
-                if edge.get("relation") not in ["DISCUSSES", "HAS_SECTION"]:
+                if edge.get("relation") not in ["DISCUSSES", "HAS_SECTION", "HAS_CHUNK", "SUPPORTS_IDEA"]:
                     src_name = g.nodes.get(src_id, {}).get("name", src_id.replace("concept:", ""))
                     rel = edge.get("relation", "RELATES_TO")
                     related_in.append(f"- [[{src_name}]] -> **{rel}**")
 
+            cat_tag = re.sub(r"[^\w-]", "", category.lower().replace(" ", "-")) or "idea"
             c_content = [
                 "---",
                 f"title: \"{name}\"",
-                "type: concept",
+                "type: idea",
+                "tags:",
+                "  - idea",
+                f"  - {cat_tag}",
                 f"category: \"{category}\"",
                 f"occurrences: {occurrences}",
                 "---",
@@ -200,20 +231,40 @@ class ObsidianExporter:
                 f"*Category: {category}*",
                 "",
             ]
-            if summary:
-                c_content.extend(["> " + summary, ""])
 
+            # Brief Description / Summary
+            if brief_desc or summary:
+                c_content.extend([
+                    "## Summary",
+                    f"> {brief_desc or summary}",
+                    "",
+                ])
+
+            # Detailed Explanation
+            if detailed_exp and detailed_exp != brief_desc:
+                c_content.extend([
+                    "## Detailed Explanation",
+                    detailed_exp,
+                    "",
+                ])
+
+            # Supporting Evidence from Chunks
+            if supporting_evidence:
+                c_content.append("## Supporting Evidence & Book Locations")
+                c_content.extend(supporting_evidence)
+                c_content.append("")
+            elif mentioned_in:
+                c_content.append("## Mentioned In")
+                c_content.extend(sorted(set(mentioned_in)))
+                c_content.append("")
+
+            # Related Ideas
             if related_out or related_in:
-                c_content.append("## Related Concepts")
+                c_content.append("## Related Ideas")
                 if related_out:
                     c_content.extend(related_out)
                 if related_in:
                     c_content.extend(related_in)
-                c_content.append("")
-
-            if mentioned_in:
-                c_content.append("## Mentioned In")
-                c_content.extend(sorted(set(mentioned_in)))
                 c_content.append("")
 
             with open(concepts_dir / filename, "w", encoding="utf-8") as f:

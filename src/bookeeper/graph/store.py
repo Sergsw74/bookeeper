@@ -76,23 +76,127 @@ class ConceptGraphStore:
         return section_node_id
 
     def add_concept(self, concept: Concept) -> str:
-        """Add or update a canonical Concept node."""
+        """Add or update an Idea / Concept node with brief description and detailed explanation."""
         node_id = f"concept:{concept.name}"
+        brief = getattr(concept, "brief_description", "") or concept.summary
+        detailed = getattr(concept, "detailed_explanation", "") or concept.summary
+
         if not self.graph.has_node(node_id):
             self.graph.add_node(
                 node_id,
                 type="Concept",
+                tag="idea",
+                tags=["idea", concept.category.lower().replace(" ", "-")],
+                is_idea=True,
                 name=concept.name,
                 category=concept.category,
+                brief_description=brief,
+                detailed_explanation=detailed,
                 summary=concept.summary,
                 occurrences=1,
             )
         else:
-            self.graph.nodes[node_id]["occurrences"] += 1
-            if len(concept.summary) > len(self.graph.nodes[node_id].get("summary", "")):
-                self.graph.nodes[node_id]["summary"] = concept.summary
+            node_data = self.graph.nodes[node_id]
+            node_data["occurrences"] += 1
+            node_data["is_idea"] = True
+            node_data["tag"] = "idea"
+            if brief and len(brief) > len(node_data.get("brief_description", "")):
+                node_data["brief_description"] = brief
+            if detailed and len(detailed) > len(node_data.get("detailed_explanation", "")):
+                node_data["detailed_explanation"] = detailed
+            if len(concept.summary) > len(node_data.get("summary", "")):
+                node_data["summary"] = concept.summary
 
         return node_id
+
+    def add_chunk(self, chunk: Any) -> str:
+        """Add a Chunk node and connect (:Section) -[:HAS_CHUNK]-> (:Chunk)."""
+        chunk_node_id = f"chunk:{chunk.chunk_id}"
+        section_node_id = f"section:{chunk.book_id}:{chunk.chapter_idx}"
+
+        # Ensure Section exists in graph
+        if not self.graph.has_node(section_node_id):
+            self.add_section(
+                book_id=chunk.book_id,
+                chapter_idx=chunk.chapter_idx,
+                title=chunk.section_title,
+            )
+
+        self.graph.add_node(
+            chunk_node_id,
+            type="Chunk",
+            chunk_id=chunk.chunk_id,
+            book_id=chunk.book_id,
+            book_title=chunk.book_title,
+            chapter_idx=chunk.chapter_idx,
+            chapter_title=getattr(chunk, "chapter_title", chunk.section_title),
+            section_title=chunk.section_title,
+            subtitle=getattr(chunk, "subtitle", chunk.section_title),
+            breadcrumb=chunk.breadcrumb,
+            text=chunk.text,
+            char_count=chunk.char_count,
+            parent_chunk_id=getattr(chunk, "parent_chunk_id", None),
+            hierarchy_level=getattr(chunk, "hierarchy_level", "child"),
+        )
+
+        # Edge: (:Section) -[:HAS_CHUNK]-> (:Chunk)
+        self.graph.add_edge(
+            section_node_id,
+            chunk_node_id,
+            relation="HAS_CHUNK",
+        )
+        return chunk_node_id
+
+    def add_idea_support_link(
+        self,
+        concept_name: str,
+        chunk: Any,
+        quote: str = "",
+        brief_description: str = "",
+        detailed_explanation: str = "",
+    ) -> None:
+        """
+        Link an Idea node directly to the supporting Chunk, Chapter, and Subtitle:
+          (:Concept/Idea) -[:SUPPORTED_BY {quote, breadcrumb, chapter_title, subtitle, chunk_id}]-> (:Chunk)
+          (:Chunk) -[:SUPPORTS_IDEA]-> (:Concept/Idea)
+        """
+        concept_node_id = f"concept:{concept_name}"
+        chunk_node_id = self.add_chunk(chunk)
+
+        if not self.graph.has_node(concept_node_id):
+            self.graph.add_node(
+                concept_node_id,
+                type="Concept",
+                tag="idea",
+                tags=["idea"],
+                is_idea=True,
+                name=concept_name,
+                category="Idea",
+                brief_description=brief_description,
+                detailed_explanation=detailed_explanation,
+                summary=brief_description or detailed_explanation,
+                occurrences=1,
+            )
+
+        # Edge: (:Concept/Idea) -[:SUPPORTED_BY]-> (:Chunk)
+        self.graph.add_edge(
+            concept_node_id,
+            chunk_node_id,
+            relation="SUPPORTED_BY",
+            quote=quote,
+            breadcrumb=chunk.breadcrumb,
+            chapter_title=getattr(chunk, "chapter_title", chunk.section_title),
+            subtitle=getattr(chunk, "subtitle", chunk.section_title),
+            chunk_id=chunk.chunk_id,
+        )
+
+        # Edge: (:Chunk) -[:SUPPORTS_IDEA]-> (:Concept/Idea)
+        self.graph.add_edge(
+            chunk_node_id,
+            concept_node_id,
+            relation="SUPPORTS_IDEA",
+            quote=quote,
+        )
 
     def add_section_concept_link(
         self,
@@ -107,8 +211,13 @@ class ConceptGraphStore:
             self.graph.add_node(
                 concept_node_id,
                 type="Concept",
+                tag="idea",
+                tags=["idea"],
+                is_idea=True,
                 name=concept_name,
-                category="Concept",
+                category="Idea",
+                brief_description=summary,
+                detailed_explanation=summary,
                 summary=summary,
                 occurrences=1,
             )

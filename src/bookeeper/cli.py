@@ -77,6 +77,23 @@ def _get_effective_settings(
     return cfg
 
 
+def _print_pool_configuration(cfg: Settings, console: Console, show_embeddings: bool = False) -> None:
+    """Print clean summary of configured Ollama pool nodes and models."""
+    servers = cfg.resolved_ollama_servers
+    emb_suffix = f" | Embeddings: [bold cyan]{cfg.embedding_model}[/bold cyan]" if show_embeddings else ""
+    if servers and len(servers) > 1:
+        nodes_str = ", ".join(f"{s.name or s.url} ({s.url})" for s in servers)
+        console.print(
+            f"[dim]Configured Ollama Multi-Server Pool ({len(servers)} nodes): [bold cyan]{nodes_str}[/bold cyan] | "
+            f"LLM: [bold cyan]{cfg.llm_model}[/bold cyan]{emb_suffix}[/dim]"
+        )
+    else:
+        console.print(
+            f"[dim]Configured Ollama: [bold cyan]{cfg.ollama_base_url}[/bold cyan] | "
+            f"LLM: [bold cyan]{cfg.llm_model}[/bold cyan]{emb_suffix}[/dim]"
+        )
+
+
 def _perform_ollama_warmup(extractor: KnowledgeExtractor, console: Console) -> Dict[str, Any]:
     """Execute warmup ping to load model and report CPU vs GPU acceleration status across server pool."""
     pool_nodes = extractor.pool.nodes
@@ -425,6 +442,7 @@ def clean_metadata(
         console.print("[dim yellow]Reset progress checkpoint for clean_metadata.[/dim yellow]")
 
     extractor = KnowledgeExtractor.from_settings(cfg)
+    _print_pool_configuration(cfg, console, show_embeddings=False)
 
     if not skip_warmup:
         _perform_ollama_warmup(extractor, console)
@@ -972,20 +990,14 @@ def build_graph(
                 client.cleanup_staged(delete_file=False)
                 should_stage = False
 
-    console.print(
-        f"[dim]Configured Ollama: [bold cyan]{cfg.ollama_base_url}[/bold cyan] | "
-        f"LLM: [bold cyan]{cfg.llm_model}[/bold cyan] | "
-        f"Embeddings: [bold cyan]{cfg.embedding_model}[/bold cyan][/dim]"
-    )
-
     extractor = KnowledgeExtractor.from_settings(cfg)
+    _print_pool_configuration(cfg, console, show_embeddings=True)
 
     if not skip_warmup:
         _perform_ollama_warmup(extractor, console)
 
     deduplicator = EntityDeduplicator.from_settings(
         cfg,
-        base_url=cfg.ollama_base_url,
         embedding_model=cfg.embedding_model,
         similarity_threshold=cfg.similarity_threshold,
     )
@@ -1210,6 +1222,8 @@ def build_graph(
                             text=chk_item.text,
                             book_title=btitle,
                             section_title=chk_item.section_title,
+                            subtitle=chk_item.subtitle,
+                            parent_context=chk_item.parent_text,
                         )
                         dur = time.time() - t0
                         srv = extractor.pool.get_last_used_server() or "ollama"
@@ -1282,16 +1296,29 @@ def build_graph(
                                 text=chk.text,
                             )
 
-                            # Deduplicate and register concepts
+                            # Register chunk node in graph
+                            store.add_chunk(chk)
+
+                            # Deduplicate and register ideas/concepts
                             for concept in extraction.concepts:
                                 canonical_concept = deduplicator.resolve_concept(concept)
                                 store.add_concept(canonical_concept)
+
+                                # Provenance link: (:Idea) -[:SUPPORTED_BY]-> (:Chunk)
+                                store.add_idea_support_link(
+                                    concept_name=canonical_concept.name,
+                                    chunk=chk,
+                                    quote=canonical_concept.supporting_quote or "",
+                                    brief_description=canonical_concept.brief_description,
+                                    detailed_explanation=canonical_concept.detailed_explanation,
+                                )
 
                                 # Link Section -> DISCUSSES -> Concept
                                 store.add_section_concept_link(
                                     section_node_id=sec_node_id,
                                     concept_name=canonical_concept.name,
                                     summary=canonical_concept.summary,
+                                    quote=canonical_concept.supporting_quote or "",
                                 )
 
                                 # Link related concepts

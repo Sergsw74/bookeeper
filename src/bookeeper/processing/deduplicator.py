@@ -119,9 +119,21 @@ class EntityDeduplicator:
             if rel not in canonical.related_concepts and rel != canonical.name:
                 canonical.related_concepts.append(rel)
 
+        # Merge descriptions
+        if incoming.detailed_explanation and len(incoming.detailed_explanation) > len(getattr(canonical, "detailed_explanation", "")):
+            canonical.detailed_explanation = incoming.detailed_explanation
+        if incoming.brief_description and len(incoming.brief_description) > len(getattr(canonical, "brief_description", "")):
+            canonical.brief_description = incoming.brief_description
+        if not getattr(canonical, "supporting_quote", None) and getattr(incoming, "supporting_quote", None):
+            canonical.supporting_quote = incoming.supporting_quote
+
         # If incoming has a significantly richer summary, update canonical summary
         if len(incoming.summary) > len(canonical.summary) + 30:
-            canonical.summary = incoming.summary
+            if hasattr(canonical, "summary"):
+                try:
+                    canonical.summary = incoming.summary
+                except Exception:
+                    pass
 
     def _embed(self, text: str) -> Optional[np.ndarray]:
         """Compute normalized unit vector for input text."""

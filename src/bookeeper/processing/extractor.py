@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from bookeeper.config import Settings
 from bookeeper.processing.ollama_pool import OllamaPool
@@ -39,21 +39,49 @@ class BookMetadata(BaseModel):
 
 
 class Concept(BaseModel):
-    """Canonical domain idea, architectural pattern, or technical theme."""
+    """Canonical domain idea, architectural pattern, principle, or technical theme."""
 
     name: str = Field(
-        description="Canonical concise 2-4 word concept name (e.g. 'Event Sourcing', 'Circuit Breaker', 'Two-Phase Commit')."
+        description="Canonical concise title of the idea or concept (2-4 words, e.g. 'Event Sourcing', 'Leader Election', 'Write-Ahead Logging')."
+    )
+    brief_description: str = Field(
+        default="",
+        description="Brief 1-2 sentence description summarizing the core idea.",
+    )
+    detailed_explanation: str = Field(
+        default="",
+        description="Detailed multi-sentence explanation of the idea, how it works, mechanisms, and key nuances.",
     )
     category: str = Field(
-        description="Category classification (e.g. 'Architectural Pattern', 'Data Structure', 'System Design Principle', 'Tradeoff', 'Theme')."
+        default="Idea",
+        description="Category classification (e.g. 'Architectural Pattern', 'System Design Principle', 'Theory', 'Tradeoff', 'Data Structure').",
     )
-    summary: str = Field(
-        description="Clear, 1-2 sentence explanation defining what this concept is and how it functions."
+    supporting_quote: Optional[str] = Field(
+        default=None,
+        description="Direct concise quote or excerpt from the text that directly introduces or supports this idea.",
     )
     related_concepts: List[str] = Field(
         default_factory=list,
-        description="List of related concept names (2-4 words each) discussed in connection with this concept.",
+        description="List of related idea/concept names discussed in connection with this idea.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_descriptions(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # If 'summary' was provided instead of brief/detailed descriptions
+            if "summary" in data and not data.get("brief_description"):
+                data["brief_description"] = data["summary"]
+            if not data.get("detailed_explanation") and data.get("brief_description"):
+                data["detailed_explanation"] = data["brief_description"]
+            if not data.get("brief_description") and data.get("detailed_explanation"):
+                data["brief_description"] = data["detailed_explanation"]
+        return data
+
+    @property
+    def summary(self) -> str:
+        """Backward-compatible summary property."""
+        return self.brief_description or self.detailed_explanation
 
 
 class SectionExtraction(BaseModel):
@@ -61,7 +89,7 @@ class SectionExtraction(BaseModel):
 
     concepts: List[Concept] = Field(
         default_factory=list,
-        description="List of technical concepts and architectural patterns discussed.",
+        description="List of technical ideas, concepts, and architectural patterns discussed.",
     )
 
 
@@ -212,19 +240,35 @@ class KnowledgeExtractor:
         text: str,
         book_title: str,
         section_title: str,
+        subtitle: Optional[str] = None,
+        parent_context: Optional[str] = None,
     ) -> SectionExtraction:
-        """Extract atomic concepts and their relationships from a section chunk with multi-server failover."""
+        """
+        Extract canonical domain ideas, principles, patterns, and their relationships
+        from a section or chunk with multi-server failover.
+        Supports parent macro context for hierarchical RAG understanding.
+        """
         system_text = (
-            "You are an expert technical knowledge graph extractor. "
-            "Extract canonical, specific technical concepts, patterns, algorithms, and design tradeoffs. "
-            "Ensure concept names are concise (2-4 words, e.g. 'Read-Copy-Update', 'Consistent Hashing'). "
-            "Identify how these concepts relate to one another."
+            "You are an expert technical knowledge extractor and concept ontologist. "
+            "Extract canonical ideas, principles, patterns, and theoretical mechanisms discussed in the text.\n"
+            "For each idea:\n"
+            "- 'name': concise canonical title (2-4 words, e.g. 'Consistent Hashing', 'Two-Phase Commit', 'Event Sourcing').\n"
+            "- 'brief_description': 1-2 sentence high-level definition of the idea.\n"
+            "- 'detailed_explanation': thorough multi-sentence technical explanation of how the idea functions, its mechanisms, and tradeoffs.\n"
+            "- 'category': classification (e.g. 'Architectural Pattern', 'System Design Principle', 'Data Structure', 'Algorithm', 'Design Tradeoff').\n"
+            "- 'supporting_quote': direct concise sentence from the text directly stating or supporting this idea.\n"
+            "- 'related_concepts': list of related idea names discussed in relation to this idea."
         )
-        human_text = (
-            f"Book: '{book_title}'\n"
-            f"Section: '{section_title}'\n\n"
-            f"Text excerpt:\n\"\"\"\n{text[:4000]}\n\"\"\"\n"
-        )
+
+        loc = f"Book: '{book_title}'\nSection/Chapter: '{section_title}'"
+        if subtitle and subtitle != section_title:
+            loc += f"\nSubsection/Subtitle: '{subtitle}'"
+
+        human_text = f"{loc}\n\n"
+        if parent_context and parent_context != text:
+            human_text += f"Parent Context (Macro Passage):\n\"\"\"\n{parent_context[:2000]}\n\"\"\"\n\n"
+        human_text += f"Target Text for Idea Extraction:\n\"\"\"\n{text[:4000]}\n\"\"\"\n"
+
         messages = [
             SystemMessage(content=system_text),
             HumanMessage(content=human_text),

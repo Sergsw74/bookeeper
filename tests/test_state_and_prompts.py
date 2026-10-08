@@ -249,3 +249,131 @@ def test_build_graph_cli_pool_and_chunks(tmp_path: Path):
         chunk_files = list(chunks_dir.glob("book_*_chunks.json"))
         assert len(chunk_files) == 1
 
+
+def test_build_graph_calibre_local_staging(tmp_path: Path):
+    """Verify build-graph stages metadata.db locally on SSD and reuses it for instant queries."""
+    import sqlite3
+    from typer.testing import CliRunner
+    from bookeeper.cli import app
+    from bookeeper.processing.extractor import Concept
+    from bookeeper.calibre.client import _register_sqlite_functions
+
+    # Setup dummy Calibre library
+    lib_dir = tmp_path / "calibre_lib"
+    lib_dir.mkdir()
+    db_path = lib_dir / "metadata.db"
+
+    conn = sqlite3.connect(str(db_path))
+    _register_sqlite_functions(conn)
+    conn.executescript("""
+        CREATE TABLE books (
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            sort TEXT,
+            author_sort TEXT,
+            pubdate TIMESTAMP,
+            path TEXT NOT NULL DEFAULT 'Author/Book'
+        );
+        CREATE TABLE authors (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL COLLATE NOCASE
+        );
+        CREATE TABLE books_authors_link (
+            id INTEGER PRIMARY KEY,
+            book INTEGER NOT NULL,
+            author INTEGER NOT NULL
+        );
+        CREATE TABLE data (
+            id INTEGER PRIMARY KEY,
+            book INTEGER NOT NULL,
+            format TEXT NOT NULL,
+            name TEXT NOT NULL
+        );
+        CREATE TABLE comments (
+            id INTEGER PRIMARY KEY,
+            book INTEGER NOT NULL UNIQUE,
+            text TEXT NOT NULL
+        );
+    """)
+    conn.execute("INSERT INTO books (id, title, sort, author_sort, path) VALUES (42, 'Graph Book', 'Graph Book', 'Author', 'Author/Book')")
+    conn.execute("INSERT INTO authors (id, name) VALUES (1, 'Jane Doe')")
+    conn.execute("INSERT INTO books_authors_link (book, author) VALUES (42, 1)")
+    conn.execute("INSERT INTO data (book, format, name) VALUES (42, 'EPUB', 'Graph Book')")
+    conn.commit()
+    conn.close()
+
+    # Create dummy EPUB file inside the library path
+    book_folder = lib_dir / "Author" / "Book"
+    book_folder.mkdir(parents=True)
+    epub_file = book_folder / "Graph Book.epub"
+    epub_file.write_text("EPUB test content", encoding="utf-8")
+
+    out_dir = tmp_path / "output"
+    chunks_dir = tmp_path / "chunks"
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(f"output_dir: {out_dir}\n", encoding="utf-8")
+
+    runner = CliRunner()
+    mock_concept = Concept(
+        name="Graph Theory",
+        category="Math",
+        summary="Study of graphs",
+        related_concepts=[],
+    )
+
+    with patch("bookeeper.processing.extractor.ChatOllama") as mock_chat_cls, \
+         patch("bookeeper.calibre.parser.BookParser.parse") as mock_parse, \
+         patch("bookeeper.calibre.parser.BookParser.is_graphical_format", return_value=False):
+
+        from bookeeper.calibre.parser import Section
+        mock_parse.return_value = [
+            Section(title="Chapter 1", chapter_idx=1, text="Graph theory concepts.")
+        ]
+        mock_instance = MagicMock()
+        mock_instance.with_structured_output.return_value.invoke.return_value = SectionExtraction(
+            concepts=[mock_concept]
+        )
+        mock_chat_cls.return_value = mock_instance
+
+        # 1. First run: Downloads metadata.db and stages it locally
+        res1 = runner.invoke(
+            app,
+            [
+                "build-graph",
+                "--all",
+                "--calibre-path", str(lib_dir),
+                "--config", str(cfg_file),
+                "--skip-warmup",
+                "--stage-db",
+                "--chunks-dir", str(chunks_dir),
+            ],
+            catch_exceptions=False,
+        )
+        assert res1.exit_code == 0
+        assert "Downloading metadata.db" in res1.stdout or "Staged database at" in res1.stdout
+        assert "Reading book catalog from staged local SQLite..." in res1.stdout
+        assert "Knowledge Graph Build Complete" in res1.stdout
+
+        # Verify staged db exists in output
+        staged_db = out_dir / ".staged_metadata.db"
+        assert staged_db.is_file()
+
+        # 2. Second run: Reuses existing staged db without re-downloading
+        res2 = runner.invoke(
+            app,
+            [
+                "build-graph",
+                "--all",
+                "--calibre-path", str(lib_dir),
+                "--config", str(cfg_file),
+                "--skip-warmup",
+                "--stage-db",
+                "--chunks-dir", str(chunks_dir),
+            ],
+            catch_exceptions=False,
+        )
+        assert res2.exit_code == 0
+        assert "Found existing local staged database" in res2.stdout
+        assert "Reading book catalog from staged local SQLite..." in res2.stdout
+
+

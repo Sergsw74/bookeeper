@@ -271,6 +271,28 @@ bookeeper test-run 3 --model "qwen2.5:3b" --calibre-path "/path/to/calibre"
 
 ---
 
+### ⚡ Instant Knowledge Graph Rebuild (`bookeeper rebuild-graph`)
+
+Reconstructs the entire Knowledge Graph from previously extracted per-book state checkpoints (`.book_states`) in seconds without running any LLM inference or re-chunking:
+
+```bash
+# Rebuild Knowledge Graph from all existing book states (swipes old graph first):
+bookeeper rebuild-graph
+
+# Rebuild and export directly to Neo4j:
+bookeeper rebuild-graph --export-neo4j
+
+# Rebuild only a specific book ID:
+bookeeper rebuild-graph --book-id 42
+
+# Rebuild up to 5 books from state files:
+bookeeper rebuild-graph --limit 5
+```
+
+- **Clean Slate**: Automatically wipes existing `knowledge_graph.json`, `knowledge_graph.graphml`, Obsidian notes, and Neo4j database before rebuilding.
+- **Zero Inferences**: Directly loads extracted concepts, quotes, and chunks from disk, reconstructing books, sections, chunks, grounding links, idea relations, and sequential links in seconds.
+- **Preserves Skipped Books**: Re-initializes checkpoint completions while preserving memorized skipped formats.
+
 ### 📤 Standalone Exporters (No Book Re-processing)
 
 Export your existing `knowledge_graph.json` directly to Obsidian, Neo4j, or GraphML without touching Calibre or Ollama:

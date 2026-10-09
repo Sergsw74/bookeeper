@@ -39,6 +39,7 @@ from bookeeper.graph.store import ConceptGraphStore
 from bookeeper.processing.chunker import ChunkStore, HierarchicalChunk, HierarchicalChunker
 from bookeeper.processing.deduplicator import EntityDeduplicator
 from bookeeper.processing.extractor import (
+    Concept,
     KnowledgeExtractor,
     SectionExtraction,
     validate_concept_chunk_grounding,
@@ -3525,6 +3526,321 @@ def test_run_command(
 
     console.print(
         f"\n[bold green]✓ Test-run completed successfully ({book_cnt} book(s) processed & verified).[/bold green]\n"
+    )
+
+
+@app.command("rebuild-graph")
+def rebuild_graph_command(
+    config_path: Optional[str] = typer.Option(
+        None, "--config", "-c", help="Path to config.yaml configuration file."
+    ),
+    calibre_path: Optional[str] = typer.Option(
+        None, "--calibre-path", help="Calibre library root path or SMB mount."
+    ),
+    states_dir: Optional[str] = typer.Option(
+        None, "--states-dir", help="Directory containing .book_states JSON files (default: output_dir/.book_states)."
+    ),
+    chunks_dir: Optional[str] = typer.Option(
+        None, "--chunks-dir", help="Directory containing cached chunk JSON files (default: output_dir/chunks)."
+    ),
+    state_file: Optional[str] = typer.Option(
+        None, "--state-file", help="Path to progress tracker state file (default: output_dir/.bookeeper_state.json)."
+    ),
+    book_id: Optional[int] = typer.Option(
+        None, "--book-id", "-b", help="Rebuild only a specific book ID."
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", "-n", help="Maximum number of books to rebuild."
+    ),
+    export_obsidian: Optional[str] = typer.Option(
+        None, "--export-obsidian", help="Path to Obsidian vault export directory."
+    ),
+    export_neo4j: Optional[bool] = typer.Option(
+        None, "--export-neo4j/--no-export-neo4j", help="Upsert rebuilt knowledge graph directly into Neo4j (default: config neo4j.enabled)."
+    ),
+    clean_export: bool = typer.Option(
+        True, "--clean-export/--no-clean-export", "--clean/--no-clean", help="Wipe existing knowledge graph and export targets before rebuilding."
+    ),
+    dedup: bool = typer.Option(
+        True, "--dedup/--no-dedup", help="Apply entity deduplication (default: True)."
+    ),
+):
+    """
+    Fast, offline rebuild of the Knowledge Graph directly from existing per-book state checkpoints (.book_states).
+    Bypasses all LLM extraction and sentence chunking, reconstructing all books, sections, chunks,
+    grounded concepts, and graph relationships in seconds.
+    Wipes existing graph content before rebuild to ensure a clean, authoritative state.
+    """
+    config_path = _resolve_opt(config_path)
+    calibre_path = _resolve_opt(calibre_path)
+    states_dir = _resolve_opt(states_dir)
+    chunks_dir = _resolve_opt(chunks_dir)
+    state_file = _resolve_opt(state_file)
+    book_id = _resolve_opt(book_id)
+    limit = _resolve_opt(limit)
+    export_obsidian = _resolve_opt(export_obsidian)
+    export_neo4j = _resolve_opt(export_neo4j)
+    clean_export = _resolve_opt(clean_export, True)
+    dedup = _resolve_opt(dedup, True)
+
+    cfg = _get_effective_settings(config_path, calibre_path)
+    output_dir = cfg.resolved_output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    graph_file = output_dir / "knowledge_graph.json"
+    graphml_dest = output_dir / "knowledge_graph.graphml"
+    vault_dest = Path(export_obsidian) if export_obsidian else output_dir / "obsidian_vault"
+
+    resolved_states_dir = Path(states_dir) if states_dir else output_dir / ".book_states"
+    resolved_chunks_dir = Path(chunks_dir) if chunks_dir else output_dir / "chunks"
+    tracker_path = Path(state_file) if state_file else cfg.resolved_state_file
+    tracker = ProgressTracker(tracker_path)
+    should_export_neo4j = cfg.neo4j.enabled if export_neo4j is None else export_neo4j
+
+    if not resolved_states_dir.is_dir():
+        console.print(f"[bold red]Book states directory not found at:[/bold red] {resolved_states_dir}")
+        raise typer.Exit(1)
+
+    # 1. Clean existing knowledge graph and exports if requested
+    if clean_export:
+        console.print(
+            "[bold yellow]Swiping existing Knowledge Graph, GraphML, Obsidian notes, and checkpoint completions...[/bold yellow]"
+        )
+        tracker.clear("build_graph", keep_skipped=True)
+        if graph_file.is_file():
+            try:
+                graph_file.unlink()
+            except Exception:
+                pass
+        if graphml_dest.is_file():
+            try:
+                graphml_dest.unlink()
+            except Exception:
+                pass
+        obs = ObsidianExporter(vault_dest)
+        obs.export(ConceptGraphStore(), clean=True)
+        if should_export_neo4j:
+            try:
+                neo_exp = Neo4jExporter.from_config(cfg.neo4j)
+                neo_exp.export(ConceptGraphStore(), clean=True, show_progress=False, console=console)
+                console.print(f"[dim yellow]✓ Cleared existing Neo4j graph nodes and relationships.[/dim yellow]")
+            except Exception as e:
+                console.print(f"[yellow]Warning: Could not wipe Neo4j database ({e})[/yellow]")
+
+    # 2. Discover book state files
+    state_files = sorted(resolved_states_dir.glob("book_*_state.json"))
+    candidate_states = []
+    for sf in state_files:
+        try:
+            with open(sf, "r", encoding="utf-8") as f:
+                s_data = json.load(f)
+            bid = s_data.get("book_id")
+            if bid is None:
+                continue
+            if book_id is not None and bid != book_id:
+                continue
+            processed = s_data.get("processed_chunks", {})
+            extracted_count = sum(1 for v in processed.values() if v.get("status") == "extracted")
+            if extracted_count > 0:
+                candidate_states.append((bid, sf, s_data, extracted_count))
+        except Exception as e:
+            logger.warning(f"Could not read state file {sf}: {e}")
+
+    candidate_states.sort(key=lambda x: x[0])
+    if limit is not None and limit > 0:
+        candidate_states = candidate_states[:limit]
+
+    if not candidate_states:
+        console.print(f"[bold yellow]No extracted book state files found in {resolved_states_dir}.[/bold yellow]")
+        raise typer.Exit(0)
+
+    console.print(
+        Panel.fit(
+            f"[bold cyan]Knowledge Graph Rebuild Initiated[/bold cyan]\n"
+            f"• Source States: [bold green]{len(candidate_states)} book(s)[/bold green] (from {resolved_states_dir.name})\n"
+            f"• Chunks Source: [dim]{resolved_chunks_dir}[/dim]\n"
+            f"• Entity Deduplication: [bold]{'Enabled' if dedup else 'Disabled'}[/bold]\n"
+            f"• Neo4j Export: [bold]{'Enabled' if should_export_neo4j else 'Disabled'}[/bold]",
+            title="bookeeper rebuild-graph",
+            border_style="cyan",
+        )
+    )
+
+    # 3. Setup store and deduplicator
+    store = ConceptGraphStore()
+    chunk_store = ChunkStore(resolved_chunks_dir)
+    deduplicator = EntityDeduplicator.from_settings(cfg) if dedup else None
+
+    # Fetch Calibre authors if available
+    authors_by_id = {}
+    client = CalibreClient(cfg.calibre_library_path)
+    if client.is_available():
+        try:
+            b_meta = client.list_books(fields=["id", "authors"])
+            authors_by_id = {b["id"]: ", ".join(b.get("authors", [])) for b in b_meta}
+        except Exception:
+            pass
+
+    t0 = time.perf_counter()
+    rebuilt_books = 0
+    total_rebuilt_chunks = 0
+    total_rebuilt_concepts = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]{task.description}[/bold cyan]"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        rebuild_task = progress.add_task(
+            "Rebuilding Knowledge Graph...",
+            total=len(candidate_states),
+            completed=0,
+        )
+
+        for bid, sf, s_data, extracted_count in candidate_states:
+            btitle = BookParser.repair_mojibake(s_data.get("book_title", f"Book {bid}"))
+            bauthor = authors_by_id.get(bid) or "Unknown"
+            progress.update(rebuild_task, description=f"Rebuilding Book #{bid} ('{btitle[:20]}')...")
+
+            # Load chunks
+            chunks = chunk_store.load_chunks(bid) if chunk_store.has_chunks(bid) else []
+            chunks_map = {c.chunk_id: c for c in chunks}
+
+            processed = s_data.get("processed_chunks", {})
+            extracted_items = [v for v in processed.values() if v.get("status") == "extracted"]
+            extracted_items.sort(key=lambda x: x.get("chunk_idx", 0))
+
+            store.add_book(bid, title=btitle, author=bauthor)
+
+            for res in extracted_items:
+                chk_id = res["chunk_id"]
+                chk = chunks_map.get(chk_id)
+                if not chk:
+                    chk = HierarchicalChunk(
+                        chunk_id=chk_id,
+                        book_id=bid,
+                        book_title=btitle,
+                        section_title=res.get("section_title", "Section"),
+                        chapter_idx=1,
+                        chunk_idx=res.get("chunk_idx", 1),
+                        text="",
+                    )
+                total_rebuilt_chunks += 1
+                sec_node_id = store.add_section(
+                    book_id=bid,
+                    chapter_idx=chk.chapter_idx,
+                    title=chk.section_title,
+                    text=chk.text,
+                )
+                store.add_chunk(chk)
+
+                extraction = res.get("extraction", {})
+                for c_dict in extraction.get("concepts", []):
+                    try:
+                        concept = Concept(**c_dict)
+                    except Exception:
+                        continue
+                    canonical_concept = deduplicator.resolve_concept(concept) if deduplicator else concept
+                    store.add_concept(canonical_concept)
+                    store.add_book_idea_link(book_id=bid, concept_name=canonical_concept.name)
+                    total_rebuilt_concepts += 1
+
+                    local_brief = (concept.brief_description or "").strip()
+                    local_detailed = (concept.detailed_explanation or "").strip()
+                    is_grounded, valid_quote = validate_concept_chunk_grounding(
+                        concept_name=canonical_concept.name,
+                        supporting_quote=concept.supporting_quote,
+                        chunk_text=chk.text,
+                        brief_description=local_brief or local_detailed,
+                    )
+                    if is_grounded:
+                        store.add_idea_support_link(
+                            concept_name=canonical_concept.name,
+                            chunk=chk,
+                            quote=valid_quote,
+                            brief_description=local_brief,
+                            detailed_explanation=local_detailed,
+                        )
+                        store.add_section_concept_link(
+                            section_node_id=sec_node_id,
+                            concept_name=canonical_concept.name,
+                            summary=concept.summary,
+                            quote=valid_quote,
+                        )
+                    for rel_name in canonical_concept.related_concepts:
+                        store.add_concept_relation(
+                            src_concept_name=canonical_concept.name,
+                            tgt_concept_name=rel_name,
+                        )
+
+            # Link sequential chunks
+            store.link_sequential_chunks(book_id=bid)
+
+            # Mark state in tracker
+            total_expected = s_data.get("total_chunks", len(chunks))
+            failed_chunks = len(s_data.get("failed_chunks", []))
+            if failed_chunks == 0 and len(extracted_items) >= total_expected and total_expected > 0:
+                tracker.mark_completed(
+                    "build_graph",
+                    bid,
+                    title=btitle,
+                    metadata={"indexing_status": "fully_indexed", "total_chunks": total_expected},
+                )
+            else:
+                tracker.mark_partially_indexed(
+                    "build_graph",
+                    bid,
+                    title=btitle,
+                    failed_chunks=failed_chunks,
+                    total_chunks=total_expected,
+                )
+
+            rebuilt_books += 1
+            progress.advance(rebuild_task)
+
+    elapsed = time.perf_counter() - t0
+
+    # Save rebuilt graph
+    store.save(graph_file)
+    obs = ObsidianExporter(vault_dest)
+    obs.export(store, clean=False)
+    gml = GraphMLExporter(graphml_dest)
+    gml.export(store)
+
+    if should_export_neo4j:
+        try:
+            console.print("\n[bold cyan]Exporting Rebuilt Knowledge Graph to Neo4j...[/bold cyan]")
+            neo_exp = Neo4jExporter.from_config(cfg.neo4j)
+            res = neo_exp.export(store, clean=False, show_progress=True, console=console)
+            clean_msg = f" (clean start: purged {res['cleaned_nodes']} previous nodes)" if res.get("clean_start") else ""
+            console.print(
+                f"[bold green]✓ Neo4j Export Complete{clean_msg}:[/bold green] "
+                f"{res['nodes_upserted']} nodes, {res['edges_upserted']} relationships "
+                f"in database '{res['database']}' at {res['uri']}."
+            )
+        except Exception as e:
+            console.print(f"[bold red]✗ Failed to export to Neo4j:[/bold red] {e}")
+
+    # Summary Table
+    st = store.stats()
+    console.print(f"\n[bold green]✓ Knowledge Graph rebuilt successfully in {elapsed:.2f}s![/bold green]")
+    console.print(
+        Panel.fit(
+            f"[bold]Rebuilt Books:[/bold] {rebuilt_books}\n"
+            f"[bold]Rebuilt Chunks:[/bold] {total_rebuilt_chunks}\n"
+            f"[bold]Rebuilt Concepts:[/bold] {total_rebuilt_concepts}\n"
+            f"[bold]Total Nodes in Graph:[/bold] {st['total_nodes']}\n"
+            f"[bold]Total Relationships:[/bold] {st['total_edges']}\n\n"
+            f"[bold green]Node Types:[/bold green]\n"
+            + "\n".join(f"  • {k}: {v}" for k, v in st["node_types"].items())
+            + "\n\n[bold green]Relationship Types:[/bold green]\n"
+            + "\n".join(f"  • {k}: {v}" for k, v in st["edge_types"].items()),
+            title="Knowledge Graph Rebuild Complete",
+            border_style="green",
+        )
     )
 
 

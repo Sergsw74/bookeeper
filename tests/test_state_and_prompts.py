@@ -1588,6 +1588,156 @@ def test_build_graph_limit_candidate_bounding(tmp_path):
         assert bids == {1}
 
 
+def test_rebuild_graph_command(tmp_path):
+    """Verify rebuild-graph swipes existing graph and rebuilds from .book_states without LLM inference."""
+    import json
+    from typer.testing import CliRunner
+    from bookeeper.cli import app
+    from bookeeper.graph.store import ConceptGraphStore
+    from bookeeper.processing.state import ProgressTracker
+
+    runner = CliRunner()
+    out_dir = tmp_path / "output"
+    out_dir.mkdir(parents=True)
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(f"output_dir: {out_dir}\n", encoding="utf-8")
+
+    # 1. Create a stale old knowledge graph to verify it gets swiped
+    old_store = ConceptGraphStore()
+    old_store.add_book(999, title="Stale Old Book")
+    old_kg_file = out_dir / "knowledge_graph.json"
+    old_store.save(old_kg_file)
+    assert old_kg_file.exists()
+
+    # 2. Setup state file in .book_states
+    b_states_dir = out_dir / ".book_states"
+    b_states_dir.mkdir()
+    state_file = b_states_dir / "book_42_state.json"
+    state_data = {
+        "book_id": 42,
+        "book_title": "The Hitchhiker Guide",
+        "total_chunks": 2,
+        "failed_chunks": [],
+        "processed_chunks": {
+            "b42_c1_p1": {
+                "chunk_id": "b42_c1_p1",
+                "chunk_idx": 1,
+                "section_title": "Chapter 1",
+                "status": "extracted",
+                "extraction": {
+                    "concepts": [
+                        {
+                            "name": "Don't Panic",
+                            "category": "Idea",
+                            "summary": "Large friendly letters on cover",
+                            "weight": 8,
+                            "brief_description": "Friendly advice in large letters",
+                            "supporting_quote": "Don't Panic",
+                            "related_concepts": ["The Answer"],
+                        }
+                    ]
+                },
+            },
+            "b42_c1_p2": {
+                "chunk_id": "b42_c1_p2",
+                "chunk_idx": 2,
+                "section_title": "Chapter 1",
+                "status": "extracted",
+                "extraction": {
+                    "concepts": [
+                        {
+                            "name": "The Answer",
+                            "category": "Idea",
+                            "summary": "The answer to life and universe is 42",
+                            "weight": 9,
+                            "brief_description": "The number forty-two",
+                            "supporting_quote": "forty-two",
+                            "related_concepts": [],
+                        }
+                    ]
+                },
+            },
+        },
+    }
+    state_file.write_text(json.dumps(state_data), encoding="utf-8")
+
+    # 3. Setup chunks in chunks_dir
+    chunks_dir = out_dir / "chunks"
+    chunks_dir.mkdir()
+    chunk_file = chunks_dir / "book_42_chunks.json"
+    chunks_data = {
+        "book_id": 42,
+        "book_title": "The Hitchhiker Guide",
+        "total_chunks": 2,
+        "chunks": [
+            {
+                "chunk_id": "b42_c1_p1",
+                "book_id": 42,
+                "book_title": "The Hitchhiker Guide",
+                "section_title": "Chapter 1",
+                "chapter_idx": 1,
+                "chunk_idx": 1,
+                "text": "It has the words Don't Panic inscribed on the cover.",
+            },
+            {
+                "chunk_id": "b42_c1_p2",
+                "book_id": 42,
+                "book_title": "The Hitchhiker Guide",
+                "section_title": "Chapter 1",
+                "chapter_idx": 1,
+                "chunk_idx": 2,
+                "text": "The answer is simple: forty-two.",
+            },
+        ],
+    }
+    chunk_file.write_text(json.dumps(chunks_data), encoding="utf-8")
+
+    # 4. Invoke rebuild-graph
+    res = runner.invoke(
+        app,
+        [
+            "rebuild-graph",
+            "--config", str(cfg_file),
+            "--no-export-neo4j",
+            "--clean-export",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert res.exit_code == 0
+    assert "Swiping existing Knowledge Graph" in res.stdout
+    assert "Knowledge Graph Rebuild Initiated" in res.stdout
+    assert "Rebuilding Book #42" in res.stdout
+    assert "Knowledge Graph rebuilt successfully" in res.stdout
+
+    # 5. Verify the rebuilt Knowledge Graph
+    rebuilt_store = ConceptGraphStore()
+    rebuilt_store.load(old_kg_file)
+    st = rebuilt_store.stats()
+
+    # Stale book 999 must be gone, Book 42 must be present
+    bids = {d["book_id"] for _, d in rebuilt_store.graph.nodes(data=True) if d.get("type") == "Book"}
+    assert bids == {42}
+    assert 999 not in bids
+
+    # Concepts must exist
+    concept_names = {d["name"] for _, d in rebuilt_store.graph.nodes(data=True) if d.get("type") in ("Concept", "Idea")}
+    assert "Don't Panic" in concept_names
+    assert "The Answer" in concept_names
+
+    # Relationship between chunks (NEXT, PREV) and concept relation (RELATES_TO)
+    edge_types = set(st["edge_types"].keys())
+    assert "NEXT" in edge_types
+    assert "PREV" in edge_types
+    assert "RELATES_TO" in edge_types
+    assert "SUPPORTS_IDEA" in edge_types
+
+    # Tracker should record Book 42 as completed
+    tracker = ProgressTracker(out_dir / ".bookeeper_state.json")
+    assert 42 in tracker.get_completed_ids("build_graph")
+
+
+
 
 
 

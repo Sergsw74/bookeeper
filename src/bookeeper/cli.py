@@ -1055,7 +1055,7 @@ def build_graph(
     from_scratch: bool = typer.Option(
         False,
         "--from-scratch",
-        help="Start build entirely from scratch: wipes progress checkpoint state, deletes existing knowledge graph files, and starts indexing from the first book.",
+        help="Start build entirely from scratch: wipes progress checkpoint state, deletes all per-book states (.book_states), purges cached chunks, deletes existing knowledge graph files, and starts indexing from the first book.",
     ),
     clean_chunks: bool = typer.Option(
         False,
@@ -1145,12 +1145,13 @@ def build_graph(
 
     if from_scratch:
         console.print(
-            "[bold yellow]Restarting build entirely from scratch: clearing progress tracker checkpoint and resetting knowledge graph...[/bold yellow]"
+            "[bold yellow]Restarting build entirely from scratch: clearing progress tracker checkpoint, resetting knowledge graph, deleting all book states and cached chunks...[/bold yellow]"
         )
         tracker.clear("build_graph")
         reset_progress = True
         resume = False
         continue_run = False
+        rechunk = True
         if clean_export is None:
             should_clean = True
         if graph_file.is_file():
@@ -1163,6 +1164,28 @@ def build_graph(
                 graphml_dest.unlink()
             except Exception:
                 pass
+
+        # 1. Mandatory cleanup: delete all per-book state checkpoints (.book_states)
+        candidate_state_dirs = {
+            output_dir / ".book_states",
+            getattr(cfg, "resolved_output_dir", output_dir) / ".book_states",
+        }
+        total_purged_states = 0
+        for b_sdir in candidate_state_dirs:
+            total_purged_states += BookProcessingState.clean_all(b_sdir)
+        if total_purged_states > 0:
+            console.print(
+                f"[bold yellow]Deleted {total_purged_states} per-book state checkpoint file(s) from .book_states.[/bold yellow]"
+            )
+
+        # 2. Chunks cleanup: delete all persistent cached chunks
+        target_chunks_path = Path(chunks_dir).expanduser().resolve() if chunks_dir else cfg.resolved_chunks_dir
+        cs = ChunkStore(target_chunks_path)
+        purged_chunks = cs.clean_all()
+        if purged_chunks > 0:
+            console.print(
+                f"[bold yellow]Deleted {purged_chunks} cached chunk file(s) from {target_chunks_path}.[/bold yellow]"
+            )
 
     store = ConceptGraphStore()
     if not from_scratch and graph_file.is_file():
@@ -1264,15 +1287,8 @@ def build_graph(
     resolved_chunks_path = Path(chunks_dir).expanduser().resolve() if chunks_dir else cfg.resolved_chunks_dir
     chunk_store = ChunkStore(resolved_chunks_path)
     if clean_chunks:
-        if resolved_chunks_path.is_dir():
-            purged_count = 0
-            for cf in resolved_chunks_path.glob("*.json"):
-                try:
-                    cf.unlink()
-                    purged_count += 1
-                except Exception:
-                    pass
-            console.print(f"[dim yellow]Purged {purged_count} cached chunk file(s) from {chunk_store.storage_dir}.[/dim yellow]")
+        purged_count = chunk_store.clean_all()
+        console.print(f"[dim yellow]Purged {purged_count} cached chunk file(s) from {chunk_store.storage_dir}.[/dim yellow]")
         rechunk = True
     console.print(f"[dim]Persistent Chunks Directory: [bold cyan]{chunk_store.storage_dir}[/bold cyan][/dim]")
 

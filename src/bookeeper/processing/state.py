@@ -486,3 +486,21 @@ class BookProcessingState:
             self.save()
             return self.data["status"]
 
+    @classmethod
+    def clean_all(cls, state_dir: Path | str) -> int:
+        """
+        Purge all per-book checkpoint files (book_*_state.json) in state_dir.
+        Returns count of deleted files.
+        """
+        p = Path(state_dir).expanduser().resolve()
+        if not p.is_dir():
+            return 0
+        count = 0
+        for f in p.glob("book_*_state.json"):
+            try:
+                f.unlink()
+                count += 1
+            except Exception:
+                pass
+        return count
+

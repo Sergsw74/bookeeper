@@ -641,6 +641,17 @@ def test_build_graph_from_scratch(tmp_path):
     old_store.add_book(1, title="Old Book One")
     old_store.save(out_dir / "knowledge_graph.json")
 
+    # Seed old per-book state and old chunk file to verify they get deleted
+    old_bstate_dir = out_dir / ".book_states"
+    old_bstate_dir.mkdir(parents=True, exist_ok=True)
+    old_bstate_file = old_bstate_dir / "book_99_state.json"
+    old_bstate_file.write_text('{"status": "partially_indexed"}', encoding="utf-8")
+
+    chunks_dir = tmp_path / "chunks"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    old_chunk_file = chunks_dir / "book_99_chunks.json"
+    old_chunk_file.write_text('{"total_chunks": 5}', encoding="utf-8")
+
     cfg_file = tmp_path / "config.yaml"
     cfg_file.write_text(f"output_dir: {out_dir}\n", encoding="utf-8")
 
@@ -666,7 +677,7 @@ def test_build_graph_from_scratch(tmp_path):
                 "--calibre-path", str(lib_dir),
                 "--config", str(cfg_file),
                 "--skip-warmup",
-                "--chunks-dir", str(tmp_path / "chunks"),
+                "--chunks-dir", str(chunks_dir),
             ],
             catch_exceptions=False,
         )
@@ -674,6 +685,11 @@ def test_build_graph_from_scratch(tmp_path):
         assert res.exit_code == 0
         assert "Restarting build entirely from scratch" in res.stdout
         assert "Starting build entirely from scratch across Calibre catalog..." in res.stdout
+        assert "Deleted 1 per-book state checkpoint file(s) from .book_states" in res.stdout
+        assert "Deleted 1 cached chunk file(s)" in res.stdout
+        assert not old_bstate_file.exists()
+        assert not old_chunk_file.exists()
+
         # Both Book 1 and Book 2 must be processed
         assert "Ingesting Book #1" in res.stdout and "Book One" in res.stdout
         assert "Ingesting Book #2" in res.stdout and "Book Two" in res.stdout

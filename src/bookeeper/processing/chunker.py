@@ -393,6 +393,19 @@ class ChunkStore:
                 pass
         return False
 
+    def clean_all(self) -> int:
+        """Purge all cached book chunk files. Returns count of deleted files."""
+        if not self.storage_dir.is_dir():
+            return 0
+        count = 0
+        for f in self.storage_dir.glob("*.json"):
+            try:
+                f.unlink()
+                count += 1
+            except Exception:
+                pass
+        return count
+
     def list_stored_book_ids(self) -> List[int]:
         """Return sorted list of book IDs currently stored."""
         ids = []

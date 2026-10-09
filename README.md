@@ -2,7 +2,7 @@
 
 > **Calibre library ingester, LLM metadata normalizer, and Concept Knowledge Graph extractor using local Ollama.**
 
-`bookeeper` bridges your digital book library (EPUB / PDF via Calibre) with local Large Language Models (Ollama) to extract structured ideas, architectural patterns, technical themes, and concept graphs mapped down to individual chapters and sections.
+`bookeeper` bridges your digital book library (EPUB / PDF / FB2 via Calibre) with local Large Language Models (Ollama) to extract structured ideas, architectural patterns, technical themes, and concept graphs mapped down to individual chapters and sections.
 
 ---
 
@@ -10,32 +10,36 @@
 
 ```mermaid
 flowchart TD
-    subgraph Calibre ["1. Ingestion"]
-        A[Calibre Library / SMB\nmetadata.db] --> B[CalibreClient]
-        B --> C[BookParser\nEPUB / PDF / FB2]
+    subgraph Calibre ["1. Ingestion & Staging"]
+        A["Calibre Library / SMB\nmetadata.db"] --> B["CalibreClient\nLocal SSD SQLite Staging"]
+        B --> C["BookParser\nEPUB / PDF / FB2\nUTF-8 Mojibake Repair"]
     end
 
     subgraph Processing ["2. Processing & LLM Pipeline"]
-        C --> D[HierarchicalChunker\nTOC & Context-Aware]
-        D --> E[(ChunkStore\noutput/chunks/)]
-        E --> F[KnowledgeExtractor\nParallel Ollama Task Pool]
-        F --> G[EntityDeduplicator\nCosine Embeddings + Max Weight]
+        C --> D["HierarchicalChunker\nTOC & Context-Aware"]
+        D --> E[("ChunkStore\noutput/chunks/")]
+        E --> F["KnowledgeExtractor\nOllama Capability Routing\nModel Fallback & Retries"]
+        F --> G["EntityDeduplicator\nCosine Embeddings + Max Weight"]
     end
 
     subgraph GraphStore ["3. Knowledge Graph Engine"]
-        G --> H[ConceptGraphStore\nNetworkX MultiDiGraph]
-        H --> I[(Persistent Graph\nknowledge_graph.json)]
+        G --> H["ConceptGraphStore\nNetworkX MultiDiGraph"]
+        H --> I[("Persistent Graph\nknowledge_graph.json")]
     end
 
     subgraph Exports ["4. Standalone Multi-Format Exporters"]
-        I --> J[Obsidian Vault\nMarkdown + Frontmatter + Index]
-        I --> K[Neo4j Exporter\nHigh-Throughput Cypher MERGE]
-        I --> L[GraphML Export\nGephi / yEd]
+        I --> J["Obsidian Vault\nMarkdown + Frontmatter + Index"]
+        I --> K["Neo4j Exporter\nLive Progress Bar + Cypher MERGE"]
+        I --> L["GraphML Export\nGephi / yEd"]
     end
 
-    subgraph RAG ["5. Decoupled Hybrid RAG"]
-        E -.->|bookeeper build-rag| M[(LightRAG Engine\nDual-Level Graph & Vectors)]
-        M --> N[bookeeper query\nInteractive Synthesis]
+    subgraph Verification ["5. Verification & Auditing"]
+        I --> O["Factual Grounding Verifier\nDedicated Verifier Model\nChunk Semantic Alignment"]
+    end
+
+    subgraph RAG ["6. Decoupled Hybrid RAG"]
+        E -.->|bookeeper build-rag| M[("LightRAG Engine\nDual-Level Graph & Vectors")]
+        M --> N["bookeeper query\nInteractive Synthesis"]
     end
 ```
 
@@ -45,29 +49,30 @@ flowchart TD
 
 ```text
 bookeeper/
-├── config.yaml               # User configuration (Ollama pool, Calibre, Neo4j, LightRAG)
-├── config.yaml.example       # Example configuration template
+├── config.yaml               # User configuration (Ollama pool, Calibre, Neo4j, LightRAG, Verifier)
+├── config.yaml.example       # Example configuration template with full options
 ├── pyproject.toml            # Project dependencies & CLI entrypoint
 ├── src/
 │   └── bookeeper/
-│       ├── cli.py            # Typer / Rich CLI commands
-│       ├── config.py         # Pydantic v2 settings loader
+│       ├── cli.py            # Typer / Rich CLI commands with live progress indicators
+│       ├── config.py         # Pydantic v2 settings loader with server capabilities & aliases
 │       ├── calibre/          # SQLite reader & EPUB/PDF parser
-│       │   ├── client.py     # Calibre library client & local DB staging
-│       │   └── parser.py     # TOC, chapter, and section parser
+│       │   ├── client.py     # Calibre library client & local DB SSD staging
+│       │   └── parser.py     # TOC, chapter, and section parser with encoding repair
 │       ├── processing/       # Chunking & Ollama pool extraction
 │       │   ├── chunker.py    # Hierarchical chunking & ChunkStore
 │       │   ├── extractor.py  # Structured concept schemas & Ollama invocation
 │       │   ├── deduplicator.py # Vector deduplication & significance weight merging
-│       │   ├── ollama_pool.py# Failover & multi-server task distribution
-│       │   └── state.py      # Resumable progress tracking
+│       │   ├── ollama_pool.py# Capability routing, failover & multi-server task distribution
+│       │   ├── verifier.py   # Grounded concept verification & discrepancy auditing
+│       │   └── state.py      # Resumable progress tracking & skipped book memorization
 │       ├── graph/            # Knowledge graph storage & exporters
 │       │   ├── store.py      # NetworkX MultiDiGraph persistence
 │       │   ├── exporters.py  # Obsidian Markdown & GraphML exporters
-│       │   └── neo4j_exporter.py # High-speed Neo4j Cypher MERGE upsert
+│       │   └── neo4j_exporter.py # Real-time Rich progress bar & Cypher MERGE upsert
 │       └── rag/              # Hybrid retrieval
 │           └── lightrag_engine.py # LightRAG wrapper with failover pool
-└── tests/                    # Pytest test suite
+└── tests/                    # Pytest test suite (115+ unit & integration tests)
 ```
 
 ---
@@ -79,10 +84,11 @@ bookeeper/
 - **Python 3.10+** (Python 3.12 recommended)
 - **Ollama** running locally or across a network cluster:
   ```bash
+  ollama pull qwen2.5:3b
   ollama pull llama3.1:8b
   ollama pull nomic-embed-text
   ```
-- **Calibre Library** (local folder or mounted SMB network share).
+- **Calibre Library** (local directory or mounted SMB network share).
 
 ### 2. Installation
 
@@ -110,29 +116,89 @@ cp config.yaml.example config.yaml
 
 Edit `config.yaml` to point to your library and Ollama server(s):
 ```yaml
-calibre:
-  library_path: "/Volumes/share/calibre" # Local path or SMB mount
+# Calibre Library Integration (Local folder or mounted SMB share)
+calibre_library_path: "/Volumes/Calibre Library"
+stage_metadata_db: true        # Stage SQLite DB on local SSD for microsecond queries
+backup_metadata_db: true       # Create remote metadata.db.bak backup before syncing
 
-ollama:
-  base_url: "http://192.168.50.10:11434"
-  model: "llama3.1:8b"
-  embedding_model: "nomic-embed-text"
-  servers: # Optional multi-node Ollama cluster
-    - url: "http://192.168.50.10:11434"
-      priority: 1
-    - url: "http://192.168.50.11:11434"
-      priority: 2
+# Primary Ollama LLM Configuration & Fallback Model
+ollama_base_url: "http://192.168.50.15:11434"
+llm_model: "qwen2.5:3b"
+llm_model_fallback: "llama3.1:8b"   # Switched to after 50% chunk retries
+request_timeout: 30                 # HTTP timeout in seconds per LLM call
+max_retries: 1                     # Retries per attempt on an Ollama server
+max_chunk_attempts: 6              # Maximum total retry attempts across pool for a stalled chunk
 
+# Dedicated Embeddings Endpoint (Local Mac or separate node)
+embedding_base_url: "http://localhost:11434"
+embedding_model: "nomic-embed-text"
+
+# Multi-Node Server Pool with Task Capabilities
+ollama_servers:
+  - url: "http://192.168.50.118:11434"
+    priority: 1
+    name: "mypc-gpu-node"
+    capability: ["llm", "embedding", "verification"]
+  - url: "http://192.168.50.15:11434"
+    priority: 2
+    name: "primary-gpu-node"
+    capability: ["llm", "embedding"]
+  - url: "http://localhost:11434"
+    priority: 4
+    name: "mac-node"
+    capability: ["llm", "embedding"]
+  - url: "http://192.168.50.20:11434"
+    priority: 10
+    name: "secondary-cpu-node"
+    capability: ["embedding"]
+
+failover_cooldown_seconds: 600
+
+# High-Performance Neo4j Graph Database Export
 neo4j:
   enabled: true
   uri: "bolt://localhost:7687"
   user: "neo4j"
   password: "password"
+  database: "neo4j"
+  batch_size: 500
   clean_export: false
 
-lightrag:
-  enabled: false # Set false for fast graph builds
+# LightRAG Retrieval Engine (Decoupled from ingestion)
+enable_lightrag: false
+
+# Factual Grounding Verification
+verification:
+  enabled: true
+  model: "llama3.1:8b"
+  percent: 1.0
+  max_examples: 20
 ```
+
+---
+
+## 🌐 Multi-Node Ollama Cluster & Task Capabilities
+
+`bookeeper` features an intelligent multi-server pooling engine designed for distributed heterogenous compute setups (e.g. powerful GPU rigs, Apple Silicon Mac nodes, and CPU servers):
+
+- **Capability-Based Routing**: Each node advertises specific capabilities:
+  - `llm`: Extraction of concepts, themes, and summaries.
+  - `embedding`: Vector embeddings via `nomic-embed-text` for semantic chunking and entity deduplication.
+  - `verification`: Factual grounding audits (`bookeeper verify`).
+  - Tasks are dispatched strictly to alive nodes that support the required capability.
+- **Priority Failover**: Servers are ordered by priority (1 is highest). If a node fails, it enters a temporary cooldown (`failover_cooldown_seconds`), automatically diverting traffic to surviving nodes.
+- **Dedicated Embeddings Offloading**: Offloading embeddings to a dedicated endpoint (`embedding_base_url`, such as a local Apple Silicon Mac) prevents remote GPU servers from unloading their LLM from VRAM to run embedding models, eliminating model-swapping latency.
+- **Parallel Task Pool & Real-Time Metrics**: Dynamically manages request pipelines and displays live terminal metrics: `active workers`, `avg latency`, `p80 latency`, and `fastest node`.
+
+---
+
+## 🛡️ Robust Processing, Encoding & Fault Tolerance
+
+- **Skip-on-First-Fail & Chunk Retrying**: When a chunk encounters an extraction error, the worker immediately defers that chunk and continues processing remaining chunks. Deferred chunks are retried at the end of the book run, ensuring pipeline throughput is not blocked.
+- **Dynamic Model Fallback (`llm_model_fallback`)**: If a difficult chunk fails more than 50% of its retry attempts on the primary model (e.g., `qwen2.5:3b`), the pool automatically swaps the prompt to the configured fallback model (e.g., `llama3.1:8b`).
+- **Full-Pipeline UTF-8 Mojibake Repair**: Cyrillic and complex multilingual character encodings (e.g., Windows-1251, ISO-8859-1, KOI8-R) are automatically repaired at every stage: Calibre metadata reading, book text parsing, prompt generation, chunk storage, knowledge graph serialization, and exports.
+- **Skipped Book Memorization**: Non-text or graphical formats (`CBR`, `CBZ`, `DJVU`) and books missing files on disk are permanently memorized in `.bookeeper_state.json` with descriptive reasons. Subsequent runs skip them in microseconds without expensive file reads or network scans.
+- **Local SQLite Staging & Safety**: When working over SMB or slow storage, `bookeeper` stages `metadata.db` to local SSD, executes transactions locally, creates an atomic `.bak` backup on the remote share, and syncs updates cleanly.
 
 ---
 
@@ -141,39 +207,51 @@ lightrag:
 ### 🚀 Building the Knowledge Graph
 
 ```bash
-# Continue indexing books from where you left off (relative to knowledge_graph.json):
+# Continue indexing books from where you left off:
 bookeeper build-graph
 
-# High-performance run (bypasses heavy LightRAG LLM merging during ingestion):
+# Continue processing from the next unprocessed book (relative to existing knowledge_graph.json):
+bookeeper build-graph --continue
+
+# High-performance run (bypasses LightRAG during book ingestion for maximum speed):
 bookeeper build-graph --no-lightrag
-
-# Continue processing and perform clean start on export targets (Obsidian / Neo4j):
-bookeeper build-graph --clean-export
-
-# Ingest a specific book by Calibre ID:
-bookeeper build-graph --book-id 42
-
-# Ingest an explicit standalone EPUB/PDF file:
-bookeeper build-graph --file "/path/to/book.epub"
 
 # Process all books in the Calibre library:
 bookeeper build-graph --all
 
-# Retry previously failed books from checkpoint state:
+# Ingest a specific book by Calibre ID:
+bookeeper build-graph --book-id 42
+
+# Ingest a standalone EPUB or PDF file directly:
+bookeeper build-graph --file "/path/to/book.epub"
+
+# Retry previously failed books recorded in checkpoint state:
 bookeeper build-graph --retry-failed
+
+# Re-check and retry books previously recorded as skipped (e.g. format issues):
+bookeeper build-graph --retry-skipped
+
+# Specify custom primary and fallback LLM models:
+bookeeper build-graph --model "qwen2.5:3b" --model-fallback "llama3.1:8b"
+
+# Automatically export to Neo4j with clean start:
+bookeeper build-graph --export-neo4j --clean-export
+
+# Wipe checkpoint state, delete existing graph, and rebuild from scratch:
+bookeeper build-graph --from-scratch
 ```
 
 ---
 
-### 📤 How to Export Only (Without Processing Books)
+### 📤 Standalone Exporters (No Book Re-processing)
 
-If you already have a `knowledge_graph.json` and want to export it to Obsidian, Neo4j, or GraphML **without connecting to Calibre or scanning/processing any books**, use the standalone export commands:
+Export your existing `knowledge_graph.json` directly to Obsidian, Neo4j, or GraphML without touching Calibre or Ollama:
 
 ```bash
 # 1. Export current graph to ALL destinations (Obsidian, GraphML, and Neo4j):
 bookeeper export
 
-# Clean export (wipes target vault and database before re-exporting current graph):
+# Clean export (purges existing target vault and database before exporting):
 bookeeper export --clean
 
 # 2. Export ONLY to Obsidian Markdown vault:
@@ -182,59 +260,46 @@ bookeeper export-obsidian
 # Clean export to custom Obsidian vault folder:
 bookeeper export-obsidian --clean --vault-dir ~/Documents/ObsidianVault
 
-# 3. Export ONLY to Neo4j (Cypher MERGE upsert):
+# 3. Export ONLY to Neo4j (Cypher MERGE upsert with live progress bar):
 bookeeper export-neo4j
 
-# Clean start (purges existing Neo4j database with DETACH DELETE, then inserts):
+# Clean start (purges existing Neo4j database with DETACH DELETE, then upserts):
 bookeeper export-neo4j --clean
 ```
 
+#### 📊 Live Neo4j Progress Bar
+`export-neo4j` renders a real-time Rich progress display:
+- **Clean Purge**: Displays detached node count when `--clean` is set.
+- **Schema Stage**: Verifies uniqueness constraints and lookup indexes on node labels.
+- **Nodes Stage**: Live progress bar showing active label (e.g. `Upserting Nodes (:Concept)`), item counts (`M of N`), elapsed time, and ETA.
+- **Relationships Stage**: Live progress bar showing active relationship type (e.g. `Upserting Relationships (:DISCUSSES)`), item counts, and ETA.
+
 ---
 
-### 🧩 Decoupled LightRAG Indexing
+### 🗑️ Removing Books from Knowledge Graph
 
-LightRAG performs deep dual-level relation extraction and vector embedding. Decoupling it from book ingestion dramatically speeds up both pipelines:
+Safely remove an unwanted book and all its associated artifacts:
 
 ```bash
-# Phase 1: Ingest books and build graph at full speed (no LightRAG bottleneck):
-bookeeper build-graph --no-lightrag
+# Remove book #42: purges Book node, sections, chunks, and orphan concepts:
+bookeeper remove-book 42
 
-# Phase 2: Build / update LightRAG database from locally cached SSD chunks:
-bookeeper build-rag
-
-# Recreate LightRAG database cleanly from scratch:
-bookeeper build-rag --clean
-
-# Index chunks for a specific book only:
-bookeeper build-rag --book-id 4
+# Remove and refresh custom Obsidian vault destination:
+bookeeper remove-book 42 --export-obsidian ~/Documents/ObsidianVault
 ```
+This command automatically updates `knowledge_graph.json`, clears the book's completed state from `.bookeeper_state.json` (allowing clean re-indexing), and refreshes Obsidian vault notes and GraphML exports.
 
 ---
 
-### 🔍 Querying the Library (LightRAG)
+### 🔬 Factual Grounding Verification & Discrepancy Audit
 
-```bash
-# Hybrid graph + vector search (recommended):
-bookeeper query "What are the core mechanisms of Paxos consensus?"
-
-# Local entity-focused search:
-bookeeper query "Who is Captain Rake?" --mode local
-
-# Global thematic summary:
-bookeeper query "What are the overarching themes of the series?" --mode global
-```
-
----
-
-### 🔬 Factual Verification & Discrepancy Audit
-
-Verify that extracted concepts and ideas in `knowledge_graph.json` are factually grounded and genuinely present in their assigned text chunks using a dedicated verifier model:
+Audit whether extracted concepts in `knowledge_graph.json` are factually grounded in their assigned text chunks using a dedicated verifier model:
 
 ```bash
 # Verify 1% of all ideas using configured dedicated verifier model:
 bookeeper verify
 
-# Custom sample percentage (e.g. 5% or 10%):
+# Custom sample percentage (e.g. 5%):
 bookeeper verify --percent 5.0
 
 # Use a dedicated, more powerful verifier model:
@@ -248,9 +313,33 @@ bookeeper verify --output ./output/audit_report.json --seed 42
 ```
 
 **Verification Output Includes:**
-- **Statistical Summary**: Total ideas in graph, candidate ideas with chunks, sampled ideas, total idea-chunk pairs evaluated, **Verified / Supported %** (Good), and **Discrepancy / Unsupported %** (Failed).
-- **Discrepancy Report Table**: Up to 20 examples of unsupported/hallucinated ideas with chunk location, quote, and detailed explanation of why the text fails to support the idea.
-- **Persistent JSON Report**: Saves the full breakdown (`stats`, `discrepancies`, and `verified_samples`).
+- **Statistical Summary**: Total ideas in graph, candidate ideas with chunks, sampled ideas, evaluated idea-chunk pairs, **Verified / Supported %**, and **Discrepancy / Unsupported %**.
+- **Discrepancy Table**: Detailed examples of unsupported ideas, showing chunk location, quotes, and reason for failure.
+- **Persistent JSON Audit Report**: Saves full breakdown of verified samples and discrepancies.
+
+---
+
+### 🧩 Decoupled LightRAG Indexing & Querying
+
+```bash
+# Build / update LightRAG database from locally cached SSD chunks:
+bookeeper build-rag
+
+# Recreate LightRAG database cleanly from scratch:
+bookeeper build-rag --clean
+
+# Index chunks for a specific book only:
+bookeeper build-rag --book-id 42
+
+# Hybrid graph + vector search (recommended):
+bookeeper query "What are the core mechanisms of Paxos consensus?"
+
+# Local entity-focused search:
+bookeeper query "Who is Captain Rake?" --mode local
+
+# Global thematic summary:
+bookeeper query "What are the overarching themes of the series?" --mode global
+```
 
 ---
 
@@ -272,10 +361,10 @@ bookeeper clean-metadata --limit 10 --dry-run
 # Display Knowledge Graph metrics (nodes, edges, node types, relationship types):
 bookeeper stats
 
-# Show processing checkpoint summary:
+# Show processing checkpoint summary and skipped books count:
 bookeeper status
 
-# Inspect active configuration and server pool:
+# Inspect active configuration and server pool capabilities:
 bookeeper config
 
 # List or search books in the library:
@@ -297,7 +386,7 @@ Every extracted idea and concept is assigned a significance weight on a scale fr
 | **9 – 10** | Specialized / Cutting-Edge | Original, deeply philosophical, or specialized concepts (*e.g.* `SmartRAG`, `Byzantine Fault Tolerant Raft`). |
 
 - **Automatic Merging**: When concepts are deduplicated across chapters or books, the graph retains the maximum observed weight: `max(canonical.weight, incoming.weight)`.
-- **Obsidian Frontmatter**: Notes include `weight: <W>` and the master index [`00_Index.md`](file:///Users/serg/repos/bookeeper/output/obsidian_vault/00_Index.md) is sorted by weight descending.
+- **Obsidian Frontmatter**: Notes include `weight: <W>` and the master index `00_Index.md` is sorted by weight descending.
 - **Neo4j Property**: Stored directly on `:Concept` nodes as `n.weight` for easy Cypher filtering:
   ```cypher
   MATCH (c:Concept) WHERE c.weight >= 7 RETURN c.name, c.weight ORDER BY c.weight DESC

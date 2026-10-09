@@ -26,7 +26,7 @@ class EntityDeduplicator:
     def __init__(
         self,
         embeddings: Optional[Embeddings] = None,
-        similarity_threshold: float = 0.85,
+        similarity_threshold: float = 0.92,
     ):
         self.embeddings = embeddings
         self.similarity_threshold = similarity_threshold
@@ -123,8 +123,6 @@ class EntityDeduplicator:
             canonical.detailed_explanation = incoming.detailed_explanation
         if incoming.brief_description and len(incoming.brief_description) > len(getattr(canonical, "brief_description", "")):
             canonical.brief_description = incoming.brief_description
-        if not getattr(canonical, "supporting_quote", None) and getattr(incoming, "supporting_quote", None):
-            canonical.supporting_quote = incoming.supporting_quote
 
         # If incoming has a significantly richer summary, update canonical summary
         if len(incoming.summary) > len(canonical.summary) + 30:

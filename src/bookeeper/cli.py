@@ -37,7 +37,11 @@ from bookeeper.graph.exporters import GraphMLExporter, Neo4jExporter, ObsidianEx
 from bookeeper.graph.store import ConceptGraphStore
 from bookeeper.processing.chunker import ChunkStore, HierarchicalChunk, HierarchicalChunker
 from bookeeper.processing.deduplicator import EntityDeduplicator
-from bookeeper.processing.extractor import KnowledgeExtractor, SectionExtraction
+from bookeeper.processing.extractor import (
+    KnowledgeExtractor,
+    SectionExtraction,
+    validate_concept_chunk_grounding,
+)
 from bookeeper.processing.ollama_pool import (
     FailoverOllamaEmbeddings,
     OllamaPool,
@@ -2153,19 +2157,36 @@ def build_graph(
                                 book_id=bid,
                                 concept_name=canonical_concept.name,
                             )
-                            store.add_idea_support_link(
+
+                            # Validate textual grounding in this specific chunk
+                            local_brief = (concept.brief_description or "").strip()
+                            local_detailed = (concept.detailed_explanation or "").strip()
+                            is_grounded, valid_quote = validate_concept_chunk_grounding(
                                 concept_name=canonical_concept.name,
-                                chunk=chk,
-                                quote=concept.supporting_quote or canonical_concept.supporting_quote or "",
-                                brief_description=concept.brief_description or canonical_concept.brief_description,
-                                detailed_explanation=concept.detailed_explanation or canonical_concept.detailed_explanation,
+                                supporting_quote=concept.supporting_quote,
+                                chunk_text=chk.text,
+                                brief_description=local_brief or local_detailed,
                             )
-                            store.add_section_concept_link(
-                                section_node_id=sec_node_id,
-                                concept_name=canonical_concept.name,
-                                summary=concept.summary or canonical_concept.summary,
-                                quote=concept.supporting_quote or canonical_concept.supporting_quote or "",
-                            )
+
+                            if is_grounded:
+                                store.add_idea_support_link(
+                                    concept_name=canonical_concept.name,
+                                    chunk=chk,
+                                    quote=valid_quote,
+                                    brief_description=local_brief,
+                                    detailed_explanation=local_detailed,
+                                )
+                                store.add_section_concept_link(
+                                    section_node_id=sec_node_id,
+                                    concept_name=canonical_concept.name,
+                                    summary=concept.summary,
+                                    quote=valid_quote,
+                                )
+                            else:
+                                logger.debug(
+                                    f"Skipping ungrounded concept link '{canonical_concept.name}' on chunk {chk.chunk_id} "
+                                    f"(neither quote nor concept name present in chunk text)"
+                                )
                             for rel_name in canonical_concept.related_concepts:
                                 store.add_concept_relation(
                                     src_concept_name=canonical_concept.name,

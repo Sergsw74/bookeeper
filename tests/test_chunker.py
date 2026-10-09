@@ -620,6 +620,72 @@ def test_hierarchical_chunker_embedding_stats_delegation():
     mock_emb.reset_stats.assert_called_once()
 
 
+def test_validate_concept_chunk_grounding_cases():
+    """Verify validate_concept_chunk_grounding correctly accepts or rejects concept-chunk pairs."""
+    from bookeeper.processing.extractor import validate_concept_chunk_grounding
+
+    chunk_text = (
+        "Earlier that day, whilst Captain Rake and his column were inside the Pygmy shrew dwelling, "
+        "the storm broke out over the sea. The purple-grey cloudbanks released a veritable deluge of rainwater."
+    )
+
+    # 1. Exact quote present in chunk
+    grounded, quote = validate_concept_chunk_grounding(
+        concept_name="Stormy Seas",
+        supporting_quote="the storm broke out over the sea",
+        chunk_text=chunk_text,
+    )
+    assert grounded is True
+    assert quote == "the storm broke out over the sea"
+
+    # 2. Rephrased quote with significant word overlap (>= 50%)
+    grounded, quote = validate_concept_chunk_grounding(
+        concept_name="Stormy Seas",
+        supporting_quote="A storm broke out violently over the sea with cloudbanks",
+        chunk_text=chunk_text,
+    )
+    assert grounded is True
+    assert quote != ""
+
+    # 3. Completely bogus/hallucinated quote and concept name absent from chunk
+    rug_chunk = "How do we get into the confounded place? The little empraking kicked the bundle of rugs."
+    grounded, quote = validate_concept_chunk_grounding(
+        concept_name="Stormy Seas",
+        supporting_quote="the storm broke out over the sea",
+        chunk_text=rug_chunk,
+    )
+    assert grounded is False
+    assert quote == ""
+
+    # 4. Bogus quote but concept name IS mentioned in the chunk
+    grounded, quote = validate_concept_chunk_grounding(
+        concept_name="Bundle of Rugs",
+        supporting_quote="this quote does not exist anywhere",
+        chunk_text=rug_chunk,
+    )
+    assert grounded is True
+    assert quote == ""  # Quote stripped because it was inaccurate
+
+    # 5. No quote provided, but concept name keywords appear in chunk
+    grounded, quote = validate_concept_chunk_grounding(
+        concept_name="Rainwater Deluge",
+        supporting_quote="",
+        chunk_text=chunk_text,
+    )
+    assert grounded is True
+    assert quote == ""
+
+    # 6. No quote provided, and concept has zero keywords in chunk
+    grounded, quote = validate_concept_chunk_grounding(
+        concept_name="Graffiti",
+        supporting_quote="",
+        chunk_text=chunk_text,
+    )
+    assert grounded is False
+    assert quote == ""
+
+
+
 
 
 

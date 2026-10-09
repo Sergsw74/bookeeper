@@ -4,10 +4,11 @@ LangChain structured output schemas and Ollama extraction chains for book metada
 
 import json
 import logging
+import re
 import shutil
 import subprocess
 import urllib.request
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
@@ -128,6 +129,77 @@ class SectionExtraction(BaseModel):
         default_factory=list,
         description="List of technical ideas, concepts, and architectural patterns discussed.",
     )
+
+
+def validate_concept_chunk_grounding(
+    concept_name: str,
+    supporting_quote: Optional[str],
+    chunk_text: str,
+    brief_description: str = "",
+) -> Tuple[bool, str]:
+    """
+    Validate whether an extracted concept has genuine textual grounding in chunk_text.
+    Returns (is_grounded, validated_quote).
+
+    - If supporting_quote is present and grounded in chunk_text -> (True, supporting_quote)
+    - If supporting_quote is present but ungrounded in chunk_text:
+        - If concept_name or brief_description has keyword overlap in chunk -> (True, "") [strip bogus quote]
+        - If neither quote nor concept has any presence in chunk -> (False, "") [omit false link]
+    - If supporting_quote is not provided:
+        - If concept_name or brief_description has keywords in chunk -> (True, "")
+        - Otherwise -> (False, "")
+    """
+    if not chunk_text:
+        return False, ""
+
+    t_clean = BookParser.repair_mojibake(chunk_text).lower()
+    t_words = set(re.findall(r"\w{3,}", t_clean))
+
+    raw_quote = (supporting_quote or "").strip()
+    quote_grounded = False
+    valid_quote = ""
+
+    if raw_quote:
+        clean_q = BookParser.repair_mojibake(raw_quote)
+        q_lower = clean_q.lower()
+        # 1. Exact or normalized whitespace substring check
+        if " ".join(q_lower.split()) in " ".join(t_clean.split()):
+            quote_grounded = True
+            valid_quote = clean_q
+        else:
+            # 2. Significant word overlap check (ignoring tiny punctuation differences)
+            q_words = set(re.findall(r"\w{4,}", q_lower))
+            if not q_words:
+                q_words = set(re.findall(r"\w{3,}", q_lower))
+            if q_words and t_words:
+                overlap = len(q_words & t_words) / len(q_words)
+                if overlap >= 0.5:
+                    quote_grounded = True
+                    valid_quote = clean_q
+
+    name_clean = BookParser.repair_mojibake(concept_name).lower()
+    name_words = set(re.findall(r"\w{3,}", name_clean))
+    name_overlap = bool(name_words & t_words)
+
+    desc_words = set(re.findall(r"\w{4,}", (brief_description or "").lower()))
+    desc_overlap = bool(desc_words and len(desc_words & t_words) >= 2)
+
+    if quote_grounded:
+        return True, valid_quote
+
+    # Quote was provided but failed grounding
+    if raw_quote:
+        if name_overlap or desc_overlap:
+            # Concept itself appears in chunk, but the quote was inaccurate -> keep concept without quote
+            return True, ""
+        # Both quote and concept name/description are completely absent
+        return False, ""
+
+    # No quote was provided
+    if name_overlap or desc_overlap:
+        return True, ""
+
+    return False, ""
 
 
 # ==============================================================================

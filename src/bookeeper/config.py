@@ -2,6 +2,7 @@
 Configuration management for bookeeper using pydantic-settings.
 """
 
+import logging
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -14,6 +15,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 VALID_CAPABILITIES = {"llm", "embedding", "verification"}
 DEFAULT_CAPABILITIES = ["llm", "embedding", "verification"]
+
+logger = logging.getLogger(__name__)
 
 
 class OllamaServerConfig(BaseModel):
@@ -615,7 +618,7 @@ def get_settings(config_path: Optional[str] = None) -> Settings:
         if p.is_file():
             try:
                 return Settings.from_yaml(p)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Could not load configuration from '{p}': {e}. Using default settings or next candidate.")
 
     return Settings()

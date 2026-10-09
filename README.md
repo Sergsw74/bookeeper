@@ -129,7 +129,8 @@ request_timeout: 30                 # HTTP timeout in seconds per LLM call
 max_retries: 1                     # Retries per attempt on an Ollama server
 max_chunk_attempts: 6              # Maximum total retry attempts across pool for a stalled chunk
 
-# Dedicated Embeddings Endpoint (Local Mac or separate node)
+# Embeddings Configuration: Dedicated Endpoint or Cluster Pool
+# Use "http://localhost:11434" for dedicated local Mac offloading, or "pool" to share cluster nodes
 embedding_base_url: "http://localhost:11434"
 embedding_model: "nomic-embed-text"
 
@@ -187,8 +188,10 @@ verification:
   - `verification`: Factual grounding audits (`bookeeper verify`).
   - Tasks are dispatched strictly to alive nodes that support the required capability.
 - **Priority Failover**: Servers are ordered by priority (1 is highest). If a node fails, it enters a temporary cooldown (`failover_cooldown_seconds`), automatically diverting traffic to surviving nodes.
-- **Dedicated Embeddings Offloading**: Offloading embeddings to a dedicated endpoint (`embedding_base_url`, such as a local Apple Silicon Mac) prevents remote GPU servers from unloading their LLM from VRAM to run embedding models, eliminating model-swapping latency.
-- **Parallel Task Pool & Real-Time Metrics**: Dynamically manages request pipelines and displays live terminal metrics: `active workers`, `avg latency`, `p80 latency`, and `fastest node`.
+- **Dedicated Offloading vs. Cluster Pool for Embeddings**:
+  - **Dedicated Offloading (`embedding_base_url: "http://localhost:11434"`)**: Offloading embeddings to a dedicated endpoint (such as a local Apple Silicon Mac) prevents remote GPU servers from unloading their LLM from VRAM to run embedding models, eliminating model-swapping latency.
+  - **Cluster Pool Mode (`embedding_base_url: "pool"`)**: If you prefer distributing embeddings across your network cluster, set `embedding_base_url: pool` (or pass `--embedding-url pool`). Embeddings will be load-balanced across all nodes advertising the `embedding` capability in `ollama_servers`.
+- **Parallel Task Pool & Real-Time Metrics**: Dynamically manages request pipelines, displays live terminal metrics (`active workers`, `avg latency`, `p80 latency`, `fastest node`), and logs per-node effort breakdowns (tasks, valuable characters, durations) at job completion.
 
 ---
 
@@ -291,19 +294,22 @@ This command automatically updates `knowledge_graph.json`, clears the book's com
 
 ---
 
-### 🔬 Factual Grounding Verification & Discrepancy Audit
+### 🔬 Verification & Auditing (`bookeeper verify`)
 
-Audit whether extracted concepts in `knowledge_graph.json` are factually grounded in their assigned text chunks using a dedicated verifier model:
+`bookeeper verify` supports **two distinct verification modes**:
+
+#### 1. Mode 1: Ideas Grounding Audit (`--mode ideas`, Default)
+Audits whether extracted concepts and relationships in `knowledge_graph.json` are factually grounded in their assigned text chunks using a dedicated, powerful LLM verifier model (e.g. `gemma4:12b`, `qwen2.5:14b-instruct`, `llama3.1:8b`).
 
 ```bash
-# Verify 1% of all ideas using configured dedicated verifier model:
+# Verify 1% of all ideas using configured verifier model (default mode):
 bookeeper verify
 
 # Custom sample percentage (e.g. 5%):
-bookeeper verify --percent 5.0
+bookeeper verify --mode ideas --percent 5.0
 
-# Use a dedicated, more powerful verifier model:
-bookeeper verify --model "qwen2.5:14b-instruct" --percent 2.0
+# Use a dedicated, more capable verifier model:
+bookeeper verify --mode ideas --model "gemma4:12b" --percent 2.0
 
 # Limit discrepancy examples shown in terminal (default: up to 20):
 bookeeper verify --max-examples 10
@@ -312,10 +318,35 @@ bookeeper verify --max-examples 10
 bookeeper verify --output ./output/audit_report.json --seed 42
 ```
 
-**Verification Output Includes:**
+**What Ideas Mode Evaluates:**
+- **Two-Line Live Status**: Real-time progress bar displaying current idea/book, ETA, task rate, and verified support percentage.
 - **Statistical Summary**: Total ideas in graph, candidate ideas with chunks, sampled ideas, evaluated idea-chunk pairs, **Verified / Supported %**, and **Discrepancy / Unsupported %**.
-- **Discrepancy Table**: Detailed examples of unsupported ideas, showing chunk location, quotes, and reason for failure.
-- **Persistent JSON Audit Report**: Saves full breakdown of verified samples and discrepancies.
+- **Discrepancy Table**: Rich table of unsupported ideas displaying chunk location, quotes, and reasoning.
+- **Server Effort Statistics**: Breakdown of tasks, throughput, durations, and valuable characters processed across each Ollama server.
+
+---
+
+#### 2. Mode 2: Semantic Chunking Coherence (`--mode chunking`)
+Verifies semantic chunk coherence and boundary accuracy using incremental sentence expansion embeddings (smart chunking). Tests whether adding subsequent sentences into a chunk maintains cosine distance within accepted thresholds, shows distance distributions across chunks, and validates that stored chunks match smart semantic boundaries.
+
+```bash
+# Verify chunking coherence for a specific book by Calibre ID:
+bookeeper verify --mode chunking --book-id 42
+
+# Verify chunking coherence across all stored books:
+bookeeper verify --mode chunking --all
+
+# Custom cosine distance threshold for semantic expansion (default: 0.20):
+bookeeper verify --mode chunking --book-id 42 --threshold 0.18
+
+# Specify dedicated embedding model or endpoint:
+bookeeper verify --mode chunking --book-id 42 --embedding-model "nomic-embed-text" --embedding-url "http://localhost:11434"
+```
+
+**What Chunking Mode Evaluates:**
+- **Boundary Precision**: Confirms sentence-to-chunk cosine distances remain within the expected semantic threshold (`--threshold`, default: `0.20`).
+- **Distance Distribution**: Visualizes mean, min, max, and outlier semantic drift distances across chapters and chunks.
+- **Cache Consistency**: Verifies that serialized chunks in `output/chunks/` correspond directly to smart semantic boundaries.
 
 ---
 

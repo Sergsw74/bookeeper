@@ -11,9 +11,12 @@ from bookeeper.processing.extractor import (
     SectionExtraction,
 )
 
+from bookeeper.processing.rolling_semantic_chunker import RollingWindowSemanticChunker
+
 __all__ = [
     "HierarchicalChunk",
     "HierarchicalChunker",
+    "RollingWindowSemanticChunker",
     "BookMetadata",
     "Concept",
     "SectionExtraction",

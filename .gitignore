@@ -67,6 +67,7 @@ calibre_test_db/
 config.yaml
 data/
 output/
+ab_test_runs/
 obsidian_vault/
 graph_exports/
 logs/

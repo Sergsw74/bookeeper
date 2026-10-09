@@ -446,3 +446,85 @@ def test_staged_database_reuse_on_resume(tmp_path: Path):
     assert CalibreClient._verify_sqlite_integrity(staged_file) is True
 
 
+def test_client_export_book_format_fallback(tmp_path: Path):
+    """Verify that export_book automatically picks available non-EPUB formats like TXT and PDF."""
+    lib_dir = tmp_path / "calibre_lib"
+    lib_dir.mkdir()
+    db_file = lib_dir / "metadata.db"
+
+    conn = sqlite3.connect(str(db_file))
+    conn.executescript("""
+        CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, path TEXT);
+        CREATE TABLE data (id INTEGER PRIMARY KEY, book INTEGER, format TEXT, name TEXT);
+    """)
+    # Book 1: only TXT
+    conn.execute("INSERT INTO books (id, title, path) VALUES (1, 'Text Notes', 'Author/Notes (1)')")
+    conn.execute("INSERT INTO data (id, book, format, name) VALUES (1, 1, 'TXT', 'Notes - Author')")
+    # Book 2: only PDF
+    conn.execute("INSERT INTO books (id, title, path) VALUES (2, 'System PDF', 'Author/System (2)')")
+    conn.execute("INSERT INTO data (id, book, format, name) VALUES (2, 2, 'PDF', 'System - Author')")
+    conn.commit()
+    conn.close()
+
+    # Create dummy files
+    book1_dir = lib_dir / "Author" / "Notes (1)"
+    book1_dir.mkdir(parents=True)
+    (book1_dir / "Notes - Author.txt").write_text("Chapter 1: Intro\nSome sample content.", encoding="utf-8")
+
+    book2_dir = lib_dir / "Author" / "System (2)"
+    book2_dir.mkdir(parents=True)
+    (book2_dir / "System - Author.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+
+    client = CalibreClient(library_path=str(lib_dir), calibredb_bin="non_existent_binary")
+    out_dir = tmp_path / "exported"
+
+    # Export without specifying fmt -> should automatically pick TXT for Book 1
+    exp1 = client.export_book(1, target_dir=out_dir)
+    assert exp1 is not None
+    assert exp1.suffix.lower() == ".txt"
+    assert exp1.is_file()
+
+    # Export Book 2 -> should automatically pick PDF
+    exp2 = client.export_book(2, target_dir=out_dir)
+    assert exp2 is not None
+    assert exp2.suffix.lower() == ".pdf"
+    assert exp2.is_file()
+
+
+def test_book_parser_txt_and_sections(tmp_path: Path):
+    """Verify BookParser parses TXT files and creates structured sections."""
+    from bookeeper.calibre.parser import BookParser
+
+    txt_file = tmp_path / "sample.txt"
+    txt_file.write_text(
+        "Chapter 1: The Beginning\nThis is the first chapter text.\n\n"
+        "Chapter 2: The Next Step\nThis is the second chapter text.",
+        encoding="utf-8",
+    )
+
+    sections = BookParser.parse(txt_file)
+    assert len(sections) == 2
+    assert "Chapter 1" in sections[0].title
+    assert "first chapter" in sections[0].text
+    assert "Chapter 2" in sections[1].title
+    assert "second chapter" in sections[1].text
+
+
+def test_export_book_reuses_cached_target_dir_file(tmp_path: Path):
+    """Verify export_book reuses existing exported file in target_dir even if source db/smb is offline."""
+    out_dir = tmp_path / "calibre_ingest"
+    out_dir.mkdir(parents=True)
+    cached_file = out_dir / "4_The Rogue Crew_ A Tale of Redwall - Brian Jacques.epub"
+    cached_file.write_text("dummy epub content", encoding="utf-8")
+
+    # Client pointing to a non-existent SMB path with no metadata.db
+    client = CalibreClient(library_path=str(tmp_path / "non_existent_smb_share"), calibredb_bin="non_existent")
+
+    # Should hit local target_dir cache immediately
+    resolved = client.export_book(4, target_dir=out_dir)
+    assert resolved == cached_file
+    assert resolved.is_file()
+
+
+
+

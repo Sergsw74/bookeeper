@@ -7,12 +7,13 @@ import logging
 import shutil
 import subprocess
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 from pydantic import BaseModel, Field, model_validator
 
+from bookeeper.calibre.parser import BookParser
 from bookeeper.config import Settings
 from bookeeper.processing.ollama_pool import OllamaPool
 
@@ -36,6 +37,15 @@ class BookMetadata(BaseModel):
     summary: str = Field(
         description="Concise catalog blurb (2-4 sentences) summarizing the book's core premise, subject, or technical themes."
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def sanitize_metadata(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            for fld in ("title", "author", "summary"):
+                if fld in data and isinstance(data[fld], str):
+                    data[fld] = BookParser.repair_mojibake(data[fld])
+        return data
 
 
 class Concept(BaseModel):
@@ -64,11 +74,32 @@ class Concept(BaseModel):
         default_factory=list,
         description="List of related idea/concept names discussed in connection with this idea.",
     )
+    weight: int = Field(
+        default=5,
+        ge=0,
+        le=10,
+        description=(
+            "Significance, depth, and specificity weight from 0 to 10. "
+            "0-2: very basic/generic concepts (e.g. 'Identification', 'Storage', 'Process', weight=0). "
+            "3-5: less generic, valuable foundational concepts (e.g. 'Risk Assessment', weight=3; 'Load Balancing', weight=4). "
+            "6-8: specific, advanced architectural approaches or paradigms (e.g. 'RAG', weight=7; 'Event Sourcing', weight=7). "
+            "9-10: highly specific, novel, or deep architectural/philosophical concepts (e.g. 'SmartRAG', weight=9; 'Deterministic Simulation Testing', weight=10)."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod
     def populate_descriptions(cls, data: Any) -> Any:
         if isinstance(data, dict):
+            for k in ("name", "brief_description", "detailed_explanation", "category", "supporting_quote", "summary"):
+                if k in data and isinstance(data[k], str):
+                    data[k] = BookParser.repair_mojibake(data[k])
+            if "related_concepts" in data and isinstance(data["related_concepts"], list):
+                data["related_concepts"] = [
+                    BookParser.repair_mojibake(c) if isinstance(c, str) else c
+                    for c in data["related_concepts"]
+                ]
+
             # If 'summary' was provided instead of brief/detailed descriptions
             if "summary" in data and not data.get("brief_description"):
                 data["brief_description"] = data["summary"]
@@ -76,6 +107,12 @@ class Concept(BaseModel):
                 data["detailed_explanation"] = data["brief_description"]
             if not data.get("brief_description") and data.get("detailed_explanation"):
                 data["brief_description"] = data["detailed_explanation"]
+            if "weight" in data:
+                try:
+                    w = int(data["weight"])
+                    data["weight"] = max(0, min(10, w))
+                except (ValueError, TypeError):
+                    data["weight"] = 5
         return data
 
     @property
@@ -108,10 +145,16 @@ class KnowledgeExtractor:
         temperature: float = 0.0,
         pool: Optional[OllamaPool] = None,
         cooldown_seconds: int = 600,
+        request_timeout: int = 30,
+        max_retries: int = 1,
+        fallback_model: Optional[str] = None,
     ):
         self.model_name = model
+        self.fallback_model = fallback_model
         self.temperature = temperature
         self.cooldown_seconds = cooldown_seconds
+        self.request_timeout = request_timeout
+        self.max_retries = max_retries
 
         if pool is not None:
             self.pool = pool
@@ -129,33 +172,134 @@ class KnowledgeExtractor:
         settings: Settings,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
+        fallback_model: Optional[str] = None,
     ) -> "KnowledgeExtractor":
         if base_url:
             urls = [u.strip() for u in base_url.split(",") if u.strip()]
-            pool = OllamaPool.from_urls(urls, cooldown_seconds=settings.failover_cooldown_seconds)
-        else:
-            pool = OllamaPool(
-                servers=settings.resolved_ollama_servers,
+            pool = OllamaPool.from_urls(
+                urls,
                 cooldown_seconds=settings.failover_cooldown_seconds,
+                max_tasks_per_server=1,  # Strictly sequential per Ollama server: no mutual execution
+            )
+        else:
+            servers = getattr(settings, "resolved_llm_servers", None) or settings.resolved_ollama_servers
+            pool = OllamaPool(
+                servers=servers,
+                cooldown_seconds=settings.failover_cooldown_seconds,
+                max_tasks_per_server=1,  # Strictly sequential per Ollama server: no mutual execution
             )
         return cls(
             pool=pool,
             model=model or settings.llm_model,
+            fallback_model=fallback_model or settings.llm_model_fallback,
             cooldown_seconds=settings.failover_cooldown_seconds,
+            request_timeout=getattr(settings, "request_timeout", 30),
+            max_retries=getattr(settings, "max_retries", 1),
         )
 
-    def _execute_structured_invoke(self, schema_cls: Any, messages: Any) -> Any:
-        """Execute structured output invocation with multi-server failover."""
-        def _invoke(url: str):
-            llm = ChatOllama(
-                base_url=url,
-                model=self.model_name,
-                temperature=self.temperature,
-            )
-            chain = llm.with_structured_output(schema_cls)
-            return chain.invoke(messages)
+    def _execute_structured_invoke(
+        self,
+        schema_cls: Any,
+        messages: Any,
+        retries: Optional[int] = None,
+        quarantine_server: bool = True,
+        exclude_urls: Optional[Set[str]] = None,
+        model: Optional[str] = None,
+    ) -> Any:
+        """Execute structured output invocation with multi-server failover, timeout, and retries."""
+        timeout_sec = str(self.request_timeout)
+        timeout_float = float(self.request_timeout)
+        effective_model = model or self.model_name
 
-        return self.pool.execute_with_failover(_invoke)
+        def _invoke(url: str):
+            # 1. Direct curl invocation with format="json" for maximum reliability with Ollama
+            if shutil.which("curl"):
+                try:
+                    msgs_payload = []
+                    for m in messages:
+                        role = "user"
+                        if hasattr(m, "type"):
+                            role = "system" if m.type == "system" else "user"
+                        content = getattr(m, "content", str(m))
+                        msgs_payload.append({"role": role, "content": content})
+
+                    body = {
+                        "model": effective_model,
+                        "messages": msgs_payload,
+                        "format": "json",
+                        "options": {
+                            "temperature": self.temperature,
+                            "top_p": 0.9,
+                        },
+                        "stream": False,
+                    }
+                    cmd = [
+                        "curl",
+                        "-s",
+                        "--max-time",
+                        timeout_sec,
+                        "-X",
+                        "POST",
+                        "-H",
+                        "Content-Type: application/json",
+                        "-d",
+                        json.dumps(body),
+                        f"{url.rstrip('/')}/api/chat",
+                    ]
+                    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                    if res.returncode == 0 and res.stdout.strip():
+                        data = json.loads(res.stdout)
+                        content = data.get("message", {}).get("content", "")
+                        if "<think>" in content and "</think>" in content:
+                            content = content.split("</think>")[-1].strip()
+                        if content and content.strip():
+                            content = content.strip()
+                            if content.startswith("```json"):
+                                content = content[7:]
+                            elif content.startswith("```"):
+                                content = content[3:]
+                            if content.endswith("```"):
+                                content = content[:-3]
+                            content = content.strip()
+                            if hasattr(schema_cls, "model_validate_json"):
+                                return schema_cls.model_validate_json(content)
+                            return json.loads(content)
+                    elif res.returncode == 28:
+                        raise TimeoutError(f"Ollama request to {url}/api/chat timed out after {timeout_sec}s")
+                    elif res.returncode != 0:
+                        logger.debug(f"Direct curl format=json returned non-zero code {res.returncode}")
+                    elif res.returncode != 0:
+                        logger.debug(f"Direct curl format=json returned non-zero code {res.returncode}")
+                except TimeoutError:
+                    raise
+                except Exception as curl_err:
+                    logger.debug(f"Direct curl format=json invoke failed: {curl_err}")
+
+            # 2. Fallback to ChatOllama structured output chain with strict timeout
+            try:
+                # Clean sampling parameters: pass only valid parameters (no mirostat, mirostat_eta, mirostat_tau, or tfs_z)
+                llm = ChatOllama(
+                    base_url=url,
+                    model=effective_model,
+                    temperature=self.temperature,
+                    top_p=0.9,
+                    sync_client_kwargs={"timeout": timeout_float},
+                    client_kwargs={"timeout": timeout_float},
+                )
+                chain = llm.with_structured_output(schema_cls)
+                return chain.invoke(messages)
+            except Exception as exc:
+                raise exc
+
+        return self.pool.execute_with_failover(
+            _invoke,
+            retries=self.max_retries if retries is None else retries,
+            max_task_duration=max(60.0, 2.5 * self.request_timeout),
+            model_name=effective_model,
+            quarantine_server=quarantine_server,
+            exclude_urls=exclude_urls,
+            capability="llm",
+        )
 
     def clean_metadata(
         self,
@@ -164,6 +308,8 @@ class KnowledgeExtractor:
         raw_comments: Optional[str] = None,
         content_sample: Optional[str] = None,
         file_hint: Optional[str] = None,
+        retries: Optional[int] = None,
+        model: Optional[str] = None,
     ) -> BookMetadata:
         """Clean and normalize title, authors, and summary blurb using content sampling."""
         from bookeeper.calibre.parser import BookParser
@@ -215,7 +361,7 @@ class KnowledgeExtractor:
         ]
 
         try:
-            result = self._execute_structured_invoke(BookMetadata, messages)
+            result = self._execute_structured_invoke(BookMetadata, messages, retries=retries, model=model)
             if isinstance(result, BookMetadata):
                 result.title = BookParser.repair_mojibake(result.title)
                 result.author = BookParser.repair_mojibake(result.author)
@@ -242,6 +388,11 @@ class KnowledgeExtractor:
         section_title: str,
         subtitle: Optional[str] = None,
         parent_context: Optional[str] = None,
+        retries: Optional[int] = None,
+        quarantine_server: bool = True,
+        exclude_urls: Optional[Set[str]] = None,
+        raise_on_error: bool = False,
+        model: Optional[str] = None,
     ) -> SectionExtraction:
         """
         Extract canonical domain ideas, principles, patterns, and their relationships
@@ -249,25 +400,64 @@ class KnowledgeExtractor:
         Supports parent macro context for hierarchical RAG understanding.
         """
         system_text = (
-            "You are an expert technical knowledge extractor and concept ontologist. "
-            "Extract canonical ideas, principles, patterns, and theoretical mechanisms discussed in the text.\n"
-            "For each idea:\n"
-            "- 'name': concise canonical title (2-4 words, e.g. 'Consistent Hashing', 'Two-Phase Commit', 'Event Sourcing').\n"
-            "- 'brief_description': 1-2 sentence high-level definition of the idea.\n"
-            "- 'detailed_explanation': thorough multi-sentence technical explanation of how the idea functions, its mechanisms, and tradeoffs.\n"
-            "- 'category': classification (e.g. 'Architectural Pattern', 'System Design Principle', 'Data Structure', 'Algorithm', 'Design Tradeoff').\n"
-            "- 'supporting_quote': direct concise sentence from the text directly stating or supporting this idea.\n"
-            "- 'related_concepts': list of related idea names discussed in relation to this idea."
+            "You are an expert knowledge extractor, domain ontologist, and conceptual analyst.\n"
+            "Your objective is to identify and extract 1 to 5 canonical ideas, concepts, themes, principles, "
+            "strategies, lore elements, or domain mechanisms present in the provided text.\n\n"
+            "EXTRACTION GUIDELINES:\n"
+            "1. GROUNDING & EVIDENCE:\n"
+            "   - All extracted concepts must be directly grounded in the Target Text.\n"
+            "   - 'supporting_quote': MUST be an exact, verbatim sentence or phrase from the Target Text supporting the concept.\n"
+            "   - Only return an empty list (\"concepts\": []) if the excerpt is purely administrative boilerplate (e.g. copyright notices, table of contents, ISBNs, page numbers).\n\n"
+            "2. DOMAIN-APPROPRIATE CONCEPTS:\n"
+            "   - For narrative literature & fiction: extract literary themes, character motifs, lore principles, tactical strategies, alliances, conflicts, cultural customs, or mythical concepts.\n"
+            "   - For technical & engineering works: extract architectural patterns, algorithms, system principles, data structures, tradeoffs, or protocols.\n"
+            "   - For general non-fiction: extract organizational principles, mental models, historical dynamics, or sociological concepts.\n"
+            "   - Negative Rule: Do NOT artificially label narrative fiction events as technical engineering concepts (e.g. do not label character accidents as 'System Design Principle').\n\n"
+            "3. SCHEMA REQUIREMENTS:\n"
+            "   - 'name': Concise canonical title (2-4 words, capitalized noun phrase, e.g. 'Tactical Ambush', 'Divination Ritual', 'Consistent Hashing').\n"
+            "   - 'brief_description': 1-2 sentence definition of the concept in context.\n"
+            "   - 'detailed_explanation': Thorough explanation of how the concept functions, its mechanism, role, and nuances.\n"
+            "   - 'category': Domain category (e.g. Tactical Strategy, Thematic Motif, Lore Concept, Architectural Pattern, Ethical Principle).\n"
+            "   - 'supporting_quote': Exact verbatim quote from the text.\n"
+            "   - 'related_concepts': List of related concept names.\n"
+            "   - 'weight': Significance score from 1 to 10 (1-3: basic mention; 4-6: prominent recurring concept or motif; 7-10: major defining pillar or core paradigm).\n\n"
+            "You MUST output valid JSON matching this schema:\n"
+            "{\n"
+            '  "concepts": [\n'
+            "    {\n"
+            '      "name": "...",\n'
+            '      "brief_description": "...",\n'
+            '      "detailed_explanation": "...",\n'
+            '      "category": "...",\n'
+            '      "supporting_quote": "...",\n'
+            '      "related_concepts": ["..."],\n'
+            '      "weight": 5\n'
+            "    }\n"
+            "  ]\n"
+            "}"
         )
+
+        book_title = BookParser.repair_mojibake(book_title)
+        section_title = BookParser.repair_mojibake(section_title)
+        subtitle = BookParser.repair_mojibake(subtitle) if subtitle else ""
+        text = BookParser.repair_mojibake(text)
+        if parent_context:
+            parent_context = BookParser.repair_mojibake(parent_context)
 
         loc = f"Book: '{book_title}'\nSection/Chapter: '{section_title}'"
         if subtitle and subtitle != section_title:
             loc += f"\nSubsection/Subtitle: '{subtitle}'"
 
         human_text = f"{loc}\n\n"
+        human_text += (
+            f"Target Text for Idea Extraction (MANDATORY: All concepts and verbatim quotes must come strictly from this text):\n"
+            f"\"\"\"\n{text[:4000]}\n\"\"\"\n"
+        )
         if parent_context and parent_context != text:
-            human_text += f"Parent Context (Macro Passage):\n\"\"\"\n{parent_context[:2000]}\n\"\"\"\n\n"
-        human_text += f"Target Text for Idea Extraction:\n\"\"\"\n{text[:4000]}\n\"\"\"\n"
+            human_text += (
+                f"\nBackground Context (Surrounding passage provided ONLY for narrative orientation - DO NOT extract concepts or quotes from here):\n"
+                f"\"\"\"\n{parent_context[:2000]}\n\"\"\"\n"
+            )
 
         messages = [
             SystemMessage(content=system_text),
@@ -275,11 +465,20 @@ class KnowledgeExtractor:
         ]
 
         try:
-            result = self._execute_structured_invoke(SectionExtraction, messages)
+            result = self._execute_structured_invoke(
+                SectionExtraction,
+                messages,
+                retries=retries,
+                quarantine_server=quarantine_server,
+                exclude_urls=exclude_urls,
+                model=model,
+            )
             if isinstance(result, SectionExtraction):
                 return result
             return SectionExtraction(**dict(result))
         except Exception as e:
+            if raise_on_error:
+                raise
             logger.warning(f"Section extraction LLM call failed across all pool servers for '{section_title}': {e}")
             return SectionExtraction(concepts=[])
 

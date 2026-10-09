@@ -16,33 +16,54 @@ calibre_password: null
 stage_metadata_db: true
 backup_metadata_db: true
 
-# Remote or Local Ollama LLM & Embeddings Configuration
+# Remote or Local Ollama LLM Configuration
 # For single-server setups, set ollama_base_url:
 ollama_base_url: "http://192.168.50.15:11434"
-llm_model: "llama3.1:8b"
+llm_model: "qwen2.5:3b"
+llm_model_fallback: "llama3.1:8b"   # Optional fallback LLM model switched to after 50% chunk retries
+request_timeout: 30       # HTTP timeout in seconds for LLM calls (prevents stuck workers)
+max_retries: 1           # Retries for an attempt on an Ollama server before failover/skip (default: 1)
+max_chunk_attempts: 6    # Maximum attempts across pool for a stalled chunk before marking failed (default: 6)
+
+# Dedicated local or remote Embeddings endpoint (Recommended for maximum performance)
+# Offloading embeddings to your local machine (e.g. Apple Silicon Mac on http://localhost:11434)
+# prevents the remote Ollama server from unloading llama3.1 from VRAM to run nomic-embed-text,
+# eliminating multi-second model-swapping latency and network delays.
+# Set to "pool" (or leave null) to share the LLM multi-server pool for embeddings.
+embedding_base_url: "http://localhost:11434"
 embedding_model: "nomic-embed-text"
 
-# Multi-server failover pool (N servers with priority ordering)
-# If defined, requests route to the highest priority available server (lowest number = highest priority).
-# If a server request fails, execution immediately fails over to the next priority server.
-# After failover_cooldown_seconds (default 600s / 10 min), bookeeper probes the previously failed server again.
+# Multi-server failover pool (N servers with priority ordering and capabilities)
+# Each node can specify its capabilities: 'llm', 'embedding', 'verification'.
+# If capability is omitted, the node supports all three tasks by default.
+# Requests route to the highest priority available server matching the required task capability.
 ollama_servers:
-  - url: "http://192.168.50.15:11434"
+  - url: "http://192.168.50.118:11434"
     priority: 1
-    name: "primary-gpu-node"
-  - url: "http://192.168.50.20:11434"
+    name: "mypc-gpu-node"
+    capability: ["llm", "embedding", "verification"]
+  - url: "http://192.168.50.15:11434"
     priority: 2
-    name: "secondary-backup-node"
+    name: "primary-gpu-node"
+    capability: ["llm", "embedding"]
+  - url: "http://localhost:11434"
+    priority: 4
+    name: "mac-node"
+    capability: ["llm", "embedding"]
+  - url: "http://192.168.50.20:11434"
+    priority: 10
+    name: "secondary-cpu-node"
+    capability: ["embedding"]
 
 failover_cooldown_seconds: 600
 
 # Parallel Task Pool across available Ollama servers
-# Concurrency auto-scales across all alive servers simultaneously:
-#   low active tasks = number of alive servers (1x per server)
-#   max active tasks by default = 3x alive servers (up to 10 active tasks)
+# Concurrency auto-scales across all alive servers (sequential 1 task per server):
+#   active tasks = number of alive servers (1x per server)
+#   Ollama processes data sequentially per server; tasks are submitted one by one per server
 # Set max_active_tasks to an integer to fix concurrency, or leave null for auto-scaling
 max_active_tasks: null
-tasks_per_server: 3
+tasks_per_server: 1
 max_active_tasks_cap: 10
 
 # Entity resolution cosine similarity threshold (0.0 - 1.0)
@@ -53,3 +74,42 @@ output_dir: "./output"
 
 # Optional path for progress checkpoint state file (defaults to output_dir/.bookeeper_state.json)
 state_file: null
+
+# ==============================================================================
+# LightRAG Engine Configuration
+# ==============================================================================
+# Fast incremental graph-enhanced indexing and dual-level (local/global/hybrid) retrieval.
+# Automatically distributes LLM synthesis and nomic-embed-text embeddings across the Ollama pool.
+enable_lightrag: true
+lightrag_dir: "./output/lightrag"
+lightrag_embedding_dim: 768
+lightrag_mode: "hybrid"  # Default retrieval mode: 'hybrid', 'local', 'global', 'naive', or 'mix'
+
+# ==============================================================================
+# Neo4j Graph Database Export Configuration
+# ==============================================================================
+# High-throughput graph database export with upsert semantics (MERGE).
+# Automatically creates schema constraints and indexes on node IDs and updates
+# existing nodes and relationships with new attributes without data duplication.
+neo4j:
+  enabled: false                      # Set to true to automatically upsert into Neo4j during build-graph
+  uri: "bolt://localhost:7687"        # Neo4j Bolt or Neo4j protocol URI (e.g. bolt://192.168.50.20:7687 or neo4j+s://...)
+  user: "neo4j"                       # Authentication username
+  password: "password"                # Authentication password
+  database: "neo4j"                   # Target Neo4j database name
+  batch_size: 500                     # Cypher UNWIND transaction batch size
+  clean_export: false                 # Set to true to perform a clean start (delete all content before export)
+
+# ==============================================================================
+# Knowledge Graph Factual Verification Configuration
+# ==============================================================================
+# Audits concept groundings against source chunks using a dedicated LLM model.
+# Randomly samples a percentage of ideas (default 1%), pulls their related chunks,
+# and verifies whether each chunk contains or supports the idea.
+verification:
+  enabled: true
+  model: "llama3.1:8b"              # Dedicated model for verification (e.g. llama3.1:8b, qwen2.5:7b-instruct)
+  percent: 1.0                      # Default sampling percentage of ideas (1.0 = 1%)
+  mode: "ideas"                     # Verification mode (default: 'ideas')
+  temperature: 0.0                  # Low temperature for strict factual evaluation
+  max_examples: 20                  # Maximum discrepancy examples to report

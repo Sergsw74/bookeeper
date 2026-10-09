@@ -2,8 +2,14 @@
 EPUB and ebook parser with Table of Contents (TOC) extraction and spine fallback.
 """
 
+import io
 import logging
+import os
 import re
+import shutil
+import tempfile
+import tarfile
+import zipfile
 from pathlib import Path
 from typing import Any, Generator, List, Optional, Tuple, Union
 
@@ -13,6 +19,56 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 
+RUSSIAN_VOWELS = set("аеёиоуыэюяАЕЁИОУЫЭЮЯ")
+MOJIBAKE_CHARS = (
+    r"(?<![a-zA-Z])[\u0080-\u00FF\u0192\u201A\u201E\u2026\u2020\u2021\u20AC\u2030\u2039\u203A\u2122]+(?![a-zA-Z])"
+)
+MOJIBAKE_RE = re.compile(MOJIBAKE_CHARS)
+CP1251_UTF8_RE = re.compile(r"[РрСс][\u0080-\u00FF\u0400-\u04FF]+")
+
+
+def _is_plausible_russian_word(word: str) -> bool:
+    cyr = [c for c in word if "\u0400" <= c <= "\u04FF"]
+    if len(cyr) < 2:
+        return False
+    if not any(c in RUSSIAN_VOWELS for c in cyr):
+        return False
+    return len(cyr) >= len(word) * 0.7
+
+
+def _repair_segment(seg: str) -> str:
+    # 1. UTF-8 decoded as CP1252 or Latin-1 (e.g. "Ð¡ÑƒÐ¿ÐµÑ€Ð¼ÐµÐ½" -> "Супермен")
+    for enc in ("cp1252", "latin1"):
+        try:
+            cand = seg.encode(enc).decode("utf-8")
+            cyr_cand = sum(1 for c in cand if "\u0400" <= c <= "\u04FF")
+            if cyr_cand > 0:
+                return cand
+        except Exception:
+            pass
+
+    # 2. CP1251 decoded as Latin-1 or CP1252 (e.g. "Ðàñïèñêó" -> "Расписку", "Ñêàìüþ" -> "Скамью")
+    if len(seg) >= 2:
+        for enc in ("latin1", "cp1252"):
+            try:
+                cand = seg.encode(enc).decode("cp1251")
+                if _is_plausible_russian_word(cand):
+                    return cand
+            except Exception:
+                pass
+
+    # 3. UTF-8 decoded as CP1251 (e.g. "Р .Р .Р ." -> "Р.Р.Р.")
+    try:
+        cand = seg.encode("cp1251").decode("utf-8")
+        cyr_cand = sum(1 for c in cand if "\u0400" <= c <= "\u04FF")
+        if cyr_cand > 0 and len(cand) < len(seg):
+            return cand
+    except Exception:
+        pass
+
+    return seg
+
+
 class Section(BaseModel):
     """Structured chapter or section extracted from an ebook."""
 
@@ -20,11 +76,19 @@ class Section(BaseModel):
     chapter_idx: int = Field(description="1-based sequence index.")
     text: str = Field(description="Cleaned extracted plain text content.")
 
+    def model_post_init(self, __context) -> None:
+        self.title = BookParser.repair_mojibake(self.title)
+        self.text = BookParser.repair_mojibake(self.text)
+
 
 class BookParser:
-    """Parser extracting structured sections from EPUB (and PDF) files."""
+    """Parser extracting structured sections from EPUB, PDF, FB2, TXT, RTF, and archive files."""
 
     GRAPHICAL_FORMATS = {"cbr", "cbz", "cbt", "cb7", "djvu"}
+    SUPPORTED_BOOK_EXTENSIONS = {".epub", ".pdf", ".txt", ".fb2", ".rtf"}
+    ARCHIVE_EXTENSIONS = {
+        ".zip", ".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".rar", ".7z"
+    }
 
     @classmethod
     def is_graphical_format(cls, fmt_or_path: str | Path) -> bool:
@@ -60,38 +124,37 @@ class BookParser:
     def repair_mojibake(cls, text: Optional[str]) -> str:
         """
         Detect and repair common character encoding corruption / mojibake:
-        - Windows-1251 decoded as Latin-1 / ISO-8859-1 (e.g. 'Ñóïåðìåí' -> 'Супермен')
-        - UTF-8 decoded as Latin-1 (e.g. 'Ð¡ÑƒÐ¿ÐµÑ€Ð¼ÐµÐ½' -> 'Супермен')
+        - Windows-1251 decoded as Latin-1 / ISO-8859-1 (e.g. 'Ðàñïèñêó' -> 'Расписку', 'Ñêàìüþ' -> 'Скамью', 'Ñóïåðìåí' -> 'Супермен')
+        - UTF-8 decoded as CP1252 / Latin-1 (e.g. 'Ð¡ÑƒÐ¿ÐµÑ€Ð¼ÐµÐ½' -> 'Супермен')
         - UTF-8 decoded as CP1251 (e.g. 'Р .Р .Р .' -> 'Р.Р.Р.')
+        Supports mixed sentences, punctuation, and Unicode typography without corrupting valid Western accented or Russian text.
         """
         if not text or not isinstance(text, str):
             return text or ""
 
-        s = text.strip()
-        if not s:
-            return text
+        s = text
 
-        # 1. Check for Latin-1 -> CP1251 mojibake (e.g. 'Ñóïåðìåí' -> 'Супермен')
+        # 1. Whole-string fast checks if applicable
+        for enc in ("cp1252", "latin1"):
+            try:
+                cand = s.encode(enc).decode("utf-8")
+                cyr_cand = sum(1 for c in cand if "\u0400" <= c <= "\u04FF")
+                cyr_orig = sum(1 for c in s if "\u0400" <= c <= "\u04FF")
+                if cyr_cand > cyr_orig and cyr_cand > 0:
+                    s = cand
+                    break
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                pass
+
         try:
             cand = s.encode("latin1").decode("cp1251")
-            cyrillic_cand = sum(1 for c in cand if "\u0400" <= c <= "\u04FF")
-            cyrillic_orig = sum(1 for c in s if "\u0400" <= c <= "\u04FF")
-            if cyrillic_cand > cyrillic_orig and cyrillic_cand > 0:
+            cyr_cand = sum(1 for c in cand if "\u0400" <= c <= "\u04FF")
+            cyr_orig = sum(1 for c in s if "\u0400" <= c <= "\u04FF")
+            if cyr_cand > cyr_orig and cyr_cand > 0 and cyr_cand >= len(s.strip()) * 0.5:
                 s = cand
         except (UnicodeEncodeError, UnicodeDecodeError):
             pass
 
-        # 2. Check for Latin-1 -> UTF-8 mojibake (e.g. 'Ð¡ÑƒÐ¿ÐµÑ€Ð¼ÐµÐ½')
-        try:
-            cand = s.encode("latin1").decode("utf-8")
-            cyrillic_cand = sum(1 for c in cand if "\u0400" <= c <= "\u04FF")
-            cyrillic_orig = sum(1 for c in s if "\u0400" <= c <= "\u04FF")
-            if cyrillic_cand > cyrillic_orig and cyrillic_cand > 0:
-                s = cand
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            pass
-
-        # 3. Check for CP1251 -> UTF-8 mojibake
         try:
             cand = s.encode("cp1251").decode("utf-8")
             if len(cand) < len(s) and sum(1 for c in cand if "\u0400" <= c <= "\u04FF") > 0:
@@ -99,7 +162,21 @@ class BookParser:
         except (UnicodeEncodeError, UnicodeDecodeError):
             pass
 
+        # 2. Segment-level repair for mixed sentences and strings with typography
+        s = MOJIBAKE_RE.sub(lambda m: _repair_segment(m.group(0)), s)
+        s = CP1251_UTF8_RE.sub(lambda m: _repair_segment(m.group(0)), s)
+
         return s
+
+    @classmethod
+    def is_archive(cls, path: Path | str) -> bool:
+        """Check if path or filename represents a supported compressed archive."""
+        p = Path(path)
+        ext = p.suffix.lower()
+        if ext in cls.ARCHIVE_EXTENSIONS:
+            return True
+        name_lower = p.name.lower()
+        return any(name_lower.endswith(arch_ext) for arch_ext in cls.ARCHIVE_EXTENSIONS)
 
     @classmethod
     def parse(cls, file_path: Path | str) -> List[Section]:
@@ -110,11 +187,27 @@ class BookParser:
 
         ext = path.suffix.lower()
         if ext == ".epub":
-            return cls.extract_epub_sections(path)
+            sections = cls.extract_epub_sections(path)
         elif ext == ".pdf":
-            return cls.extract_pdf_sections(path)
+            sections = cls.extract_pdf_sections(path)
+        elif ext == ".txt":
+            sections = cls.extract_txt_sections(path)
+        elif ext == ".fb2":
+            sections = cls.extract_fb2_sections(path)
+        elif ext == ".rtf":
+            sections = cls.extract_rtf_sections(path)
+        elif ext in cls.ARCHIVE_EXTENSIONS or cls.is_archive(path):
+            sections = cls.extract_archive_sections(path)
         else:
-            raise ValueError(f"Unsupported ebook extension: '{ext}'. Supported: .epub, .pdf")
+            raise ValueError(
+                f"Unsupported ebook extension: '{ext}'. "
+                f"Supported: .epub, .pdf, .txt, .fb2, .rtf, .zip, .tar, .rar, .7z"
+            )
+
+        for s in sections:
+            s.title = cls.repair_mojibake(s.title)
+            s.text = cls.repair_mojibake(s.text)
+        return sections
 
     @classmethod
     def extract_epub_sections(cls, epub_path: Path | str) -> List[Section]:
@@ -210,20 +303,40 @@ class BookParser:
         except ImportError as e:
             raise ImportError("pypdf is required to parse PDF files. Install with `pip install pypdf`") from e
 
-        reader = PdfReader(str(path))
-        num_pages = len(reader.pages)
-        sections: List[Section] = []
+        # First attempt standard open
+        try:
+            reader = PdfReader(str(path), strict=False)
+        except Exception:
+            # Fallback for PDFs with malformed EOF markers (e.g. %%%%EOF or trailing garbage)
+            try:
+                raw_bytes = path.read_bytes()
+                cleaned_bytes = re.sub(rb"%+EOF\s*$", b"%%EOF\n", raw_bytes)
+                reader = PdfReader(io.BytesIO(cleaned_bytes), strict=False)
+            except Exception as e:
+                logger.warning(f"Could not parse PDF '{path.name}': {e}")
+                return []
 
+        try:
+            num_pages = len(reader.pages)
+        except Exception:
+            return []
+
+        sections: List[Section] = []
         current_text: List[str] = []
         current_page_start = 1
+        total_extracted_chars = 0
 
         for page_idx, page in enumerate(reader.pages, start=1):
-            page_text = page.extract_text() or ""
+            try:
+                page_text = page.extract_text() or ""
+            except Exception:
+                page_text = ""
             cleaned = cls._clean_whitespace(page_text)
             if not cleaned:
                 continue
 
             current_text.append(cleaned)
+            total_extracted_chars += len(cleaned)
             combined = "\n\n".join(current_text)
 
             # Flush roughly every 5 pages or ~6,000 characters
@@ -237,6 +350,352 @@ class BookParser:
                 )
                 current_text = []
                 current_page_start = page_idx + 1
+
+        if not sections and total_extracted_chars == 0:
+            logger.info(f"PDF '{path.name}' has 0 extractable text characters (image/infographic scan).")
+
+        return sections
+
+    @classmethod
+    def _split_into_sections(cls, text: str, default_title: str = "Section") -> List[Section]:
+        """Split plain text into Section objects by chapter headings or paragraph batches."""
+        chapter_pattern = re.compile(
+            r"(?:^|\n)(?=#{1,3}\s+[^\n]+|(?:Chapter|Глава|Section|Part|Act)\s+[\dIVXLCDM]+[^\n]*)",
+            re.IGNORECASE,
+        )
+        parts = [p for p in chapter_pattern.split(text) if p and p.strip()]
+        sections: List[Section] = []
+
+        if len(parts) > 1:
+            pending_prefix = ""
+            for idx, part in enumerate(parts, start=1):
+                cleaned = cls._clean_whitespace(part)
+                if len(cleaned) < 20:
+                    pending_prefix = (pending_prefix + "\n\n" + cleaned).strip()
+                    continue
+                if pending_prefix:
+                    cleaned = pending_prefix + "\n\n" + cleaned
+                    pending_prefix = ""
+                lines = part.strip().split("\n")
+                first_line = lines[0].strip().lstrip("#").strip() if lines else f"Section {idx}"
+                title = first_line if len(first_line) <= 80 else f"Section {idx}"
+                sections.append(Section(title=title, chapter_idx=len(sections) + 1, text=cleaned))
+            if pending_prefix and sections:
+                sections[-1].text = sections[-1].text + "\n\n" + pending_prefix
+        else:
+            cleaned_full = cls._clean_whitespace(text)
+            if len(cleaned_full) >= 20:
+                paragraphs = text.split("\n\n")
+                cur_batch: List[str] = []
+                cur_len = 0
+                sec_idx = 1
+                for p in paragraphs:
+                    p_clean = cls._clean_whitespace(p)
+                    if not p_clean:
+                        continue
+                    cur_batch.append(p_clean)
+                    cur_len += len(p_clean)
+                    if cur_len >= 6000:
+                        sections.append(
+                            Section(
+                                title=f"{default_title} {sec_idx}" if default_title != "Section" else f"Section {sec_idx}",
+                                chapter_idx=sec_idx,
+                                text="\n\n".join(cur_batch),
+                            )
+                        )
+                        sec_idx += 1
+                        cur_batch = []
+                        cur_len = 0
+                if cur_batch:
+                    sections.append(
+                        Section(
+                            title=f"{default_title} {sec_idx}" if default_title != "Section" else f"Section {sec_idx}",
+                            chapter_idx=sec_idx,
+                            text="\n\n".join(cur_batch),
+                        )
+                    )
+
+        if not sections:
+            cleaned_full = cls._clean_whitespace(text)
+            if cleaned_full:
+                sections.append(Section(title=default_title, chapter_idx=1, text=cleaned_full))
+
+        return sections
+
+    @classmethod
+    def extract_txt_sections(cls, txt_path: Path | str) -> List[Section]:
+        """Extract sections from plain text file."""
+        path = Path(txt_path).expanduser().resolve()
+        raw = path.read_bytes()
+        text = ""
+        for enc in ("utf-8", "cp1251", "latin-1"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if not text:
+            text = raw.decode("utf-8", errors="ignore")
+
+        return cls._split_into_sections(text, default_title=path.stem)
+
+    @classmethod
+    def extract_rtf_sections(cls, rtf_path: Path | str) -> List[Section]:
+        """
+        Extract plain text and structured sections from an RTF (Rich Text Format) file.
+        Supports standard ANSI, Windows-1251 (Cyrillic), UTF-8, and other codepages.
+        """
+        path = Path(rtf_path).expanduser().resolve()
+        raw_bytes = path.read_bytes()
+
+        # 1. Detect codepage from RTF header if present (e.g. \ansicpg1251)
+        cpg_match = re.search(rb"\\ansicpg(\d+)", raw_bytes[:1000])
+        cpg = cpg_match.group(1).decode("ascii") if cpg_match else None
+        target_encoding = f"cp{cpg}" if cpg else None
+
+        text = ""
+        # 2. Extract using striprtf if available
+        try:
+            from striprtf.striprtf import rtf_to_text
+            try:
+                raw_str = raw_bytes.decode("latin1")
+                text = rtf_to_text(raw_str, encoding=target_encoding or "cp1251")
+            except Exception:
+                raw_str = raw_bytes.decode("utf-8", errors="ignore")
+                text = rtf_to_text(raw_str, encoding=target_encoding)
+        except ImportError:
+            # 3. Fallback regex RTF stripper
+            text = cls._fallback_rtf_to_text(raw_bytes, encoding=target_encoding or "cp1251")
+
+        # Repair any residual mojibake (e.g. latin1 CP1251 confusion)
+        text = cls.repair_mojibake(text)
+
+        return cls._split_into_sections(text, default_title=path.stem)
+
+    @classmethod
+    def _fallback_rtf_to_text(cls, raw_bytes: bytes, encoding: str = "cp1251") -> str:
+        """Fallback lightweight RTF plain text extractor when striprtf is not installed."""
+        def _replace_hex(match):
+            return bytes([int(match.group(1), 16)])
+
+        cleaned_bytes = re.sub(rb"\\'([0-9a-fA-F]{2})", _replace_hex, raw_bytes)
+        try:
+            decoded = cleaned_bytes.decode(encoding, errors="ignore")
+        except Exception:
+            decoded = cleaned_bytes.decode("utf-8", errors="ignore")
+
+        decoded = re.sub(r"\{\\(?:fonttbl|colortbl|stylesheet|info)[^}]*\}", "", decoded)
+        decoded = re.sub(r"\\(?:par|line)\b", "\n", decoded)
+        decoded = re.sub(r"\\[a-zA-Z]+-?\d* ? ", " ", decoded)
+        decoded = re.sub(r"\\[a-zA-Z]+-?\d*", "", decoded)
+        decoded = re.sub(r"[{}]", "", decoded)
+        return cls._clean_whitespace(decoded)
+
+    @classmethod
+    def extract_archive_sections(cls, archive_path: Path | str) -> List[Section]:
+        """
+        Open and inspect an archive (.zip, .tar, .rar, .7z), discover the ebook inside,
+        extract it to a temporary directory, and parse its sections.
+        """
+        path = Path(archive_path).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Archive file not found: {path}")
+
+        name_lower = path.name.lower()
+
+        is_zip = zipfile.is_zipfile(path) or name_lower.endswith(".zip")
+        is_tar = (
+            tarfile.is_tarfile(path)
+            or any(name_lower.endswith(ext) for ext in (".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz"))
+        )
+        is_rar = name_lower.endswith(".rar")
+        is_7z = name_lower.endswith(".7z")
+
+        with tempfile.TemporaryDirectory() as extract_dir:
+            tmp_dir = Path(extract_dir)
+
+            if is_zip:
+                with zipfile.ZipFile(path, "r") as zf:
+                    member_names = [m for m in zf.namelist() if not m.endswith("/")]
+                    candidates = cls._select_archive_candidates(member_names)
+                    if not candidates:
+                        cls._check_archive_rejection(path, member_names)
+                    # Check if archive has multiple text parts
+                    txt_parts = [c for c in candidates if Path(c).suffix.lower() == ".txt"]
+                    if len(txt_parts) > 1 and len(candidates) == len(txt_parts):
+                        txt_parts.sort()
+                        all_sections = []
+                        for part in txt_parts:
+                            zf.extract(part, path=tmp_dir)
+                            all_sections.extend(cls.extract_txt_sections(tmp_dir / part))
+                        for i, s in enumerate(all_sections, start=1):
+                            s.chapter_idx = i
+                        return all_sections
+
+                    chosen = candidates[0]
+                    zf.extract(chosen, path=tmp_dir)
+                    extracted_file = tmp_dir / chosen
+
+            elif is_tar:
+                with tarfile.open(path, "r:*") as tf:
+                    member_names = [m.name for m in tf.getmembers() if m.isfile()]
+                    candidates = cls._select_archive_candidates(member_names)
+                    if not candidates:
+                        cls._check_archive_rejection(path, member_names)
+                    chosen = candidates[0]
+                    member = tf.getmember(chosen)
+                    try:
+                        tf.extract(member, path=tmp_dir, filter="data")
+                    except TypeError:
+                        tf.extract(member, path=tmp_dir)
+                    extracted_file = tmp_dir / chosen
+
+            elif is_rar:
+                extracted_file = cls._extract_rar(path, tmp_dir)
+
+            elif is_7z:
+                try:
+                    import py7zr
+                    with py7zr.SevenZipFile(path, "r") as szf:
+                        member_names = szf.getnames()
+                        candidates = cls._select_archive_candidates(member_names)
+                        if not candidates:
+                            cls._check_archive_rejection(path, member_names)
+                        chosen = candidates[0]
+                        szf.extract(path=tmp_dir, targets=[chosen])
+                        extracted_file = tmp_dir / chosen
+                except ImportError as e:
+                    raise ImportError("py7zr is required to unpack .7z files. Install with `pip install py7zr`") from e
+
+            else:
+                # Generic zip fallback
+                try:
+                    with zipfile.ZipFile(path, "r") as zf:
+                        member_names = [m for m in zf.namelist() if not m.endswith("/")]
+                        candidates = cls._select_archive_candidates(member_names)
+                        if not candidates:
+                            cls._check_archive_rejection(path, member_names)
+                        chosen = candidates[0]
+                        zf.extract(chosen, path=tmp_dir)
+                        extracted_file = tmp_dir / chosen
+                except Exception:
+                    raise ValueError(f"Unsupported archive format: '{path.suffix}'.")
+
+            return cls.parse(extracted_file)
+
+    @classmethod
+    def _select_archive_candidates(cls, names: List[str]) -> List[str]:
+        """Filter and rank archive members to find best ebook candidate."""
+        valid = [
+            n for n in names
+            if not any(part.startswith(".") or part.startswith("__MACOSX") for part in Path(n).parts)
+        ]
+
+        # Priority ranking: EPUB > FB2 > PDF > RTF > TXT
+        priority = {
+            ".epub": 10,
+            ".fb2": 9,
+            ".pdf": 8,
+            ".rtf": 7,
+            ".txt": 6,
+        }
+
+        candidates = []
+        for name in valid:
+            ext = Path(name).suffix.lower()
+            if ext in priority:
+                candidates.append((priority[ext], name))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return [c[1] for c in candidates]
+
+    @classmethod
+    def _extract_rar(cls, path: Path, tmp_dir: Path) -> Path:
+        """Extract candidate ebook file from RAR archive using rarfile, bsdtar, or unrar."""
+        # 1. Try rarfile
+        try:
+            import rarfile
+            with rarfile.RarFile(path, "r") as rf:
+                names = [n for n in rf.namelist() if not n.endswith("/")]
+                candidates = cls._select_archive_candidates(names)
+                if not candidates:
+                    cls._check_archive_rejection(path, names)
+                chosen = candidates[0]
+                rf.extract(chosen, path=tmp_dir)
+                return tmp_dir / chosen
+        except Exception:
+            pass
+
+        # 2. Try bsdtar / unrar subprocess
+        import subprocess
+        for tool in ("/usr/bin/bsdtar", "bsdtar", "unrar"):
+            tool_path = shutil.which(tool)
+            if tool_path:
+                try:
+                    list_cmd = [tool_path, "-tf", str(path)] if "tar" in tool else [tool_path, "lb", str(path)]
+                    res = subprocess.run(list_cmd, capture_output=True, text=True, check=False)
+                    if res.returncode == 0:
+                        names = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+                        candidates = cls._select_archive_candidates(names)
+                        if candidates:
+                            chosen = candidates[0]
+                            extract_cmd = (
+                                [tool_path, "-xf", str(path), "-C", str(tmp_dir), chosen]
+                                if "tar" in tool
+                                else [tool_path, "e", "-y", str(path), chosen, str(tmp_dir)]
+                            )
+                            subprocess.run(extract_cmd, capture_output=True, check=False)
+                            extracted = tmp_dir / chosen
+                            if extracted.is_file():
+                                return extracted
+                except Exception:
+                    continue
+
+        raise ValueError(f"Could not extract RAR archive '{path.name}'.")
+
+    @classmethod
+    def _check_archive_rejection(cls, archive_path: Path, names: List[str]) -> None:
+        """Raise appropriate error if archive contains only images or no supported files."""
+        image_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+        non_meta = [
+            n for n in names
+            if not any(part.startswith(".") or part.startswith("__MACOSX") for part in Path(n).parts)
+        ]
+        if non_meta and all(Path(n).suffix.lower() in image_exts for n in non_meta):
+            raise ValueError(f"Archive '{archive_path.name}' only contains images (comic/graphical archive).")
+        raise ValueError(
+            f"Archive '{archive_path.name}' contains no supported ebook files "
+            f"({', '.join(sorted(cls.SUPPORTED_BOOK_EXTENSIONS))}). Found: {names[:10]}"
+        )
+
+    @classmethod
+    def extract_fb2_sections(cls, fb2_path: Path | str) -> List[Section]:
+        """Extract structured sections from FB2 (FictionBook) file."""
+        path = Path(fb2_path).expanduser().resolve()
+        raw = path.read_bytes()
+        enc = "windows-1251" if b"windows-1251" in raw[:200].lower() else "utf-8"
+        try:
+            soup = BeautifulSoup(raw.decode(enc, errors="replace"), "xml")
+        except Exception:
+            try:
+                soup = BeautifulSoup(raw.decode(enc, errors="replace"), "html.parser")
+            except Exception:
+                soup = BeautifulSoup(raw.decode("utf-8", errors="ignore"), "html.parser")
+
+        sections: List[Section] = []
+        fb2_sections = soup.find_all("section")
+        for idx, s in enumerate(fb2_sections, start=1):
+            title_tag = s.find("title")
+            title = cls._clean_whitespace(title_tag.text) if title_tag else f"Section {idx}"
+            text = cls._clean_whitespace(s.text)
+            if len(text) < 40:
+                continue
+            sections.append(Section(title=title, chapter_idx=len(sections) + 1, text=text))
+
+        if not sections:
+            body = soup.find("body")
+            if body and len(body.text.strip()) > 30:
+                sections.append(Section(title=path.stem, chapter_idx=1, text=cls._clean_whitespace(body.text)))
 
         return sections
 

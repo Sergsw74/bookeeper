@@ -40,6 +40,11 @@ dependencies = [
     "pyyaml",
     "numpy",
     "httpx",
+    "lightrag-hku>=1.5.7",
+    "neo4j>=5.18.0",
+    "striprtf>=0.0.26",
+    "rarfile>=4.0",
+    "py7zr>=0.20.0",
 ]
 
 [project.optional-dependencies]

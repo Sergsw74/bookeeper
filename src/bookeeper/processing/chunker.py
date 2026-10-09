@@ -10,7 +10,7 @@ import re
 import tempfile
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from langchain_core.embeddings import Embeddings
 from pydantic import BaseModel, Field
@@ -41,6 +41,21 @@ class HierarchicalChunk(BaseModel):
     next_chunk_id: Optional[str] = None
 
     def model_post_init(self, __context) -> None:
+        from bookeeper.calibre.parser import BookParser
+
+        if self.text:
+            self.text = BookParser.repair_mojibake(self.text)
+        if self.book_title:
+            self.book_title = BookParser.repair_mojibake(self.book_title)
+        if self.section_title:
+            self.section_title = BookParser.repair_mojibake(self.section_title)
+        if self.chapter_title:
+            self.chapter_title = BookParser.repair_mojibake(self.chapter_title)
+        if self.subtitle:
+            self.subtitle = BookParser.repair_mojibake(self.subtitle)
+        if self.parent_text:
+            self.parent_text = BookParser.repair_mojibake(self.parent_text)
+
         if not self.char_count and self.text:
             self.char_count = len(self.text)
         if not self.word_count and self.text:
@@ -99,6 +114,18 @@ class HierarchicalChunker:
                 )
             except Exception as e:
                 logger.warning(f"Could not initialize SemanticChunker with embeddings: {e}")
+
+    @property
+    def embedding_stats(self) -> dict:
+        """Return embedding throughput statistics if supported by underlying embeddings."""
+        if hasattr(self.embeddings, "embedding_stats"):
+            return self.embeddings.embedding_stats
+        return {}
+
+    def reset_embedding_stats(self) -> None:
+        """Reset embedding throughput counters if supported."""
+        if hasattr(self.embeddings, "reset_stats"):
+            self.embeddings.reset_stats()
 
     def _extract_subsections(self, text: str, default_title: str) -> List[tuple[str, str]]:
         """
@@ -207,11 +234,27 @@ class HierarchicalChunker:
         sections: List[Section],
         book_id: int,
         book_title: str,
+        progress_callback: Optional[Callable[[int, int, str, int], None]] = None,
     ) -> List[HierarchicalChunk]:
-        """Process all sections of a book sequentially."""
+        """
+        Process all sections of a book sequentially with progress reporting.
+
+        Args:
+            sections: List of parsed Book sections.
+            book_id: Calibre book ID.
+            book_title: Title of the book.
+            progress_callback: Optional callback invoked as
+                progress_callback(completed_sections, total_sections, current_section_title, total_chunks)
+        """
         all_chunks: List[HierarchicalChunk] = []
-        for sec in sections:
-            all_chunks.extend(self.chunk_section(sec, book_id, book_title))
+        total_sections = len(sections)
+        for idx, sec in enumerate(sections):
+            if progress_callback:
+                progress_callback(idx, total_sections, sec.title, len(all_chunks))
+            sec_chunks = self.chunk_section(sec, book_id, book_title)
+            all_chunks.extend(sec_chunks)
+            if progress_callback:
+                progress_callback(idx + 1, total_sections, sec.title, len(all_chunks))
 
         # Re-link across section boundaries if needed
         for i in range(len(all_chunks)):
@@ -360,6 +403,18 @@ class ChunkStore:
             except Exception:
                 pass
         return sorted(ids)
+
+    def get_book_title(self, book_id: int) -> Optional[str]:
+        """Retrieve stored book title for a book ID without parsing all chunks."""
+        p = self._chunk_file(book_id)
+        if not p.is_file():
+            return None
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("book_title")
+        except Exception:
+            return None
 
     def stats(self) -> dict:
         """Return summary statistics of the chunk store."""

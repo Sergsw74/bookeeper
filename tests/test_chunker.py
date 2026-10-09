@@ -5,6 +5,7 @@ NetworkX graph insertions, and Obsidian export without requiring live Calibre or
 
 from pathlib import Path
 import tempfile
+from unittest.mock import MagicMock
 import pytest
 
 from bookeeper.calibre.parser import Section
@@ -399,5 +400,226 @@ In snapshotting, the entire current system state is written to stable storage.
     assert f"Chunk {target_chunk.chunk_id}" in idea_content
     assert "Raft Leader Election" in idea_content
     assert "Raft decomposes consensus into leader election" in idea_content
+
+
+def test_book_literature_note_plane_and_idea_links(tmp_path):
+    """Verify Book nodes act as literature notes with research planes and link bidirectionally with Idea nodes."""
+    store = ConceptGraphStore()
+
+    # 1. Add Book
+    b_id = store.add_book(
+        book_id=42,
+        title="Designing Data-Intensive Applications",
+        author="Martin Kleppmann",
+        summary="The definitive guide to the architecture of data systems.",
+    )
+    assert b_id == "book:42"
+
+    book_node = store.graph.nodes["book:42"]
+    assert "literature-note" in book_node["tags"]
+    assert "research-source" in book_node["tags"]
+    assert "book" in book_node["tags"]
+
+    # 2. Add Idea
+    idea = Concept(
+        name="LSM-Trees",
+        brief_description="Log-Structured Merge-Trees maintain fast writes by indexing append-only segments.",
+        detailed_explanation="Writes go to an in-memory Memtable before being flushed to immutable SSTables. Compaction runs in background to merge segments.",
+        category="Storage Architecture",
+    )
+    store.add_concept(idea)
+
+    # 3. Add Book <-> Idea bidirectional link
+    store.add_book_idea_link(book_id=42, concept_name="LSM-Trees")
+
+    assert store.graph.has_edge("book:42", "concept:LSM-Trees")
+    assert store.graph["book:42"]["concept:LSM-Trees"]["relation"] == "EXPLORES_IDEA"
+    assert store.graph.has_edge("concept:LSM-Trees", "book:42")
+    assert store.graph["concept:LSM-Trees"]["book:42"]["relation"] == "FEATURED_IN"
+
+    # 4. Export to Obsidian Vault and verify note generation
+    vault_dir = tmp_path / "obsidian_vault"
+    exporter = ObsidianExporter(vault_dir)
+    exporter.export(store)
+
+    # Check Book note
+    book_file = vault_dir / "Books" / "Designing Data-Intensive Applications.md"
+    assert book_file.is_file()
+    book_content = book_file.read_text(encoding="utf-8")
+
+    assert "type: book" in book_content
+    assert "literature-note" in book_content
+    assert "research-source" in book_content
+    assert "## 📖 Overview & Abstract" in book_content
+    assert "The definitive guide to the architecture of data systems." in book_content
+    assert "## 💡 Core Ideas & Conceptual Knowledge Plane" in book_content
+    assert "### Storage Architecture" in book_content
+    assert "[[LSM-Trees]]" in book_content
+    assert "Log-Structured Merge-Trees maintain fast writes" in book_content
+    assert "## 🔬 Research & Reading Notes" in book_content
+    assert "### Key Synthesis" in book_content
+    assert "### Cross-Book Conceptual Connections" in book_content
+
+    # Check Idea note
+    idea_file = vault_dir / "Concepts" / "LSM-Trees.md"
+    assert idea_file.is_file()
+    idea_content = idea_file.read_text(encoding="utf-8")
+
+    assert "type: idea" in idea_content
+    assert "## 📚 Featured in Books" in idea_content
+    assert "[[Designing Data-Intensive Applications|Designing Data-Intensive Applications]]" in idea_content
+    assert "Martin Kleppmann" in idea_content
+    # Ensure EXPLORES_IDEA / FEATURED_IN didn't pollute "Related Ideas"
+    assert "## Related Ideas" not in idea_content
+
+
+def test_concept_weight_lifecycle_and_export(tmp_path):
+    """Verify concept weights (0=basic, 3=risk assessment, 7=RAG, 9=SmartRAG), merging, and export."""
+    from bookeeper.processing.deduplicator import EntityDeduplicator
+
+    # 1. Test model instantiation and clamping
+    c_ident = Concept(name="Identification", category="Security", summary="Basic identity check", weight=0)
+    c_risk = Concept(name="Risk Assessment", category="Security", summary="Evaluation of risk factors", weight=3)
+    c_rag = Concept(name="RAG", category="AI Architecture", summary="Retrieval Augmented Generation", weight=7)
+    c_smartrag = Concept(name="SmartRAG", category="AI Architecture", summary="Adaptive agentic RAG mechanism", weight=9)
+
+    assert c_ident.weight == 0
+    assert c_risk.weight == 3
+    assert c_rag.weight == 7
+    assert c_smartrag.weight == 9
+
+    # Clamping test
+    c_clamped_high = Concept(name="Super Concept", category="Test", summary="...", weight=15)
+    c_clamped_low = Concept(name="Low Concept", category="Test", summary="...", weight=-5)
+    assert c_clamped_high.weight == 10
+    assert c_clamped_low.weight == 0
+
+    # 2. Test ConceptGraphStore weight storage and update
+    store = ConceptGraphStore()
+    store.add_concept(c_ident)
+    store.add_concept(c_rag)
+    store.add_concept(c_smartrag)
+
+    assert store.graph.nodes["concept:Identification"]["weight"] == 0
+    assert store.graph.nodes["concept:RAG"]["weight"] == 7
+
+    # Updating RAG with higher weight updates it; lower weight does not downgrade it
+    c_rag_more_specific = Concept(name="RAG", category="AI Architecture", summary="Deeper RAG nuances", weight=8)
+    store.add_concept(c_rag_more_specific)
+    assert store.graph.nodes["concept:RAG"]["weight"] == 8
+
+    c_rag_generic_mention = Concept(name="RAG", category="AI Architecture", summary="Brief mention", weight=5)
+    store.add_concept(c_rag_generic_mention)
+    assert store.graph.nodes["concept:RAG"]["weight"] == 8
+
+    # 3. Test Deduplicator merging retains max weight
+    dedup = EntityDeduplicator(similarity_threshold=0.85)
+    canon = Concept(name="Risk Assessment", category="Security", summary="Base definition", weight=3)
+    incoming = Concept(name="Risk Assessment", category="Security", summary="Enhanced definition", weight=6)
+    resolved = dedup.resolve_concept(canon)
+    resolved_merged = dedup.resolve_concept(incoming)
+    assert resolved_merged.weight == 6
+
+    # 4. Verify Obsidian Export includes weight in frontmatter and sorts MOC by weight
+    vault_dir = tmp_path / "obsidian_vault"
+    exporter = ObsidianExporter(vault_dir)
+    exporter.export(store)
+
+    smartrag_file = vault_dir / "Concepts" / "SmartRAG.md"
+    assert smartrag_file.is_file()
+    content = smartrag_file.read_text(encoding="utf-8")
+    assert "weight: 9" in content
+    assert "Weight / Significance: 9/10" in content
+
+    # Check 00_Index.md sorts SmartRAG (w:9) before RAG (w:8)
+    index_file = vault_dir / "00_Index.md"
+    index_content = index_file.read_text(encoding="utf-8")
+    smartrag_pos = index_content.find("[[SmartRAG]]")
+    rag_pos = index_content.find("[[RAG]]")
+    assert smartrag_pos != -1 and rag_pos != -1
+    assert smartrag_pos < rag_pos  # SmartRAG (9) appears before RAG (8)
+
+    # 5. Verify stats includes average weight
+    stats = store.stats()
+    assert "average_concept_weight" in stats
+    assert stats["average_concept_weight"] > 0
+
+
+def test_obsidian_clean_export(tmp_path):
+    """Verify clean export deletes stale Obsidian notes before writing new ones."""
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir(parents=True)
+    stale_file = vault_dir / "Concepts" / "OldStaleConcept.md"
+    stale_file.parent.mkdir(parents=True)
+    stale_file.write_text("obsolete content", encoding="utf-8")
+
+    store = ConceptGraphStore()
+    store.add_concept(Concept(name="FreshConcept", category="Idea", summary="Fresh idea"))
+
+    exporter = ObsidianExporter(vault_dir, clean=True)
+    exporter.export(store)
+
+    assert not stale_file.exists()
+    assert (vault_dir / "Concepts" / "FreshConcept.md").exists()
+
+
+def test_chunk_book_progress_callback():
+    """Verify that chunk_book triggers progress_callback at each section boundary."""
+    chunker = HierarchicalChunker(max_chunk_chars=300, min_chunk_chars=50)
+    sections = [
+        Section(
+            title="Chapter 1: Foundations",
+            chapter_idx=1,
+            text="This is chapter 1 with sufficient content to form a valid chunk. It discusses foundational concepts.",
+        ),
+        Section(
+            title="Chapter 2: Implementations",
+            chapter_idx=2,
+            text="This is chapter 2 with sufficient content to form another valid chunk. It focuses on implementation.",
+        ),
+    ]
+
+    calls = []
+
+    def _cb(completed: int, total: int, sec_title: str, num_chunks: int):
+        calls.append((completed, total, sec_title, num_chunks))
+
+    chunks = chunker.chunk_book(
+        sections=sections,
+        book_id=42,
+        book_title="Test Progress Book",
+        progress_callback=_cb,
+    )
+
+    assert len(chunks) == 2
+    assert len(calls) == 4  # 2 calls per section (start and completion)
+    # First section start and end
+    assert calls[0] == (0, 2, "Chapter 1: Foundations", 0)
+    assert calls[1][0] == 1
+    assert calls[1][1] == 2
+    assert calls[1][2] == "Chapter 1: Foundations"
+    assert calls[1][3] == 1
+
+    # Second section start and end
+    assert calls[2][0] == 1
+    assert calls[2][1] == 2
+    assert calls[2][2] == "Chapter 2: Implementations"
+    assert calls[2][3] == 1
+    assert calls[3] == (2, 2, "Chapter 2: Implementations", 2)
+
+
+def test_hierarchical_chunker_embedding_stats_delegation():
+    """Verify that HierarchicalChunker delegates embedding_stats and reset_embedding_stats."""
+    mock_emb = MagicMock()
+    mock_emb.embedding_stats = {"total_texts": 42, "speed_texts_per_sec": 19.5}
+
+    chunker = HierarchicalChunker(embeddings=mock_emb)
+    assert chunker.embedding_stats == {"total_texts": 42, "speed_texts_per_sec": 19.5}
+
+    chunker.reset_embedding_stats()
+    mock_emb.reset_stats.assert_called_once()
+
+
+
 
 

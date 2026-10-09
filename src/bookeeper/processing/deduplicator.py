@@ -10,6 +10,7 @@ import numpy as np
 from langchain_core.embeddings import Embeddings
 from langchain_ollama import OllamaEmbeddings
 
+from bookeeper.calibre.parser import BookParser
 from bookeeper.config import Settings
 from bookeeper.processing.extractor import Concept
 
@@ -53,12 +54,9 @@ class EntityDeduplicator:
             if base_url:
                 urls = [u.strip() for u in base_url.split(",") if u.strip()]
                 pool = OllamaPool.from_urls(urls, cooldown_seconds=settings.failover_cooldown_seconds)
+                embeddings = FailoverOllamaEmbeddings(pool=pool, model=e_model)
             else:
-                pool = OllamaPool(
-                    servers=settings.resolved_ollama_servers,
-                    cooldown_seconds=settings.failover_cooldown_seconds,
-                )
-            embeddings = FailoverOllamaEmbeddings(pool=pool, model=e_model)
+                embeddings = FailoverOllamaEmbeddings.from_settings(settings, model=e_model)
         except Exception as e:
             logger.warning(f"Could not initialize FailoverOllamaEmbeddings: {e}")
             embeddings = None
@@ -80,7 +78,8 @@ class EntityDeduplicator:
         If similarity exceeds similarity_threshold, merge and return the canonical Concept.
         Otherwise, register and return the new Concept.
         """
-        raw_name = concept.name.strip()
+        concept.name = BookParser.repair_mojibake(concept.name.strip())
+        raw_name = concept.name
         norm_name = self._normalize_name(raw_name)
 
         # 1. Exact or case-insensitive string match
@@ -135,6 +134,9 @@ class EntityDeduplicator:
                 except Exception:
                     pass
 
+        # Retain highest significance weight observed
+        canonical.weight = max(getattr(canonical, "weight", 5), getattr(incoming, "weight", 5))
+
     def _embed(self, text: str) -> Optional[np.ndarray]:
         """Compute normalized unit vector for input text."""
         if self.embeddings is None:
@@ -152,3 +154,7 @@ class EntityDeduplicator:
     def get_canonical_concepts(self) -> List[Concept]:
         """Return all unique canonical concepts registered so far."""
         return [c for _, c in self._cache.values()]
+
+
+# Backward-compatibility alias
+ConceptDeduplicator = EntityDeduplicator

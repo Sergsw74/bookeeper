@@ -10,7 +10,7 @@ import shutil
 import sqlite3
 import subprocess
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +106,7 @@ class CalibreClient:
     @property
     def is_remote_url(self) -> bool:
         """Check if library_path is an HTTP/HTTPS remote URL."""
-        p = self.library_path.strip().lower()
+        p = str(self.library_path or "").strip().lower()
         return p.startswith("http://") or p.startswith("https://")
 
     @property
@@ -216,7 +216,10 @@ class CalibreClient:
         if create_backup and self.db_path.is_file():
             backup_path = self.db_path.with_name("metadata.db.bak")
             logger.info(f"Creating backup of original database at {backup_path}...")
-            shutil.copy2(self.db_path, backup_path)
+            try:
+                shutil.copyfile(self.db_path, backup_path)
+            except Exception:
+                _copy_file_with_progress(self.db_path, backup_path)
 
         # 3. Copy staged DB back to remote/original destination
         logger.info(f"Uploading staged database from {self.staged_db_path} to {self.db_path}...")
@@ -499,15 +502,35 @@ class CalibreClient:
         self,
         book_id: int,
         target_dir: Path | str,
-        fmt: str = "EPUB",
+        fmt: Optional[Union[str, List[str]]] = None,
     ) -> Optional[Path]:
         """
         Locate or export book format.
+        Prefers EPUB, PDF, TXT, FB2, etc. in priority order if fmt is None.
         If accessing via SMB/local path, copies file directly from book directory.
         Otherwise calls calibredb export.
         """
         out_path = Path(target_dir).expanduser().resolve()
         out_path.mkdir(parents=True, exist_ok=True)
+
+        preferred = [fmt.upper()] if isinstance(fmt, str) else (
+            [f.upper() for f in fmt] if fmt else ["EPUB", "FB2", "PDF", "RTF", "TXT", "ZIP", "RAR", "TAR", "7Z", "MOBI", "AZW3"]
+        )
+
+        # 0. Fast cache hit: check if target_dir already has an exported file for this book
+        for p_fmt in preferred:
+            candidates = [
+                f for f in out_path.glob(f"{book_id}_*.{p_fmt.lower()}")
+                if f.is_file() and f.stat().st_size > 0
+            ]
+            if candidates:
+                return candidates[0]
+        all_matches = [
+            f for f in out_path.glob(f"{book_id}_*.*")
+            if f.is_file() and f.stat().st_size > 0 and not f.name.endswith((".json", ".part", ".tmp"))
+        ]
+        if all_matches:
+            return all_matches[0]
 
         # 1. Direct file resolution if on SMB share or local directory
         db_to_use = self.active_db_path
@@ -519,30 +542,50 @@ class CalibreClient:
                 SELECT b.path, d.name, d.format
                 FROM books b
                 JOIN data d ON b.id = d.book
-                WHERE b.id = ? AND UPPER(d.format) = ?
+                WHERE b.id = ?
                 """,
-                (book_id, fmt.upper()),
+                (book_id,),
             )
-            row = cursor.fetchone()
+            rows = cursor.fetchall()
             conn.close()
 
-            if row:
-                rel_path, name, ext = row
+            # Find best match based on preference order
+            rows_by_fmt = {r[2].upper(): r for r in rows}
+            selected_row = None
+            for p_fmt in preferred:
+                if p_fmt in rows_by_fmt:
+                    selected_row = rows_by_fmt[p_fmt]
+                    break
+            if not selected_row and rows:
+                selected_row = rows[0]
+
+            if selected_row:
+                rel_path, name, ext = selected_row
                 source_file = self.local_path / rel_path / f"{name}.{ext.lower()}"
                 if source_file.is_file():
                     dest_file = out_path / f"{book_id}_{name}.{ext.lower()}"
-                    shutil.copy2(source_file, dest_file)
+                    # Fast cache hit: reuse already exported file if size matches
+                    if dest_file.is_file() and dest_file.stat().st_size == source_file.stat().st_size:
+                        return dest_file
+
+                    # Use copyfile avoiding macOS/SMB chflags/copystat PermissionError
+                    try:
+                        shutil.copyfile(source_file, dest_file)
+                    except Exception:
+                        with open(source_file, "rb") as fsrc, open(dest_file, "wb") as fdst:
+                            shutil.copyfileobj(fsrc, fdst)
                     return dest_file
 
         # 2. Fallback to calibredb export
         if shutil.which(self.calibredb_bin):
+            formats_arg = ",".join(preferred)
             cmd = self._build_base_args() + [
                 "export",
                 str(book_id),
                 "--to-dir",
                 str(out_path),
                 "--formats",
-                fmt.upper(),
+                formats_arg,
                 "--dont-save-cover",
                 "--dont-write-opf",
                 "--template",
@@ -550,10 +593,11 @@ class CalibreClient:
             ]
             result = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if result.returncode == 0:
-                candidates = list(out_path.glob(f"{book_id}_*.{fmt.lower()}"))
-                if candidates:
-                    return candidates[0]
-                all_matches = list(out_path.glob(f"*.{fmt.lower()}"))
+                for p_fmt in preferred:
+                    candidates = list(out_path.glob(f"{book_id}_*.{p_fmt.lower()}"))
+                    if candidates:
+                        return candidates[0]
+                all_matches = list(out_path.glob(f"{book_id}_*.*"))
                 return all_matches[0] if all_matches else None
 
         return None

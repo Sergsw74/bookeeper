@@ -1,0 +1,148 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    deployment.kubernetes.io/revision: "10"
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"apps/v1","kind":"Deployment","metadata":{"annotations":{"deployment.kubernetes.io/revision":"9","meta.helm.sh/release-name":"calibre","meta.helm.sh/release-namespace":"media"},"creationTimestamp":"2022-08-26T16:10:22Z","generation":25,"labels":{"app.kubernetes.io/instance":"calibre","app.kubernetes.io/managed-by":"Helm","app.kubernetes.io/name":"calibre","app.kubernetes.io/version":"version-v5.21.0","helm.sh/chart":"calibre-5.4.2"},"name":"calibre","namespace":"media","resourceVersion":"540157739","uid":"4c09d3b3-fd6f-49ad-a904-dd369c3b0207"},"spec":{"progressDeadlineSeconds":600,"replicas":1,"revisionHistoryLimit":3,"selector":{"matchLabels":{"app.kubernetes.io/instance":"calibre","app.kubernetes.io/name":"calibre"}},"strategy":{"type":"Recreate"},"template":{"metadata":{"creationTimestamp":null,"labels":{"app.kubernetes.io/instance":"calibre","app.kubernetes.io/name":"calibre"}},"spec":{"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"is_nas","operator":"In","values":["y"]}]}]}}},"automountServiceAccountToken":true,"containers":[{"env":[{"name":"CLI_ARGS"},{"name":"DOCKER_MODS","value":"linuxserver/mods:universal-calibre"},{"name":"GUAC_PASS"},{"name":"GUAC_USER"},{"name":"OAUTHLIB_RELAX_TOKEN_SCOPE","value":"1"},{"name":"PGID","value":"1000"},{"name":"PUID","value":"1000"},{"name":"TZ","value":"America/Los Angeles"},{"name":"UMASK_SET","value":"022"},{"name":"SECURE_CONNECTION","value":"false"}],"image":"linuxserver/calibre:latest","imagePullPolicy":"Always","livenessProbe":{"failureThreshold":3,"periodSeconds":10,"successThreshold":1,"tcpSocket":{"port":8080},"timeoutSeconds":1},"name":"calibre","ports":[{"containerPort":8080,"name":"http","protocol":"TCP"},{"containerPort":8081,"name":"webserver","protocol":"TCP"}],"readinessProbe":{"failureThreshold":3,"periodSeconds":10,"successThreshold":1,"tcpSocket":{"port":8080},"timeoutSeconds":1},"resources":{},"startupProbe":{"failureThreshold":30,"periodSeconds":5,"successThreshold":1,"tcpSocket":{"port":8080},"timeoutSeconds":1},"terminationMessagePath":"/dev/termination-log","terminationMessagePolicy":"File","volumeMounts":[{"mountPath":"/config","name":"config"},{"mountPath":"/books","name":"data"}]}],"dnsPolicy":"ClusterFirst","enableServiceLinks":true,"restartPolicy":"Always","schedulerName":"default-scheduler","securityContext":{},"serviceAccount":"default","serviceAccountName":"default","terminationGracePeriodSeconds":30,"volumes":[{"hostPath":{"path":"/mnt/safe/calibre/config","type":""},"name":"config"},{"hostPath":{"path":"/mnt/media/Files/Books","type":""},"name":"data"}]}}}}
+    meta.helm.sh/release-name: calibre
+    meta.helm.sh/release-namespace: media
+  creationTimestamp: "2022-08-26T16:10:22Z"
+  generation: 30
+  labels:
+    app.kubernetes.io/instance: calibre
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: calibre
+    app.kubernetes.io/version: version-v5.21.0
+    helm.sh/chart: calibre-5.4.2
+  name: calibre
+  namespace: media
+  resourceVersion: "605361599"
+  uid: 4c09d3b3-fd6f-49ad-a904-dd369c3b0207
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: calibre
+      app.kubernetes.io/name: calibre
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        app.kubernetes.io/instance: calibre
+        app.kubernetes.io/name: calibre
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: is_nas
+                operator: In
+                values:
+                - "y"
+      automountServiceAccountToken: true
+      containers:
+      - env:
+        - name: CLI_ARGS
+        - name: DOCKER_MODS
+          value: linuxserver/mods:universal-calibre
+        - name: GUAC_PASS
+        - name: GUAC_USER
+        - name: OAUTHLIB_RELAX_TOKEN_SCOPE
+          value: "1"
+        - name: PGID
+          value: "1000"
+        - name: PUID
+          value: "1000"
+        - name: TZ
+          value: America/Los Angeles
+        - name: UMASK_SET
+          value: "022"
+        - name: SECURE_CONNECTION
+          value: "false"        
+        - name: CUSTOM_HTTPS
+          value: "false"
+        - name: FORCE_HTTPS
+          value: "false"
+        - name: REVERSE_PROXY
+          value: "true"
+        image: linuxserver/calibre:latest
+        imagePullPolicy: Always
+        livenessProbe:
+          failureThreshold: 3
+          periodSeconds: 10
+          successThreshold: 1
+          tcpSocket:
+            port: 8080
+          timeoutSeconds: 1
+        name: calibre
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        - containerPort: 8081
+          name: webserver
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 3
+          periodSeconds: 10
+          successThreshold: 1
+          tcpSocket:
+            port: 8080
+          timeoutSeconds: 1
+        resources: {}
+        startupProbe:
+          failureThreshold: 30
+          periodSeconds: 5
+          successThreshold: 1
+          tcpSocket:
+            port: 8080
+          timeoutSeconds: 1
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /config
+          name: config
+        - mountPath: /books
+          name: data
+      dnsPolicy: ClusterFirst
+      enableServiceLinks: true
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      serviceAccount: default
+      serviceAccountName: default
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - hostPath:
+          path: /mnt/safe/calibre/config
+          type: ""
+        name: config
+      - hostPath:
+          path: /mnt/media/Files/Books
+          type: ""
+        name: data
+status:
+  availableReplicas: 1
+  conditions:
+  - lastTransitionTime: "2022-08-26T16:10:22Z"
+    lastUpdateTime: "2026-02-11T03:23:29Z"
+    message: ReplicaSet "calibre-b4bb5f566" has successfully progressed.
+    reason: NewReplicaSetAvailable
+    status: "True"
+    type: Progressing
+  - lastTransitionTime: "2026-10-07T15:02:28Z"
+    lastUpdateTime: "2026-10-07T15:02:28Z"
+    message: Deployment has minimum availability.
+    reason: MinimumReplicasAvailable
+    status: "True"
+    type: Available
+  observedGeneration: 30
+  readyReplicas: 1
+  replicas: 1
+  updatedReplicas: 1

@@ -5,11 +5,14 @@ Exporters for Concept Knowledge Graph: Obsidian Markdown Vault with wikilinks, G
 import json
 import logging
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import networkx as nx
 
+from bookeeper.calibre.parser import BookParser
+from bookeeper.graph.neo4j_exporter import Neo4jExporter
 from bookeeper.graph.store import ConceptGraphStore
 
 logger = logging.getLogger(__name__)
@@ -17,7 +20,8 @@ logger = logging.getLogger(__name__)
 
 def sanitize_filename(name: str) -> str:
     """Sanitize title or concept name for safe filenames across OS filesystems."""
-    clean = re.sub(r'[\\/*?:"<>|]', "", name).strip()
+    clean = BookParser.repair_mojibake(name)
+    clean = re.sub(r'[\\/*?:"<>|]', "", clean).strip()
     return clean or "Untitled"
 
 
@@ -27,11 +31,23 @@ class ObsidianExporter:
     with YAML frontmatter and [[wiki-links]] between Books, Sections, and Concepts.
     """
 
-    def __init__(self, output_dir: Path | str, create_moc: bool = True):
+    def __init__(self, output_dir: Path | str, create_moc: bool = True, clean: bool = False):
         self.output_dir = Path(output_dir).expanduser().resolve()
         self.create_moc = create_moc
+        self.clean = clean
 
-    def export(self, store: ConceptGraphStore) -> Path:
+    def export(self, store: ConceptGraphStore, clean: Optional[bool] = None) -> Path:
+        effective_clean = self.clean if clean is None else clean
+        if effective_clean and self.output_dir.exists():
+            logger.info(f"Performing clean start: purging existing Obsidian vault notes at {self.output_dir}")
+            for sub in ["Books", "Sections", "Concepts"]:
+                p = self.output_dir / sub
+                if p.is_dir():
+                    shutil.rmtree(p)
+            index_file = self.output_dir / "00_Index.md"
+            if index_file.is_file():
+                index_file.unlink()
+
         self.output_dir.mkdir(parents=True, exist_ok=True)
         books_dir = self.output_dir / "Books"
         sections_dir = self.output_dir / "Sections"
@@ -53,48 +69,100 @@ class ObsidianExporter:
             summary = attrs.get("summary", "")
             filename = sanitize_filename(title) + ".md"
 
-            # Discover sections and concepts for this book
+            # Discover sections and ideas for this book
             child_sections = []
-            discussed_concepts = set()
+            explored_ideas: Dict[str, Dict[str, str]] = {}
 
+            # Direct book-to-idea linkages
+            for _, c_id, edge in g.out_edges(node_id, data=True):
+                if edge.get("relation") == "EXPLORES_IDEA":
+                    c_attrs = g.nodes.get(c_id, {})
+                    c_name = c_attrs.get("name", c_id.replace("concept:", ""))
+                    explored_ideas[c_name] = {
+                        "category": c_attrs.get("category", "Idea"),
+                        "brief": c_attrs.get("brief_description", "") or c_attrs.get("summary", ""),
+                    }
+
+            # Discover via sections
             for _, sec_id, edge in g.out_edges(node_id, data=True):
                 if edge.get("relation") == "HAS_SECTION":
                     sec_attrs = g.nodes.get(sec_id, {})
                     sec_title = sec_attrs.get("title", sec_id)
                     child_sections.append(sec_title)
 
-                    # Concepts discussed in this section
                     for _, c_id, c_edge in g.out_edges(sec_id, data=True):
                         if c_edge.get("relation") == "DISCUSSES":
-                            c_name = g.nodes.get(c_id, {}).get("name", c_id.replace("concept:", ""))
-                            discussed_concepts.add(c_name)
+                            c_attrs = g.nodes.get(c_id, {})
+                            c_name = c_attrs.get("name", c_id.replace("concept:", ""))
+                            if c_name not in explored_ideas:
+                                explored_ideas[c_name] = {
+                                    "category": c_attrs.get("category", "Idea"),
+                                    "brief": c_attrs.get("brief_description", "") or c_attrs.get("summary", ""),
+                                }
+
+            author_tag = re.sub(r"[^\w-]", "", author.lower().replace(" ", "-")) if author and author != "Unknown Author" else ""
+            tag_list = ["book", "literature-note", "research-source"]
+            if author_tag and author_tag not in tag_list:
+                tag_list.append(author_tag)
 
             content = [
                 "---",
                 f"title: \"{title}\"",
                 "type: book",
+                "tags:",
+            ]
+            for t in tag_list:
+                content.append(f"  - {t}")
+            content.extend([
                 f"author: \"{author}\"",
+                f"total_sections: {len(child_sections)}",
+                f"total_ideas: {len(explored_ideas)}",
                 "---",
                 "",
-                f"# {title}",
+                f"# 📚 {title}",
                 f"*Author: {author}*",
                 "",
-            ]
+            ])
             if summary:
-                content.extend(["> " + summary.replace("\n", " "), ""])
+                clean_sum = summary.replace("\n", " ")
+                content.extend([
+                    "## 📖 Overview & Abstract",
+                    f"> {clean_sum}",
+                    "",
+                ])
+
+            if explored_ideas:
+                content.append("## 💡 Core Ideas & Conceptual Knowledge Plane")
+                # Group ideas by category
+                grouped: Dict[str, List[tuple[str, str]]] = {}
+                for iname, idata in sorted(explored_ideas.items()):
+                    grouped.setdefault(idata["category"], []).append((iname, idata["brief"]))
+
+                for cat, items in sorted(grouped.items()):
+                    content.append(f"### {cat}")
+                    for iname, ibrief in items:
+                        if ibrief:
+                            content.append(f"- **[[{iname}]]**: {ibrief}")
+                        else:
+                            content.append(f"- [[{iname}]]")
+                    content.append("")
 
             if child_sections:
-                content.append("## Sections")
+                content.append("## 📑 Sections & Chapter Hierarchy")
                 for s in child_sections:
                     sec_note_name = f"{title} - {s}"
                     content.append(f"- [[{sec_note_name}|{s}]]")
                 content.append("")
 
-            if discussed_concepts:
-                content.append("## Core Concepts Discovered")
-                for c in sorted(discussed_concepts):
-                    content.append(f"- [[{c}]]")
-                content.append("")
+            content.extend([
+                "## 🔬 Research & Reading Notes",
+                "### Key Synthesis",
+                f"<!-- Key takeaways, literature synthesis, and insights for {title} -->",
+                "",
+                "### Cross-Book Conceptual Connections",
+                f"<!-- Conceptual threads connecting ideas in {title} to other books in the library -->",
+                "",
+            ])
 
             with open(books_dir / filename, "w", encoding="utf-8") as f:
                 f.write("\n".join(content))
@@ -157,8 +225,9 @@ class ObsidianExporter:
             detailed_exp = attrs.get("detailed_explanation", "")
             summary = attrs.get("summary", "") or brief_desc or detailed_exp
             occurrences = attrs.get("occurrences", 1)
+            weight = attrs.get("weight", 5)
 
-            categories.setdefault(category, []).append(name)
+            categories.setdefault(category, []).append((name, weight))
             filename = sanitize_filename(name) + ".md"
 
             # 3a. Supporting chunks & book locations (SUPPORTED_BY edges)
@@ -202,7 +271,7 @@ class ObsidianExporter:
             # 3c. Outgoing relations to other concepts
             related_out = []
             for _, tgt_id, edge in g.out_edges(node_id, data=True):
-                if edge.get("relation") not in ["DISCUSSES", "SUPPORTED_BY", "HAS_SECTION", "HAS_CHUNK"]:
+                if edge.get("relation") not in ["DISCUSSES", "SUPPORTED_BY", "HAS_SECTION", "HAS_CHUNK", "FEATURED_IN", "EXPLORES_IDEA"]:
                     tgt_name = g.nodes.get(tgt_id, {}).get("name", tgt_id.replace("concept:", ""))
                     rel = edge.get("relation", "RELATES_TO")
                     related_out.append(f"- **{rel}** -> [[{tgt_name}]]")
@@ -210,7 +279,7 @@ class ObsidianExporter:
             # 3d. Incoming relations from other concepts
             related_in = []
             for src_id, _, edge in g.in_edges(node_id, data=True):
-                if edge.get("relation") not in ["DISCUSSES", "HAS_SECTION", "HAS_CHUNK", "SUPPORTS_IDEA"]:
+                if edge.get("relation") not in ["DISCUSSES", "HAS_SECTION", "HAS_CHUNK", "SUPPORTS_IDEA", "EXPLORES_IDEA", "FEATURED_IN"]:
                     src_name = g.nodes.get(src_id, {}).get("name", src_id.replace("concept:", ""))
                     rel = edge.get("relation", "RELATES_TO")
                     related_in.append(f"- [[{src_name}]] -> **{rel}**")
@@ -224,11 +293,12 @@ class ObsidianExporter:
                 "  - idea",
                 f"  - {cat_tag}",
                 f"category: \"{category}\"",
+                f"weight: {weight}",
                 f"occurrences: {occurrences}",
                 "---",
                 "",
                 f"# {name}",
-                f"*Category: {category}*",
+                f"*Category: {category}* | *Weight / Significance: {weight}/10*",
                 "",
             ]
 
@@ -248,6 +318,30 @@ class ObsidianExporter:
                     "",
                 ])
 
+            # 3e. Books featuring this idea (FEATURED_IN edges, EXPLORES_IDEA in-edges, or via supporting chunks)
+            featured_books = set()
+            for _, b_id, edge in g.out_edges(node_id, data=True):
+                if edge.get("relation") == "FEATURED_IN":
+                    b_attrs = g.nodes.get(b_id, {})
+                    btitle = b_attrs.get("title", b_id.replace("book:", ""))
+                    bauth = b_attrs.get("author", "Unknown Author")
+                    featured_books.add((btitle, bauth))
+
+            for src_id, _, edge in g.in_edges(node_id, data=True):
+                if edge.get("relation") == "EXPLORES_IDEA":
+                    b_attrs = g.nodes.get(src_id, {})
+                    btitle = b_attrs.get("title", src_id.replace("book:", ""))
+                    bauth = b_attrs.get("author", "Unknown Author")
+                    featured_books.add((btitle, bauth))
+
+            for _, chunk_id, edge in g.out_edges(node_id, data=True):
+                if edge.get("relation") == "SUPPORTED_BY":
+                    chk_attrs = g.nodes.get(chunk_id, {})
+                    bid = chk_attrs.get("book_id")
+                    if bid and g.has_node(f"book:{bid}"):
+                        b_attrs = g.nodes[f"book:{bid}"]
+                        featured_books.add((b_attrs.get("title", f"Book {bid}"), b_attrs.get("author", "Unknown Author")))
+
             # Supporting Evidence from Chunks
             if supporting_evidence:
                 c_content.append("## Supporting Evidence & Book Locations")
@@ -256,6 +350,14 @@ class ObsidianExporter:
             elif mentioned_in:
                 c_content.append("## Mentioned In")
                 c_content.extend(sorted(set(mentioned_in)))
+                c_content.append("")
+
+            # Featured in Books
+            if featured_books:
+                c_content.append("## 📚 Featured in Books")
+                for btitle, bauth in sorted(featured_books):
+                    auth_str = f" by *{bauth}*" if bauth and bauth != "Unknown Author" else ""
+                    c_content.append(f"- **[[{sanitize_filename(btitle)}|{btitle}]]**{auth_str}")
                 c_content.append("")
 
             # Related Ideas
@@ -279,10 +381,12 @@ class ObsidianExporter:
                 "Welcome to your extracted book knowledge graph. Click on any concept or book below or explore via Obsidian's **Graph View**.",
                 "",
             ]
-            for cat, names in sorted(categories.items()):
+            for cat, items in sorted(categories.items()):
                 moc.append(f"## {cat}")
-                for n in sorted(names):
-                    moc.append(f"- [[{n}]]")
+                # Sort concepts by weight descending, then alphabetically by name
+                for n, w in sorted(items, key=lambda x: (-x[1], x[0])):
+                    weight_badge = f" `(w: {w})`" if w is not None else ""
+                    moc.append(f"- [[{n}]]{weight_badge}")
                 moc.append("")
 
             with open(index_path, "w", encoding="utf-8") as f:

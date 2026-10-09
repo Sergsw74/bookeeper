@@ -200,13 +200,29 @@ class ProgressTracker:
             return True
         return False
 
-    def clear(self, operation: Optional[str] = None) -> None:
-        """Reset state for a specific operation or all operations."""
+    def clear(self, operation: Optional[str] = None, preserve_skipped: bool = False) -> None:
+        """Reset state for a specific operation or all operations.
+
+        If preserve_skipped is True, entries marked with status='skipped' are preserved.
+        """
         if operation:
             ops = self.state.setdefault("operations", {})
-            ops[operation] = {}
+            if preserve_skipped:
+                ops[operation] = {
+                    bid: rec for bid, rec in ops.get(operation, {}).items()
+                    if rec.get("status") == "skipped"
+                }
+            else:
+                ops[operation] = {}
         else:
-            self.state["operations"] = {}
+            if preserve_skipped:
+                for op in list(self.state.get("operations", {}).keys()):
+                    self.state["operations"][op] = {
+                        bid: rec for bid, rec in self.state["operations"][op].items()
+                        if rec.get("status") == "skipped"
+                    }
+            else:
+                self.state["operations"] = {}
         self.save()
 
     def summary(self, operation: str) -> Dict[str, Any]:

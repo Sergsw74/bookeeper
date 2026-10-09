@@ -1208,10 +1208,12 @@ def build_graph(
     tracker = ProgressTracker(tracker_path)
 
     if from_scratch:
+        tracker.clear("build_graph", preserve_skipped=True)
+        preserved_cnt = len(tracker.get_skipped_ids("build_graph"))
+        preserved_str = f" (preserving {preserved_cnt} skipped books in skip list)" if preserved_cnt > 0 else ""
         console.print(
-            "[bold yellow]Restarting build entirely from scratch: clearing progress tracker checkpoint, resetting knowledge graph, deleting all book states and cached chunks...[/bold yellow]"
+            f"[bold yellow]Restarting build entirely from scratch: clearing progress tracker checkpoint, resetting knowledge graph, deleting all book states and cached chunks{preserved_str}...[/bold yellow]"
         )
-        tracker.clear("build_graph")
         reset_progress = True
         resume = False
         continue_run = False
@@ -1379,8 +1381,8 @@ def build_graph(
             lightrag_engine = None
 
     if reset_progress and not from_scratch:
-        tracker.clear("build_graph")
-        console.print("[dim yellow]Reset progress checkpoint for build_graph.[/dim yellow]")
+        tracker.clear("build_graph", preserve_skipped=True)
+        console.print("[dim yellow]Reset progress checkpoint for build_graph (preserving skipped books in skip list).[/dim yellow]")
 
     books_to_process = []
 
@@ -1527,6 +1529,19 @@ def build_graph(
                         f"({len(completed_ids)} in graph). {len(target_list)} remaining to process. {next_bid_str}"
                     )
                 console.print(f"[dim cyan]{msg}[/dim cyan]")
+        elif from_scratch and not retry_skipped:
+            tracker_skipped = tracker.get_skipped_ids("build_graph")
+            if tracker_skipped:
+                orig_len = len(target_list)
+                target_list = [b for b in target_list if b.get("id") not in tracker_skipped]
+                bypassed = orig_len - len(target_list)
+                if bypassed > 0:
+                    next_bid_str = f"Next book: #{target_list[0]['id']} ('{target_list[0].get('title', '')}')" if target_list else "None (all books skipped)"
+                    msg = (
+                        f"Preserved Skip List: Bypassed {bypassed} previously skipped book(s) "
+                        f"(graphical or unsupported formats). {len(target_list)} remaining to process. {next_bid_str}"
+                    )
+                    console.print(f"[dim cyan]{msg}[/dim cyan]")
 
         export_dir = output_dir / "calibre_ingest"
         for b in target_list:

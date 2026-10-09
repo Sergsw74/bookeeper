@@ -7,6 +7,7 @@ from bookeeper.processing.deduplicator import EntityDeduplicator
 from bookeeper.processing.extractor import (
     BookMetadata,
     Concept,
+    ExtractedIdea,
     KnowledgeExtractor,
     SectionExtraction,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "RollingWindowSemanticChunker",
     "BookMetadata",
     "Concept",
+    "ExtractedIdea",
     "SectionExtraction",
     "KnowledgeExtractor",
     "EntityDeduplicator",

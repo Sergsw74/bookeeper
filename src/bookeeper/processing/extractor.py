@@ -123,13 +123,120 @@ class Concept(BaseModel):
         return self.brief_description or self.detailed_explanation
 
 
-class SectionExtraction(BaseModel):
-    """Extraction output containing all concepts discovered in a section."""
+class ExtractedIdea(BaseModel):
+    """
+    Core intellectual idea extracted from a book chunk, anchored by an exact verbatim quote.
+    """
 
+    source_quote: str = Field(
+        description="Exact verbatim sentence from the chunk anchoring this idea.",
+    )
+    idea_statement: str = Field(
+        description="Concise, self-contained factual claim (1–2 sentences).",
+    )
+    key_entities: List[str] = Field(
+        default_factory=list,
+        description="List of distinct key entities, topics, or concepts involved.",
+    )
+    idea_type: str = Field(
+        default="Definition",
+        description="Type classification: 'Definition' | 'Argument' | 'Mechanism' | 'Example'.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def sanitize_idea(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            for k in ("source_quote", "idea_statement", "idea_type"):
+                if k in data and isinstance(data[k], str):
+                    data[k] = BookParser.repair_mojibake(data[k])
+            if "key_entities" in data and isinstance(data["key_entities"], list):
+                data["key_entities"] = [
+                    BookParser.repair_mojibake(e) if isinstance(e, str) else e
+                    for e in data["key_entities"]
+                ]
+            if "idea_type" in data and isinstance(data["idea_type"], str):
+                val = data["idea_type"].strip().capitalize()
+                if val in {"Definition", "Argument", "Mechanism", "Example"}:
+                    data["idea_type"] = val
+        return data
+
+    def to_concept(self) -> Concept:
+        """Convert extracted idea into canonical Concept representation for knowledge graph."""
+        name = self.key_entities[0] if self.key_entities else self.idea_statement[:60].strip()
+        related = [e for e in self.key_entities if e != name]
+        return Concept(
+            name=name,
+            brief_description=self.idea_statement,
+            detailed_explanation=self.idea_statement,
+            category=self.idea_type,
+            supporting_quote=self.source_quote,
+            related_concepts=related,
+            weight=7 if self.idea_type in {"Argument", "Mechanism"} else 5,
+        )
+
+
+class SectionExtraction(BaseModel):
+    """Extraction output containing all ideas and concepts discovered in a section or chunk."""
+
+    extracted_ideas: List[ExtractedIdea] = Field(
+        default_factory=list,
+        description="List of core intellectual ideas extracted from the chunk.",
+    )
     concepts: List[Concept] = Field(
         default_factory=list,
         description="List of technical ideas, concepts, and architectural patterns discussed.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_ideas_and_concepts(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            ideas_raw = data.get("extracted_ideas") or []
+            concepts_raw = data.get("concepts") or []
+
+            # Case 1: extracted_ideas provided, concepts empty -> synthesize concepts
+            if ideas_raw and not concepts_raw:
+                synthesized_concepts = []
+                parsed_ideas = []
+                for item in ideas_raw:
+                    if isinstance(item, dict):
+                        idea_obj = ExtractedIdea(**item)
+                    elif isinstance(item, ExtractedIdea):
+                        idea_obj = item
+                    else:
+                        continue
+                    parsed_ideas.append(idea_obj)
+                    synthesized_concepts.append(idea_obj.to_concept())
+                data["extracted_ideas"] = parsed_ideas
+                data["concepts"] = synthesized_concepts
+
+            # Case 2: concepts provided, extracted_ideas empty -> synthesize extracted_ideas
+            elif concepts_raw and not ideas_raw:
+                synthesized_ideas = []
+                parsed_concepts = []
+                for item in concepts_raw:
+                    if isinstance(item, dict):
+                        concept_obj = Concept(**item)
+                    elif isinstance(item, Concept):
+                        concept_obj = item
+                    else:
+                        continue
+                    parsed_concepts.append(concept_obj)
+                    cat = concept_obj.category.capitalize() if concept_obj.category else "Definition"
+                    idea_type = cat if cat in {"Definition", "Argument", "Mechanism", "Example"} else "Definition"
+                    entities = [concept_obj.name] + [r for r in concept_obj.related_concepts if r != concept_obj.name]
+                    synthesized_ideas.append(
+                        ExtractedIdea(
+                            source_quote=concept_obj.supporting_quote or "",
+                            idea_statement=concept_obj.brief_description or concept_obj.detailed_explanation or concept_obj.name,
+                            key_entities=entities,
+                            idea_type=idea_type,
+                        )
+                    )
+                data["concepts"] = parsed_concepts
+                data["extracted_ideas"] = synthesized_ideas
+        return data
 
 
 def validate_concept_chunk_grounding(
@@ -499,38 +606,35 @@ class KnowledgeExtractor:
         Supports parent macro context for hierarchical RAG understanding.
         """
         system_text = (
-            "You are an expert knowledge extractor, domain ontologist, and conceptual analyst.\n"
-            "Your objective is to identify and extract 1 to 5 canonical ideas, concepts, themes, principles, "
-            "strategies, lore elements, or domain mechanisms present in the provided text.\n\n"
-            "EXTRACTION GUIDELINES:\n"
-            "1. GROUNDING & EVIDENCE:\n"
-            "   - All extracted concepts must be directly grounded in the Target Text.\n"
-            "   - 'supporting_quote': MUST be an exact, verbatim sentence or phrase from the Target Text supporting the concept.\n"
-            "   - Only return an empty list (\"concepts\": []) if the excerpt is purely administrative boilerplate (e.g. copyright notices, table of contents, ISBNs, page numbers).\n\n"
-            "2. DOMAIN-APPROPRIATE CONCEPTS:\n"
-            "   - For narrative literature & fiction: extract literary themes, character motifs, lore principles, tactical strategies, alliances, conflicts, cultural customs, or mythical concepts.\n"
-            "   - For technical & engineering works: extract architectural patterns, algorithms, system principles, data structures, tradeoffs, or protocols.\n"
-            "   - For general non-fiction: extract organizational principles, mental models, historical dynamics, or sociological concepts.\n"
-            "   - Negative Rule: Do NOT artificially label narrative fiction events as technical engineering concepts (e.g. do not label character accidents as 'System Design Principle').\n\n"
-            "3. SCHEMA REQUIREMENTS:\n"
-            "   - 'name': Concise canonical title (2-4 words, capitalized noun phrase, e.g. 'Tactical Ambush', 'Divination Ritual', 'Consistent Hashing').\n"
-            "   - 'brief_description': 1-2 sentence definition of the concept in context.\n"
-            "   - 'detailed_explanation': Thorough explanation of how the concept functions, its mechanism, role, and nuances.\n"
-            "   - 'category': Domain category (e.g. Tactical Strategy, Thematic Motif, Lore Concept, Architectural Pattern, Ethical Principle).\n"
-            "   - 'supporting_quote': Exact verbatim quote from the text.\n"
-            "   - 'related_concepts': List of related concept names.\n"
-            "   - 'weight': Significance score from 1 to 10 (1-3: basic mention; 4-6: prominent recurring concept or motif; 7-10: major defining pillar or core paradigm).\n\n"
-            "You MUST output valid JSON matching this schema:\n"
+            "You are an expert knowledge-graph extractor. Your goal is to extract core intellectual ideas from the provided book chunk.\n\n"
+            "Rules:\n"
+            "1. Every idea must be anchored by an exact verbatim quote from the text.\n"
+            '2. The "idea_statement" must be a concise, self-contained factual claim (1–2 sentences).\n'
+            "3. Do not invent details not present in the chunk.\n"
+            "4. Extract only distinct, meaningful concepts (usually 1 to 3 per chunk). If the chunk contains no standalone ideas, output an empty list.\n"
+            "5. Return strictly valid JSON matching the schema below.\n"
+            "Output Format:\n"
             "{\n"
-            '  "concepts": [\n'
+            '  "extracted_ideas": [\n'
             "    {\n"
-            '      "name": "...",\n'
-            '      "brief_description": "...",\n'
-            '      "detailed_explanation": "...",\n'
-            '      "category": "...",\n'
-            '      "supporting_quote": "...",\n'
-            '      "related_concepts": ["..."],\n'
-            '      "weight": 5\n'
+            '      "source_quote": "Exact verbatim sentence from the chunk",\n'
+            '      "idea_statement": "Concise summary of the concept or argument",\n'
+            '      "key_entities": ["Topic A", "Concept B"],\n'
+            '      "idea_type": "Definition" | "Argument" | "Mechanism" | "Example"\n'
+            "    }\n"
+            "  ]\n"
+            "}\n\n"
+            "Example:\n"
+            "Chunk:\n"
+            '"Systems theory demonstrates that complex networks exhibit emergent properties. In ant colonies, no single ant understands the global architecture of the nest, yet through simple local pheromone interactions, highly coordinated structures arise spontaneously."\n\n'
+            "Response:\n"
+            "{\n"
+            '  "extracted_ideas": [\n'
+            "    {\n"
+            '      "source_quote": "In ant colonies, no single ant understands the global architecture of the nest, yet through simple local pheromone interactions, highly coordinated structures arise spontaneously.",\n'
+            '      "idea_statement": "Complex coordination emerges from local rules without central leadership.",\n'
+            '      "key_entities": ["Systems Theory", "Emergence", "Self-organization"],\n'
+            '      "idea_type": "Mechanism"\n'
             "    }\n"
             "  ]\n"
             "}"
@@ -543,19 +647,25 @@ class KnowledgeExtractor:
         if parent_context:
             parent_context = BookParser.repair_mojibake(parent_context)
 
-        loc = f"Book: '{book_title}'\nSection/Chapter: '{section_title}'"
-        if subtitle and subtitle != section_title:
-            loc += f"\nSubsection/Subtitle: '{subtitle}'"
+        loc = ""
+        if book_title or section_title:
+            loc = f"Context: Book: '{book_title}' | Section: '{section_title}'"
+            if subtitle and subtitle != section_title:
+                loc += f" | Subsection: '{subtitle}'"
+            loc += "\n\n"
 
-        human_text = f"{loc}\n\n"
-        human_text += (
-            f"Target Text for Idea Extraction (MANDATORY: All concepts and verbatim quotes must come strictly from this text):\n"
-            f"\"\"\"\n{text[:4000]}\n\"\"\"\n"
+        human_text = (
+            f"{loc}"
+            "Now process the following text:\n\n"
+            "Chunk:\n"
+            '"""\n'
+            f"{text[:4000]}\n"
+            '"""'
         )
         if parent_context and parent_context != text:
             human_text += (
-                f"\nBackground Context (Surrounding passage provided ONLY for narrative orientation - DO NOT extract concepts or quotes from here):\n"
-                f"\"\"\"\n{parent_context[:2000]}\n\"\"\"\n"
+                f"\n\nBackground Context (Surrounding passage provided ONLY for narrative orientation - DO NOT extract concepts or quotes from here):\n"
+                f'"""\n{parent_context[:2000]}\n"""'
             )
 
         messages = [
@@ -577,13 +687,62 @@ class KnowledgeExtractor:
                 task_type="llm",
             )
             if isinstance(result, SectionExtraction):
-                return result
-            return SectionExtraction(**dict(result))
+                extraction_obj = result
+            else:
+                extraction_obj = SectionExtraction(**dict(result))
+
+            # Validate quote grounding for extracted ideas
+            validated_ideas = []
+            for idea in extraction_obj.extracted_ideas:
+                is_grounded, val_quote = validate_concept_chunk_grounding(
+                    concept_name=idea.idea_statement,
+                    supporting_quote=idea.source_quote,
+                    chunk_text=text,
+                    brief_description=idea.idea_statement,
+                )
+                if is_grounded:
+                    if val_quote:
+                        idea.source_quote = val_quote
+                    validated_ideas.append(idea)
+            extraction_obj.extracted_ideas = validated_ideas
+            extraction_obj.concepts = [i.to_concept() for i in validated_ideas]
+            return extraction_obj
         except Exception as e:
             if raise_on_error:
                 raise
             logger.warning(f"Section extraction LLM call failed across all pool servers for '{section_title}': {e}")
-            return SectionExtraction(concepts=[])
+            return SectionExtraction(concepts=[], extracted_ideas=[])
+
+    def extract_ideas(
+        self,
+        text: str,
+        book_title: str = "",
+        section_title: str = "",
+        subtitle: Optional[str] = None,
+        parent_context: Optional[str] = None,
+        retries: Optional[int] = None,
+        quarantine_server: bool = True,
+        exclude_urls: Optional[Set[str]] = None,
+        raise_on_error: bool = False,
+        model: Optional[str] = None,
+    ) -> List[ExtractedIdea]:
+        """
+        Extract core intellectual ideas from chunk text using exact knowledge-graph prompt.
+        Returns list of ExtractedIdea instances.
+        """
+        extraction = self.extract_section(
+            text=text,
+            book_title=book_title,
+            section_title=section_title,
+            subtitle=subtitle,
+            parent_context=parent_context,
+            retries=retries,
+            quarantine_server=quarantine_server,
+            exclude_urls=exclude_urls,
+            raise_on_error=raise_on_error,
+            model=model,
+        )
+        return extraction.extracted_ideas
 
     def warmup_and_check_device(
         self,

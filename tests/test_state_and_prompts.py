@@ -1515,6 +1515,80 @@ def test_test_run_command_pipeline(tmp_path):
         assert bids == {1, 2}
 
 
+def test_build_graph_limit_candidate_bounding(tmp_path):
+    """Verify build-graph with --limit N bounds books_to_process and progress display to N books."""
+    import sqlite3
+    from unittest.mock import patch, MagicMock
+    from typer.testing import CliRunner
+    from bookeeper.cli import app
+    from bookeeper.graph.store import ConceptGraphStore
+    from bookeeper.processing.extractor import Concept, SectionExtraction
+    from bookeeper.calibre.parser import Section
+
+    runner = CliRunner()
+    lib_dir = tmp_path / "calibre_lib"
+    lib_dir.mkdir()
+    conn = sqlite3.connect(lib_dir / "metadata.db")
+    c = conn.cursor()
+    c.execute("CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, sort TEXT, author_sort TEXT, pubdate TIMESTAMP, path TEXT, has_cover INTEGER DEFAULT 0)")
+    c.execute("CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)")
+    c.execute("CREATE TABLE books_authors_link (id INTEGER PRIMARY KEY, book INTEGER, author INTEGER)")
+    c.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, book INTEGER, format TEXT, uncompressed_size INTEGER, name TEXT)")
+    c.execute("CREATE TABLE comments (id INTEGER PRIMARY KEY, book INTEGER UNIQUE, text TEXT)")
+
+    for bid in range(1, 6):
+        rel_path = f"author_{bid}/book_{bid}"
+        c.execute("INSERT INTO books (id, title, path) VALUES (?, ?, ?)", (bid, f"Book {bid}", rel_path))
+        c.execute("INSERT INTO authors (id, name) VALUES (?, ?)", (bid, f"Author {bid}"))
+        c.execute("INSERT INTO books_authors_link (book, author) VALUES (?, ?)", (bid, bid))
+        bdir = lib_dir / f"author_{bid}" / f"book_{bid}"
+        bdir.mkdir(parents=True)
+        (bdir / f"book_{bid}.epub").write_bytes(b"dummy")
+        c.execute("INSERT INTO data (book, format, uncompressed_size, name) VALUES (?, 'EPUB', 100, ?)", (bid, f"book_{bid}"))
+    conn.commit()
+    conn.close()
+
+    out_dir = tmp_path / "output"
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(f"output_dir: {out_dir}\ncalibre_library_path: {lib_dir}\n", encoding="utf-8")
+
+    mock_concept = Concept(name="Concept Alpha", category="Idea", summary="Alpha idea", weight=5, related_concepts=[])
+
+    with patch("bookeeper.processing.extractor.ChatOllama") as mock_chat_cls, \
+         patch("bookeeper.calibre.parser.BookParser.parse") as mock_parse, \
+         patch("bookeeper.calibre.parser.BookParser.is_graphical_format", return_value=False):
+
+        mock_parse.return_value = [Section(title="Ch 1", chapter_idx=1, text="Alpha text content " * 10)]
+        mock_inst = MagicMock()
+        mock_inst.with_structured_output.return_value.invoke.return_value = SectionExtraction(concepts=[mock_concept])
+        mock_chat_cls.return_value = mock_inst
+
+        res = runner.invoke(
+            app,
+            [
+                "build-graph",
+                "--from-scratch",
+                "--limit", "1",
+                "--config", str(cfg_file),
+                "--calibre-path", str(lib_dir),
+                "--skip-warmup",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert res.exit_code == 0
+        assert "Starting pipeline for 1 book(s)..." in res.stdout
+        assert "Ingesting Book #1 (1/1): Book 1" in res.stdout
+        assert "Ingesting Book #2" not in res.stdout
+        assert "Reached target limit of 1 successfully processed book(s)" in res.stdout
+
+        final_store = ConceptGraphStore()
+        final_store.load(out_dir / "knowledge_graph.json")
+        bids = {d["book_id"] for _, d in final_store.graph.nodes(data=True) if d.get("type") == "Book"}
+        assert bids == {1}
+
+
+
 
 
 

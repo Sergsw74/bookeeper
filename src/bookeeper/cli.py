@@ -1535,6 +1535,8 @@ def build_graph(
 
         export_dir = output_dir / "calibre_ingest"
         for b in target_list:
+            if limit is not None and limit > 0 and len(books_to_process) >= limit:
+                break
             bid = b["id"]
             formats = b.get("formats", [])
             # Check if book only has graphical formats (CBR, CBZ, DJVU)
@@ -3378,7 +3380,7 @@ def remove_book_cmd(
     Purges the book node, its sections, chunks, and any orphan concepts that only belonged to this book.
     Also clears its completed state from the progress checkpoint so it can be re-indexed cleanly.
     """
-    cfg = load_settings(config)
+    cfg = get_settings(config)
     output_dir = cfg.resolved_output_dir
     graph_file = output_dir / "knowledge_graph.json"
     tracker = ProgressTracker(cfg.resolved_state_file)
@@ -3490,6 +3492,20 @@ def test_run_command(
         if e.exit_code != 0:
             console.print(f"[bold red]Stage 1 build-graph exited with code {e.exit_code}. Aborting test-run.[/bold red]")
             raise
+
+    # Verify that Stage 1 successfully populated books in the knowledge graph
+    eff_cfg = _get_effective_settings(config_path, calibre_path, model=model)
+    kg_file = eff_cfg.resolved_output_dir / "knowledge_graph.json"
+    if kg_file.is_file():
+        chk_store = ConceptGraphStore()
+        chk_store.load(kg_file)
+        indexed_books = [n for n, d in chk_store.graph.nodes(data=True) if d.get("type") == "Book"]
+        if not indexed_books:
+            console.print(
+                "[bold red]Stage 1 build-graph completed but 0 books were successfully indexed into the Knowledge Graph. "
+                "Aborting test-run verification.[/bold red]"
+            )
+            raise typer.Exit(1)
 
     # 2. Automatically Run Verification
     console.print(

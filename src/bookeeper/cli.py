@@ -3,6 +3,7 @@ Production-quality Typer CLI interface for bookeeper with rich progress bars and
 """
 
 import json
+import logging
 import queue
 import random
 import threading
@@ -65,6 +66,7 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 class DaemonThreadPoolExecutor(ThreadPoolExecutor):
@@ -1194,10 +1196,13 @@ def build_graph(
     tracker = ProgressTracker(tracker_path)
 
     if from_scratch:
+        num_skipped_before = len(tracker.get_skipped_ids("build_graph")) if not retry_skipped else 0
+        tracker.clear("build_graph", keep_skipped=not retry_skipped)
+        skipped_suffix = f" (preserving {num_skipped_before} memorized skipped book(s))" if num_skipped_before else ""
         console.print(
-            "[bold yellow]Restarting build entirely from scratch: clearing progress tracker checkpoint, resetting knowledge graph, deleting all book states and cached chunks...[/bold yellow]"
+            f"[bold yellow]Restarting build entirely from scratch{skipped_suffix}: clearing progress tracker checkpoint, "
+            "resetting knowledge graph, deleting all book states and cached chunks...[/bold yellow]"
         )
-        tracker.clear("build_graph")
         reset_progress = True
         resume = False
         continue_run = False
@@ -1515,6 +1520,18 @@ def build_graph(
                         f"({len(completed_ids)} in graph). {len(target_list)} remaining to process. {next_bid_str}"
                     )
                 console.print(f"[dim cyan]{msg}[/dim cyan]")
+        elif not retry_skipped and tracker.get_skipped_ids("build_graph"):
+            tracker_skipped = tracker.get_skipped_ids("build_graph")
+            orig_len = len(target_list)
+            target_list = [b for b in target_list if b.get("id") not in tracker_skipped]
+            bypassed = orig_len - len(target_list)
+            if bypassed > 0:
+                next_bid_str = f"Next book: #{target_list[0]['id']} ('{target_list[0].get('title', '')}')" if target_list else "None (all books processed or skipped)"
+                from_scratch_label = " (from scratch)" if from_scratch else ""
+                console.print(
+                    f"[dim cyan]Knowledge Graph Build{from_scratch_label}: Bypassed {bypassed} memorized skipped book(s) "
+                    f"(graphical/unsupported formats). {len(target_list)} remaining to process. {next_bid_str}[/dim cyan]"
+                )
 
         export_dir = output_dir / "calibre_ingest"
         for b in target_list:

@@ -616,9 +616,10 @@ def test_build_graph_from_scratch(tmp_path):
     """)
     conn.execute("INSERT INTO books (id, title, path) VALUES (1, 'Book One', 'Author/B1')")
     conn.execute("INSERT INTO books (id, title, path) VALUES (2, 'Book Two', 'Author/B2')")
+    conn.execute("INSERT INTO books (id, title, path) VALUES (3, 'Comic Three', 'Author/B3')")
     conn.execute("INSERT INTO authors (id, name) VALUES (1, 'Author')")
-    conn.execute("INSERT INTO books_authors_link (book, author) VALUES (1, 1), (2, 1)")
-    conn.execute("INSERT INTO data (book, format, name) VALUES (1, 'EPUB', 'Book One'), (2, 'EPUB', 'Book Two')")
+    conn.execute("INSERT INTO books_authors_link (book, author) VALUES (1, 1), (2, 1), (3, 1)")
+    conn.execute("INSERT INTO data (book, format, name) VALUES (1, 'EPUB', 'Book One'), (2, 'EPUB', 'Book Two'), (3, 'CBR', 'Comic Three')")
     conn.commit()
     conn.close()
 
@@ -631,10 +632,12 @@ def test_build_graph_from_scratch(tmp_path):
     out_dir.mkdir(parents=True)
     state_file = out_dir / "state.json"
 
-    # Seed state file with book 1 already completed
+    # Seed state file with book 1 already completed and book 3 memorized skipped
     tracker = ProgressTracker(state_file)
     tracker.mark_completed("build_graph", 1, title="Book One")
+    tracker.mark_skipped("build_graph", 3, title="Comic Three", reason="graphical: CBR")
     assert 1 in tracker.get_completed_ids("build_graph")
+    assert 3 in tracker.get_skipped_ids("build_graph")
 
     # Seed an old graph
     old_store = ConceptGraphStore()
@@ -693,6 +696,15 @@ def test_build_graph_from_scratch(tmp_path):
         # Both Book 1 and Book 2 must be processed
         assert "Ingesting Book #1" in res.stdout and "Book One" in res.stdout
         assert "Ingesting Book #2" in res.stdout and "Book Two" in res.stdout
+
+        # Book 3 was preserved as skipped and bypassed without rescan
+        assert "preserving 1 memorized skipped book(s)" in res.stdout
+        assert "Bypassed 1 memorized skipped book(s)" in res.stdout
+        assert "⚡ Memorized skipped book #3" not in res.stdout
+
+        # Verify final tracker preserved skipped book 3
+        reloaded_tracker = ProgressTracker(state_file)
+        assert reloaded_tracker.get_skipped_ids("build_graph") == {3}
 
         # Verify final graph has both books
         final_store = ConceptGraphStore()

@@ -140,7 +140,13 @@ class LightRAGEngine:
                 raise
 
         target_pool = self.embedding_pool if use_embedding_pool else self.pool
-        return target_pool.execute_with_failover(_invoke, retries=3)
+        req_chars = len(data.get("prompt", "")) or (sum(len(t) for t in data.get("input", [])) if isinstance(data.get("input"), list) else len(str(data.get("input", ""))))
+        return target_pool.execute_with_failover(
+            _invoke,
+            retries=3,
+            input_chars=req_chars,
+            task_type="embedding" if use_embedding_pool else "rag",
+        )
 
     async def _llm_model_func(
         self,

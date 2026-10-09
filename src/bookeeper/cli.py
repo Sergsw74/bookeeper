@@ -9,7 +9,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import typer
 from langchain_ollama import OllamaEmbeddings
@@ -37,7 +37,12 @@ from bookeeper.graph.store import ConceptGraphStore
 from bookeeper.processing.chunker import ChunkStore, HierarchicalChunk, HierarchicalChunker
 from bookeeper.processing.deduplicator import EntityDeduplicator
 from bookeeper.processing.extractor import KnowledgeExtractor, SectionExtraction
-from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings, OllamaPool
+from bookeeper.processing.ollama_pool import (
+    FailoverOllamaEmbeddings,
+    OllamaPool,
+    aggregate_server_statistics,
+    format_server_stats_table,
+)
 from bookeeper.processing.state import BookProcessingState, ProgressTracker
 from bookeeper.processing.verifier import (
     IdeaVerifier,
@@ -285,6 +290,23 @@ def _perform_ollama_warmup(extractor: KnowledgeExtractor, console: Console) -> D
         )
 
     return status
+
+
+def _print_ollama_server_stats(
+    pools: Sequence[OllamaPool],
+    console: Console,
+    title: str = "Ollama Server Workload & Effort Statistics",
+) -> None:
+    """Print clean summary table of Ollama server efforts (chars processed, tasks, avg/total time)."""
+    valid_pools = [p for p in pools if p is not None]
+    if not valid_pools:
+        return
+    stats = aggregate_server_statistics(valid_pools)
+    if not stats:
+        return
+    table = format_server_stats_table(stats, title=title)
+    console.print()
+    console.print(table)
 
 
 @app.command()
@@ -923,6 +945,8 @@ def clean_metadata(
                     f"[dim](across {len(durations)} normalized books)[/dim]"
                 )
             console.print(summary_text)
+
+        _print_ollama_server_stats([extractor.pool], console=console, title="Ollama Server Metadata Cleaning Effort")
 
     finally:
         if should_stage and client.is_staged:
@@ -2249,6 +2273,11 @@ def build_graph(
                 f"[dim](across {len(durations)} extracted chunk tasks)[/dim]"
             )
 
+        pools_to_report = [extractor.pool]
+        if hasattr(embeddings, "pool") and getattr(embeddings, "pool", None) is not extractor.pool:
+            pools_to_report.append(embeddings.pool)
+        _print_ollama_server_stats(pools_to_report, console=console)
+
         if interrupted:
             console.print(
                 f"[bold yellow]Graph build stopped by user.[/bold yellow] "
@@ -2993,6 +3022,7 @@ def verify_command(
         with open(report_dest, "w", encoding="utf-8") as f:
             json.dump(report.model_dump(), f, indent=2, ensure_ascii=False)
         console.print(f"[dim green]✓ Full chunking verification report saved to: [bold]{report_dest}[/bold][/dim green]\n")
+        _print_ollama_server_stats([pool], console=console, title="Ollama Server Chunking Verification Effort Statistics")
         return
 
     # Mode: 'ideas'
@@ -3128,6 +3158,7 @@ def verify_command(
     with open(report_dest, "w", encoding="utf-8") as f:
         json.dump(report.model_dump(), f, indent=2, ensure_ascii=False)
     console.print(f"[dim green]✓ Full verification report saved to: [bold]{report_dest}[/bold][/dim green]\n")
+    _print_ollama_server_stats([pool], console=console, title="Ollama Server Verification Effort Statistics")
 
 
 @app.command("remove-book")

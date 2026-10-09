@@ -11,7 +11,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 from langchain_core.embeddings import Embeddings
 from langchain_ollama import OllamaEmbeddings
@@ -34,6 +34,15 @@ class OllamaServerNode:
     last_error: Optional[str] = None
     active_tasks: int = 0
     last_task_start: Optional[float] = None
+
+    # Workload and effort statistics
+    total_tasks: int = 0
+    success_tasks: int = 0
+    failed_tasks: int = 0
+    success_chars: int = 0
+    total_duration: float = 0.0
+    success_duration: float = 0.0
+    stats_by_type: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     @property
     def label(self) -> str:
@@ -93,6 +102,63 @@ class OllamaServerNode:
         """Release server from current task without placing into cooldown."""
         self.failed_at = None
         self.last_error = error
+
+    def record_task_attempt(
+        self,
+        duration: float,
+        success: bool,
+        chars: int = 0,
+        task_type: str = "llm",
+    ) -> None:
+        """Record the outcome, execution time, and characters for a task on this server."""
+        self.total_tasks += 1
+        self.total_duration += max(0.0, duration)
+        tt = (task_type or "llm").strip().lower()
+
+        if tt not in self.stats_by_type:
+            self.stats_by_type[tt] = {
+                "total_tasks": 0,
+                "success_tasks": 0,
+                "failed_tasks": 0,
+                "success_chars": 0,
+                "total_duration": 0.0,
+                "success_duration": 0.0,
+            }
+
+        sub = self.stats_by_type[tt]
+        sub["total_tasks"] += 1
+        sub["total_duration"] += max(0.0, duration)
+
+        if success:
+            self.success_tasks += 1
+            self.success_duration += max(0.0, duration)
+            self.success_chars += max(0, chars)
+            sub["success_tasks"] += 1
+            sub["success_duration"] += max(0.0, duration)
+            sub["success_chars"] += max(0, chars)
+        else:
+            self.failed_tasks += 1
+            sub["failed_tasks"] += 1
+
+    @property
+    def avg_duration(self) -> float:
+        """Average duration across all task attempts on this server."""
+        return (self.total_duration / self.total_tasks) if self.total_tasks > 0 else 0.0
+
+    @property
+    def avg_success_duration(self) -> float:
+        """Average duration across successful tasks on this server."""
+        return (self.success_duration / self.success_tasks) if self.success_tasks > 0 else 0.0
+
+    def reset_statistics(self) -> None:
+        """Reset workload statistics counters."""
+        self.total_tasks = 0
+        self.success_tasks = 0
+        self.failed_tasks = 0
+        self.success_chars = 0
+        self.total_duration = 0.0
+        self.success_duration = 0.0
+        self.stats_by_type.clear()
 
 
 _thread_local = threading.local()
@@ -351,12 +417,15 @@ class OllamaPool:
         quarantine_server: bool = True,
         exclude_urls: Optional[Set[str]] = None,
         capability: Optional[str] = None,
+        input_chars: int = 0,
+        task_type: Optional[str] = None,
     ) -> Any:
         """
         Execute an operation passing base_url.
         Enforces sequential submission/execution per Ollama server (at most max_tasks_per_server per node),
         routes across idle servers by priority, retries on transient errors, and automatically fails over.
         Optionally filters candidate servers by required capability ('llm', 'embedding', 'verification').
+        Tracks execution efforts, task counts, durations, and valuable characters processed per node.
         """
         pool_nodes = self.nodes_for_capability(capability)
         if not pool_nodes:
@@ -389,6 +458,12 @@ class OllamaPool:
                                 )
                                 n.active_tasks = 0
                                 n.last_task_start = None
+                                n.record_task_attempt(
+                                    duration=elapsed,
+                                    success=False,
+                                    chars=0,
+                                    task_type=task_type or capability or "llm",
+                                )
                                 if quarantine_server:
                                     n.mark_failure(f"Watchdog: task exceeded {max_task_duration:.1f}s")
                                 else:
@@ -457,14 +532,30 @@ class OllamaPool:
                 max_attempts = max(1, retries)
                 attempt = 0
                 while attempt < max_attempts:
+                    t_attempt_start = time.perf_counter()
                     try:
                         _thread_local.last_used_server = selected_node.label
                         _thread_local.last_used_server_url = selected_node.url
                         result = operation(selected_node.url)
+                        dur = time.perf_counter() - t_attempt_start
                         with self._condition:
                             selected_node.mark_success()
+                            selected_node.record_task_attempt(
+                                duration=dur,
+                                success=True,
+                                chars=input_chars,
+                                task_type=task_type or capability or "llm",
+                            )
                         return result
                     except Exception as e:
+                        dur = time.perf_counter() - t_attempt_start
+                        with self._condition:
+                            selected_node.record_task_attempt(
+                                duration=dur,
+                                success=False,
+                                chars=0,
+                                task_type=task_type or capability or "llm",
+                            )
                         last_exception = e
                         conn_err = is_connection_error(e)
 
@@ -576,6 +667,36 @@ class OllamaPool:
                 )
             return status_list
 
+    def get_server_statistics(self) -> List[Dict[str, Any]]:
+        """Return snapshot list of workload, task counts, and effort statistics for all pool nodes."""
+        with self._lock:
+            stats_list = []
+            for n in sorted(self.nodes, key=lambda x: x.priority):
+                stats_list.append(
+                    {
+                        "name": n.label,
+                        "url": n.url,
+                        "priority": n.priority,
+                        "capabilities": list(n.capabilities),
+                        "total_tasks": n.total_tasks,
+                        "success_tasks": n.success_tasks,
+                        "failed_tasks": n.failed_tasks,
+                        "success_chars": n.success_chars,
+                        "total_duration": n.total_duration,
+                        "success_duration": n.success_duration,
+                        "avg_duration": n.avg_duration,
+                        "avg_success_duration": n.avg_success_duration,
+                        "stats_by_type": {k: dict(v) for k, v in n.stats_by_type.items()},
+                    }
+                )
+            return stats_list
+
+    def reset_server_statistics(self) -> None:
+        """Reset workload and effort statistics across all nodes."""
+        with self._lock:
+            for n in self.nodes:
+                n.reset_statistics()
+
 
 class FailoverOllamaEmbeddings(Embeddings):
     """
@@ -671,12 +792,18 @@ class FailoverOllamaEmbeddings(Embeddings):
                                 return embs
                     raise exc
 
+            batch_chars = sum(len(t) for t in batch_texts)
             t0 = time.perf_counter()
-            result = self.pool.execute_with_failover(_embed, capability="embedding")
+            result = self.pool.execute_with_failover(
+                _embed,
+                capability="embedding",
+                input_chars=batch_chars,
+                task_type="embedding",
+            )
             elapsed = time.perf_counter() - t0
             with self._lock:
                 self.total_embedded_texts += len(batch_texts)
-                self.total_embedded_chars += sum(len(t) for t in batch_texts)
+                self.total_embedded_chars += batch_chars
                 self.total_embedding_seconds += elapsed
             return result
 
@@ -718,11 +845,210 @@ class FailoverOllamaEmbeddings(Embeddings):
                             return embs[0]
                 raise exc
 
+        query_chars = len(text)
         t0 = time.perf_counter()
-        result = self.pool.execute_with_failover(_embed, capability="embedding")
+        result = self.pool.execute_with_failover(
+            _embed,
+            capability="embedding",
+            input_chars=query_chars,
+            task_type="embedding",
+        )
         elapsed = time.perf_counter() - t0
         with self._lock:
             self.total_embedded_texts += 1
-            self.total_embedded_chars += len(text)
+            self.total_embedded_chars += query_chars
             self.total_embedding_seconds += elapsed
         return result
+
+
+def format_duration_friendly(seconds: float) -> str:
+    """Format duration in seconds into a human-readable string (e.g. 12.3s, 5m 20s, 1h 14m 02s)."""
+    if seconds <= 0:
+        return "0.0s"
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    m = int(seconds // 60)
+    s = int(seconds % 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h = int(m // 60)
+    rem_m = int(m % 60)
+    return f"{h}h {rem_m:02d}m {s:02d}s"
+
+
+def format_chars_friendly(chars: int) -> str:
+    """Format character count into a human-readable string (e.g. 485,120 (473.8 KB))."""
+    if chars <= 0:
+        return "0 chars"
+    if chars < 1024:
+        return f"{chars:,} chars"
+    elif chars < 1024 * 1024:
+        kb = chars / 1024.0
+        return f"{chars:,} ({kb:.1f} KB)"
+    else:
+        mb = chars / (1024.0 * 1024.0)
+        return f"{chars:,} ({mb:.2f} MB)"
+
+
+def aggregate_server_statistics(pools: Sequence[OllamaPool]) -> List[Dict[str, Any]]:
+    """
+    Consolidate workload and effort metrics across multiple OllamaPool instances
+    (e.g. LLM pool, embedding pool, verification pool), grouped by server URL.
+    """
+    aggregated: Dict[str, Dict[str, Any]] = {}
+    for pool in pools:
+        if not pool:
+            continue
+        for node_stat in pool.get_server_statistics():
+            url = node_stat["url"]
+            if url not in aggregated:
+                aggregated[url] = {
+                    "name": node_stat["name"],
+                    "url": url,
+                    "priority": node_stat["priority"],
+                    "capabilities": set(node_stat.get("capabilities", [])),
+                    "total_tasks": 0,
+                    "success_tasks": 0,
+                    "failed_tasks": 0,
+                    "success_chars": 0,
+                    "total_duration": 0.0,
+                    "success_duration": 0.0,
+                    "stats_by_type": {},
+                }
+            entry = aggregated[url]
+            entry["capabilities"].update(node_stat.get("capabilities", []))
+            entry["priority"] = min(entry["priority"], node_stat.get("priority", 1))
+            entry["total_tasks"] += node_stat.get("total_tasks", 0)
+            entry["success_tasks"] += node_stat.get("success_tasks", 0)
+            entry["failed_tasks"] += node_stat.get("failed_tasks", 0)
+            entry["success_chars"] += node_stat.get("success_chars", 0)
+            entry["total_duration"] += node_stat.get("total_duration", 0.0)
+            entry["success_duration"] += node_stat.get("success_duration", 0.0)
+
+            for t_type, t_st in node_stat.get("stats_by_type", {}).items():
+                if t_type not in entry["stats_by_type"]:
+                    entry["stats_by_type"][t_type] = {
+                        "total_tasks": 0,
+                        "success_tasks": 0,
+                        "failed_tasks": 0,
+                        "success_chars": 0,
+                        "total_duration": 0.0,
+                    }
+                sub = entry["stats_by_type"][t_type]
+                sub["total_tasks"] += t_st.get("total_tasks", 0)
+                sub["success_tasks"] += t_st.get("success_tasks", 0)
+                sub["failed_tasks"] += t_st.get("failed_tasks", 0)
+                sub["success_chars"] += t_st.get("success_chars", 0)
+                sub["total_duration"] += t_st.get("total_duration", 0.0)
+
+    result = []
+    for url, entry in aggregated.items():
+        tot = entry["total_tasks"]
+        dur = entry["total_duration"]
+        entry["capabilities"] = sorted(entry["capabilities"])
+        entry["avg_duration"] = (dur / tot) if tot > 0 else 0.0
+        result.append(entry)
+
+    return sorted(result, key=lambda x: x["priority"])
+
+
+def format_server_stats_table(
+    stats: List[Dict[str, Any]],
+    title: str = "Ollama Server Workload & Effort Statistics",
+) -> Any:
+    """
+    Build a Rich Table presenting per-server job and effort statistics:
+    - Valuable/accepted/successfully processed characters
+    - Success tasks vs total tasks (with completion rate)
+    - Average time and total time per server
+    - Task type breakdown (LLM, Embedding, Verification)
+    """
+    from rich.table import Table
+
+    table = Table(title=title, border_style="cyan")
+    table.add_column("Server Node", style="bold", min_width=20)
+    table.add_column("Capabilities", style="dim", justify="center")
+    table.add_column("Success Tasks", justify="right", style="green")
+    table.add_column("Total Tasks", justify="right")
+    table.add_column("Valuable Chars", justify="right", style="cyan")
+    table.add_column("Avg Time", justify="right", style="bold green")
+    table.add_column("Total Time", justify="right", style="bold yellow")
+    table.add_column("Task Breakdown", style="dim", min_width=22)
+
+    total_success = 0
+    total_tasks = 0
+    total_chars = 0
+    total_time = 0.0
+
+    for s in stats:
+        suc = s["success_tasks"]
+        tot = s["total_tasks"]
+        chars = s["success_chars"]
+        dur = s["total_duration"]
+        avg_dur = s.get("avg_duration", 0.0)
+
+        total_success += suc
+        total_tasks += tot
+        total_chars += chars
+        total_time += dur
+
+        server_label = f"{s['name']}\n[dim]{s['url']}[/dim]"
+        caps_str = ", ".join(s.get("capabilities", [])) or "all"
+
+        if tot > 0:
+            rate = (suc / tot * 100.0) if tot > 0 else 0.0
+            rate_color = "green" if rate == 100.0 else ("yellow" if rate >= 80.0 else "red")
+            tot_str = f"{tot} [{rate_color}]({rate:.1f}%)[/{rate_color}]"
+            suc_str = f"[bold green]{suc:,}[/bold green]"
+            chars_str = f"[bold cyan]{format_chars_friendly(chars)}[/bold cyan]"
+            avg_str = f"{avg_dur:.2f}s"
+            time_str = format_duration_friendly(dur)
+        else:
+            tot_str = "[dim]0 (--)[/dim]"
+            suc_str = "[dim]0[/dim]"
+            chars_str = "[dim]0 chars[/dim]"
+            avg_str = "[dim]--[/dim]"
+            time_str = "[dim]0.0s[/dim]"
+
+        # Task breakdown string
+        breakdown_parts = []
+        for tt, sub in s.get("stats_by_type", {}).items():
+            sub_tot = sub.get("total_tasks", 0)
+            sub_suc = sub.get("success_tasks", 0)
+            sub_chars = sub.get("success_chars", 0)
+            if sub_tot > 0:
+                breakdown_parts.append(
+                    f"{tt.upper()}: {sub_suc}/{sub_tot} ({format_chars_friendly(sub_chars)})"
+                )
+        breakdown_str = "\n".join(breakdown_parts) if breakdown_parts else ("[dim]Idle[/dim]" if tot == 0 else "[dim]LLM[/dim]")
+
+        table.add_row(
+            server_label,
+            caps_str,
+            suc_str,
+            tot_str,
+            chars_str,
+            avg_str,
+            time_str,
+            breakdown_str,
+        )
+
+    # Summary row
+    table.add_section()
+    overall_rate = (total_success / total_tasks * 100.0) if total_tasks > 0 else 0.0
+    overall_avg = (total_time / total_tasks) if total_tasks > 0 else 0.0
+    rate_color = "green" if overall_rate == 100.0 else ("yellow" if overall_rate >= 80.0 else "red")
+    overall_tot_str = f"[bold]{total_tasks:,}[/bold] [{rate_color}]({overall_rate:.1f}%)[/{rate_color}]" if total_tasks > 0 else "0"
+
+    table.add_row(
+        f"[bold]Total Pool Effort ({len(stats)} nodes)[/bold]",
+        "-",
+        f"[bold green]{total_success:,}[/bold green]",
+        overall_tot_str,
+        f"[bold cyan]{format_chars_friendly(total_chars)}[/bold cyan]",
+        f"[bold green]{overall_avg:.2f}s[/bold green]" if total_tasks > 0 else "--",
+        f"[bold yellow]{format_duration_friendly(total_time)}[/bold yellow]",
+        f"[bold]{total_success} success / {total_tasks} total[/bold]",
+    )
+
+    return table

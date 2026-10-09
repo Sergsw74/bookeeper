@@ -179,11 +179,21 @@ class IdeaVerifier:
                 except Exception as e:
                     logger.debug(f"Warmup ping error for {node.url}: {e}")
 
-    def _execute_structured_invoke(self, messages: List[Any]) -> VerificationResult:
+    def _execute_structured_invoke(
+        self,
+        messages: List[Any],
+        input_chars: int = 0,
+    ) -> VerificationResult:
         """
         Execute structured LLM invoke with automatic pool failover and curl fallback
         to ensure resilience against network timeouts and macOS Local Network Privacy.
         """
+        if input_chars <= 0 and messages:
+            for m in messages:
+                content = getattr(m, "content", "")
+                if isinstance(content, str):
+                    input_chars += len(content)
+
         def _invoke(url: str) -> VerificationResult:
             try:
                 # Clean sampling parameters: pass only valid parameters (no mirostat, mirostat_eta, mirostat_tau, or tfs_z)
@@ -252,7 +262,13 @@ class IdeaVerifier:
                         raise ValueError(f"Ollama server {url} returned empty content")
                 raise exc
 
-        return self.pool.execute_with_failover(_invoke, retries=self.retries, capability="verification")
+        return self.pool.execute_with_failover(
+            _invoke,
+            retries=self.retries,
+            capability="verification",
+            input_chars=input_chars,
+            task_type="verification",
+        )
 
     def verify_idea_chunk(
         self,

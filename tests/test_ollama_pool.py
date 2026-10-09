@@ -955,6 +955,122 @@ def test_pool_for_capability_subpool():
     assert len(embed_pool.nodes) == 2
 
 
+def test_ollama_server_node_record_task_attempt():
+    """Verify task attempt metrics: characters, task counts, duration, and averages."""
+    node = OllamaServerNode(url="http://node-gpu:11434", priority=1, name="gpu-node")
+    assert node.total_tasks == 0
+    assert node.success_tasks == 0
+    assert node.failed_tasks == 0
+    assert node.success_chars == 0
+    assert node.total_duration == 0.0
+
+    # 1. Record successful LLM task
+    node.record_task_attempt(duration=2.5, success=True, chars=1200, task_type="llm")
+    assert node.total_tasks == 1
+    assert node.success_tasks == 1
+    assert node.failed_tasks == 0
+    assert node.success_chars == 1200
+    assert pytest.approx(node.total_duration, 0.01) == 2.5
+    assert pytest.approx(node.avg_duration, 0.01) == 2.5
+
+    # 2. Record failed task (chars should NOT be added to success_chars)
+    node.record_task_attempt(duration=1.0, success=False, chars=1500, task_type="llm")
+    assert node.total_tasks == 2
+    assert node.success_tasks == 1
+    assert node.failed_tasks == 1
+    assert node.success_chars == 1200  # Still 1200, failed attempt chars discarded!
+    assert pytest.approx(node.total_duration, 0.01) == 3.5
+    assert pytest.approx(node.avg_duration, 0.01) == 1.75
+    assert pytest.approx(node.avg_success_duration, 0.01) == 2.5
+
+    # 3. Record successful embedding task
+    node.record_task_attempt(duration=0.5, success=True, chars=800, task_type="embedding")
+    assert node.total_tasks == 3
+    assert node.success_tasks == 2
+    assert node.success_chars == 2000
+    assert "embedding" in node.stats_by_type
+    assert node.stats_by_type["embedding"]["success_tasks"] == 1
+    assert node.stats_by_type["embedding"]["success_chars"] == 800
+
+    # 4. Reset stats
+    node.reset_statistics()
+    assert node.total_tasks == 0
+    assert node.success_chars == 0
+
+
+def test_ollama_pool_execute_with_failover_metrics():
+    """Verify execute_with_failover automatically records task counts and valuable characters."""
+    servers = [
+        OllamaServerConfig(url="http://node-fail:11434", priority=1, name="fail-node"),
+        OllamaServerConfig(url="http://node-ok:11434", priority=2, name="ok-node"),
+    ]
+    pool = OllamaPool(servers=servers, cooldown_seconds=600)
+
+    # Invocation where fail-node fails and ok-node succeeds
+    def mock_operation(url: str):
+        if "node-fail" in url:
+            raise ConnectionRefusedError("Offline")
+        return "success_data"
+
+    res = pool.execute_with_failover(
+        mock_operation,
+        retries=1,
+        input_chars=3500,
+        task_type="llm",
+    )
+    assert res == "success_data"
+
+    fail_node = next(n for n in pool.nodes if n.url == "http://node-fail:11434")
+    ok_node = next(n for n in pool.nodes if n.url == "http://node-ok:11434")
+
+    # Fail node has 1 attempted task, 0 success, 0 accepted chars
+    assert fail_node.total_tasks >= 1
+    assert fail_node.success_tasks == 0
+    assert fail_node.success_chars == 0
+
+    # Ok node has 1 attempted task, 1 success, 3500 accepted chars
+    assert ok_node.total_tasks == 1
+    assert ok_node.success_tasks == 1
+    assert ok_node.success_chars == 3500
+
+
+def test_aggregate_server_statistics_and_table_formatting():
+    """Verify multi-pool stats aggregation and Rich table formatting."""
+    from bookeeper.processing.ollama_pool import (
+        aggregate_server_statistics,
+        format_server_stats_table,
+    )
+
+    # Pool 1 (LLM pool)
+    p1 = OllamaPool.from_urls(["http://node-gpu:11434"])
+    p1.nodes[0].record_task_attempt(duration=5.0, success=True, chars=10000, task_type="llm")
+
+    # Pool 2 (Embedding pool, sharing same node-gpu)
+    p2 = OllamaPool.from_urls(["http://node-gpu:11434", "http://node-cpu:11434"])
+    p2.nodes[0].record_task_attempt(duration=1.0, success=True, chars=4000, task_type="embedding")
+    p2.nodes[1].record_task_attempt(duration=2.0, success=True, chars=2500, task_type="embedding")
+
+    aggregated = aggregate_server_statistics([p1, p2])
+    assert len(aggregated) == 2
+
+    gpu_stat = next(s for s in aggregated if s["url"] == "http://node-gpu:11434")
+    assert gpu_stat["total_tasks"] == 2
+    assert gpu_stat["success_tasks"] == 2
+    assert gpu_stat["success_chars"] == 14000  # 10000 + 4000
+    assert pytest.approx(gpu_stat["total_duration"], 0.01) == 6.0
+
+    cpu_stat = next(s for s in aggregated if s["url"] == "http://node-cpu:11434")
+    assert cpu_stat["total_tasks"] == 1
+    assert cpu_stat["success_tasks"] == 1
+    assert cpu_stat["success_chars"] == 2500
+
+    # Generate Rich table
+    table = format_server_stats_table(aggregated, title="Test Server Statistics")
+    assert table is not None
+    assert len(table.rows) == 3  # 2 servers + 1 summary row
+    assert table.title == "Test Server Statistics"
+
+
 
 
 

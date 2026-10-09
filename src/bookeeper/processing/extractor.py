@@ -205,11 +205,19 @@ class KnowledgeExtractor:
         quarantine_server: bool = True,
         exclude_urls: Optional[Set[str]] = None,
         model: Optional[str] = None,
+        input_chars: int = 0,
+        task_type: str = "llm",
     ) -> Any:
         """Execute structured output invocation with multi-server failover, timeout, and retries."""
         timeout_sec = str(self.request_timeout)
         timeout_float = float(self.request_timeout)
         effective_model = model or self.model_name
+
+        if input_chars <= 0 and messages:
+            for m in messages:
+                content = getattr(m, "content", "")
+                if isinstance(content, str):
+                    input_chars += len(content)
 
         def _invoke(url: str):
             # 1. Direct curl invocation with format="json" for maximum reliability with Ollama
@@ -268,8 +276,6 @@ class KnowledgeExtractor:
                         raise TimeoutError(f"Ollama request to {url}/api/chat timed out after {timeout_sec}s")
                     elif res.returncode != 0:
                         logger.debug(f"Direct curl format=json returned non-zero code {res.returncode}")
-                    elif res.returncode != 0:
-                        logger.debug(f"Direct curl format=json returned non-zero code {res.returncode}")
                 except TimeoutError:
                     raise
                 except Exception as curl_err:
@@ -299,6 +305,8 @@ class KnowledgeExtractor:
             quarantine_server=quarantine_server,
             exclude_urls=exclude_urls,
             capability="llm",
+            input_chars=input_chars,
+            task_type=task_type,
         )
 
     def clean_metadata(
@@ -360,8 +368,17 @@ class KnowledgeExtractor:
             HumanMessage(content=user_content),
         ]
 
+        meta_chars = len(raw_title) + sum(len(a) for a in raw_authors) + len(raw_comments or "") + len(content_sample or "")
+
         try:
-            result = self._execute_structured_invoke(BookMetadata, messages, retries=retries, model=model)
+            result = self._execute_structured_invoke(
+                BookMetadata,
+                messages,
+                retries=retries,
+                model=model,
+                input_chars=meta_chars,
+                task_type="llm",
+            )
             if isinstance(result, BookMetadata):
                 result.title = BookParser.repair_mojibake(result.title)
                 result.author = BookParser.repair_mojibake(result.author)
@@ -464,6 +481,8 @@ class KnowledgeExtractor:
             HumanMessage(content=human_text),
         ]
 
+        chunk_chars = len(text)
+
         try:
             result = self._execute_structured_invoke(
                 SectionExtraction,
@@ -472,6 +491,8 @@ class KnowledgeExtractor:
                 quarantine_server=quarantine_server,
                 exclude_urls=exclude_urls,
                 model=model,
+                input_chars=chunk_chars,
+                task_type="llm",
             )
             if isinstance(result, SectionExtraction):
                 return result

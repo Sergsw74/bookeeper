@@ -3,6 +3,7 @@ Production-quality Typer CLI interface for bookeeper with rich progress bars and
 """
 
 import json
+import logging
 import queue
 import random
 import threading
@@ -29,6 +30,8 @@ from rich.progress import (
 )
 from rich.table import Table
 from rich.text import Text
+
+logger = logging.getLogger(__name__)
 
 from bookeeper.calibre.client import CalibreClient
 from bookeeper.calibre.parser import BookParser
@@ -3367,7 +3370,7 @@ def remove_book_cmd(
     Purges the book node, its sections, chunks, and any orphan concepts that only belonged to this book.
     Also clears its completed state from the progress checkpoint so it can be re-indexed cleanly.
     """
-    cfg = load_settings(config)
+    cfg = get_settings(config)
     output_dir = cfg.resolved_output_dir
     graph_file = output_dir / "knowledge_graph.json"
     tracker = ProgressTracker(cfg.resolved_state_file)

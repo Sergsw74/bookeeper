@@ -155,6 +155,13 @@ class IngestionRemainingColumn(ProgressColumn):
         return Text(f"ETA: {eta_str}", style=style)
 
 
+def _resolve_opt(val: Any, default: Any = None) -> Any:
+    """Unwrap Typer OptionInfo when commands are called directly within Python."""
+    if hasattr(val, "default"):
+        return val.default
+    return val if val is not None else default
+
+
 def _get_effective_settings(
     config_path: Optional[str] = None,
     calibre_path: Optional[str] = None,
@@ -168,6 +175,17 @@ def _get_effective_settings(
     max_chunk_attempts: Optional[int] = None,
 ) -> Settings:
     """Retrieve settings and merge explicit CLI arguments with highest precedence."""
+    config_path = _resolve_opt(config_path)
+    calibre_path = _resolve_opt(calibre_path)
+    ollama_url = _resolve_opt(ollama_url)
+    model = _resolve_opt(model)
+    model_fallback = _resolve_opt(model_fallback)
+    embedding_model = _resolve_opt(embedding_model)
+    embedding_url = _resolve_opt(embedding_url)
+    request_timeout = _resolve_opt(request_timeout)
+    max_retries = _resolve_opt(max_retries)
+    max_chunk_attempts = _resolve_opt(max_chunk_attempts)
+
     cfg = get_settings(config_path)
     overrides = {}
     if calibre_path:
@@ -1117,12 +1135,40 @@ def build_graph(
     max_chunk_attempts: Optional[int] = typer.Option(
         None, "--max-chunk-attempts", help="Maximum total retry attempts across pool for a stalled chunk before marking failed (default: 6)."
     ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", "-n", help="Stop build-graph after successfully processing N books."
+    ),
 ):
     """
     Ingest sections, perform semantic chunking, extract concepts via Ollama,
     deduplicate entities, and export the Concept Knowledge Graph.
     Supports persistent checkpointing to resume from interrupted runs or retry failed books.
     """
+    book_id = _resolve_opt(book_id)
+    file_path = _resolve_opt(file_path)
+    all_books = _resolve_opt(all_books, False)
+    export_obsidian = _resolve_opt(export_obsidian)
+    resume = _resolve_opt(resume, True)
+    retry_failed = _resolve_opt(retry_failed, False)
+    retry_skipped = _resolve_opt(retry_skipped, False)
+    reset_progress = _resolve_opt(reset_progress, False)
+    from_scratch = _resolve_opt(from_scratch, False)
+    clean_chunks = _resolve_opt(clean_chunks, False)
+    start_from_id = _resolve_opt(start_from_id)
+    state_file = _resolve_opt(state_file)
+    skip_warmup = _resolve_opt(skip_warmup, False)
+    chunks_dir = _resolve_opt(chunks_dir)
+    rechunk = _resolve_opt(rechunk, False)
+    max_tasks = _resolve_opt(max_tasks)
+    stage_db = _resolve_opt(stage_db)
+    fresh_db = _resolve_opt(fresh_db, False)
+    enable_lightrag = _resolve_opt(enable_lightrag)
+    lightrag_dir = _resolve_opt(lightrag_dir)
+    export_neo4j = _resolve_opt(export_neo4j)
+    clean_export = _resolve_opt(clean_export)
+    continue_run = _resolve_opt(continue_run, False)
+    limit = _resolve_opt(limit)
+
     cfg = _get_effective_settings(
         config_path,
         calibre_path,
@@ -2253,6 +2299,12 @@ def build_graph(
                 completed_in_session += 1
                 console.print(f"  [dim green]✓ Book #{bid} concepts integrated and graph checkpoint saved.[/dim green]")
 
+                if limit is not None and limit > 0 and completed_in_session >= limit:
+                    console.print(
+                        f"\n[bold green]✓ Reached target limit of {limit} successfully processed book(s). Halting build-graph as requested.[/bold green]"
+                    )
+                    break
+
             except KeyboardInterrupt:
                 store.remove_book(bid)
                 raise
@@ -2880,6 +2932,20 @@ def verify_command(
       within accepted thresholds, shows distance distribution across chunks within the book,
       and verifies that actual stored chunks match smart semantic boundaries.
     """
+    graph_file = _resolve_opt(graph_file)
+    percent = _resolve_opt(percent)
+    mode = _resolve_opt(mode)
+    book_id = _resolve_opt(book_id)
+    all_books = _resolve_opt(all_books, False)
+    threshold = _resolve_opt(threshold)
+    chunks_dir = _resolve_opt(chunks_dir)
+    model = _resolve_opt(model)
+    temperature = _resolve_opt(temperature)
+    max_examples = _resolve_opt(max_examples)
+    output_report = _resolve_opt(output_report)
+    seed = _resolve_opt(seed)
+    max_tasks = _resolve_opt(max_tasks)
+
     cfg = _get_effective_settings(
         config_path=config_path,
         embedding_model=embedding_model,
@@ -3322,6 +3388,106 @@ def remove_book_cmd(
     else:
         tracker.remove_book("build_graph", book_id)
         console.print(f"[bold yellow]Book #{book_id} was not found in the Knowledge Graph (checkpoint cleared).[/bold yellow]")
+
+
+@app.command("test-run")
+def test_run_command(
+    book_cnt: int = typer.Argument(
+        ...,
+        metavar="BOOK-CNT",
+        help="Number of books to successfully process from scratch before running verification.",
+    ),
+    config_path: Optional[str] = typer.Option(
+        None, "--config", "-c", help="Path to config.yaml file."
+    ),
+    calibre_path: Optional[str] = typer.Option(
+        None, "--calibre-path", help="Calibre library path or SMB mount."
+    ),
+    timeout: int = typer.Option(
+        60, "--request-timeout", "--timeout", help="HTTP timeout in seconds for Ollama LLM requests (default: 60s)."
+    ),
+    percent: float = typer.Option(
+        1.0, "--percent", "-p", help="Percentage of ideas to randomly verify (default: 1.0 for 1%)."
+    ),
+    mode: str = typer.Option(
+        "ideas", "--mode", "-m", help="Verification mode (default: 'ideas')."
+    ),
+    model: Optional[str] = typer.Option(
+        None, "--model", help="Optional override LLM model for build-graph."
+    ),
+    verifier_model: Optional[str] = typer.Option(
+        None, "--verifier-model", help="Optional dedicated verifier LLM model for verify."
+    ),
+    export_neo4j: Optional[bool] = typer.Option(
+        None, "--export-neo4j/--no-export-neo4j", help="Upsert knowledge graph directly into Neo4j (default: config.yaml neo4j.enabled)."
+    ),
+    skip_warmup: bool = typer.Option(
+        False, "--skip-warmup", help="Skip Ollama warmup and GPU acceleration check."
+    ),
+):
+    """
+    Execute an end-to-end test run across {book-cnt} books:
+    1. Rebuilds knowledge graph from scratch for the first {book-cnt} books:
+       (--from-scratch --no-lightrag --clean-export --timeout 60)
+    2. Halts immediately once {book-cnt} books have completed successfully.
+    3. Automatically starts factual verification on the resulting graph (--mode ideas --percent 1%).
+    """
+    if book_cnt < 1:
+        console.print("[bold red]book-cnt must be at least 1[/bold red]")
+        raise typer.Exit(1)
+
+    console.print(
+        Panel.fit(
+            f"[bold cyan]🧪 Test Run Pipeline Initiated[/bold cyan]\n"
+            f"• Target Books: [bold green]{book_cnt}[/bold green] (from scratch)\n"
+            f"• Build Parameters: [dim]--from-scratch --no-lightrag --clean-export --timeout {timeout}[/dim]\n"
+            f"• Verification: [bold green]{percent}%[/bold green] (mode: [cyan]{mode}[/cyan])",
+            title="bookeeper test-run",
+            border_style="cyan",
+        )
+    )
+
+    # 1. Build Graph from Scratch for first book_cnt books
+    console.print(
+        f"\n[bold yellow]═══ Stage 1/2: Building Knowledge Graph from scratch (limit: {book_cnt} books) ═══[/bold yellow]\n"
+    )
+    try:
+        build_graph(
+            calibre_path=calibre_path,
+            config_path=config_path,
+            from_scratch=True,
+            enable_lightrag=False,
+            clean_export=True,
+            request_timeout=timeout,
+            limit=book_cnt,
+            model=model,
+            export_neo4j=export_neo4j,
+            skip_warmup=skip_warmup,
+        )
+    except typer.Exit as e:
+        if e.exit_code != 0:
+            console.print(f"[bold red]Stage 1 build-graph exited with code {e.exit_code}. Aborting test-run.[/bold red]")
+            raise
+
+    # 2. Automatically Run Verification
+    console.print(
+        f"\n[bold yellow]═══ Stage 2/2: Verifying Knowledge Graph Integrity ({percent}%, mode: {mode}) ═══[/bold yellow]\n"
+    )
+    try:
+        verify_command(
+            config_path=config_path,
+            percent=percent,
+            mode=mode,
+            model=verifier_model,
+        )
+    except typer.Exit as e:
+        if e.exit_code != 0:
+            console.print(f"[bold red]Stage 2 verification exited with code {e.exit_code}.[/bold red]")
+            raise
+
+    console.print(
+        f"\n[bold green]✓ Test-run completed successfully ({book_cnt} book(s) processed & verified).[/bold green]\n"
+    )
 
 
 if __name__ == "__main__":

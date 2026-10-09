@@ -242,7 +242,32 @@ bookeeper build-graph --export-neo4j --clean-export
 
 # Wipe checkpoint state, delete existing graph, and rebuild from scratch:
 bookeeper build-graph --from-scratch
+
+# Ingest up to N books and stop (e.g. process 5 books):
+bookeeper build-graph --limit 5
 ```
+
+---
+
+### 🧪 Automated Test-Run Pipeline (`bookeeper test-run`)
+
+Runs an end-to-end integration pipeline from scratch for a specified number of books, stopping immediately after successfully indexing `{book-cnt}` books, and then automatically launches verification:
+
+```bash
+# Ingest 5 books from scratch and automatically verify 1% of ideas:
+bookeeper test-run 5
+
+# Customize timeout, sample percentage, or verification mode:
+bookeeper test-run 10 --timeout 60 --percent 2.0 --mode ideas
+
+# Test run with a specific LLM model and custom Calibre path:
+bookeeper test-run 3 --model "qwen2.5:3b" --calibre-path "/path/to/calibre"
+```
+
+**Pipeline Workflow:**
+1. **Stage 1 (Build Graph)**: Executes `build-graph` with `--from-scratch`, `--no-lightrag`, `--clean-export`, and `--timeout 60` (or configured value), processing books until exactly `{book-cnt}` books are successfully integrated into the knowledge graph.
+2. **Stage 2 (Verification)**: Automatically triggers `bookeeper verify` (default `--mode ideas`, `--percent 1.0%`) to validate factual grounding and report integrity statistics.
+
 
 ---
 

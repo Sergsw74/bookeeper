@@ -1405,6 +1405,105 @@ def test_resume_bypasses_memorized_skipped_books(tmp_path: Path):
     assert [b["id"] for b in target_list] == [2, 5]
 
 
+def test_test_run_command_pipeline(tmp_path):
+    """Verify bookeeper test-run {book-cnt} builds graph from scratch for limit books then verifies."""
+    import sqlite3
+    from unittest.mock import patch
+    from typer.testing import CliRunner
+    from bookeeper.cli import app
+    from bookeeper.graph.store import ConceptGraphStore
+    from bookeeper.processing.extractor import Concept, SectionExtraction
+    from bookeeper.processing.verifier import VerificationReport, VerificationStats
+
+    runner = CliRunner()
+
+    # 1. Setup Calibre DB with 3 books
+    lib_dir = tmp_path / "calibre_lib"
+    lib_dir.mkdir()
+    conn = sqlite3.connect(lib_dir / "metadata.db")
+    c = conn.cursor()
+    c.execute("CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, sort TEXT, author_sort TEXT, pubdate TIMESTAMP, path TEXT, has_cover INTEGER DEFAULT 0)")
+    c.execute("CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)")
+    c.execute("CREATE TABLE books_authors_link (id INTEGER PRIMARY KEY, book INTEGER, author INTEGER)")
+    c.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, book INTEGER, format TEXT, uncompressed_size INTEGER, name TEXT)")
+    c.execute("CREATE TABLE comments (id INTEGER PRIMARY KEY, book INTEGER UNIQUE, text TEXT)")
+
+    for bid, title in [(1, "Book One"), (2, "Book Two"), (3, "Book Three")]:
+        rel_path = f"author_{bid}/book_{bid}"
+        c.execute("INSERT INTO books (id, title, path) VALUES (?, ?, ?)", (bid, title, rel_path))
+        c.execute("INSERT INTO authors (id, name) VALUES (?, ?)", (bid, f"Author {bid}"))
+        c.execute("INSERT INTO books_authors_link (book, author) VALUES (?, ?)", (bid, bid))
+        bdir = lib_dir / f"author_{bid}" / f"book_{bid}"
+        bdir.mkdir(parents=True)
+        epub_file = bdir / f"book_{bid}.epub"
+        epub_file.write_bytes(b"dummy epub")
+        c.execute("INSERT INTO data (book, format, uncompressed_size, name) VALUES (?, 'EPUB', 100, ?)", (bid, f"book_{bid}"))
+    conn.commit()
+    conn.close()
+
+    out_dir = tmp_path / "output"
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(f"output_dir: {out_dir}\ncalibre_library_path: {lib_dir}\n", encoding="utf-8")
+
+    from bookeeper.calibre.parser import Section
+    mock_concept = Concept(name="Concept X", category="Idea", summary="Test idea", weight=5, related_concepts=[])
+
+    mock_report = VerificationReport(
+        stats=VerificationStats(
+            total_ideas_in_graph=2,
+            candidate_ideas_with_chunks=2,
+            sampled_ideas=1,
+            sample_percentage=1.0,
+            mode="ideas",
+            model_name="test-model",
+            total_evaluations=1,
+            verified_count=1,
+            discrepancy_count=0,
+            verified_percentage=100.0,
+            discrepancy_percentage=0.0,
+            total_duration_seconds=1.0,
+        ),
+        discrepancies=[],
+        verified_samples=[],
+    )
+
+    with patch("bookeeper.processing.extractor.ChatOllama") as mock_chat_cls, \
+         patch("bookeeper.calibre.parser.BookParser.parse") as mock_parse, \
+         patch("bookeeper.calibre.parser.BookParser.is_graphical_format", return_value=False), \
+         patch("bookeeper.cli.verify_graph", return_value=mock_report):
+
+        mock_parse.return_value = [Section(title="Ch 1", chapter_idx=1, text="Sample text " * 10)]
+        mock_instance = MagicMock()
+        mock_instance.with_structured_output.return_value.invoke.return_value = SectionExtraction(concepts=[mock_concept])
+        mock_chat_cls.return_value = mock_instance
+
+        res = runner.invoke(
+            app,
+            [
+                "test-run",
+                "2",
+                "--config", str(cfg_file),
+                "--calibre-path", str(lib_dir),
+                "--skip-warmup",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert res.exit_code == 0
+        assert "Test Run Pipeline Initiated" in res.stdout
+        assert "Stage 1/2: Building Knowledge Graph from scratch (limit: 2 books)" in res.stdout
+        assert "Reached target limit of 2 successfully processed book(s)" in res.stdout
+        assert "Stage 2/2: Verifying Knowledge Graph Integrity" in res.stdout
+        assert "Test-run completed successfully (2 book(s) processed & verified)" in res.stdout
+
+        # Verify exactly Book 1 and Book 2 were processed, Book 3 was NOT processed
+        final_store = ConceptGraphStore()
+        final_store.load(out_dir / "knowledge_graph.json")
+        bids = {d["book_id"] for _, d in final_store.graph.nodes(data=True) if d.get("type") == "Book"}
+        assert bids == {1, 2}
+
+
+
 
 
 

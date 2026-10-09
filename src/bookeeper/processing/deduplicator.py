@@ -1,14 +1,16 @@
 """
-Embedding-based entity resolution and concept deduplication using OllamaEmbeddings.
+Embedding-based entity resolution and concept deduplication using OllamaEmbeddings
+and two-tier LLM-assisted verification and synthesis.
 """
 
 import logging
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from langchain_core.embeddings import Embeddings
-from langchain_ollama import OllamaEmbeddings
+from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 
 from bookeeper.calibre.parser import BookParser
 from bookeeper.config import Settings
@@ -17,19 +19,47 @@ from bookeeper.processing.extractor import Concept
 logger = logging.getLogger(__name__)
 
 
+class ConceptDeduplicationDecision(BaseModel):
+    """Structured decision and synthesized concept details from LLM disambiguation."""
+
+    is_same_concept: bool = Field(
+        description="True if both concepts refer to the same underlying entity, idea, technique, strategy, or theme.",
+    )
+    canonical_name: Optional[str] = Field(
+        default=None,
+        description="If similar, provide the most concise, accurate, canonical name representing both concepts (2-4 words, capitalized noun phrase).",
+    )
+    brief_description: Optional[str] = Field(
+        default=None,
+        description="If similar, provide a synthesized, general 1-2 sentence definition combining the essence of both concepts.",
+    )
+    detailed_explanation: Optional[str] = Field(
+        default=None,
+        description="If similar, provide a synthesized comprehensive explanation combining details, mechanisms, and nuances from both concepts.",
+    )
+    reasoning: Optional[str] = Field(
+        default=None,
+        description="A concise sentence explaining why they are or are not the same concept.",
+    )
+
+
 class EntityDeduplicator:
     """
     Deduplicates and canonicalizes concept names across books and sections
-    using vector embeddings and rolling cosine similarity cache.
+    using vector embeddings, two-tier thresholding, and LLM-assisted synthesis.
     """
 
     def __init__(
         self,
         embeddings: Optional[Embeddings] = None,
-        similarity_threshold: float = 0.92,
+        similarity_threshold: float = 0.80,
+        high_similarity_threshold: float = 0.95,
+        extractor: Optional[Any] = None,
     ):
         self.embeddings = embeddings
         self.similarity_threshold = similarity_threshold
+        self.high_similarity_threshold = high_similarity_threshold
+        self.extractor = extractor
 
         # Canonical name -> (Normalized unit vector, Concept instance)
         self._cache: Dict[str, Tuple[Optional[np.ndarray], Concept]] = {}
@@ -41,6 +71,8 @@ class EntityDeduplicator:
         base_url: Optional[str] = None,
         embedding_model: Optional[str] = None,
         similarity_threshold: Optional[float] = None,
+        high_similarity_threshold: Optional[float] = None,
+        extractor: Optional[Any] = None,
     ) -> "EntityDeduplicator":
         from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings, OllamaPool
 
@@ -48,7 +80,12 @@ class EntityDeduplicator:
         s_thresh = (
             similarity_threshold
             if similarity_threshold is not None
-            else settings.similarity_threshold
+            else getattr(settings, "similarity_threshold", 0.80)
+        )
+        high_s_thresh = (
+            high_similarity_threshold
+            if high_similarity_threshold is not None
+            else getattr(settings, "high_similarity_threshold", 0.95)
         )
         try:
             if base_url:
@@ -64,6 +101,8 @@ class EntityDeduplicator:
         return cls(
             embeddings=embeddings,
             similarity_threshold=s_thresh,
+            high_similarity_threshold=high_s_thresh,
+            extractor=extractor,
         )
 
     @staticmethod
@@ -75,14 +114,19 @@ class EntityDeduplicator:
     def resolve_concept(self, concept: Concept) -> Concept:
         """
         Compare incoming concept against existing graph concepts.
-        If similarity exceeds similarity_threshold, merge and return the canonical Concept.
-        Otherwise, register and return the new Concept.
+        - Similarity >= high_similarity_threshold (0.95) or exact name match:
+          Definitely the same concept. Merge into canonical Concept directly without LLM.
+        - Similarity between similarity_threshold (0.80) and high_similarity_threshold (0.95):
+          Probably similar. Ask LLM model with concept names and descriptions to verify
+          if they are actually similar, and synthesize general name and descriptions.
+        - Similarity < similarity_threshold (0.80):
+          Distinct concept. Register and return as new canonical Concept.
         """
         concept.name = BookParser.repair_mojibake(concept.name.strip())
         raw_name = concept.name
         norm_name = self._normalize_name(raw_name)
 
-        # 1. Exact or case-insensitive string match
+        # 1. Exact or case-insensitive string match (highest confidence)
         for canon_name, (_, existing) in self._cache.items():
             if self._normalize_name(canon_name) == norm_name:
                 self._merge_into(existing, concept)
@@ -93,6 +137,7 @@ class EntityDeduplicator:
         if concept_vec is not None and self._cache:
             best_sim = -1.0
             best_match: Optional[Concept] = None
+            best_canon_name: Optional[str] = None
 
             for canon_name, (cached_vec, existing_concept) in self._cache.items():
                 if cached_vec is not None:
@@ -100,20 +145,160 @@ class EntityDeduplicator:
                     if sim > best_sim:
                         best_sim = sim
                         best_match = existing_concept
+                        best_canon_name = canon_name
 
-            if best_match is not None and best_sim >= self.similarity_threshold:
+            # Case A: High Confidence (>= 0.95) -> Definitive match, merge directly
+            if best_match is not None and best_sim >= self.high_similarity_threshold:
                 logger.debug(
-                    f"Merged concept '{raw_name}' -> '{best_match.name}' (similarity: {best_sim:.3f})"
+                    f"Direct merge '{raw_name}' -> '{best_match.name}' (high confidence similarity: {best_sim:.3f})"
                 )
                 self._merge_into(best_match, concept)
                 return best_match
+
+            # Case B: Probable match (0.80 <= similarity < 0.95) -> Disambiguate and synthesize via LLM
+            if best_match is not None and best_sim >= self.similarity_threshold:
+                if self.extractor is not None:
+                    decision = self._ask_llm_disambiguation(best_match, concept, best_sim)
+                    if decision.is_same_concept:
+                        logger.info(
+                            f"LLM confirmed merge '{raw_name}' -> '{best_match.name}' "
+                            f"(sim: {best_sim:.3f}, reasoning: {decision.reasoning})"
+                        )
+                        self._merge_with_llm_decision(best_match, concept, decision, best_canon_name)
+                        return best_match
+                    else:
+                        logger.info(
+                            f"LLM rejected merge between '{raw_name}' and '{best_match.name}' "
+                            f"(sim: {best_sim:.3f}, reasoning: {decision.reasoning}). Keeping as separate concepts."
+                        )
+                else:
+                    # Fallback if no LLM extractor is configured: merge based on vector similarity
+                    logger.debug(
+                        f"Merged concept '{raw_name}' -> '{best_match.name}' (similarity: {best_sim:.3f}, no LLM)"
+                    )
+                    self._merge_into(best_match, concept)
+                    return best_match
 
         # 3. Register as new canonical node
         self._cache[raw_name] = (concept_vec, concept)
         return concept
 
+    def _ask_llm_disambiguation(
+        self,
+        canonical: Concept,
+        incoming: Concept,
+        similarity: float,
+    ) -> ConceptDeduplicationDecision:
+        """Ask LLM to determine if two concepts are similar and synthesize unified descriptions."""
+        system_instruction = (
+            "You are an expert knowledge graph ontologist and entity resolution specialist.\n"
+            "Your task is to determine whether two concept candidates extracted from literature "
+            "refer to the exact same underlying concept, entity, strategic principle, or motif, "
+            "or whether they represent distinct concepts that must remain separate in the knowledge graph.\n\n"
+            "Guidelines:\n"
+            "1. Same Concept Criteria:\n"
+            "   - They refer to the identical core idea, tactic, theme, or phenomenon, even if phrased slightly differently "
+            "or originating from different narrative contexts.\n"
+            "   - E.g. 'Tactical Ambush' and 'Surprise Ambush Attack' -> SAME.\n"
+            "   - E.g. 'Radioactive Fallout Shelter' and 'Underground Nuclear Bunker' -> SAME.\n"
+            "2. Distinct Concepts Criteria:\n"
+            "   - They describe different actions, opposite strategies, or unrelated phenomena, even if they share a general domain.\n"
+            "   - E.g. 'Tactical Retreat' vs 'Ambush Defense' -> DIFFERENT (opposing tactical maneuvers).\n"
+            "   - E.g. 'Wall Graffiti' vs 'Propaganda Slogan' -> DIFFERENT.\n"
+            "3. If they are the SAME concept (is_same_concept: true):\n"
+            "   - Synthesize the most accurate canonical capitalized name ('canonical_name', 2-4 words).\n"
+            "   - Synthesize a clear, unified 1-2 sentence definition ('brief_description').\n"
+            "   - Synthesize a comprehensive explanation ('detailed_explanation') merging mechanisms, nuances, and context from both.\n"
+            "4. If they are DIFFERENT concepts (is_same_concept: false):\n"
+            "   - Do not synthesize names or descriptions; explain why in 'reasoning'."
+        )
+
+        user_content = (
+            f"Concept 1 (Existing Canonical in Knowledge Graph):\n"
+            f"- Name: {canonical.name}\n"
+            f"- Category: {getattr(canonical, 'category', 'General')}\n"
+            f"- Brief Description: {getattr(canonical, 'brief_description', '') or getattr(canonical, 'summary', '')}\n"
+            f"- Detailed Explanation: {getattr(canonical, 'detailed_explanation', '')}\n\n"
+            f"Concept 2 (Incoming Candidate):\n"
+            f"- Name: {incoming.name}\n"
+            f"- Category: {getattr(incoming, 'category', 'General')}\n"
+            f"- Brief Description: {getattr(incoming, 'brief_description', '') or getattr(incoming, 'summary', '')}\n"
+            f"- Detailed Explanation: {getattr(incoming, 'detailed_explanation', '')}\n\n"
+            f"Cosine Similarity Score between names: {similarity:.3f}\n\n"
+            f"Are these two concepts referring to the same underlying concept? "
+            f"If yes, synthesize the canonical name, brief description, and detailed explanation."
+        )
+
+        messages = [
+            SystemMessage(content=system_instruction),
+            HumanMessage(content=user_content),
+        ]
+
+        try:
+            if hasattr(self.extractor, "_execute_structured_invoke"):
+                res = self.extractor._execute_structured_invoke(
+                    ConceptDeduplicationDecision,
+                    messages,
+                    task_type="deduplication",
+                )
+                if isinstance(res, ConceptDeduplicationDecision):
+                    return res
+                return ConceptDeduplicationDecision(**dict(res))
+            elif hasattr(self.extractor, "invoke"):
+                res = self.extractor.invoke(messages)
+                if isinstance(res, ConceptDeduplicationDecision):
+                    return res
+                return ConceptDeduplicationDecision(**dict(res))
+        except Exception as e:
+            logger.warning(f"LLM deduplication disambiguation failed: {e}. Defaulting to distinct concepts.")
+            return ConceptDeduplicationDecision(
+                is_same_concept=False,
+                reasoning=f"LLM invocation failed: {e}",
+            )
+
+        return ConceptDeduplicationDecision(is_same_concept=False)
+
+    def _merge_with_llm_decision(
+        self,
+        canonical: Concept,
+        incoming: Concept,
+        decision: ConceptDeduplicationDecision,
+        canon_cache_key: Optional[str] = None,
+    ) -> None:
+        """Merge incoming concept using LLM-synthesized name and descriptions."""
+        # 1. Update related concepts
+        for rel in incoming.related_concepts:
+            if rel not in canonical.related_concepts and rel != canonical.name:
+                canonical.related_concepts.append(rel)
+
+        # 2. Update descriptions using synthesized LLM output
+        if decision.brief_description and decision.brief_description.strip():
+            canonical.brief_description = decision.brief_description.strip()
+            canonical.summary = decision.brief_description.strip()
+        elif incoming.brief_description and len(incoming.brief_description) > len(getattr(canonical, "brief_description", "")):
+            canonical.brief_description = incoming.brief_description
+
+        if decision.detailed_explanation and decision.detailed_explanation.strip():
+            canonical.detailed_explanation = decision.detailed_explanation.strip()
+        elif incoming.detailed_explanation and len(incoming.detailed_explanation) > len(getattr(canonical, "detailed_explanation", "")):
+            canonical.detailed_explanation = incoming.detailed_explanation
+
+        # 3. Retain highest significance weight observed
+        canonical.weight = max(getattr(canonical, "weight", 5), getattr(incoming, "weight", 5))
+
+        # 4. Canonical name update if synthesized
+        if decision.canonical_name and decision.canonical_name.strip():
+            new_name = decision.canonical_name.strip()
+            if new_name != canonical.name:
+                old_name = canonical.name
+                canonical.name = new_name
+                if canon_cache_key and canon_cache_key in self._cache:
+                    cached_vec, _ = self._cache[canon_cache_key]
+                    self._cache[new_name] = (cached_vec, canonical)
+                    self._cache[old_name] = (cached_vec, canonical)
+
     def _merge_into(self, canonical: Concept, incoming: Concept) -> None:
-        """Merge incoming concept's related concepts and details into canonical node."""
+        """Merge incoming concept's related concepts and details into canonical node (heuristic fallback)."""
         for rel in incoming.related_concepts:
             if rel not in canonical.related_concepts and rel != canonical.name:
                 canonical.related_concepts.append(rel)

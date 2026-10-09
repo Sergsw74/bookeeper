@@ -685,6 +685,174 @@ def test_validate_concept_chunk_grounding_cases():
     assert quote == ""
 
 
+def test_entity_deduplicator_two_tier_high_confidence():
+    """Verify similarity >= 0.95 merges directly without calling LLM."""
+    from unittest.mock import MagicMock
+    from bookeeper.processing.deduplicator import EntityDeduplicator
+
+    # Vectors with cosine similarity 0.97
+    mock_emb = MagicMock()
+    mock_emb.embed_query.side_effect = lambda text: [1.0, 0.0] if "Underground Bunker" in text else [0.97, 0.243]
+
+    mock_extractor = MagicMock()
+    dedup = EntityDeduplicator(
+        embeddings=mock_emb,
+        similarity_threshold=0.80,
+        high_similarity_threshold=0.95,
+        extractor=mock_extractor,
+    )
+
+    c1 = Concept(
+        name="Underground Bunker",
+        category="Shelter",
+        brief_description="Subterranean protective habitat.",
+        detailed_explanation="Reinforced structure designed to protect inhabitants.",
+        weight=6,
+    )
+    c2 = Concept(
+        name="Underground Shelter",
+        category="Shelter",
+        brief_description="Subterranean safety vault.",
+        detailed_explanation="Bunker engineered against radiation.",
+        weight=8,
+    )
+
+    r1 = dedup.resolve_concept(c1)
+    r2 = dedup.resolve_concept(c2)
+
+    assert r1 is r2
+    assert r1.name == "Underground Bunker"
+    assert r1.weight == 8
+    # LLM was NOT invoked because similarity (0.97) >= 0.95
+    mock_extractor._execute_structured_invoke.assert_not_called()
+
+
+def test_entity_deduplicator_two_tier_llm_confirmed_merge():
+    """Verify similarity between 0.80 and 0.95 invokes LLM and synthesizes canonical name & descriptions."""
+    from unittest.mock import MagicMock
+    from bookeeper.processing.deduplicator import EntityDeduplicator, ConceptDeduplicationDecision
+
+    # Vectors with cosine similarity ~0.88
+    mock_emb = MagicMock()
+    mock_emb.embed_query.side_effect = lambda text: [1.0, 0.0] if "Tactical Ambush" in text else [0.88, 0.475]
+
+    mock_extractor = MagicMock()
+    mock_extractor._execute_structured_invoke.return_value = ConceptDeduplicationDecision(
+        is_same_concept=True,
+        canonical_name="Surprise Ambush Tactic",
+        brief_description="Coordinated covert surprise assault from concealment.",
+        detailed_explanation="A combat maneuver where an operative hides to ambush the opposing force swiftly.",
+        reasoning="Both describe the exact same combat ambush maneuver.",
+    )
+
+    dedup = EntityDeduplicator(
+        embeddings=mock_emb,
+        similarity_threshold=0.80,
+        high_similarity_threshold=0.95,
+        extractor=mock_extractor,
+    )
+
+    c1 = Concept(
+        name="Tactical Ambush",
+        category="Combat Strategy",
+        brief_description="Waiting in shadows to attack.",
+        detailed_explanation="Old detailed explanation.",
+        weight=5,
+    )
+    c2 = Concept(
+        name="Surprise Flank Strike",
+        category="Combat Strategy",
+        brief_description="Striking from unexpected angles.",
+        detailed_explanation="New detailed explanation.",
+        weight=7,
+    )
+
+    r1 = dedup.resolve_concept(c1)
+    r2 = dedup.resolve_concept(c2)
+
+    assert r1 is r2
+    # Canonical name was updated to LLM synthesized canonical name
+    assert r1.name == "Surprise Ambush Tactic"
+    assert r1.brief_description == "Coordinated covert surprise assault from concealment."
+    assert r1.detailed_explanation == "A combat maneuver where an operative hides to ambush the opposing force swiftly."
+    assert r1.weight == 7
+    # LLM was invoked once for the disambiguation
+    mock_extractor._execute_structured_invoke.assert_called_once()
+
+
+def test_entity_deduplicator_two_tier_llm_rejected_merge():
+    """Verify similarity between 0.80 and 0.95 keeps concepts separate when LLM rejects merge."""
+    from unittest.mock import MagicMock
+    from bookeeper.processing.deduplicator import EntityDeduplicator, ConceptDeduplicationDecision
+
+    mock_emb = MagicMock()
+    mock_emb.embed_query.side_effect = lambda text: [1.0, 0.0] if "Tactical Retreat" in text else [0.85, 0.527]
+
+    mock_extractor = MagicMock()
+    mock_extractor._execute_structured_invoke.return_value = ConceptDeduplicationDecision(
+        is_same_concept=False,
+        reasoning="Tactical Retreat is a withdrawal maneuver, whereas Defensive Stand is holding ground.",
+    )
+
+    dedup = EntityDeduplicator(
+        embeddings=mock_emb,
+        similarity_threshold=0.80,
+        high_similarity_threshold=0.95,
+        extractor=mock_extractor,
+    )
+
+    c1 = Concept(
+        name="Tactical Retreat",
+        category="Combat Strategy",
+        brief_description="Withdrawing troops to preserve forces.",
+        weight=6,
+    )
+    c2 = Concept(
+        name="Defensive Stand",
+        category="Combat Strategy",
+        brief_description="Holding a fortification against odds.",
+        weight=7,
+    )
+
+    r1 = dedup.resolve_concept(c1)
+    r2 = dedup.resolve_concept(c2)
+
+    # Must NOT merge: they are distinct concepts!
+    assert r1 is not r2
+    assert r1.name == "Tactical Retreat"
+    assert r2.name == "Defensive Stand"
+    assert len(dedup.get_canonical_concepts()) == 2
+
+
+def test_entity_deduplicator_two_tier_low_similarity():
+    """Verify similarity < 0.80 does not invoke LLM and registers as new concept immediately."""
+    from unittest.mock import MagicMock
+    from bookeeper.processing.deduplicator import EntityDeduplicator
+
+    mock_emb = MagicMock()
+    # Cosine similarity = 0.50 (< 0.80)
+    mock_emb.embed_query.side_effect = lambda text: [1.0, 0.0] if "Graffiti" in text else [0.50, 0.866]
+
+    mock_extractor = MagicMock()
+    dedup = EntityDeduplicator(
+        embeddings=mock_emb,
+        similarity_threshold=0.80,
+        high_similarity_threshold=0.95,
+        extractor=mock_extractor,
+    )
+
+    c1 = Concept(name="Graffiti", category="Art", summary="Wall drawings", weight=4)
+    c2 = Concept(name="Tunnel Patrol", category="Security", summary="Station guards", weight=6)
+
+    r1 = dedup.resolve_concept(c1)
+    r2 = dedup.resolve_concept(c2)
+
+    assert r1 is not r2
+    assert len(dedup.get_canonical_concepts()) == 2
+    mock_extractor._execute_structured_invoke.assert_not_called()
+
+
+
 
 
 

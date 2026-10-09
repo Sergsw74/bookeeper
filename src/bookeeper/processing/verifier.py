@@ -229,6 +229,8 @@ class IdeaVerifier:
                     cmd = [
                         "curl",
                         "-s",
+                        "--connect-timeout",
+                        "3",
                         "--max-time",
                         str(timeout),
                         "-X",
@@ -330,6 +332,8 @@ class IdeaVerifier:
                     cmd = [
                         "curl",
                         "-s",
+                        "--connect-timeout",
+                        "3",
                         "--max-time",
                         str(self.timeout),
                         "-X",

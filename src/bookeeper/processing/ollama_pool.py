@@ -197,9 +197,15 @@ def is_connection_error(exc: Exception) -> bool:
         "network is unreachable",
         "host is down",
         "no route to host",
+        "errno 65",          # macOS No route to host
         "remotedisconnected",
         "remote end closed connection",
         "connection reset by peer",
+        "connection timed out",
+        "connecttimeout",
+        "connecterror",
+        "could not resolve host",
+        "nodename nor servname provided",
     ]
     return any(p in err_str for p in patterns)
 

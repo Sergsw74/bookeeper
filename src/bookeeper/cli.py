@@ -374,7 +374,7 @@ def config(
             f"[bold green]LLM Model:[/bold green] {cfg.llm_model}\n"
             f"[bold green]Embedding Model:[/bold green] {cfg.embedding_model}\n"
             f"[bold green]Embedding Endpoint:[/bold green] {emb_endpoint_str}\n"
-            f"[bold green]Similarity Threshold:[/bold green] {cfg.similarity_threshold}\n"
+            f"[bold green]Similarity Thresholds:[/bold green] {cfg.similarity_threshold} (LLM check) / {getattr(cfg, 'high_similarity_threshold', 0.95)} (Direct merge)\n"
             f"[bold green]Output Directory:[/bold green] {cfg.resolved_output_dir}\n"
             f"[bold green]LightRAG Engine:[/bold green] {'[bold green]Enabled[/bold green]' if cfg.enable_lightrag else '[dim]Disabled[/dim]'} (dir: {cfg.resolved_lightrag_dir}, mode: [cyan]{cfg.lightrag_mode}[/cyan])\n"
             f"[bold green]Neo4j Export:[/bold green] {'[bold green]Enabled[/bold green]' if cfg.neo4j.enabled else '[dim]Disabled[/dim]'} (uri: [cyan]{cfg.neo4j.uri}[/cyan], db: {cfg.neo4j.database}, user: {cfg.neo4j.user})",
@@ -1331,6 +1331,8 @@ def build_graph(
         cfg,
         embedding_model=cfg.embedding_model,
         similarity_threshold=cfg.similarity_threshold,
+        high_similarity_threshold=getattr(cfg, "high_similarity_threshold", 0.95),
+        extractor=extractor,
     )
 
     # Initialize ChunkStore for local persistence and fast reuse of book chunks
@@ -1970,6 +1972,7 @@ def build_graph(
                                 with stats_lock:
                                     fresh_in_flight += 1
                                     active_tasks_count += 1
+                                _update_progress_description()
                             else:  # cur_phase == "retry"
                                 try:
                                     chk_item, attempt, tried_urls = retry_queue.get(timeout=0.2)
@@ -1982,6 +1985,7 @@ def build_graph(
                                 with stats_lock:
                                     retry_in_flight += 1
                                     active_tasks_count += 1
+                                _update_progress_description()
 
                             t0 = time.time()
                             srv = "ollama"
@@ -2146,6 +2150,7 @@ def build_graph(
                                     with stats_lock:
                                         retry_in_flight = max(0, retry_in_flight - 1)
                                         active_tasks_count = max(0, active_tasks_count - 1)
+                                _update_progress_description()
 
                     chunk_executor = DaemonThreadPoolExecutor(max_workers=pool_concurrency)
                     worker_futures = []

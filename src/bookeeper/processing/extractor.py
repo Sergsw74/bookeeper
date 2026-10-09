@@ -121,6 +121,10 @@ class Concept(BaseModel):
         """Backward-compatible summary property."""
         return self.brief_description or self.detailed_explanation
 
+    @summary.setter
+    def summary(self, val: str) -> None:
+        self.brief_description = val
+
 
 class SectionExtraction(BaseModel):
     """Extraction output containing all concepts discovered in a section."""
@@ -316,6 +320,8 @@ class KnowledgeExtractor:
                     cmd = [
                         "curl",
                         "-s",
+                        "--connect-timeout",
+                        "3",
                         "--max-time",
                         timeout_sec,
                         "-X",
@@ -344,11 +350,13 @@ class KnowledgeExtractor:
                             if hasattr(schema_cls, "model_validate_json"):
                                 return schema_cls.model_validate_json(content)
                             return json.loads(content)
+                    elif res.returncode == 7:
+                        raise ConnectionRefusedError(f"Ollama server {url} unreachable / connection refused (curl code 7)")
                     elif res.returncode == 28:
                         raise TimeoutError(f"Ollama request to {url}/api/chat timed out after {timeout_sec}s")
                     elif res.returncode != 0:
                         logger.debug(f"Direct curl format=json returned non-zero code {res.returncode}")
-                except TimeoutError:
+                except (TimeoutError, ConnectionError):
                     raise
                 except Exception as curl_err:
                     logger.debug(f"Direct curl format=json invoke failed: {curl_err}")

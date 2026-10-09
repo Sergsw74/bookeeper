@@ -379,8 +379,12 @@ class Settings(BaseSettings):
 
     # Processing & Deduplication
     similarity_threshold: float = Field(
-        default=0.92,
-        description="Cosine similarity threshold for merging duplicate concept nodes (recommended: 0.92-0.95).",
+        default=0.80,
+        description="Cosine similarity threshold above which concept candidates are considered potentially similar and evaluated via LLM (default: 0.80).",
+    )
+    high_similarity_threshold: float = Field(
+        default=0.95,
+        description="Cosine similarity threshold for automatic direct concept merge without LLM (default: 0.95).",
     )
 
     # Output directory for graphs & exports

@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from bookeeper.graph.store import ConceptGraphStore
 from bookeeper.processing.chunker import ChunkStore, HierarchicalChunk
-from bookeeper.processing.ollama_pool import OllamaPool
+from bookeeper.processing.ollama_pool import OllamaPool, _thread_local
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,7 @@ class VerificationItem(BaseModel):
     is_supported: bool
     confidence: float
     explanation: str
+    server_node: Optional[str] = None
 
 
 class VerificationStats(BaseModel):
@@ -99,6 +100,74 @@ def _clean_json_str(text: str) -> str:
             lines = lines[:-1]
         text = "\n".join(lines).strip()
     return text
+
+
+def _parse_verification_text(text: str) -> Optional[VerificationResult]:
+    """
+    Resilient parser to extract a valid VerificationResult from model output:
+    1. Direct JSON parse (cleaned of thinking tags / markdown fences)
+    2. Embedded JSON regex extraction { ... }
+    3. Heuristic text fallback for freeform text or markdown bullet points
+       (e.g., '* Target Idea: "Rampart" *does* substantiate the...')
+    """
+    if not text or not str(text).strip():
+        return None
+
+    raw_str = str(text).strip()
+    cleaned = _clean_json_str(raw_str)
+
+    # 1. Direct JSON parse
+    try:
+        return VerificationResult.model_validate_json(cleaned)
+    except Exception:
+        pass
+
+    # 2. Search for embedded JSON object block
+    match = re.search(r"\{[\s\S]*\}", cleaned)
+    if match:
+        try:
+            return VerificationResult.model_validate_json(match.group(0))
+        except Exception:
+            pass
+
+    # 3. Heuristic text analysis for markdown/freeform model answers
+    lower = raw_str.lower()
+    negative_patterns = [
+        "does not substantiate", "does not support", "is not supported",
+        "not substantiated", "unsupported", "absent", "fabricated",
+        "not grounded", "*does not*", "fails to substantiate",
+        "no evidence", "not mentioned", "is unsupported: true",
+        "is_supported: false", 'is_supported": false', "is_supported': false",
+    ]
+    positive_patterns = [
+        "does substantiate", "substantiates", "is supported",
+        "genuinely contains", "directly supports", "supports the idea",
+        "*does* substantiate", "clearly explores", "directly mentions",
+        "well supported", "is_supported: true", 'is_supported": true',
+        "is_supported': true",
+    ]
+
+    is_supported: Optional[bool] = None
+    if any(p in lower for p in negative_patterns):
+        is_supported = False
+    elif any(p in lower for p in positive_patterns):
+        is_supported = True
+    else:
+        if "verdict: pass" in lower or "verdict: true" in lower:
+            is_supported = True
+        elif "verdict: fail" in lower or "verdict: false" in lower:
+            is_supported = False
+
+    if is_supported is not None:
+        clean_text = " ".join(raw_str.replace("*", "").split())
+        explanation = clean_text[:250] + ("..." if len(clean_text) > 250 else "")
+        return VerificationResult(
+            is_supported=is_supported,
+            confidence=0.85,
+            explanation=explanation,
+        )
+
+    return None
 
 
 class IdeaVerifier:
@@ -211,10 +280,34 @@ class IdeaVerifier:
                     return res
                 if isinstance(res, dict):
                     return VerificationResult.model_validate(res)
+                parsed = _parse_verification_text(str(res))
+                if parsed:
+                    return parsed
                 cleaned = _clean_json_str(str(res))
                 return VerificationResult.model_validate_json(cleaned)
             except Exception as exc:
-                # Resilient fallback via curl for macOS Sequoia LAN routing
+                # 1. Recover if exception contains raw model output (e.g. Pydantic ValidationError)
+                if hasattr(exc, "errors"):
+                    try:
+                        for err in exc.errors():
+                            inp = err.get("input")
+                            if inp and isinstance(inp, str):
+                                parsed = _parse_verification_text(inp)
+                                if parsed:
+                                    return parsed
+                    except Exception:
+                        pass
+
+                err_str = str(exc)
+                if "input_value=" in err_str:
+                    match = re.search(r"input_value=['\"]([\s\S]*?)['\"], input_type=", err_str)
+                    if match:
+                        raw_input = match.group(1).replace(r"\n", "\n").replace(r"\'", "'").replace(r'\"', '"')
+                        parsed = _parse_verification_text(raw_input)
+                        if parsed:
+                            return parsed
+
+                # 2. Resilient fallback via curl with standard "format": "json"
                 if shutil.which("curl"):
                     msgs_payload = []
                     for m in messages:
@@ -224,11 +317,10 @@ class IdeaVerifier:
                         content = getattr(m, "content", str(m))
                         msgs_payload.append({"role": role, "content": content})
 
-                    schema_dict = VerificationResult.model_json_schema()
                     body = {
                         "model": self.model_name,
                         "messages": msgs_payload,
-                        "format": schema_dict,
+                        "format": "json",
                         "options": {
                             "temperature": self.temperature,
                             "top_p": 0.9,
@@ -250,16 +342,18 @@ class IdeaVerifier:
                     ]
                     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
                     if res.returncode == 0 and res.stdout.strip():
-                        data = json.loads(res.stdout)
-                        if "error" in data:
-                            raise RuntimeError(f"Ollama server {url} error: {data['error']}")
-                        content = data.get("message", {}).get("content", "")
-                        if not content and "thinking" in data.get("message", {}):
-                            content = data["message"]["thinking"]
-                        cleaned = _clean_json_str(content)
-                        if cleaned:
-                            return VerificationResult.model_validate_json(cleaned)
-                        raise ValueError(f"Ollama server {url} returned empty content")
+                        try:
+                            data = json.loads(res.stdout)
+                            if "error" in data:
+                                raise RuntimeError(f"Ollama server {url} error: {data['error']}")
+                            content = data.get("message", {}).get("content", "")
+                            if not content and "thinking" in data.get("message", {}):
+                                content = data["message"]["thinking"]
+                            parsed = _parse_verification_text(content)
+                            if parsed:
+                                return parsed
+                        except Exception:
+                            pass
                 raise exc
 
         return self.pool.execute_with_failover(
@@ -268,6 +362,8 @@ class IdeaVerifier:
             capability="verification",
             input_chars=input_chars,
             task_type="verification",
+            quarantine_server=False,
+            max_task_duration=max(180.0, 3.0 * float(self.timeout)),
         )
 
     def verify_idea_chunk(
@@ -307,7 +403,15 @@ class IdeaVerifier:
             "4. OBJECTIVE JUSTIFICATION:\n"
             "   - In `explanation`, provide a concise 1-2 sentence objective justification. "
             "If unsupported, state what the chunk is actually about and specifically why the concept is absent or unjustified.\n"
-            "   - In `confidence`, provide a score from 0.0 to 1.0 reflecting your verification certainty."
+            "   - In `confidence`, provide a score from 0.0 to 1.0 reflecting your verification certainty.\n\n"
+            "MANDATORY RESPONSE FORMAT:\n"
+            "You MUST respond ONLY with a raw JSON object matching the following schema. "
+            "Do NOT wrap in markdown backticks, do NOT write bullet points, and do NOT include any introductory or concluding text:\n"
+            "{\n"
+            '  "is_supported": true,\n'
+            '  "confidence": 0.95,\n'
+            '  "explanation": "Clear 1-2 sentence justification here."\n'
+            "}"
         )
 
         user_content = (
@@ -457,6 +561,7 @@ def verify_graph(
             section_title=task_item["section_title"],
             chunk_text=task_item["chunk_text"],
         )
+        server_lbl = getattr(_thread_local, "last_used_server", None)
         return VerificationItem(
             idea_name=task_item["idea_name"],
             idea_category=task_item["idea_category"],
@@ -471,6 +576,7 @@ def verify_graph(
             is_supported=res.is_supported,
             confidence=res.confidence,
             explanation=res.explanation,
+            server_node=server_lbl,
         )
 
     # 5. Execute evaluations with worker concurrency
@@ -486,7 +592,10 @@ def verify_graph(
                 discrepancies.append(item)
 
             if progress_callback:
-                progress_callback(completed_count, total_evals, item.idea_name)
+                try:
+                    progress_callback(completed_count, total_evals, item.idea_name, item)
+                except TypeError:
+                    progress_callback(completed_count, total_evals, item.idea_name)
 
     # 6. Calculate statistics
     duration = round(time.time() - start_time, 2)
@@ -788,7 +897,10 @@ class ChunkingVerifier:
                     )
 
             if progress_callback:
-                progress_callback(idx, total_chunks, chk.chunk_id)
+                try:
+                    progress_callback(idx, total_chunks, chk.chunk_id, is_coh, chk)
+                except TypeError:
+                    progress_callback(idx, total_chunks, chk.chunk_id)
 
         # 2. Section-level reconstruction & comparison with actual chunks
         from collections import defaultdict

@@ -13,7 +13,8 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import typer
 from langchain_ollama import OllamaEmbeddings
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
@@ -46,6 +47,7 @@ from bookeeper.processing.ollama_pool import (
 from bookeeper.processing.state import BookProcessingState, ProgressTracker
 from bookeeper.processing.verifier import (
     IdeaVerifier,
+    VerificationItem,
     VerificationReport,
     verify_graph,
     verify_chunking,
@@ -2895,27 +2897,55 @@ def verify_command(
 
         embeddings = FailoverOllamaEmbeddings.from_settings(cfg, model=effective_emb_model)
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}[/bold blue]"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("({task.completed}/{task.total})"),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Verifying chunk coherence...", total=100)
+        t_chunk_start = time.perf_counter()
+        coherent_cnt = 0
+        divergent_cnt = 0
 
-            def _on_chunk_progress(completed: int, total: int, chunk_id: str):
-                emb_st = getattr(embeddings, "embedding_stats", {})
-                spd_txt = emb_st.get("speed_texts_per_sec", 0.0)
-                spd_str = f" ({spd_txt:.1f} sent/s)" if spd_txt > 0 else ""
-                progress.update(
-                    task,
-                    completed=completed,
-                    total=total,
-                    description=f"Auditing '{chunk_id[:24]}' ...{spd_str}",
+        chunk_progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]Total Progress:[/bold cyan]"),
+            BarColumn(bar_width=25),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TextColumn("{task.fields[stats_line]}"),
+            console=console,
+        )
+        tot_chunk_task = chunk_progress.add_task("chunk_total", total=100, completed=0, stats_line="")
+        cur_chunk_line = Text.from_markup("[bold blue]Current Chunk:[/bold blue] Initializing chunk auditor...")
+
+        with Live(Group(cur_chunk_line, chunk_progress), console=console, refresh_per_second=10) as live:
+            def _on_chunk_progress(completed: int, total: int, chunk_id: str, is_coh: bool = True, chk: Any = None):
+                nonlocal coherent_cnt, divergent_cnt
+                if is_coh:
+                    coherent_cnt += 1
+                    status_badge = "[bold green]✓ Coherent[/bold green]"
+                else:
+                    divergent_cnt += 1
+                    status_badge = "[bold red]✗ Divergent[/bold red]"
+
+                book_part = f" | '{chk.book_title[:20]}'" if chk and getattr(chk, "book_title", None) else ""
+                sec_part = f" ({chk.section_title[:15]})" if chk and getattr(chk, "section_title", None) else ""
+                cur_text = f"[bold blue]Current Chunk:[/bold blue] '{chunk_id[:24]}'{book_part}{sec_part} | {status_badge}"
+
+                elapsed = time.perf_counter() - t_chunk_start
+                rate = (completed / elapsed) if elapsed > 0 else 0.0
+                if completed > 0 and total > completed and rate > 0:
+                    rem_sec = (total - completed) / rate
+                    eta_str = format_eta_min_sec(rem_sec)
+                elif completed >= total:
+                    eta_str = "0m 00s"
+                else:
+                    eta_str = "--m --s"
+
+                rate_str = f"{rate:.2f} chunk/s" if rate > 0 else "-- chunk/s"
+                stats_str = (
+                    f" | [bold yellow]{rate_str}[/bold yellow] | ETA: {eta_str} | "
+                    f"[bold green]✓ {coherent_cnt} coherent[/bold green] | "
+                    f"[bold red]✗ {divergent_cnt} divergent[/bold red]"
                 )
+
+                chunk_progress.update(tot_chunk_task, completed=completed, total=total, stats_line=stats_str)
+                live.update(Group(Text.from_markup(cur_text), chunk_progress))
 
             report = verify_chunking(
                 chunk_store=chunk_store,
@@ -3073,24 +3103,63 @@ def verify_command(
         warmup_verifier = IdeaVerifier(pool=pool, model_name=effective_model)
         warmup_verifier.warmup(timeout=90)
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold blue]{task.description}[/bold blue]"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TextColumn("({task.completed}/{task.total})"),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Auditing idea-chunk groundings...", total=100)
+    t_verify_start = time.perf_counter()
+    verified_cnt = 0
+    discrepancy_cnt = 0
 
-        def _on_progress(completed: int, total: int, idea_name: str):
-            progress.update(
-                task,
-                completed=completed,
-                total=total,
-                description=f"Auditing '{idea_name[:25]}'..."
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]Total Progress:[/bold cyan]"),
+        BarColumn(bar_width=25),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TextColumn("{task.fields[stats_line]}"),
+        console=console,
+    )
+    tot_task = progress.add_task("total", total=100, completed=0, stats_line="")
+    cur_line = Text.from_markup("[bold blue]Current Idea:[/bold blue] Initializing verifier pool...")
+
+    with Live(Group(cur_line, progress), console=console, refresh_per_second=10) as live:
+        def _on_progress(completed: int, total: int, idea_name: str, item: Optional[VerificationItem] = None):
+            nonlocal verified_cnt, discrepancy_cnt
+            if item is not None:
+                if item.is_supported:
+                    verified_cnt += 1
+                    status_badge = "[bold green]✓ Supported[/bold green]"
+                else:
+                    discrepancy_cnt += 1
+                    status_badge = "[bold red]✗ Discrepancy[/bold red]"
+
+                server_str = f" [dim]via {item.server_node}[/dim]" if item.server_node else ""
+                short_idea = (item.idea_name[:24] + "...") if len(item.idea_name) > 27 else item.idea_name
+                short_book = (item.book_title[:20] + "...") if len(item.book_title) > 23 else item.book_title
+                cur_text = (
+                    f"[bold blue]Current Idea:[/bold blue] '{short_idea}' | '{short_book}' "
+                    f"({item.chunk_id}) | {status_badge}{server_str}"
+                )
+            else:
+                short_idea = (idea_name[:28] + "...") if len(idea_name) > 31 else idea_name
+                cur_text = f"[bold blue]Current Idea:[/bold blue] '{short_idea}' | [bold yellow]Auditing...[/bold yellow]"
+
+            elapsed = time.perf_counter() - t_verify_start
+            rate = (completed / elapsed) if elapsed > 0 else 0.0
+            if completed > 0 and total > completed and rate > 0:
+                rem_sec = (total - completed) / rate
+                eta_str = format_eta_min_sec(rem_sec)
+            elif completed >= total:
+                eta_str = "0m 00s"
+            else:
+                eta_str = "--m --s"
+
+            rate_str = f"{rate:.2f} task/s" if rate > 0 else "-- task/s"
+            stats_str = (
+                f" | [bold yellow]{rate_str}[/bold yellow] | ETA: {eta_str} | "
+                f"[bold green]✓ {verified_cnt} passed[/bold green] | "
+                f"[bold red]✗ {discrepancy_cnt} failed[/bold red]"
             )
+
+            progress.update(tot_task, completed=completed, total=total, stats_line=stats_str)
+            live.update(Group(Text.from_markup(cur_text), progress))
 
         report = verify_graph(
             store=store,

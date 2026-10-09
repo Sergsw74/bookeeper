@@ -18,6 +18,7 @@ from bookeeper.processing.verifier import (
     VerificationItem,
     VerificationReport,
     VerificationResult,
+    _parse_verification_text,
     verify_graph,
 )
 
@@ -389,4 +390,108 @@ verification:
         assert data["mode"] == "chunking"
         assert data["stats"]["total_chunks"] == 1
         assert data["stats"]["coherent_chunks"] == 1
+
+
+def test_parse_verification_text():
+    """Verify JSON extraction, fence stripping, and heuristic text parsing."""
+    # 1. Clean JSON
+    res1 = _parse_verification_text('{"is_supported": true, "confidence": 0.95, "explanation": "Direct match"}')
+    assert res1 is not None
+    assert res1.is_supported is True
+    assert res1.confidence == 0.95
+    assert "Direct match" in res1.explanation
+
+    # 2. Markdown wrapped JSON with thinking tags
+    raw_md = (
+        "<think>Let me analyze...</think>\n"
+        "```json\n"
+        '{"is_supported": false, "confidence": 0.8, "explanation": "Not mentioned in chunk."}\n'
+        "```"
+    )
+    res2 = _parse_verification_text(raw_md)
+    assert res2 is not None
+    assert res2.is_supported is False
+    assert res2.confidence == 0.8
+
+    # 3. Freeform text matching user's real-world error log:
+    # '* Target Idea: "Rampart" *does* substantiate the premise...'
+    res3 = _parse_verification_text('* Target Idea: "Rampart" *does* substantiate the premise of fortress construction.')
+    assert res3 is not None
+    assert res3.is_supported is True
+    assert "Rampart" in res3.explanation
+
+    # 4. Negative freeform text
+    res4 = _parse_verification_text('* Target Idea: "Data Streaming" does not substantiate the passage about cooking.')
+    assert res4 is not None
+    assert res4.is_supported is False
+    assert "cooking" in res4.explanation
+
+    # 5. Empty or whitespace
+    assert _parse_verification_text("") is None
+    assert _parse_verification_text("   ") is None
+
+
+def test_execute_structured_invoke_recovers_validation_error(mock_pool):
+    """Test that when LangChain raises a ValidationError on bullet text, it is recovered without cooldown."""
+    verifier = IdeaVerifier(pool=mock_pool, model_name="llama3.1:8b")
+
+    # Simulate ChatOllama raising ValidationError with input_value
+    from langchain_core.messages import HumanMessage
+    from pydantic_core import ValidationError
+
+    def _mock_execute_failover(op, **kwargs):
+        # Verify quarantine_server is disabled so server does not cool down for 600s
+        assert kwargs.get("quarantine_server") is False
+        assert kwargs.get("max_task_duration") >= 180.0
+        return op("http://localhost:11434")
+
+    bullet_text = '* Target Idea: "Rampart" *does* substantiate the fortress defense.'
+    with patch.object(mock_pool, "execute_with_failover", side_effect=_mock_execute_failover):
+        with patch("bookeeper.processing.verifier.ChatOllama") as mock_chat:
+            mock_inst = MagicMock()
+            mock_chat.return_value = mock_inst
+            mock_struct = MagicMock()
+            mock_inst.with_structured_output.return_value = mock_struct
+
+            # Mock structured_llm.invoke raising ValueError / string matching validation error
+            mock_struct.invoke.side_effect = ValueError(
+                f"1 validation error for VerificationResult\n"
+                f"  Invalid JSON: expected value [type=json_invalid, input_value='{bullet_text}', input_type=str]"
+            )
+
+            res = verifier._execute_structured_invoke([HumanMessage(content="test")])
+            assert res.is_supported is True
+            assert "fortress defense" in res.explanation
+
+
+def test_verify_graph_passes_item_to_progress_callback(mock_pool, populated_store):
+    """Verify that progress_callback receives the item including its server_node."""
+    received_items = []
+
+    def _callback(completed, total, idea_name, item=None):
+        if item is not None:
+            received_items.append(item)
+
+    mock_res = VerificationResult(
+        is_supported=True,
+        confidence=0.9,
+        explanation="Concept matches chunk",
+    )
+
+    with patch.object(IdeaVerifier, "_execute_structured_invoke", return_value=mock_res):
+        report = verify_graph(
+            store=populated_store,
+            pool=mock_pool,
+            model_name="llama3.1:8b",
+            percent=30.0,
+            seed=42,
+            progress_callback=_callback,
+        )
+
+        assert len(received_items) == report.stats.total_evaluations
+        for item in received_items:
+            assert isinstance(item, VerificationItem)
+            assert item.is_supported is True
+            assert item.idea_name
+
 

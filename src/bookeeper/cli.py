@@ -2140,15 +2140,15 @@ def build_graph(
                             store.add_idea_support_link(
                                 concept_name=canonical_concept.name,
                                 chunk=chk,
-                                quote=canonical_concept.supporting_quote or "",
-                                brief_description=canonical_concept.brief_description,
-                                detailed_explanation=canonical_concept.detailed_explanation,
+                                quote=concept.supporting_quote or canonical_concept.supporting_quote or "",
+                                brief_description=concept.brief_description or canonical_concept.brief_description,
+                                detailed_explanation=concept.detailed_explanation or canonical_concept.detailed_explanation,
                             )
                             store.add_section_concept_link(
                                 section_node_id=sec_node_id,
                                 concept_name=canonical_concept.name,
-                                summary=canonical_concept.summary,
-                                quote=canonical_concept.supporting_quote or "",
+                                summary=concept.summary or canonical_concept.summary,
+                                quote=concept.supporting_quote or canonical_concept.supporting_quote or "",
                             )
                             for rel_name in canonical_concept.related_concepts:
                                 store.add_concept_relation(
@@ -3161,6 +3161,10 @@ def verify_command(
             progress.update(tot_task, completed=completed, total=total, stats_line=stats_str)
             live.update(Group(Text.from_markup(cur_text), progress))
 
+        raw_cdir = chunks_dir or getattr(cfg, "chunks_dir", None) or (cfg.resolved_output_dir / "chunks" if hasattr(cfg, "resolved_output_dir") else None)
+        chunks_storage_dir = Path(raw_cdir).expanduser().resolve() if raw_cdir else None
+        chunk_store = ChunkStore(chunks_storage_dir) if chunks_storage_dir and chunks_storage_dir.is_dir() else None
+
         report = verify_graph(
             store=store,
             pool=pool,
@@ -3172,6 +3176,7 @@ def verify_command(
             seed=seed,
             concurrency=pool_concurrency,
             progress_callback=_on_progress,
+            chunk_store=chunk_store,
         )
 
     # 1. Summary Metrics Table

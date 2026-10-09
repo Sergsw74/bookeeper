@@ -275,6 +275,8 @@ class ConceptGraphStore:
             chunk_node_id,
             relation="SUPPORTED_BY",
             quote=quote,
+            brief_description=brief_description,
+            detailed_explanation=detailed_explanation,
             breadcrumb=chunk.breadcrumb,
             chapter_title=getattr(chunk, "chapter_title", chunk.section_title),
             subtitle=getattr(chunk, "subtitle", chunk.section_title),
@@ -287,6 +289,8 @@ class ConceptGraphStore:
             concept_node_id,
             relation="SUPPORTS_IDEA",
             quote=quote,
+            brief_description=brief_description,
+            detailed_explanation=detailed_explanation,
         )
 
     def add_section_concept_link(

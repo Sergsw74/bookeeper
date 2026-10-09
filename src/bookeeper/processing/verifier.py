@@ -375,34 +375,39 @@ class IdeaVerifier:
         book_title: str,
         section_title: str,
         chunk_text: str,
+        prior_context: str = "",
+        subsequent_context: str = "",
     ) -> VerificationResult:
         """
-        Verify whether the assigned text chunk contains or supports the given idea.
+        Verify whether the assigned text chunk (with surrounding scene context) contains or supports the given idea.
         """
         system_prompt = (
-            "You are a strict, objective knowledge graph auditor and fact-checking specialist.\n"
+            "You are a strict, objective knowledge graph auditor and factual verification specialist.\n"
             "Your task is to verify whether an assigned text chunk from a book genuinely contains, discusses, "
-            "exemplifies, or directly supports an extracted concept/idea.\n\n"
+            "exemplifies, dramatizes, or directly supports an extracted concept/idea.\n\n"
             "EVALUATION CRITERIA:\n"
-            "1. DIRECT SUBSTANTIVE EVIDENCE:\n"
-            "   - Set `is_supported: true` (Good) if the text chunk directly mentions, explains, defines, "
-            "or clearly explores and substantiates the concept.\n"
-            "   - Set `is_supported: false` (Failed / Discrepancy) if the concept is completely absent, "
-            "fabricated, or not grounded in this specific text chunk.\n\n"
+            "1. DIRECT & NARRATIVE SUBSTANTIVE EVIDENCE:\n"
+            "   - Set `is_supported: true` (Good) if the assigned text chunk directly mentions, explains, defines, "
+            "depicts, dramatizes, or clearly explores the concept/idea. In narrative works, narrative enactment, tactical choices, "
+            "character dialogues, or conflicts that directly demonstrate the concept count as valid support.\n"
+            "   - Set `is_supported: false` (Failed / Discrepancy) if the concept is completely absent, fabricated, "
+            "or entirely disconnected from the passage.\n\n"
             "2. DETECT OVER-ABSTRACTION & CATEGORY MISMATCH:\n"
-            "   - Set `is_supported: false` if mundane story events, casual dialogue banter, or routine physical actions "
-            "have been artificially elevated into formal engineering principles, scientific laws, or abstract theoretical frameworks.\n"
-            "   - Generic Example: Claiming a routine character mishap or slip is a 'System Design Principle' like 'Human Error' "
-            "or 'Fault Tolerance', or claiming casual greeting dialogue is a 'Communication Protocol'. "
-            "Such conceptual over-generalizations must be marked `is_supported: false`.\n"
-            "   - Set `is_supported: false` if the excerpt describes unrelated interactions while the concept is nowhere to be found.\n\n"
-            "3. SUPPORTING QUOTE GROUNDING:\n"
-            "   - If a Supporting Quote is provided, check whether it actually exists within the assigned text chunk. "
-            "If the quote is missing from this chunk (e.g., extracted from another passage or made up) and the chunk text itself "
-            "does not substantiate the idea, mark `is_supported: false`.\n\n"
-            "4. OBJECTIVE JUSTIFICATION:\n"
-            "   - In `explanation`, provide a concise 1-2 sentence objective justification. "
-            "If unsupported, state what the chunk is actually about and specifically why the concept is absent or unjustified.\n"
+            "   - Set `is_supported: false` if trivial mundane actions or casual conversational banter have been artificially "
+            "elevated into formal engineering principles, scientific laws, or military frameworks.\n"
+            "   - Example: Claiming a routine physical misstep is a 'System Design Principle' like 'Fault Tolerance', or "
+            "claiming a routine greeting is a 'Military Tactical Retreat'. Such conceptual over-generalizations must be marked `is_supported: false`.\n"
+            "   - However, genuine story actions (e.g. retreating from a battle, evading an ambush, organizing a defense) do support "
+            "the corresponding concept, even if the characters do not speak in formal academic terminology.\n\n"
+            "3. SUPPORTING QUOTE EVALUATION:\n"
+            "   - If a Supporting Quote is provided, check whether it is grounded in the passage. If a quote is absent or approximate, "
+            "evaluate whether the text chunk itself still substantively depicts or supports the concept. Do NOT reject a genuinely "
+            "grounded idea solely because an extracted quote was paraphrased or loosely referenced, as long as the passage itself supports the idea.\n\n"
+            "4. SURROUNDING CONTEXT:\n"
+            "   - Preceding or following excerpts (if provided) provide scene context. The primary chunk is the focus, but surrounding context "
+            "may establish characters, setting, or ongoing actions.\n\n"
+            "5. OBJECTIVE JUSTIFICATION:\n"
+            "   - In `explanation`, provide a concise 1-2 sentence objective justification.\n"
             "   - In `confidence`, provide a score from 0.0 to 1.0 reflecting your verification certainty.\n\n"
             "MANDATORY RESPONSE FORMAT:\n"
             "You MUST respond ONLY with a raw JSON object matching the following schema. "
@@ -418,15 +423,28 @@ class IdeaVerifier:
             f"Target Idea/Concept:\n"
             f"- Name: \"{idea_name}\"\n"
             f"- Category: \"{idea_category}\"\n"
-            f"- Summary: \"{idea_summary}\"\n"
         )
+        if idea_summary:
+            user_content += f"- General Concept Summary / Definition: \"{idea_summary}\"\n"
         if quote:
             user_content += f"- Supporting Quote: \"{quote}\"\n"
 
+        user_content += f"\nSource Location: Book '{book_title}', Section '{section_title}'\n\n"
+
+        if prior_context:
+            user_content += f"[Preceding Excerpt Context]:\n...{prior_context.strip()}\n\n"
+
         user_content += (
-            f"\nAssigned Text Chunk (from '{book_title}', Section '{section_title}'):\n"
-            f"\"\"\"\n{chunk_text[:3500]}\n\"\"\"\n\n"
-            f"Does this assigned text chunk genuinely contain or support the idea \"{idea_name}\"?"
+            f"[Primary Assigned Text Chunk (Focus of Evaluation)]:\n"
+            f"\"\"\"\n{chunk_text.strip()[:3500]}\n\"\"\"\n\n"
+        )
+
+        if subsequent_context:
+            user_content += f"[Following Excerpt Context]:\n{subsequent_context.strip()}...\n\n"
+
+        user_content += (
+            f"Does this assigned text chunk (understood within its surrounding context) genuinely contain, "
+            f"discuss, dramatize, or support the idea \"{idea_name}\"?"
         )
 
         messages = [
@@ -445,6 +463,80 @@ class IdeaVerifier:
             )
 
 
+def get_surrounding_chunk_context(
+    chunk_id: str,
+    book_id: Optional[int],
+    chunk_store: Optional[ChunkStore] = None,
+    graph: Optional[Any] = None,
+    window_chars: int = 500,
+    book_chunks_cache: Optional[Dict[int, List[HierarchicalChunk]]] = None,
+) -> Tuple[str, str]:
+    """
+    Retrieve predecessor and successor context excerpts for an atomic chunk.
+    Uses ChunkStore if available, or falls back to graph sibling chunk nodes in the section.
+    Returns (prior_excerpt, subsequent_excerpt).
+    """
+    if window_chars <= 0:
+        return "", ""
+
+    # 1. Look up through ChunkStore
+    if chunk_store is not None and book_id is not None:
+        try:
+            if book_chunks_cache is not None:
+                if book_id not in book_chunks_cache:
+                    loaded = chunk_store.load_chunks(book_id)
+                    book_chunks_cache[book_id] = loaded or []
+                b_chunks = book_chunks_cache[book_id]
+            else:
+                b_chunks = chunk_store.load_chunks(book_id) or []
+
+            if b_chunks:
+                match_idx = next((i for i, c in enumerate(b_chunks) if c.chunk_id == chunk_id), None)
+                if match_idx is not None:
+                    prior = ""
+                    if match_idx > 0:
+                        txt = b_chunks[match_idx - 1].text.strip()
+                        prior = txt[-window_chars:].strip()
+                    subsequent = ""
+                    if match_idx < len(b_chunks) - 1:
+                        txt = b_chunks[match_idx + 1].text.strip()
+                        subsequent = txt[:window_chars].strip()
+                    return prior, subsequent
+        except Exception as e:
+            logger.debug(f"Failed to retrieve chunk context from ChunkStore for {chunk_id}: {e}")
+
+    # 2. Look up through Knowledge Graph sibling chunks connected to the same Section
+    if graph is not None:
+        try:
+            target_node_id = f"chunk:{chunk_id}"
+            if target_node_id in graph:
+                section_parents = [
+                    src for src, _, d in graph.in_edges(target_node_id, data=True)
+                    if d.get("relation") == "HAS_CHUNK"
+                ]
+                if section_parents:
+                    sec_id = section_parents[0]
+                    sibling_ids = [
+                        tgt for _, tgt, d in graph.out_edges(sec_id, data=True)
+                        if d.get("relation") == "HAS_CHUNK"
+                    ]
+                    if target_node_id in sibling_ids:
+                        idx = sibling_ids.index(target_node_id)
+                        prior = ""
+                        if idx > 0:
+                            p_txt = graph.nodes[sibling_ids[idx - 1]].get("text", "").strip()
+                            prior = p_txt[-window_chars:].strip()
+                        subsequent = ""
+                        if idx < len(sibling_ids) - 1:
+                            s_txt = graph.nodes[sibling_ids[idx + 1]].get("text", "").strip()
+                            subsequent = s_txt[:window_chars].strip()
+                        return prior, subsequent
+        except Exception as e:
+            logger.debug(f"Failed to retrieve chunk context from graph for {chunk_id}: {e}")
+
+    return "", ""
+
+
 def verify_graph(
     store: ConceptGraphStore,
     pool: OllamaPool,
@@ -456,11 +548,14 @@ def verify_graph(
     seed: Optional[int] = None,
     concurrency: int = 3,
     timeout: int = 300,
-    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    progress_callback: Optional[Callable[..., None]] = None,
+    chunk_store: Optional[ChunkStore] = None,
+    context_window_chars: int = 500,
 ) -> VerificationReport:
     """
     Perform factual verification of ideas in the Knowledge Graph against their assigned chunks.
-    Randomly samples `percent`% of ideas, pulls their related chunks, and audits grounding.
+    Randomly samples `percent`% of ideas, pulls their related chunks, sanitizes quotes,
+    enriches with surrounding scene context, and audits grounding.
     """
     start_time = time.time()
     verifier = IdeaVerifier(pool=pool, model_name=model_name, temperature=temperature, timeout=timeout)
@@ -520,7 +615,10 @@ def verify_graph(
     rng = random.Random(seed) if seed is not None else random.Random()
     sampled_candidates = rng.sample(candidates, sample_size)
 
-    # 4. Gather all idea-chunk tasks
+    # Cache loaded book chunks across evaluation tasks
+    book_chunks_cache: Dict[int, List[HierarchicalChunk]] = {}
+
+    # 4. Gather all idea-chunk tasks with sanitized quotes and surrounding context
     eval_tasks: List[Dict[str, Any]] = []
     for c_id, c_attrs, chunks in sampled_candidates:
         c_name = c_attrs.get("name", c_id.replace("concept:", ""))
@@ -529,22 +627,64 @@ def verify_graph(
         c_wt = c_attrs.get("weight", 5)
 
         for chunk_node_id, chunk_attrs, edge_data in chunks:
-            quote = edge_data.get("quote", "")
+            raw_quote = edge_data.get("quote", "")
             chunk_text = chunk_attrs.get("text", "")
-            if not chunk_text and quote:
-                chunk_text = quote
+            if not chunk_text and raw_quote:
+                chunk_text = raw_quote
+
+            # 1. Quote sanitization:
+            # Merged canonical concepts from previous runs/books may leak cross-book quotes.
+            # Only pass quote to the verifier if it is actually grounded in this chunk's text!
+            sanitized_quote = ""
+            if raw_quote and chunk_text:
+                q_norm = " ".join(raw_quote.lower().split())
+                t_norm = " ".join(chunk_text.lower().split())
+                if q_norm in t_norm:
+                    sanitized_quote = raw_quote
+                else:
+                    # Check significant word overlap
+                    q_words = set(re.findall(r"\w{4,}", q_norm))
+                    if q_words:
+                        t_words = set(re.findall(r"\w{4,}", t_norm))
+                        overlap = len(q_words & t_words) / len(q_words)
+                        if overlap >= 0.5:
+                            sanitized_quote = raw_quote
+
+            # 2. Localized description / summary:
+            # Prioritize chunk-level description on the edge over global canonical summary
+            brief = (edge_data.get("brief_description") or "").strip()
+            detailed = (edge_data.get("detailed_explanation") or "").strip()
+            if brief and detailed and brief != detailed:
+                local_desc = f"{brief}. {detailed}"
+            else:
+                local_desc = detailed or brief
+            effective_summary = local_desc if local_desc else c_sum
+
+            bid = chunk_attrs.get("book_id")
+            chk_id = chunk_attrs.get("chunk_id", chunk_node_id.replace("chunk:", ""))
+
+            prior_ctx, sub_ctx = get_surrounding_chunk_context(
+                chunk_id=chk_id,
+                book_id=bid,
+                chunk_store=chunk_store,
+                graph=store.graph,
+                window_chars=context_window_chars,
+                book_chunks_cache=book_chunks_cache,
+            )
 
             eval_tasks.append({
                 "idea_name": c_name,
                 "idea_category": c_cat,
-                "idea_summary": c_sum,
+                "idea_summary": effective_summary,
                 "idea_weight": c_wt,
-                "quote": quote,
-                "chunk_id": chunk_attrs.get("chunk_id", chunk_node_id.replace("chunk:", "")),
-                "book_id": chunk_attrs.get("book_id"),
+                "quote": sanitized_quote,
+                "chunk_id": chk_id,
+                "book_id": bid,
                 "book_title": chunk_attrs.get("book_title", "Unknown"),
                 "section_title": chunk_attrs.get("section_title", chunk_attrs.get("chapter_title", "Unknown")),
                 "chunk_text": chunk_text,
+                "prior_context": prior_ctx,
+                "subsequent_context": sub_ctx,
             })
 
     total_evals = len(eval_tasks)
@@ -560,6 +700,8 @@ def verify_graph(
             book_title=task_item["book_title"],
             section_title=task_item["section_title"],
             chunk_text=task_item["chunk_text"],
+            prior_context=task_item.get("prior_context", ""),
+            subsequent_context=task_item.get("subsequent_context", ""),
         )
         server_lbl = getattr(_thread_local, "last_used_server", None)
         return VerificationItem(

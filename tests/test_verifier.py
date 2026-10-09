@@ -19,6 +19,7 @@ from bookeeper.processing.verifier import (
     VerificationReport,
     VerificationResult,
     _parse_verification_text,
+    get_surrounding_chunk_context,
     verify_graph,
 )
 
@@ -493,5 +494,114 @@ def test_verify_graph_passes_item_to_progress_callback(mock_pool, populated_stor
             assert isinstance(item, VerificationItem)
             assert item.is_supported is True
             assert item.idea_name
+
+
+def test_get_surrounding_chunk_context_chunk_store(tmp_path):
+    """Test retrieving prior and subsequent context excerpts using ChunkStore."""
+    from bookeeper.processing.chunker import ChunkStore, HierarchicalChunk
+
+    store = ChunkStore(tmp_path / "chunks")
+    c1 = HierarchicalChunk(
+        chunk_id="b1_c1_p1", book_id=1, book_title="Book", chapter_idx=1,
+        section_title="Chapter 1", chunk_idx=1, text="The prologue begins with ancient prophecies.",
+    )
+    c2 = HierarchicalChunk(
+        chunk_id="b1_c1_p2", book_id=1, book_title="Book", chapter_idx=1,
+        section_title="Chapter 1", chunk_idx=2, text="The hero trains vigorously for the coming battle.",
+    )
+    c3 = HierarchicalChunk(
+        chunk_id="b1_c1_p3", book_id=1, book_title="Book", chapter_idx=1,
+        section_title="Chapter 1", chunk_idx=3, text="Finally, the battle commenced at dawn.",
+    )
+    store.save_chunks(1, "Book", [c1, c2, c3])
+
+    # Middle chunk has both prior and subsequent context
+    prior, subsequent = get_surrounding_chunk_context(
+        chunk_id="b1_c1_p2", book_id=1, chunk_store=store, window_chars=20,
+    )
+    assert "ancient prophecies." in prior
+    assert "Finally, the battle" in subsequent
+
+    # First chunk has no prior context
+    prior1, subsequent1 = get_surrounding_chunk_context(
+        chunk_id="b1_c1_p1", book_id=1, chunk_store=store, window_chars=20,
+    )
+    assert prior1 == ""
+    assert "The hero trains" in subsequent1
+
+
+def test_quote_sanitization_in_verify_graph(mock_pool):
+    """Test that mismatched quotes leaked across books are sanitized out, while valid quotes are kept."""
+    store = ConceptGraphStore()
+    store.add_book(1, title="Metro 2033", author="Glukhovsky")
+
+    # Concept with canonical summary mentioning different characters
+    concept = Concept(
+        name="Tactical Retreat",
+        category="Tactics",
+        summary="A military maneuver involving Verdauga Greeneyes and woodlanders in Mossflower.",
+        weight=7,
+        related_concepts=[],
+    )
+    store.add_concept(concept)
+
+    # Chunk discussing Metro shift change
+    chk = HierarchicalChunk(
+        chunk_id="chk_metro_1",
+        chunk_idx=1,
+        book_id=1,
+        book_title="Metro 2033",
+        chapter_idx=1,
+        chapter_title="Chapter 1",
+        section_title="Shift Change",
+        breadcrumb="Metro 2033 > Chapter 1",
+        text="The shift was finally over at the station. Guards walked back to the central platform.",
+        char_count=80,
+        word_count=15,
+    )
+    store.add_chunk(chk)
+
+    # Support link with a quote leaked from an entirely different book (Redwall)
+    alien_quote = "Garrent and the otters took cover behind the rampart."
+    store.add_idea_support_link(
+        concept_name="Tactical Retreat",
+        chunk=chk,
+        quote=alien_quote,
+        brief_description="Guards retreating from the watch post.",
+        detailed_explanation="Shift change at the station.",
+    )
+
+    prompts_received = []
+
+    def _mock_invoke(messages):
+        user_content = messages[-1].content
+        prompts_received.append(user_content)
+        return VerificationResult(
+            is_supported=True,
+            confidence=0.9,
+            explanation="Grounded in guards walking back.",
+        )
+
+    with patch.object(IdeaVerifier, "_execute_structured_invoke", side_effect=_mock_invoke):
+        report = verify_graph(
+            store=store,
+            pool=mock_pool,
+            model_name="llama3.1:8b",
+            percent=100.0,
+            seed=42,
+        )
+
+        assert report.stats.total_evaluations == 1
+        assert len(prompts_received) == 1
+        received_prompt = prompts_received[0]
+
+        # Verify alien quote was sanitized out (NOT passed to the prompt)
+        assert alien_quote not in received_prompt
+        assert "Supporting Quote:" not in received_prompt
+
+        # Verify localized description from edge was used instead of canonical Mossflower summary
+        assert "Verdauga Greeneyes" not in received_prompt
+        assert "Guards retreating from the watch post" in received_prompt
+
 
 

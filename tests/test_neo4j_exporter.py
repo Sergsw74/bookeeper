@@ -270,3 +270,128 @@ def test_neo4j_export_progress_callback():
     assert len(node_events) > 0
     assert node_events[-1][1] == node_events[-1][2]
 
+
+def test_chunk_next_prev_relationships_in_store():
+    """Verify ConceptGraphStore correctly links consecutive chunks with NEXT and PREV edges."""
+    store = ConceptGraphStore()
+    store.add_book(book_id=1, title="Chronicles of Narnia")
+
+    # Add three sequential chunks
+    c1 = HierarchicalChunk(
+        chunk_id="b1_c1_p1_aaa",
+        book_id=1,
+        book_title="Chronicles of Narnia",
+        chapter_idx=1,
+        chunk_idx=1,
+        section_title="Chapter 1",
+        text="Once there were four children...",
+        next_chunk_id="b1_c1_p2_bbb",
+    )
+    c2 = HierarchicalChunk(
+        chunk_id="b1_c1_p2_bbb",
+        book_id=1,
+        book_title="Chronicles of Narnia",
+        chapter_idx=1,
+        chunk_idx=2,
+        section_title="Chapter 1",
+        text="They explored the wardrobe...",
+        prev_chunk_id="b1_c1_p1_aaa",
+        next_chunk_id="b1_c1_p3_ccc",
+    )
+    c3 = HierarchicalChunk(
+        chunk_id="b1_c1_p3_ccc",
+        book_id=1,
+        book_title="Chronicles of Narnia",
+        chapter_idx=1,
+        chunk_idx=3,
+        section_title="Chapter 1",
+        text="They entered Narnia...",
+        prev_chunk_id="b1_c1_p2_bbb",
+    )
+
+    store.add_chunk(c1)
+    store.add_chunk(c2)
+    store.add_chunk(c3)
+
+    g = store.graph
+    # Verify nodes exist
+    assert g.has_node("chunk:b1_c1_p1_aaa")
+    assert g.has_node("chunk:b1_c1_p2_bbb")
+    assert g.has_node("chunk:b1_c1_p3_ccc")
+
+    # Verify NEXT edges
+    assert g.has_edge("chunk:b1_c1_p1_aaa", "chunk:b1_c1_p2_bbb")
+    assert g.edges["chunk:b1_c1_p1_aaa", "chunk:b1_c1_p2_bbb"]["relation"] == "NEXT"
+    assert g.has_edge("chunk:b1_c1_p2_bbb", "chunk:b1_c1_p3_ccc")
+    assert g.edges["chunk:b1_c1_p2_bbb", "chunk:b1_c1_p3_ccc"]["relation"] == "NEXT"
+
+    # Verify PREV edges
+    assert g.has_edge("chunk:b1_c1_p2_bbb", "chunk:b1_c1_p1_aaa")
+    assert g.edges["chunk:b1_c1_p2_bbb", "chunk:b1_c1_p1_aaa"]["relation"] == "PREV"
+    assert g.has_edge("chunk:b1_c1_p3_ccc", "chunk:b1_c1_p2_bbb")
+    assert g.edges["chunk:b1_c1_p3_ccc", "chunk:b1_c1_p2_bbb"]["relation"] == "PREV"
+
+    # Verify edge stats
+    stats = store.stats()
+    assert stats["edge_types"]["NEXT"] == 2
+    assert stats["edge_types"]["PREV"] == 2
+
+
+def test_neo4j_export_chunk_next_prev_relationships():
+    """Verify Neo4jExporter exports (:Chunk)-[:NEXT]->(:Chunk) and (:Chunk)-[:PREV]->(:Chunk)."""
+    store = ConceptGraphStore()
+    store.add_book(book_id=2, title="Lord of the Rings")
+
+    c1 = HierarchicalChunk(
+        chunk_id="b2_c1_p1_111",
+        book_id=2,
+        book_title="Lord of the Rings",
+        chapter_idx=1,
+        chunk_idx=1,
+        section_title="Concerning Hobbits",
+        text="Hobbits are an unobtrusive people...",
+    )
+    c2 = HierarchicalChunk(
+        chunk_id="b2_c1_p2_222",
+        book_id=2,
+        book_title="Lord of the Rings",
+        chapter_idx=1,
+        chunk_idx=2,
+        section_title="Concerning Hobbits",
+        text="They love peace and quiet...",
+    )
+
+    store.add_chunk(c1)
+    store.add_chunk(c2)
+    # Ensure link_sequential_chunks creates the links even if chunks lacked explicit prev/next at creation
+    store.link_sequential_chunks(book_id=2)
+
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    with patch("bookeeper.graph.neo4j_exporter.GraphDatabase.driver", return_value=mock_driver):
+        exporter = Neo4jExporter(uri="bolt://localhost:7687", database="neo4j")
+        result = exporter.export(store)
+
+    assert result["status"] == "success"
+    assert "NEXT" in result["edge_breakdown"]
+    assert "PREV" in result["edge_breakdown"]
+    assert result["edge_breakdown"]["NEXT"] == 1
+    assert result["edge_breakdown"]["PREV"] == 1
+
+    executed_queries = [call.args[0] for call in mock_session.run.call_args_list]
+
+    # Verify NEXT Cypher query
+    next_queries = [q for q in executed_queries if "MERGE (source)-[r:`NEXT`]->(target)" in q]
+    assert len(next_queries) > 0
+    assert "MATCH (source:`Chunk`" in next_queries[0]
+    assert "MATCH (target:`Chunk`" in next_queries[0]
+
+    # Verify PREV Cypher query
+    prev_queries = [q for q in executed_queries if "MERGE (source)-[r:`PREV`]->(target)" in q]
+    assert len(prev_queries) > 0
+    assert "MATCH (source:`Chunk`" in prev_queries[0]
+    assert "MATCH (target:`Chunk`" in prev_queries[0]
+
+

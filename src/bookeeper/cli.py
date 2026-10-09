@@ -2172,6 +2172,9 @@ def build_graph(
                                     tgt_concept_name=rel_name,
                                 )
 
+                    # Ensure sequential NEXT and PREV relationships between chunks for this book
+                    store.link_sequential_chunks(book_id=bid)
+
                     overall_completed_fraction = float(book_idx)
                     overall_remaining_fraction = max(0.0, total_books - overall_completed_fraction)
                     overall_elapsed = time.perf_counter() - pipeline_start_time

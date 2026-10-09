@@ -4,6 +4,7 @@ Directed Concept Knowledge Graph store implemented with NetworkX DiGraph.
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -207,6 +208,10 @@ class ConceptGraphStore:
                 title=chunk.section_title,
             )
 
+        chunk_idx = getattr(chunk, "chunk_idx", 0)
+        prev_chunk_id = getattr(chunk, "prev_chunk_id", None)
+        next_chunk_id = getattr(chunk, "next_chunk_id", None)
+
         self.graph.add_node(
             chunk_node_id,
             type="Chunk",
@@ -222,6 +227,9 @@ class ConceptGraphStore:
             char_count=chunk.char_count,
             parent_chunk_id=getattr(chunk, "parent_chunk_id", None),
             hierarchy_level=getattr(chunk, "hierarchy_level", "child"),
+            chunk_idx=chunk_idx,
+            prev_chunk_id=prev_chunk_id,
+            next_chunk_id=next_chunk_id,
         )
 
         # Edge: (:Section) -[:HAS_CHUNK]-> (:Chunk)
@@ -230,7 +238,101 @@ class ConceptGraphStore:
             chunk_node_id,
             relation="HAS_CHUNK",
         )
+
+        # Sequential edges between chunks: (:Chunk A) -[:NEXT]-> (:Chunk B), (:Chunk B) -[:PREV]-> (:Chunk A)
+        if prev_chunk_id:
+            p_nid = f"chunk:{prev_chunk_id}" if not str(prev_chunk_id).startswith("chunk:") else str(prev_chunk_id)
+            if self.graph.has_node(p_nid):
+                self.graph.add_edge(p_nid, chunk_node_id, relation="NEXT")
+                self.graph.add_edge(chunk_node_id, p_nid, relation="PREV")
+
+        if next_chunk_id:
+            n_nid = f"chunk:{next_chunk_id}" if not str(next_chunk_id).startswith("chunk:") else str(next_chunk_id)
+            if self.graph.has_node(n_nid):
+                self.graph.add_edge(chunk_node_id, n_nid, relation="NEXT")
+                self.graph.add_edge(n_nid, chunk_node_id, relation="PREV")
+
         return chunk_node_id
+
+    def link_sequential_chunks(self, book_id: Optional[int] = None) -> int:
+        """
+        Link consecutive Chunk nodes within each book with :NEXT and :PREV edges:
+          (:Chunk A) -[:NEXT]-> (:Chunk B)
+          (:Chunk B) -[:PREV]-> (:Chunk A)
+
+        Uses explicit prev_chunk_id / next_chunk_id properties or orders chunks
+        by (chapter_idx, chunk_idx / global_chunk_idx).
+        Returns the number of sequential chunk pairs linked.
+        """
+        chunks_by_book: Dict[int, List[tuple[str, Dict[str, Any]]]] = {}
+        for node_id, attrs in self.graph.nodes(data=True):
+            if attrs.get("type") == "Chunk":
+                b_id = attrs.get("book_id", 0)
+                if book_id is not None and b_id != book_id:
+                    continue
+                chunks_by_book.setdefault(b_id, []).append((node_id, attrs))
+
+        def get_chunk_sort_key(item: tuple[str, Dict[str, Any]]) -> tuple[int, int, str]:
+            node_id, attrs = item
+            ch_idx = int(attrs.get("chapter_idx") or 0)
+            c_idx = int(attrs.get("chunk_idx") or 0)
+            if c_idx > 0:
+                return (ch_idx, c_idx, node_id)
+            cid = str(attrs.get("chunk_id", node_id))
+            m_p = re.search(r"_p(\d+)_", cid)
+            if m_p:
+                return (ch_idx, int(m_p.group(1)), node_id)
+            bc = str(attrs.get("breadcrumb", ""))
+            m_bc = re.search(r"\[part\s+(\d+)\.(\d+)\]", bc)
+            if m_bc:
+                return (int(m_bc.group(1)), int(m_bc.group(2)), node_id)
+            return (ch_idx, 0, node_id)
+
+        linked_pairs = 0
+        for b_id, chunk_list in chunks_by_book.items():
+            if len(chunk_list) < 2:
+                continue
+
+            sorted_chunks = sorted(chunk_list, key=get_chunk_sort_key)
+            for i in range(len(sorted_chunks) - 1):
+                curr_id, curr_attrs = sorted_chunks[i]
+                next_id, next_attrs = sorted_chunks[i + 1]
+
+                # Ensure edges exist
+                self.graph.add_edge(curr_id, next_id, relation="NEXT")
+                self.graph.add_edge(next_id, curr_id, relation="PREV")
+
+                curr_cid = curr_attrs.get("chunk_id") or curr_id.replace("chunk:", "")
+                next_cid = next_attrs.get("chunk_id") or next_id.replace("chunk:", "")
+                curr_attrs.setdefault("next_chunk_id", next_cid)
+                next_attrs.setdefault("prev_chunk_id", curr_cid)
+                if not curr_attrs.get("chunk_idx"):
+                    curr_attrs["chunk_idx"] = i + 1
+                if not next_attrs.get("chunk_idx"):
+                    next_attrs["chunk_idx"] = i + 2
+
+                linked_pairs += 1
+
+        # Also connect any explicit prev_chunk_id / next_chunk_id references if present
+        for node_id, attrs in self.graph.nodes(data=True):
+            if attrs.get("type") == "Chunk":
+                b_id = attrs.get("book_id", 0)
+                if book_id is not None and b_id != book_id:
+                    continue
+                prev_cid = attrs.get("prev_chunk_id")
+                if prev_cid:
+                    p_nid = f"chunk:{prev_cid}" if not str(prev_cid).startswith("chunk:") else str(prev_cid)
+                    if self.graph.has_node(p_nid):
+                        self.graph.add_edge(p_nid, node_id, relation="NEXT")
+                        self.graph.add_edge(node_id, p_nid, relation="PREV")
+                next_cid = attrs.get("next_chunk_id")
+                if next_cid:
+                    n_nid = f"chunk:{next_cid}" if not str(next_cid).startswith("chunk:") else str(next_cid)
+                    if self.graph.has_node(n_nid):
+                        self.graph.add_edge(node_id, n_nid, relation="NEXT")
+                        self.graph.add_edge(n_nid, node_id, relation="PREV")
+
+        return linked_pairs
 
     def add_idea_support_link(
         self,
@@ -463,6 +565,8 @@ class ConceptGraphStore:
         """Persist graph to JSON node-link format."""
         path = Path(file_path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.link_sequential_chunks()
 
         data = json_graph.node_link_data(self.graph)
         with open(path, "w", encoding="utf-8") as f:

@@ -274,6 +274,9 @@ class Neo4jExporter:
                 if progress_callback:
                     progress_callback("clean", deleted_before_export, deleted_before_export, "Clean start complete")
 
+            # Ensure sequential NEXT and PREV relationships between chunks exist in graph
+            store.link_sequential_chunks()
+
             g = store.graph
             total_nodes = g.number_of_nodes()
             total_edges = g.number_of_edges()

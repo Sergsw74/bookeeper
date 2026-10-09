@@ -247,10 +247,15 @@ def _perform_ollama_warmup(extractor: KnowledgeExtractor, console: Console) -> D
     """Execute warmup ping to load model and report CPU vs GPU acceleration status across server pool."""
     pool_nodes = extractor.pool.nodes
     node_cap_map = {n.url.rstrip("/"): ", ".join(n.capabilities) for n in pool_nodes}
+    node_mac_map = {n.url.rstrip("/"): n.mac for n in pool_nodes}
+
+    def _status_cb(msg: str):
+        console.print(f"[bold yellow]⚡ {msg}[/bold yellow]")
+
     with console.status(
         f"[bold blue]Checking Ollama acceleration across server pool ({len(pool_nodes)} node(s))...[/bold blue]"
     ):
-        status = extractor.warmup_and_check_device()
+        status = extractor.warmup_and_check_device(on_status_callback=_status_cb)
 
     servers = status.get("servers", [])
     primary = status.get("primary", {})
@@ -265,6 +270,7 @@ def _perform_ollama_warmup(extractor: KnowledgeExtractor, console: Console) -> D
         table.add_column("Priority", justify="center", width=8)
         table.add_column("Endpoint", style="bold white", min_width=25)
         table.add_column("Capabilities", style="yellow")
+        table.add_column("WOL MAC", style="dim cyan")
         table.add_column("Device / Mode", style="magenta")
         table.add_column("VRAM Offload", justify="right")
         table.add_column("Pool State", style="green")
@@ -282,7 +288,8 @@ def _perform_ollama_warmup(extractor: KnowledgeExtractor, console: Console) -> D
             if st != "ok":
                 pool_state = f"[red]{st}[/red]"
             caps = node_cap_map.get(url.rstrip("/"), "llm, embedding, verification")
-            table.add_row(pri, url, caps, dev, vram_str, pool_state)
+            wol_mac = node_mac_map.get(url.rstrip("/")) or "[dim]-[/dim]"
+            table.add_row(pri, url, caps, wol_mac, dev, vram_str, pool_state)
 
         console.print(table)
 
@@ -360,16 +367,20 @@ def config(
     for s in cfg.resolved_ollama_servers:
         name_tag = f" ({s.name})" if s.name else ""
         cap_tag = f" [{s.capability_str}]"
-        servers_desc.append(f"    • [cyan]{s.url}[/cyan]{name_tag}{cap_tag} [dim](priority: {s.priority})[/dim]")
+        mac_tag = f" [yellow](WOL MAC: {s.mac}{' + secret' if s.wol_secret else ''})[/yellow]" if s.mac else ""
+        servers_desc.append(f"    • [cyan]{s.url}[/cyan]{name_tag}{cap_tag}{mac_tag} [dim](priority: {s.priority})[/dim]")
     servers_block = "\n".join(servers_desc)
 
     emb_endpoint_str = "[dim]shares LLM pool[/dim]" if cfg.uses_llm_pool_for_embeddings else f"[cyan]{cfg.embedding_base_url}[/cyan] [bold green](dedicated local)[/bold green]"
+
+    wol_status_str = f"[bold green]Enabled[/bold green] (timeout: {cfg.wol_wait_seconds}s, interval: {cfg.wol_probe_interval}s)" if cfg.wol_enabled else "[dim]Disabled[/dim]"
 
     console.print(
         Panel.fit(
             f"[bold green]Calibre Library / SMB Share:[/bold green] {cfg.calibre_library_path}\n"
             f"[bold green]Calibre Auth:[/bold green] user={cfg.calibre_user or '[dim]none[/dim]'}\n"
             f"[bold green]Ollama Failover Pool ({len(cfg.resolved_ollama_servers)} server(s)):[/bold green]\n{servers_block}\n"
+            f"[bold green]Wake-on-LAN (WOL):[/bold green] {wol_status_str}\n"
             f"[bold green]Failover Cooldown:[/bold green] {cfg.failover_cooldown_seconds}s\n"
             f"[bold green]LLM Model:[/bold green] {cfg.llm_model}\n"
             f"[bold green]Embedding Model:[/bold green] {cfg.embedding_model}\n"

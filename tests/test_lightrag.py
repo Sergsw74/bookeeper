@@ -136,5 +136,5 @@ def test_cli_query_empty_directory_exits():
         empty_dir = Path(tmpdir) / "empty_rag"
         result = runner.invoke(app, ["query", "What is Raft?", "--lightrag-dir", str(empty_dir)])
         assert result.exit_code != 0
-        assert "is empty or does not exist" in result.output
+        assert "is empty or does not exist" in " ".join(result.output.split())
         assert "bookeeper build-graph --lightrag" in result.output

@@ -2,6 +2,7 @@
 Configuration management for bookeeper using pydantic-settings.
 """
 
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, List, Optional
@@ -25,6 +26,22 @@ class OllamaServerConfig(BaseModel):
         default_factory=lambda: list(DEFAULT_CAPABILITIES),
         description="List of capabilities supported by this node: 'llm', 'embedding', 'verification'.",
     )
+    mac: Optional[str] = Field(
+        default=None,
+        description="MAC address for Wake-on-LAN (e.g. 'D8:43:AE:FA:44:95').",
+    )
+    wol_broadcast: str = Field(
+        default="255.255.255.255",
+        description="Broadcast IP address for WOL magic packet (default: 255.255.255.255).",
+    )
+    wol_port: int = Field(
+        default=9,
+        description="UDP port for WOL magic packet (default: 9).",
+    )
+    wol_secret: Optional[str] = Field(
+        default=None,
+        description="Optional Wake-on-LAN password/secret (e.g. 6-byte hex '01:02:03:04:05:06' or 4-byte/ASCII string).",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -36,7 +53,26 @@ class OllamaServerConfig(BaseModel):
             # If capability is passed as string (e.g. "embedding" or "llm, embedding")
             if "capability" in data and isinstance(data["capability"], str):
                 data["capability"] = [c.strip() for c in data["capability"].split(",") if c.strip()]
+            # Accept 'wol_mac' as alias for 'mac'
+            if "wol_mac" in data and "mac" not in data:
+                data["mac"] = data.pop("wol_mac")
+            # Accept 'secret' or 'wol_password' as alias for 'wol_secret'
+            if "secret" in data and "wol_secret" not in data:
+                data["wol_secret"] = data.pop("secret")
+            if "wol_password" in data and "wol_secret" not in data:
+                data["wol_secret"] = data.pop("wol_password")
         return data
+
+    @field_validator("mac")
+    @classmethod
+    def clean_mac(cls, v: Optional[str]) -> Optional[str]:
+        if not v:
+            return None
+        v_clean = v.strip()
+        hex_only = re.sub(r"[^0-9a-fA-F]", "", v_clean)
+        if len(hex_only) != 12:
+            raise ValueError(f"Invalid MAC address '{v}': must contain 12 hexadecimal characters.")
+        return ":".join(hex_only[i : i + 2].upper() for i in range(0, 12, 2))
 
     @field_validator("url")
     @classmethod
@@ -216,6 +252,26 @@ class Settings(BaseSettings):
     failover_cooldown_seconds: int = Field(
         default=600,
         description="Cooldown duration in seconds (default 600s = 10 min) before retrying a failed server.",
+    )
+    wol_enabled: bool = Field(
+        default=True,
+        description="Enable Wake-on-LAN for unreachable Ollama servers during warmup.",
+    )
+    wol_wait_seconds: int = Field(
+        default=120,
+        description="Max seconds to wait for server to boot after sending WOL magic packet (default: 120s / 2 mins).",
+    )
+    wol_probe_interval: float = Field(
+        default=5.0,
+        description="Seconds between connectivity probes while waiting for woken server (default: 5.0s).",
+    )
+    wol_broadcast: str = Field(
+        default="255.255.255.255",
+        description="Default broadcast IP address for Wake-on-LAN (default: 255.255.255.255).",
+    )
+    wol_port: int = Field(
+        default=9,
+        description="Default UDP port for Wake-on-LAN (default: 9).",
     )
     max_active_tasks: Optional[int] = Field(
         default=None,

@@ -465,7 +465,8 @@ def test_embedding_base_url_routing_separate_from_llm_pool():
     cli_cfg = _get_effective_settings(None, embedding_url="pool")
     assert cli_cfg.uses_llm_pool_for_embeddings is True
     assert cli_cfg.embedding_base_url == "pool"
-    assert cli_cfg.resolved_embedding_servers[0].url == cli_cfg.ollama_base_url
+    expected_pool_url = cli_cfg.resolved_ollama_servers[0].url if cli_cfg.ollama_servers else cli_cfg.ollama_base_url
+    assert cli_cfg.resolved_embedding_servers[0].url == expected_pool_url
 
 
 def test_failover_ollama_embeddings_speed_tracking():

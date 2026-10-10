@@ -12,6 +12,7 @@ from bookeeper.processing.qa_probe import (
     QAProbeEvaluation,
     QASystemBlockMetrics,
     format_ideas_as_claims,
+    format_ideas_for_context,
     clean_llm_json_response,
     parse_json_array_safely,
     generate_qa_probes,
@@ -21,7 +22,7 @@ from bookeeper.processing.qa_probe import (
 )
 
 
-def test_format_ideas_as_claims():
+def test_format_ideas_for_context():
     # 1. Concept objects
     c1 = Concept(
         name="Format Conversion",
@@ -35,11 +36,10 @@ def test_format_ideas_as_claims():
         brief_description="Tags book genres",
     )
     claims_text = format_ideas_as_claims([c1, c2])
-    assert "Claim 1: Format Conversion" in claims_text
-    assert "Summary: Converts EPUB to MOBI" in claims_text
-    assert "Details: Automatic format conversion occurs" in claims_text
-    assert "Claim 2: Metadata Tagging" in claims_text
-    assert "Summary: Tags book genres" in claims_text
+    assert "[1] Concept: Format Conversion" in claims_text
+    assert "Explanation: Automatic format conversion occurs when sync is initiated." in claims_text
+    assert "[2] Concept: Metadata Tagging" in claims_text
+    assert "Explanation: Tags book genres" in claims_text
 
     # 2. Concept with quote and category
     c3 = Concept(
@@ -49,17 +49,16 @@ def test_format_ideas_as_claims():
         detailed_explanation="Encrypted keys prevent unauthorized copying.",
         supporting_quote="DRM was used to restrict user freedom.",
     )
-    claims_text3 = format_ideas_as_claims([c3])
-    assert "Claim 1: DRM Protection [Security]" in claims_text3
-    assert "Summary: Digital rights management restricts reading." in claims_text3
-    assert "Details: Encrypted keys prevent unauthorized copying." in claims_text3
-    assert 'Supporting Text: "DRM was used to restrict user freedom."' in claims_text3
+    claims_text3 = format_ideas_for_context([c3])
+    assert "[1] Concept: DRM Protection" in claims_text3
+    assert "Explanation: Encrypted keys prevent unauthorized copying." in claims_text3
+    assert 'Direct Context/Quote: "DRM was used to restrict user freedom."' in claims_text3
 
     # 3. String fallback
-    assert "Claim 1: Simple Idea" in format_ideas_as_claims(["Simple Idea"])
+    assert "[1] Concept: Simple Idea" in format_ideas_for_context(["Simple Idea"])
 
-    # 3. Empty list
-    assert format_ideas_as_claims([]) == "(No knowledge claims extracted for this block)"
+    # 4. Empty list
+    assert format_ideas_for_context([]) == "(No knowledge claims extracted for this block)"
 
 
 def test_json_parsing_and_cleaning():
@@ -90,8 +89,20 @@ def test_json_parsing_and_cleaning():
 def test_generate_qa_probes():
     mock_pool = MagicMock()
     mock_resp = json.dumps([
-        {"question": "Why did X fail?", "gold_answer": "Because Y happened.", "is_cross_sentence": True},
-        {"question": "What is Z?", "gold_answer": "Z is a standard format.", "is_cross_sentence": False},
+        {
+            "question_id": 1,
+            "question": "Why did X fail?",
+            "gold_answer": "Because Y happened.",
+            "is_cross_sentence": True,
+            "source_sentence_references": ["X failed because Y happened.", "Y happened."],
+        },
+        {
+            "question_id": 2,
+            "question": "What is Z?",
+            "gold_answer": "Z is a standard format.",
+            "is_cross_sentence": False,
+            "source_sentence_references": ["Z is a standard format maintained by the community."],
+        },
     ])
     mock_pool.generate.return_value = (mock_resp, {})
 
@@ -105,7 +116,10 @@ def test_generate_qa_probes():
     assert len(probes) == 2
     assert probes[0].question == "Why did X fail?"
     assert probes[0].is_cross_sentence is True
+    assert len(probes[0].source_sentence_references) == 2
+    assert probes[0].source_sentence_references[0] == "X failed because Y happened."
     assert probes[1].gold_answer == "Z is a standard format."
+    assert len(probes[1].source_sentence_references) == 1
 
 
 def test_answer_probe():

@@ -32,6 +32,7 @@ class QAProbeItem(BaseModel):
     question: str
     gold_answer: str
     is_cross_sentence: bool = False
+    source_sentence_references: List[str] = Field(default_factory=list)
 
 
 class QAProbeEvaluation(BaseModel):
@@ -65,54 +66,50 @@ class QASystemBlockMetrics(BaseModel):
 # ==============================================================================
 
 
-def format_ideas_as_claims(ideas: List[Any]) -> str:
+def format_ideas_for_context(ideas: List[Any]) -> str:
     """
-    Format deduplicated Concept objects or string ideas into a structured list of claims.
-    Includes title, brief summary, and detailed explanation to supply complete context.
+    Format deduplicated Concept objects or dictionary ideas into structured Markdown blocks
+    including supporting quotes and detailed explanations.
     """
     if not ideas:
         return "(No knowledge claims extracted for this block)"
 
-    claims = []
-    for idx, item in enumerate(ideas, 1):
-        if isinstance(item, Concept):
-            title = item.name.strip()
-            summary = (getattr(item, "brief_description", "") or getattr(item, "summary", "") or "").strip()
-            details = (getattr(item, "detailed_explanation", "") or "").strip()
-            quote = (getattr(item, "supporting_quote", "") or "").strip()
-            category = (getattr(item, "category", "") or "").strip()
-
-            claim_text = f"Claim {idx}: {title}"
-            if category and category != "Idea":
-                claim_text += f" [{category}]"
-            if summary:
-                claim_text += f"\nSummary: {summary}"
-            if details and details != summary:
-                claim_text += f"\nDetails: {details}"
-            if quote:
-                claim_text += f"\nSupporting Text: \"{quote}\""
-            claims.append(claim_text)
-        elif isinstance(item, dict):
-            title = str(item.get("name", "")).strip()
-            summary = str(item.get("brief_description") or item.get("summary", "")).strip()
-            details = str(item.get("detailed_explanation", "")).strip()
-            quote = str(item.get("supporting_quote") or item.get("quote", "")).strip()
-            category = str(item.get("category", "")).strip()
-
-            claim_text = f"Claim {idx}: {title}"
-            if category and category != "Idea":
-                claim_text += f" [{category}]"
-            if summary:
-                claim_text += f"\nSummary: {summary}"
-            if details and details != summary:
-                claim_text += f"\nDetails: {details}"
-            if quote:
-                claim_text += f"\nSupporting Text: \"{quote}\""
-            claims.append(claim_text)
+    formatted_blocks = []
+    for idx, idea in enumerate(ideas, 1):
+        if isinstance(idea, Concept):
+            name = idea.name or "Unnamed Concept"
+            explanation = (
+                getattr(idea, "detailed_explanation", "")
+                or getattr(idea, "brief_description", "")
+                or getattr(idea, "summary", "")
+                or ""
+            ).strip()
+            quote = (getattr(idea, "supporting_quote", "") or getattr(idea, "quote", "") or "").strip()
+        elif isinstance(idea, dict):
+            name = idea.get("name") or "Unnamed Concept"
+            explanation = (
+                idea.get("detailed_explanation")
+                or idea.get("brief_description")
+                or idea.get("summary")
+                or ""
+            ).strip()
+            quote = (idea.get("supporting_quote") or idea.get("quote") or "").strip()
         else:
-            claims.append(f"Claim {idx}: {str(item).strip()}")
+            name = str(idea).strip()
+            explanation = ""
+            quote = ""
 
-    return "\n\n".join(claims)
+        block = f"[{idx}] Concept: {name}\n    Explanation: {explanation}"
+        if quote:
+            block += f'\n    Direct Context/Quote: "{quote}"'
+        formatted_blocks.append(block)
+
+    return "\n\n".join(formatted_blocks)
+
+
+def format_ideas_as_claims(ideas: List[Any]) -> str:
+    """Backward-compatible alias for format_ideas_for_context."""
+    return format_ideas_for_context(ideas)
 
 
 # ==============================================================================
@@ -178,25 +175,40 @@ def generate_qa_probes(
     num_questions: int = 5,
 ) -> List[QAProbeItem]:
     """
-    Generate fact-based QA probes directly from unbroken passage W_raw.
-    Requires at least 3 multi-sentence/cross-boundary probes.
+    Generate fact-based QA probes directly from unbroken passage W_raw (canonical_window).
+    Targets structural concepts, actions, and causal relationships with explicit negative constraints
+    and verbatim sentence references.
     """
     prompt = (
-        "You are an adversarial test designer evaluating knowledge extraction systems.\n\n"
-        f"Given the passage below, generate exactly {num_questions} specific, fact-based Question-Answer pairs.\n\n"
-        "CRITICAL REQUIREMENTS:\n"
-        "1. At least 3 questions MUST require connecting information from two separate sentences or clauses "
-        '(e.g., causal relationships "Why did X happen?", conditions "Under what criteria does Y apply?", '
-        'or sequences "What happened after Z?"). Mark these with "is_cross_sentence": true.\n'
-        '2. The remaining questions can test localized facts ("is_cross_sentence": false).\n'
-        '3. "gold_answer" must be a concise, factual 1-2 sentence ground truth answer grounded strictly in the passage.\n\n'
+        "You are an expert NLP benchmark engineer evaluating a conceptual Knowledge Base and Knowledge Graph.\n"
+        f"Read the passage below and construct {num_questions} fact-based Question-Answer probes testing the retention of core knowledge.\n\n"
+        "### PROBE SELECTION CRITERIA (WHAT TO ASK):\n"
+        "1. Focus strictly on:\n"
+        "   - ENTITY RELATIONSHIPS: Functional, hierarchical, causal, or social links between characters, groups, systems, or components.\n"
+        "   - CAUSAL CHAINS & STATE CHANGES: Why an action occurred, what decision was made, what condition was triggered, and the direct consequence.\n"
+        "   - STRUCTURAL RULES & THEMATIC MECHANISMS: Explicit operational rules, lore constraints, or tactical configurations.\n"
+        "2. At least 3 questions MUST be CROSS-BOUNDARY:\n"
+        "   - They must require synthesizing facts that span across multiple sentences (e.g., premise or condition in Sentence A, outcome or qualification in Sentence B).\n\n"
+        "### NEGATIVE CONSTRAINTS (STRICTLY FORBIDDEN):\n"
+        "- NO TRIVIA: Do not ask about superficial, incidental dialogue details, single-use slang, minor character quips, or verbatim insult nicknames "
+        '(e.g., do NOT ask "What did X call Y?", "What was the exact phrase shouted?", or "What specific insult was used?").\n'
+        '- NO GENERIC QUESTIONS: Avoid high-level vagueness like "What is the main topic of this paragraph?", "What are the characters doing?", or "Summarize the text".\n'
+        "- NO UNSUPPORTED INFERENCES: Every probe must have unambiguous, objective factual ground truth directly stated in the text.\n\n"
+        "### CITATION / REFERENCE REQUIREMENT:\n"
+        "For every generated probe, you MUST provide the exact verbatim excerpt or sentence(s) from the passage that supply the ground truth. "
+        "If the probe is cross-sentence, you must provide the separate excerpts that are being bridged.\n\n"
         f"Passage:\n\"\"\"\n{w_raw[:7000]}\n\"\"\"\n\n"
-        "Return strictly valid JSON with this schema:\n"
+        "Return strictly valid JSON matching this schema:\n"
         "[\n"
         "  {\n"
-        '    "question": "string",\n'
-        '    "gold_answer": "string",\n'
-        '    "is_cross_sentence": true\n'
+        '    "question_id": 1,\n'
+        '    "question": "<specific, non-trivial relational or causal question>",\n'
+        '    "gold_answer": "<concise 1-2 sentence ground truth containing the necessary facts>",\n'
+        '    "is_cross_sentence": true,\n'
+        '    "source_sentence_references": [\n'
+        '      "<exact verbatim quote of premise or first fact from passage>",\n'
+        '      "<exact verbatim quote of consequence or second fact from passage (if cross-sentence)>"\n'
+        "    ]\n"
         "  }\n"
         "]\n"
     )
@@ -209,23 +221,36 @@ def generate_qa_probes(
         for idx, item in enumerate(items, 1):
             if not isinstance(item, dict):
                 continue
+            qid = item.get("question_id", idx)
+            try:
+                qid = int(qid)
+            except (ValueError, TypeError):
+                qid = idx
             q = str(item.get("question", "")).strip()
             a = str(item.get("gold_answer", item.get("answer", ""))).strip()
             is_cross = bool(item.get("is_cross_sentence", False))
+            refs = item.get("source_sentence_references", [])
+            if isinstance(refs, str):
+                refs = [refs]
+            elif not isinstance(refs, list):
+                refs = []
+            refs = [str(r).strip() for r in refs if str(r).strip()]
+
             if q and a:
                 probes.append(
                     QAProbeItem(
-                        question_id=idx,
+                        question_id=qid,
                         question=q,
                         gold_answer=a,
                         is_cross_sentence=is_cross,
+                        source_sentence_references=refs,
                     )
                 )
 
         if probes:
             # Enforce at least some cross-sentence probes if model didn't set flags
             if not any(p.is_cross_sentence for p in probes) and len(probes) >= 2:
-                # Mark questions starting with Why / How / What happens if as cross-sentence
+                # Mark questions starting with Why / How / What caused as cross-sentence
                 for p in probes:
                     q_lower = p.question.lower()
                     if any(q_lower.startswith(w) for w in ("why", "how", "what caused", "under what", "when")):
@@ -244,15 +269,17 @@ def generate_qa_probes(
         return [
             QAProbeItem(
                 question_id=1,
-                question=f"What is the main topic discussed in: '{sentences[0][:60]}...'?",
+                question=f"What fact is described regarding: '{sentences[0][:60]}'?",
                 gold_answer=sentences[0],
                 is_cross_sentence=False,
+                source_sentence_references=[sentences[0]],
             ),
             QAProbeItem(
                 question_id=2,
-                question=f"What relationship connects '{sentences[0][:40]}' and '{sentences[1][:40]}'?",
-                gold_answer=f"{sentences[0]} then {sentences[1]}",
+                question=f"What causal or sequential relationship connects '{sentences[0][:40]}' and '{sentences[1][:40]}'?",
+                gold_answer=f"{sentences[0]} precedes {sentences[1]}",
                 is_cross_sentence=True,
+                source_sentence_references=[sentences[0], sentences[1]],
             ),
         ]
 
@@ -262,6 +289,7 @@ def generate_qa_probes(
             question="What fact is stated in the passage?",
             gold_answer=w_raw[:150],
             is_cross_sentence=False,
+            source_sentence_references=[w_raw[:150]],
         )
     ]
 
@@ -285,10 +313,10 @@ def answer_probe(
         return "INSUFFICIENT_INFORMATION"
 
     prompt = (
-        "Answer the question using ONLY the provided list of extracted knowledge claims.\n"
-        "Do not assume, infer, or extrapolate anything outside these claims.\n"
-        'If the claims do not contain enough information to answer the question completely and accurately, respond with exactly: "INSUFFICIENT_INFORMATION".\n\n'
-        f"Extracted Knowledge Claims:\n\"\"\"\n{claims_context}\n\"\"\"\n\n"
+        "Answer the question below using ONLY the provided verified claims and supporting context.\n"
+        "Do not assume or invent facts outside these claims.\n"
+        'If the claims do not contain sufficient evidence to answer the question, output EXACTLY: "INSUFFICIENT_INFORMATION".\n\n'
+        f"Extracted Knowledge Base:\n\"\"\"\n{claims_context}\n\"\"\"\n\n"
         f"Question: {question}\n\n"
         "Concise Answer:"
     )

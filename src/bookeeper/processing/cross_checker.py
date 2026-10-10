@@ -254,11 +254,17 @@ def find_aligned_candidate_chunks(
     new_chunks: List[Dict[str, Any]],
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """
-    Match candidate chunks using absolute document character offsets or exact token intervals:
-    1. Determine absolute character bounds of the old chunks in the full text [start_char, end_char].
-    2. Select ONLY new chunks whose text intersects with [start_char, end_char] (c_start < end_char and c_end > start_char).
-    Enforces strict character-interval intersection to ensure block_b_text always encompasses
-    the identical passage as block_a_text, preventing union_len drift and disproportion collapse.
+    Match candidate chunks using forward-anchored exact document bounds and midpoint-bounded selection:
+    1. Forward Offset Resolution:
+       - Locate start_char using the full .strip() content of old_chunks[0] in raw_doc_text.
+       - Locate end_char of old_chunks[-1] strictly searching FORWARD from start_char:
+         end_rel = raw_doc_text.find(old_chunks[-1]["content"].strip(), start_char)
+         end_char = end_rel + len(old_chunks[-1]["content"].strip())
+       - Define canonical_window = raw_doc_text[start_char : end_char].
+    2. Midpoint Bounded Selection for Candidate Chunks:
+       - For every candidate chunk in new_chunks, find its exact span [c_start, c_end] in raw_doc_text.
+       - Calculate midpoint: c_mid = c_start + (len(chunk_content) // 2).
+       - Include candidate chunk iff start_char <= c_mid <= end_char.
     """
     if not raw_doc_text or not old_chunks or not new_chunks:
         return "", []
@@ -266,7 +272,7 @@ def find_aligned_candidate_chunks(
     def _text(c: Dict[str, Any]) -> str:
         return (c.get("content") or c.get("text") or "").strip()
 
-    # 1. Determine absolute character bounds of the old chunks in the full text
+    # 1. Forward Offset Resolution
     start_anchor = _text(old_chunks[0])
     start_char, _ = find_interval_in_text(raw_doc_text, start_anchor, 0)
     if start_char == -1:
@@ -279,10 +285,11 @@ def find_aligned_candidate_chunks(
     else:
         end_char = len(raw_doc_text)
 
-    target_span = raw_doc_text[start_char:end_char]
+    canonical_window = raw_doc_text[start_char:end_char]
 
-    # 2. Select ONLY new chunks whose text intersects with [start_char, end_char]
+    # 2. Midpoint Bounded Selection for Candidate Chunks
     aligned_new = []
+    candidate_spans = []
     last_search = 0
     for chunk in new_chunks:
         chunk_text = _text(chunk)
@@ -292,12 +299,21 @@ def find_aligned_candidate_chunks(
         if c_start == -1:
             continue
         last_search = max(last_search, c_start)
+        candidate_spans.append((chunk, c_start, c_end))
 
-        # Overlap condition: chunk begins before target ends, and ends after target begins
-        if c_start < end_char and c_end > start_char:
+        # Midpoint Bounded Selection:
+        # Include candidate chunk iff start_char <= c_mid <= end_char
+        c_mid = c_start + (len(chunk_text) // 2)
+        if start_char <= c_mid <= end_char:
             aligned_new.append(chunk)
 
-    return target_span, aligned_new
+    # Fallback to interval overlap if midpoint selection yielded empty list (e.g. boundary edge case)
+    if not aligned_new and candidate_spans:
+        for chunk, c_start, c_end in candidate_spans:
+            if c_start < end_char and c_end > start_char:
+                aligned_new.append(chunk)
+
+    return canonical_window, aligned_new
 
 
 def find_overlapping_chunks(
@@ -761,7 +777,8 @@ def print_block_comparison(
     excerpt_b = w_b[:350].replace('\n', ' ')
     _out(f"   \"{excerpt_b}...\"")
 
-    _out(f"\n📏 ALIGNMENT: Disproportion = {disproportion:.4f} | Union = {union_len} chars")
+    len_ratio = len(w_b) / max(1, len(w_raw))
+    _out(f"\n📏 ALIGNMENT: Disproportion = {disproportion:.4f} | Ratio (B/A) = {len_ratio:.3f} | Union = {union_len} chars")
 
     _out(f"\n💡 EXTRACTED CLAIMS CONTEXT:")
     _out(f"   • BLOCK A: {len(ideas_old)} unique ideas")
@@ -790,6 +807,12 @@ def print_block_comparison(
         probe_tag = "[Cross-Sentence]" if p.is_cross_sentence else "[Single-Fact]"
         _out(f"   {p.question_id}. {probe_tag} {p.question}")
         _out(f"      • Gold: {p.gold_answer}")
+        if getattr(p, "source_sentence_references", None):
+            for r_idx, ref in enumerate(p.source_sentence_references, 1):
+                ref_preview = ref[:120].replace("\n", " ")
+                if len(ref) > 120:
+                    ref_preview += "..."
+                _out(f"        [Source Ref {r_idx}]: \"{ref_preview}\"")
 
         e_a = eval_old_map.get(p.question_id)
         if e_a:
@@ -902,8 +925,10 @@ def run_cross_check(
     for b_id in chunks_by_book_b:
         chunks_by_book_b[b_id].sort(key=lambda x: (int(x[1].get("chapter_idx") or 0), int(x[1].get("chunk_idx") or 0)))
 
-    # Filter books with at least 3 chunks
-    valid_books = [bid for bid in common_book_ids if len(chunks_by_book_a.get(bid, [])) >= 3]
+    # Filter books with at least 5 chunks (fallback to 3, then 1)
+    valid_books = [bid for bid in common_book_ids if len(chunks_by_book_a.get(bid, [])) >= 5]
+    if not valid_books:
+        valid_books = [bid for bid in common_book_ids if len(chunks_by_book_a.get(bid, [])) >= 3]
     if not valid_books:
         valid_books = [bid for bid in chunks_by_book_a if len(chunks_by_book_a[bid]) >= 1]
 
@@ -919,12 +944,13 @@ def run_cross_check(
         if not valid_books:
             break
 
-        # 1. Select random book and 3 consecutive chunks from Graph A
+        # 1. Select random book and consecutive chunks from Graph A (window of 5 chunks)
         target_bid = random.choice(valid_books)
         c_list = chunks_by_book_a[target_bid]
-        max_start = max(0, len(c_list) - 3)
+        window_size = min(5, len(c_list))
+        max_start = max(0, len(c_list) - window_size)
         start_idx = random.randint(0, max_start)
-        old_slice = c_list[start_idx : start_idx + 3]
+        old_slice = c_list[start_idx : start_idx + window_size]
 
         old_chunk_ids = [c[0] for c in old_slice]
         old_chunk_dicts = [c[1] for c in old_slice]
@@ -935,7 +961,7 @@ def run_cross_check(
 
         # Skip cross-chapter boundaries if chapter has multiple chunks
         chaps_in_slice = set(c[1].get("chapter_idx") for c in old_slice)
-        if len(chaps_in_slice) > 1 and len(c_list) > 3:
+        if len(chaps_in_slice) > 1 and len(c_list) > window_size:
             continue
 
         # Reconstruct chapter reference text
@@ -953,7 +979,7 @@ def run_cross_check(
         if not candidate_new_chunks:
             continue
 
-        # 2 & 3. Align candidate chunks using character intervals
+        # 2 & 3. Align candidate chunks using character intervals and midpoint bounded selection
         target_span, new_chunk_dicts = find_aligned_candidate_chunks(
             raw_doc_text=raw_doc_text,
             old_chunks=old_chunk_dicts,
@@ -969,6 +995,17 @@ def run_cross_check(
         new_chunk_ids = [d.get("chunk_id") or d.get("id", "") for d in new_chunk_dicts]
         new_chunk_texts = [d.get("text", "") for d in new_chunk_dicts]
         w_b = stitch_chunks_dedup_text(new_chunk_texts)
+
+        # Assert / check chunk length ratio len(block_b_text) / len(block_a_text) within [0.85, 1.15]
+        len_a = len(w_raw)
+        len_b = len(w_b)
+        if len_a > 0:
+            ratio = len_b / len_a
+            if not (0.85 <= ratio <= 1.15):
+                logger.warning(
+                    f"Chunk length ratio {ratio:.3f} outside [0.85, 1.15] range "
+                    f"(Block A: {len_a} chars, Block B: {len_b} chars)"
+                )
 
         # 4. Compute chunk disproportion: intersect(block_A, block_B) / union(block_A, block_B)
         sum_len_a, sum_len_b, union_len, disproportion = compute_chunk_disproportion(

@@ -746,3 +746,43 @@ def test_aligned_chunks_disproportion_and_union():
     assert abs(union_len - len(target_span)) < 50
 
 
+def test_midpoint_bounded_candidate_selection():
+    """Verify that candidate chunks are selected based on whether their midpoint falls within [start_char, end_char]."""
+    raw_doc = (
+        "AAAAA11111"  # 0..10
+        "BBBBB22222"  # 10..20
+        "CCCCC33333"  # 20..30
+        "DDDDD44444"  # 30..40
+        "EEEEE55555"  # 40..50
+        "FFFFF66666"  # 50..60
+        "GGGGG77777"  # 60..70
+        "HHHHH88888"  # 70..80
+    )
+
+    # Old chunk covers [20, 60]
+    old_chunks = [{"chunk_id": "old_1", "text": "CCCCC33333DDDDD44444EEEEE55555"}]
+
+    # Chunk with midpoint < 20 (span [5, 20], len 15, midpoint = 12) -> excluded
+    c_before = {"chunk_id": "c_before", "text": "11111BBBBB22222"}
+
+    # Chunk with midpoint in [20, 60] (span [15, 35], len 20, midpoint = 25) -> included
+    c_overlap_start = {"chunk_id": "c_overlap_start", "text": "22222CCCCC33333DDDDD"}
+
+    # Chunk fully inside (span [30, 50], midpoint = 40) -> included
+    c_inside = {"chunk_id": "c_inside", "text": "DDDDD44444EEEEE55555"}
+
+    # Chunk with midpoint in [20, 60] (span [40, 55], len 15, midpoint = 47) -> included
+    c_overlap_end = {"chunk_id": "c_overlap_end", "text": "EEEEE55555FFFFF"}
+
+    # Chunk with midpoint > 60 (span [55, 75], len 20, midpoint = 65) -> excluded
+    c_after = {"chunk_id": "c_after", "text": "66666GGGGG77777HHHHH"}
+
+    new_chunks = [c_before, c_overlap_start, c_inside, c_overlap_end, c_after]
+    canonical_window, aligned = find_aligned_candidate_chunks(raw_doc, old_chunks, new_chunks)
+
+    assert "CCCCC33333DDDDD44444EEEEE55555" in canonical_window
+    aligned_ids = [c["chunk_id"] for c in aligned]
+    assert aligned_ids == ["c_overlap_start", "c_inside", "c_overlap_end"]
+
+
+

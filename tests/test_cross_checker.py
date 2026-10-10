@@ -557,6 +557,12 @@ def test_run_cross_check_with_print_chunks(sample_graphs, mock_pool, capsys):
     )
 
     assert isinstance(report, CrossCheckReport)
+    assert len(report.samples) == 1
+    sample = report.samples[0]
+    assert len(sample.generator_prompt) > 20
+    assert len(sample.claims_context_old) > 20
+    assert len(sample.claims_context_new) > 20
+    assert "[1] Concept:" in sample.claims_context_old
     captured = capsys.readouterr()
     assert "Alignment Comparison" in captured.out
 

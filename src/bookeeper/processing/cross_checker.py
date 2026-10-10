@@ -31,7 +31,9 @@ from bookeeper.processing.qa_probe import (
     QAProbeEvaluation,
     QAProbeItem,
     QASystemBlockMetrics,
+    build_generator_prompt,
     evaluate_block_qa_probes,
+    format_ideas_for_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,6 +107,11 @@ class CrossCheckBlockResult(BaseModel):
     probes: List[QAProbeItem] = Field(default_factory=list)
     delta_qa_recall: float = 0.0
     delta_seam_integrity: float = 0.0
+
+    # Verification Prompts & Formatted Claims Context
+    generator_prompt: str = ""
+    claims_context_old: str = ""
+    claims_context_new: str = ""
 
 
 class CrossCheckSummary(BaseModel):
@@ -1067,6 +1074,10 @@ def run_cross_check(
         dur = round(time.time() - t0, 2)
         curr_idx = len(samples) + 1
 
+        claims_ctx_old = format_ideas_for_context(dedup_ideas_old)
+        claims_ctx_new = format_ideas_for_context(dedup_ideas_new)
+        gen_prompt = build_generator_prompt(w_raw)
+
         block_result = CrossCheckBlockResult(
             sample_index=curr_idx,
             book_id=target_bid,
@@ -1093,6 +1104,9 @@ def run_cross_check(
             probes=probes,
             delta_qa_recall=delta_rec,
             delta_seam_integrity=delta_seam,
+            generator_prompt=gen_prompt,
+            claims_context_old=claims_ctx_old,
+            claims_context_new=claims_ctx_new,
         )
         samples.append(block_result)
 

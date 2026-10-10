@@ -45,6 +45,8 @@ class QAProbeEvaluation(BaseModel):
     predicted_answer: str
     verdict: Literal["PASS", "FAIL"]
     reason: str = ""
+    answering_prompt: str = ""
+    judge_prompt: str = ""
 
 
 class QASystemBlockMetrics(BaseModel):
@@ -168,18 +170,14 @@ def parse_json_array_safely(text: str) -> List[Dict[str, Any]]:
 # ==============================================================================
 
 
-def generate_qa_probes(
-    w_raw: str,
-    pool: OllamaPool,
-    model_name: str,
-    num_questions: int = 5,
-) -> List[QAProbeItem]:
-    """
-    Generate fact-based QA probes directly from unbroken passage W_raw (canonical_window).
-    Targets structural concepts, actions, and causal relationships with explicit negative constraints
-    and verbatim sentence references.
-    """
-    prompt = (
+# ==============================================================================
+# 1. Targeted QA Probe Generation
+# ==============================================================================
+
+
+def build_generator_prompt(w_raw: str, num_questions: int = 5) -> str:
+    """Construct the complete prompt sent to the Oracle model to generate relational QA probes."""
+    return (
         "You are an expert NLP benchmark engineer evaluating a conceptual Knowledge Base and Knowledge Graph.\n"
         f"Read the passage below and construct {num_questions} fact-based Question-Answer probes testing the retention of core knowledge.\n\n"
         "### PROBE SELECTION CRITERIA (WHAT TO ASK):\n"
@@ -189,6 +187,10 @@ def generate_qa_probes(
         "   - STRUCTURAL RULES & THEMATIC MECHANISMS: Explicit operational rules, lore constraints, or tactical configurations.\n"
         "2. At least 3 questions MUST be CROSS-BOUNDARY:\n"
         "   - They must require synthesizing facts that span across multiple sentences (e.g., premise or condition in Sentence A, outcome or qualification in Sentence B).\n\n"
+        "### CRITICAL PROBE REQUIREMENTS:\n"
+        "- DO NOT quote raw sentences in the question (e.g., NEVER ask \"What relationship connects 'Quote A' and 'Quote B'?\").\n"
+        '- Frame all questions around entities, actions, or decisions in natural language (e.g., "Why did X decide to do Y?" or "What consequence occurred after Z?").\n'
+        '- Do NOT generate questions testing the physical order of sentences in the text (e.g., no "precedes" or chronological sentence order questions).\n\n'
         "### NEGATIVE CONSTRAINTS (STRICTLY FORBIDDEN):\n"
         "- NO TRIVIA: Do not ask about superficial, incidental dialogue details, single-use slang, minor character quips, or verbatim insult nicknames "
         '(e.g., do NOT ask "What did X call Y?", "What was the exact phrase shouted?", or "What specific insult was used?").\n'
@@ -202,7 +204,7 @@ def generate_qa_probes(
         "[\n"
         "  {\n"
         '    "question_id": 1,\n'
-        '    "question": "<specific, non-trivial relational or causal question>",\n'
+        '    "question": "<specific, non-trivial relational or causal question in natural language>",\n'
         '    "gold_answer": "<concise 1-2 sentence ground truth containing the necessary facts>",\n'
         '    "is_cross_sentence": true,\n'
         '    "source_sentence_references": [\n'
@@ -212,6 +214,20 @@ def generate_qa_probes(
         "  }\n"
         "]\n"
     )
+
+
+def generate_qa_probes(
+    w_raw: str,
+    pool: OllamaPool,
+    model_name: str,
+    num_questions: int = 5,
+) -> List[QAProbeItem]:
+    """
+    Generate fact-based QA probes directly from unbroken passage W_raw (canonical_window).
+    Targets structural concepts, actions, and causal relationships with explicit negative constraints
+    and verbatim sentence references.
+    """
+    prompt = build_generator_prompt(w_raw, num_questions=num_questions)
 
     try:
         raw_text, _ = pool.generate(model_name, prompt, temperature=0.0)
@@ -263,21 +279,21 @@ def generate_qa_probes(
     except Exception as exc:
         logger.warning(f"QA Probe generation failed: {exc}")
 
-    # Fallback minimal probe based on passage content
+    # Fallback minimal probe based on passage content without quoting raw sentences or chronological order
     sentences = [s.strip() for s in re.split(r"[.!?]", w_raw) if len(s.strip()) > 15]
     if len(sentences) >= 2:
         return [
             QAProbeItem(
                 question_id=1,
-                question=f"What fact is described regarding: '{sentences[0][:60]}'?",
+                question="What initial premise or condition is established in the passage?",
                 gold_answer=sentences[0],
                 is_cross_sentence=False,
                 source_sentence_references=[sentences[0]],
             ),
             QAProbeItem(
                 question_id=2,
-                question=f"What causal or sequential relationship connects '{sentences[0][:40]}' and '{sentences[1][:40]}'?",
-                gold_answer=f"{sentences[0]} precedes {sentences[1]}",
+                question="What outcome or consequence followed the initial condition?",
+                gold_answer=sentences[1],
                 is_cross_sentence=True,
                 source_sentence_references=[sentences[0], sentences[1]],
             ),
@@ -286,7 +302,7 @@ def generate_qa_probes(
     return [
         QAProbeItem(
             question_id=1,
-            question="What fact is stated in the passage?",
+            question="What core fact is stated in the passage?",
             gold_answer=w_raw[:150],
             is_cross_sentence=False,
             source_sentence_references=[w_raw[:150]],
@@ -297,6 +313,18 @@ def generate_qa_probes(
 # ==============================================================================
 # 2. Constrained Closed-Book Answering
 # ==============================================================================
+
+
+def build_answering_prompt(claims_context: str, question: str) -> str:
+    """Construct prompt sent to the answering model constrained strictly to extracted claims."""
+    return (
+        "Answer the question below using ONLY the provided verified claims and supporting context.\n"
+        "Do not assume or invent facts outside these claims.\n"
+        'If the claims do not contain sufficient evidence to answer the question, output EXACTLY: "INSUFFICIENT_INFORMATION".\n\n'
+        f"Extracted Knowledge Base:\n\"\"\"\n{claims_context}\n\"\"\"\n\n"
+        f"Question: {question}\n\n"
+        "Concise Answer:"
+    )
 
 
 def answer_probe(
@@ -312,14 +340,7 @@ def answer_probe(
     if not claims_context.strip() or "(No knowledge claims extracted" in claims_context:
         return "INSUFFICIENT_INFORMATION"
 
-    prompt = (
-        "Answer the question below using ONLY the provided verified claims and supporting context.\n"
-        "Do not assume or invent facts outside these claims.\n"
-        'If the claims do not contain sufficient evidence to answer the question, output EXACTLY: "INSUFFICIENT_INFORMATION".\n\n'
-        f"Extracted Knowledge Base:\n\"\"\"\n{claims_context}\n\"\"\"\n\n"
-        f"Question: {question}\n\n"
-        "Concise Answer:"
-    )
+    prompt = build_answering_prompt(claims_context, question)
 
     try:
         raw_text, _ = pool.generate(model_name, prompt, temperature=0.0)
@@ -337,6 +358,30 @@ def answer_probe(
 # ==============================================================================
 
 
+def build_judge_prompt(gold_answer: str, candidate_answer: str, w_raw: str) -> str:
+    """
+    Construct the judge arbitration prompt evaluating core semantic entailment
+    instead of verbatim sub-fact matching.
+    """
+    return (
+        "You are an objective judge evaluating whether a candidate answer accurately conveys ground truth facts.\n\n"
+        f'Ground Truth Answer: "{gold_answer}"\n'
+        f'Candidate Answer: "{candidate_answer}"\n\n'
+        f"Passage Context (for reference):\n\"\"\"\n{w_raw[:4000]}\n\"\"\"\n\n"
+        "Judge Verdict Guidelines:\n"
+        "- If Candidate Answer is \"INSUFFICIENT_INFORMATION\" or indicates lack of evidence, mark as \"FAIL\".\n"
+        "- If Candidate Answer directly contradicts the ground truth or hallucinates untrue facts, mark as \"FAIL\".\n"
+        "- If Candidate Answer conveys the primary causal mechanism or core entity fact, mark as \"PASS\" "
+        "(even if secondary details from other sentences are missing).\n"
+        "- Do not require verbatim token matching. Evaluate whether the semantic proposition is asserted.\n\n"
+        "Return strictly valid JSON:\n"
+        "{\n"
+        '  "verdict": "PASS" | "FAIL",\n'
+        '  "reason": "concise rationale"\n'
+        "}\n"
+    )
+
+
 def judge_probe_answer(
     gold_answer: str,
     predicted_answer: str,
@@ -346,6 +391,7 @@ def judge_probe_answer(
 ) -> Tuple[Literal["PASS", "FAIL"], str]:
     """
     Compare Candidate Answer against Ground Truth Answer.
+    Uses core semantic entailment guidelines and stops using raw token overlap fallback.
     Returns (verdict, reason).
     """
     pred_clean = predicted_answer.strip()
@@ -353,26 +399,10 @@ def judge_probe_answer(
     # Fast short-circuits
     if not pred_clean:
         return "FAIL", "Candidate answer is empty."
-    if pred_clean.upper().startswith("INSUFFICIENT_INFORMATION"):
+    if pred_clean.upper().startswith("INSUFFICIENT_INFORMATION") or "INSUFFICIENT_INFORMATION" in pred_clean.upper():
         return "FAIL", "Candidate indicated insufficient information in extracted claims."
 
-    prompt = (
-        "You are an objective judge evaluating whether a candidate answer accurately conveys ground truth facts.\n\n"
-        f'Ground Truth Answer: "{gold_answer}"\n'
-        f'Candidate Answer: "{pred_clean}"\n\n'
-        f"Passage Context (for reference):\n\"\"\"\n{w_raw[:4000]}\n\"\"\"\n\n"
-        "Evaluation Criteria:\n"
-        '1. If Candidate Answer is "INSUFFICIENT_INFORMATION" or states that info is missing, mark as "FAIL".\n'
-        "2. If Candidate Answer contradicts the ground truth or hallucinates extra unsupported facts, mark as "
-        '"FAIL".\n'
-        "3. If Candidate Answer correctly conveys the essential ground truth facts (including necessary conditions or qualifiers), mark as "
-        '"PASS".\n\n'
-        "Return strictly valid JSON:\n"
-        "{\n"
-        '  "verdict": "PASS" | "FAIL",\n'
-        '  "reason": "concise rationale"\n'
-        "}\n"
-    )
+    prompt = build_judge_prompt(gold_answer, pred_clean, w_raw)
 
     try:
         raw_text, _ = pool.generate(model_name, prompt, temperature=0.0)
@@ -385,14 +415,7 @@ def judge_probe_answer(
         return verdict, reason  # type: ignore
     except Exception as exc:
         logger.warning(f"Judging probe answer failed: {exc}")
-        # Substring / token fallback
-        gold_words = set(re.findall(r"\w+", gold_answer.lower()))
-        pred_words = set(re.findall(r"\w+", pred_clean.lower()))
-        common = gold_words & pred_words
-        overlap = len(common) / max(1, len(gold_words))
-        if overlap >= 0.5:
-            return "PASS", f"Fallback token overlap ({overlap:.2f}) passed."
-        return "FAIL", f"Fallback token overlap ({overlap:.2f}) failed."
+        return "FAIL", f"Judge evaluation error: {exc}"
 
 
 # ==============================================================================
@@ -424,7 +447,9 @@ def evaluate_block_qa_probes(
 
     for p in probes:
         # 1. Old / Baseline evaluation
+        prompt_ans_old = build_answering_prompt(claims_old, p.question)
         pred_old = answer_probe(claims_old, p.question, pool, model_name)
+        prompt_judge_old = build_judge_prompt(p.gold_answer, pred_old, w_raw)
         verdict_old, reason_old = judge_probe_answer(p.gold_answer, pred_old, w_raw, pool, model_name)
         evals_old.append(
             QAProbeEvaluation(
@@ -435,11 +460,15 @@ def evaluate_block_qa_probes(
                 predicted_answer=pred_old,
                 verdict=verdict_old,
                 reason=reason_old,
+                answering_prompt=prompt_ans_old,
+                judge_prompt=prompt_judge_old,
             )
         )
 
         # 2. New / Candidate evaluation
+        prompt_ans_new = build_answering_prompt(claims_new, p.question)
         pred_new = answer_probe(claims_new, p.question, pool, model_name)
+        prompt_judge_new = build_judge_prompt(p.gold_answer, pred_new, w_raw)
         verdict_new, reason_new = judge_probe_answer(p.gold_answer, pred_new, w_raw, pool, model_name)
         evals_new.append(
             QAProbeEvaluation(
@@ -450,6 +479,8 @@ def evaluate_block_qa_probes(
                 predicted_answer=pred_new,
                 verdict=verdict_new,
                 reason=reason_new,
+                answering_prompt=prompt_ans_new,
+                judge_prompt=prompt_judge_new,
             )
         )
 

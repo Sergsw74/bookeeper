@@ -19,6 +19,9 @@ from bookeeper.processing.qa_probe import (
     answer_probe,
     judge_probe_answer,
     evaluate_block_qa_probes,
+    build_generator_prompt,
+    build_answering_prompt,
+    build_judge_prompt,
 )
 
 
@@ -222,3 +225,35 @@ def test_evaluate_block_qa_probes():
     assert m_new.failed_probes == 1
     assert m_new.qa_recall == 0.5
     assert m_new.seam_integrity_rate == 0.0  # 0/1 cross-sentence passed
+
+    # Verify answering_prompt and judge_prompt are captured on evaluations
+    assert len(m_old.evaluations[0].answering_prompt) > 20
+    assert "Extracted Knowledge Base:" in m_old.evaluations[0].answering_prompt
+    assert len(m_old.evaluations[0].judge_prompt) > 20
+    assert "Judge Verdict Guidelines:" in m_old.evaluations[0].judge_prompt
+
+
+def test_prompt_builders_and_guidelines():
+    """Verify prompt templates enforce critical probe requirements and relaxed judge guidelines."""
+    # 1. Generator prompt requirements
+    gen_p = build_generator_prompt("Some passage about King Arthur.", 5)
+    assert "DO NOT quote raw sentences in the question" in gen_p
+    assert "Frame all questions around entities, actions, or decisions in natural language" in gen_p
+    assert 'no "precedes" or chronological sentence order questions' in gen_p
+    assert "source_sentence_references" in gen_p
+
+    # 2. Judge prompt guidelines
+    judge_p = build_judge_prompt("Arthur became king.", "Arthur assumed the crown.", "Context")
+    assert 'If Candidate Answer conveys the primary causal mechanism or core entity fact, mark as "PASS"' in judge_p
+    assert "Do not require verbatim token matching. Evaluate whether the semantic proposition is asserted." in judge_p
+
+
+def test_judge_no_token_overlap_fallback():
+    """Verify that failed LLM judge calls fail without token overlap fallback."""
+    mock_pool = MagicMock()
+    mock_pool.generate.side_effect = RuntimeError("Connection timed out")
+
+    # Even with identical text (100% token overlap), must NOT pass via fallback token overlap
+    verdict, reason = judge_probe_answer("The quick brown fox", "The quick brown fox", "Passage", mock_pool, "model")
+    assert verdict == "FAIL"
+    assert "Judge evaluation error" in reason

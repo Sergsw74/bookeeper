@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 _macos_bridge_lock = threading.Lock()
 _macos_bridge_tunnels: Dict[str, Tuple[str, subprocess.Popen]] = {}
+_url_resolution_cache: Dict[str, str] = {}
 
 
 def _cleanup_macos_bridges() -> None:
@@ -38,6 +39,7 @@ def _cleanup_macos_bridges() -> None:
             except Exception:
                 pass
         _macos_bridge_tunnels.clear()
+        _url_resolution_cache.clear()
 
 
 atexit.register(_cleanup_macos_bridges)
@@ -65,6 +67,8 @@ def get_effective_server_url(url: str) -> str:
 
     cache_key = f"{host}:{port}"
     with _macos_bridge_lock:
+        if cache_key in _url_resolution_cache:
+            return _url_resolution_cache[cache_key]
         if cache_key in _macos_bridge_tunnels:
             eff_url, proc = _macos_bridge_tunnels[cache_key]
             if proc.poll() is None:
@@ -82,9 +86,13 @@ def get_effective_server_url(url: str) -> str:
         is_errno_65 = err.errno == 65 or "no route to host" in err_msg or "errno 65" in err_msg
         if not is_errno_65:
             # Failure is not macOS local network permission block, so don't tunnel
+            with _macos_bridge_lock:
+                _url_resolution_cache[cache_key] = url
             return url
 
     if direct_ok:
+        with _macos_bridge_lock:
+            _url_resolution_cache[cache_key] = url
         return url
 
     # Direct connection blocked by macOS Local Network Privacy -> start localhost bridge via /usr/bin/python3
@@ -156,6 +164,7 @@ def get_effective_server_url(url: str) -> str:
             if bound and proc.poll() is None:
                 effective_url = f"http://127.0.0.1:{local_port}"
                 _macos_bridge_tunnels[cache_key] = (effective_url, proc)
+                _url_resolution_cache[cache_key] = effective_url
                 logger.info(
                     f"Established transparent macOS loopback bridge 127.0.0.1:{local_port} -> {host}:{port} "
                     f"to bypass macOS Sequoia Local Network Privacy block on {url}."

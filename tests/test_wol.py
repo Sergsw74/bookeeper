@@ -157,40 +157,42 @@ def test_warmup_wol_triggers_and_retries():
 
     extractor_node1 = pool.nodes[0]
     with patch.object(extractor_node1, "wake", wraps=extractor_node1.wake):
-        with patch("bookeeper.processing.ollama_pool.send_wake_on_lan", return_value=True) as mock_wol:
-            with patch("time.sleep", return_value=None):
-                with patch("urllib.request.urlopen") as mock_open:
-                    probe_count = [0]
-                    def custom_urlopen(req, timeout=15):
-                        url = req.full_url
-                        if "192.168.50.118" in url:
-                            probe_count[0] += 1
-                            if probe_count[0] <= 2:
-                                raise ConnectionError("Host down")
-                            # After WOL packet, probe succeeds!
-                            m = MagicMock()
-                            if "/api/ps" in url:
-                                m.read.return_value = b'{"models": [{"name": "qwen2.5:3b", "size": 1000, "size_vram": 1000, "runner": "cuda"}]}'
+        with patch("shutil.which", return_value=None):
+            with patch("bookeeper.processing.ollama_pool.send_wake_on_lan", return_value=True) as mock_wol:
+                with patch("time.sleep", return_value=None):
+                    with patch("urllib.request.urlopen") as mock_open:
+                        probe_count = [0]
+
+                        def custom_urlopen(req, timeout=15):
+                            url = req.full_url
+                            if "192.168.50.118" in url or pool.nodes[0].target_url.rstrip("/") in url:
+                                probe_count[0] += 1
+                                if probe_count[0] <= 2:
+                                    raise ConnectionError("Host down")
+                                # After WOL packet, probe succeeds!
+                                m = MagicMock()
+                                if "/api/ps" in url:
+                                    m.read.return_value = b'{"models": [{"name": "qwen2.5:3b", "size": 1000, "size_vram": 1000, "runner": "cuda"}]}'
+                                else:
+                                    m.read.return_value = b'{"version": "0.4.0"}'
+                                m.__enter__.return_value = m
+                                return m
                             else:
-                                m.read.return_value = b'{"version": "0.4.0"}'
-                            m.__enter__.return_value = m
-                            return m
-                        else:
-                            m = MagicMock()
-                            m.read.return_value = b'{"models": [{"name": "qwen2.5:3b", "size": 1000, "size_vram": 1000, "runner": "cuda"}]}'
-                            m.__enter__.return_value = m
-                            return m
+                                m = MagicMock()
+                                m.read.return_value = b'{"models": [{"name": "qwen2.5:3b", "size": 1000, "size_vram": 1000, "runner": "cuda"}]}'
+                                m.__enter__.return_value = m
+                                return m
 
-                    mock_open.side_effect = custom_urlopen
-                    res = extractor.warmup_and_check_device(on_status_callback=status_callback)
+                        mock_open.side_effect = custom_urlopen
+                        res = extractor.warmup_and_check_device(on_status_callback=status_callback)
 
-                    assert mock_wol.called
-                    assert res["status"] == "ok"
-                    # Node 1 woke up and became active GPU primary
-                    assert res["primary"]["url"] == "http://192.168.50.118:11434"
-                    assert res["primary"]["status"] == "ok"
-                    assert res["primary"]["is_gpu"] is True
-                    assert any("Woke up" in m or "awake" in m for m in status_messages)
+                        assert mock_wol.called
+                        assert res["status"] == "ok"
+                        # Node 1 woke up and became active GPU primary
+                        assert res["primary"]["url"] == "http://192.168.50.118:11434"
+                        assert res["primary"]["status"] == "ok"
+                        assert res["primary"]["is_gpu"] is True
+                        assert any("Woke up" in m or "awake" in m for m in status_messages)
 
 
 def test_warmup_wol_timeout_graceful_fallback():
@@ -211,25 +213,26 @@ def test_warmup_wol_timeout_graceful_fallback():
     def status_callback(msg):
         status_messages.append(msg)
 
-    with patch("bookeeper.processing.ollama_pool.send_wake_on_lan", return_value=True) as mock_wol:
-        with patch("time.sleep", return_value=None):
-            with patch("urllib.request.urlopen") as mock_open:
-                def custom_urlopen(req, timeout=15):
-                    url = req.full_url
-                    if "192.168.50.118" in url:
-                        raise ConnectionError("Host dead")
-                    m = MagicMock()
-                    m.read.return_value = b'{"models": [{"name": "qwen2.5:3b", "size": 1000, "size_vram": 1000, "runner": "cuda"}]}'
-                    m.__enter__.return_value = m
-                    return m
+    with patch("shutil.which", return_value=None):
+        with patch("bookeeper.processing.ollama_pool.send_wake_on_lan", return_value=True) as mock_wol:
+            with patch("time.sleep", return_value=None):
+                with patch("urllib.request.urlopen") as mock_open:
+                    def custom_urlopen(req, timeout=15):
+                        url = req.full_url
+                        if "192.168.50.118" in url or pool.nodes[0].target_url.rstrip("/") in url:
+                            raise ConnectionError("Host dead")
+                        m = MagicMock()
+                        m.read.return_value = b'{"models": [{"name": "qwen2.5:3b", "size": 1000, "size_vram": 1000, "runner": "cuda"}]}'
+                        m.__enter__.return_value = m
+                        return m
 
-                mock_open.side_effect = custom_urlopen
-                res = extractor.warmup_and_check_device(on_status_callback=status_callback)
+                    mock_open.side_effect = custom_urlopen
+                    res = extractor.warmup_and_check_device(on_status_callback=status_callback)
 
-                assert mock_wol.called
-                assert res["status"] == "ok"
-                # Server 1 remains unreachable, Server 2 is selected as active primary
-                server1_rep = next(r for r in res["servers"] if r["url"] == "http://192.168.50.118:11434")
-                assert server1_rep["status"] == "unreachable"
-                assert res["primary"]["url"] == "http://192.168.50.15:11434"
+                    assert mock_wol.called
+                    assert res["status"] == "ok"
+                    # Server 1 remains unreachable, Server 2 is selected as active primary
+                    server1_rep = next(r for r in res["servers"] if r["url"] == "http://192.168.50.118:11434")
+                    assert server1_rep["status"] == "unreachable"
+                    assert res["primary"]["url"] == "http://192.168.50.15:11434"
                 assert any("did not respond" in m for m in status_messages)

@@ -581,3 +581,28 @@ def test_cross_check_cli_print_chunks_option(tmp_path, sample_graphs):
         call_kwargs = mock_run.call_args.kwargs
         assert call_kwargs["print_chunks"] == 3
 
+
+def test_compute_chunk_disproportion_repetitive_text():
+    """Verify compute_chunk_disproportion handles repetitive or poetic structures with high overlap."""
+    text_a = (
+        "Poor mother was so forgetful, She put a plum pudden in bed, "
+        "An' covered my brother with custard, 'That'll do us for supper,' she said! "
+        "Oh woe is me, what a family, There used t'be just six of us, "
+        "The day Grandma took up knitting, She couldn't tell yarn from fur, "
+        "But she clacked her needles all evening, An' knitted herself to the chair!"
+    )
+    # text_b has slight variation (e.g. omitting the first sentence)
+    text_b = (
+        "An' covered my brother with custard, 'That'll do us for supper,' she said! "
+        "Oh woe is me, what a family, There used t'be just six of us, "
+        "The day Grandma took up knitting, She couldn't tell yarn from fur, "
+        "But she clacked her needles all evening, An' knitted herself to the chair!"
+    )
+
+    sum_a, sum_b, union_len, disp = compute_chunk_disproportion([text_a], [text_b], text_a)
+    # Disproportion must be high (> 0.80), not near 0.50
+    assert disp > 0.80
+    # Union length must be close to len(text_a), not 2x
+    assert union_len < len(text_a) * 1.2
+
+

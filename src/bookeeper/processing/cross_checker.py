@@ -193,26 +193,32 @@ def find_overlapping_chunks(
     chunks.sort(key=lambda x: (int(x.get("chapter_idx") or 0), int(x.get("chunk_idx") or 0)))
 
     w_raw_norm = " ".join(w_raw.lower().split())
-    prefix = w_raw_norm[:300]
+    prefix = w_raw_norm[:350]
 
-    # Find starting chunk in B with strongest prefix match
-    best_start = -1
-    best_score = 0
+    # Find starting chunk in B with strongest match at the beginning of prefix
+    start_candidates = []
     for idx, c in enumerate(chunks):
         t_norm = " ".join(c.get("text", "").lower().split())
         if not t_norm:
             continue
-        sm = SequenceMatcher(None, prefix, t_norm[:500])
-        m = sm.find_longest_match(0, len(prefix), 0, min(500, len(t_norm)))
-        if m.size > best_score:
-            best_score = m.size
-            best_start = idx
+        sm = SequenceMatcher(None, prefix, t_norm, autojunk=False)
+        m = sm.find_longest_match(0, len(prefix), 0, len(t_norm))
+        if m.size >= 25:
+            # Score prioritizing matches that start at the beginning of w_raw (m.a near 0)
+            score = m.size - (m.a * 3)
+            start_candidates.append((score, m.a, m.size, idx))
+
+    if start_candidates:
+        start_candidates.sort(key=lambda x: x[0], reverse=True)
+        best_start = start_candidates[0][3]
+    else:
+        best_start = -1
 
     # Fallback to general sequence / substring matching if prefix match was weak
-    if best_start == -1 or best_score < 30:
+    if best_start == -1:
         for idx, c in enumerate(chunks):
             t_norm = " ".join(c.get("text", "").lower().split())
-            if t_norm and (t_norm[:80] in w_raw_norm or w_raw_norm[:80] in t_norm):
+            if t_norm and (t_norm[:60] in w_raw_norm or w_raw_norm[:60] in t_norm):
                 best_start = idx
                 break
 
@@ -223,17 +229,25 @@ def find_overlapping_chunks(
             t_norm = " ".join(c.get("text", "").lower().split())
             if not t_norm:
                 continue
-            sm = SequenceMatcher(None, w_raw_norm, t_norm)
+            sm = SequenceMatcher(None, w_raw_norm, t_norm, autojunk=False)
             match = sm.find_longest_match(0, len(w_raw_norm), 0, len(t_norm))
             ratio = match.size / max(1, len(t_norm))
             if ratio >= min_overlap:
                 fallback_candidates.append(c)
         return fallback_candidates
 
-    # Contiguous slice expansion: accumulate chunks until stitched length reaches or exceeds w_raw
-    max_k = min(40, len(chunks) - best_start)
+    # Contiguous slice expansion: accumulate chunks that overlap w_raw
+    max_k = min(50, len(chunks) - best_start)
     candidates = []
     for k in range(1, max_k + 1):
+        c_k = chunks[best_start + k - 1]
+        t_norm_k = " ".join(c_k.get("text", "").lower().split())
+        # Check overlap of chunk k with w_raw to stop expanding when passage in B ends
+        if k > 1:
+            sm_k = SequenceMatcher(None, w_raw_norm, t_norm_k, autojunk=False)
+            m_k = sm_k.find_longest_match(0, len(w_raw_norm), 0, len(t_norm_k))
+            if m_k.size < 20:
+                break
         slice_k = chunks[best_start : best_start + k]
         w_k = stitch_chunks_dedup_text([c.get("text", "") for c in slice_k])
         candidates.append((slice_k, w_k, len(w_k)))
@@ -282,12 +296,15 @@ def compute_chunk_disproportion(
     w_a_norm = " ".join(w_raw.lower().split())
     w_b_norm = " ".join(w_b.lower().split())
 
-    sm = SequenceMatcher(None, w_a_norm, w_b_norm)
-    match_len = sum(b.size for b in sm.get_matching_blocks())
-    union_len = len(w_raw) + len(w_b) - match_len
-    union_len = max(1, union_len)
+    sm = SequenceMatcher(None, w_a_norm, w_b_norm, autojunk=False)
+    match_len = sum(b.size for b in sm.get_matching_blocks() if b.size > 0)
+    union_norm = max(1, len(w_a_norm) + len(w_b_norm) - match_len)
+    disproportion = round(len(w_a_norm) / union_norm, 4)
 
-    disproportion = round(len(w_raw) / union_len, 4)
+    # Scale union length back to raw character space
+    scale = len(w_raw) / max(1, len(w_a_norm))
+    union_len = max(1, round(union_norm * scale))
+
     return sum_len_a, sum_len_b, union_len, disproportion
 
 

@@ -602,7 +602,7 @@ class KnowledgeExtractor:
         model: Optional[str] = None,
     ) -> List[Concept]:
         """Convenience method to extract canonical concepts/ideas from text using the Oracle model."""
-        result = self.extract_concepts_from_section(
+        result = self.extract_section(
             text=text,
             book_title=book_title,
             section_title=section_title,
@@ -610,6 +610,8 @@ class KnowledgeExtractor:
             model=model,
         )
         return result.concepts
+
+    extract_concepts_from_section = extract_section
 
     def warmup_and_check_device(
         self,

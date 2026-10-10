@@ -250,3 +250,17 @@ def test_cli_verify_chunk_mode(populated_chunk_store, tmp_path, mock_pool):
     assert data["mode"] == "chunk"
     assert "overall_success_rate" in data["stats"]
     assert "overall_fail_rate" in data["stats"]
+
+
+def test_knowledge_extractor_extract_ideas(mock_pool):
+    """Test that extract_ideas delegates to extract_section properly."""
+    from bookeeper.processing.extractor import KnowledgeExtractor, SectionExtraction
+
+    extractor = KnowledgeExtractor(pool=mock_pool, model="oracle-llama")
+    expected_concept = Concept(name="Domain Concept", category="Core", summary="Summary text")
+
+    with patch.object(extractor, "extract_section", return_value=SectionExtraction(concepts=[expected_concept])) as mock_sec:
+        concepts = extractor.extract_ideas("Some chunk text", book_title="Book A", section_title="Sec 1")
+        assert len(concepts) == 1
+        assert concepts[0].name == "Domain Concept"
+        mock_sec.assert_called_once()

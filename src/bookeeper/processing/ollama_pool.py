@@ -2,8 +2,10 @@
 Multi-server smart proxy and failover client for Ollama with priority routing and automatic recovery.
 """
 
+import atexit
 import json
 import logging
+import os
 import re
 import shutil
 import socket
@@ -12,9 +14,10 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from langchain_core.embeddings import Embeddings
 from langchain_ollama import OllamaEmbeddings
@@ -22,6 +25,149 @@ from langchain_ollama import OllamaEmbeddings
 from bookeeper.config import DEFAULT_CAPABILITIES, OllamaServerConfig
 
 logger = logging.getLogger(__name__)
+
+_macos_bridge_lock = threading.Lock()
+_macos_bridge_tunnels: Dict[str, Tuple[str, subprocess.Popen]] = {}
+
+
+def _cleanup_macos_bridges() -> None:
+    with _macos_bridge_lock:
+        for key, (eff_url, proc) in _macos_bridge_tunnels.items():
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        _macos_bridge_tunnels.clear()
+
+
+atexit.register(_cleanup_macos_bridges)
+
+
+def get_effective_server_url(url: str) -> str:
+    """
+    On macOS Sequoia and newer, ad-hoc signed CLI/venv binaries may be restricted by
+    Local Network Privacy from connecting directly to LAN endpoints (returning [Errno 65] No route to host),
+    while system-signed binaries like /usr/bin/python3 are unrestricted.
+    This helper checks if direct socket connection raises Errno 65 and automatically spawns a transparent
+    localhost loopback forwarder using /usr/bin/python3, returning http://127.0.0.1:<port>.
+    On Linux, Windows, or when direct connection works, returns url unchanged.
+    """
+    if sys.platform != "darwin":
+        return url
+
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    # Localhost / loopback is never restricted
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return url
+
+    cache_key = f"{host}:{port}"
+    with _macos_bridge_lock:
+        if cache_key in _macos_bridge_tunnels:
+            eff_url, proc = _macos_bridge_tunnels[cache_key]
+            if proc.poll() is None:
+                return eff_url
+
+    # Test direct connection
+    direct_ok = False
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.3)
+            s.connect((host, port))
+            direct_ok = True
+    except OSError as err:
+        err_msg = str(err).lower()
+        is_errno_65 = err.errno == 65 or "no route to host" in err_msg or "errno 65" in err_msg
+        if not is_errno_65:
+            # Failure is not macOS local network permission block, so don't tunnel
+            return url
+
+    if direct_ok:
+        return url
+
+    # Direct connection blocked by macOS Local Network Privacy -> start localhost bridge via /usr/bin/python3
+    system_python = "/usr/bin/python3"
+    if not os.path.exists(system_python):
+        return url
+
+    with _macos_bridge_lock:
+        if cache_key in _macos_bridge_tunnels:
+            eff_url, proc = _macos_bridge_tunnels[cache_key]
+            if proc.poll() is None:
+                return eff_url
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            local_port = s.getsockname()[1]
+
+        bridge_code = (
+            f"import socket, threading, sys\n"
+            f"def fwd(a, b):\n"
+            f"    try:\n"
+            f"        while True:\n"
+            f"            d = a.recv(8192)\n"
+            f"            if not d: break\n"
+            f"            b.sendall(d)\n"
+            f"    except: pass\n"
+            f"    finally:\n"
+            f"        try: a.close()\n"
+            f"        except: pass\n"
+            f"        try: b.close()\n"
+            f"        except: pass\n"
+            f"def h(cs):\n"
+            f"    try:\n"
+            f"        rs = socket.socket()\n"
+            f"        rs.connect(('{host}', {port}))\n"
+            f"    except:\n"
+            f"        cs.close()\n"
+            f"        return\n"
+            f"    threading.Thread(target=fwd, args=(cs, rs), daemon=True).start()\n"
+            f"    threading.Thread(target=fwd, args=(rs, cs), daemon=True).start()\n"
+            f"srv = socket.socket()\n"
+            f"srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+            f"srv.bind(('127.0.0.1', {local_port}))\n"
+            f"srv.listen(32)\n"
+            f"while True:\n"
+            f"    c, _ = srv.accept()\n"
+            f"    threading.Thread(target=h, args=(c,), daemon=True).start()\n"
+        )
+
+        try:
+            proc = subprocess.Popen(
+                [system_python, "-c", bridge_code],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            # Give forwarder up to 0.5s to bind
+            t_end = time.time() + 0.5
+            bound = False
+            while time.time() < t_end:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as test_s:
+                        test_s.settimeout(0.1)
+                        test_s.connect(("127.0.0.1", local_port))
+                        bound = True
+                        break
+                except Exception:
+                    time.sleep(0.05)
+
+            if bound and proc.poll() is None:
+                effective_url = f"http://127.0.0.1:{local_port}"
+                _macos_bridge_tunnels[cache_key] = (effective_url, proc)
+                logger.info(
+                    f"Established transparent macOS loopback bridge 127.0.0.1:{local_port} -> {host}:{port} "
+                    f"to bypass macOS Sequoia Local Network Privacy block on {url}."
+                )
+                return effective_url
+            else:
+                proc.terminate()
+        except Exception as e:
+            logger.debug(f"Failed to start macOS bridge for {url}: {e}")
+
+    return url
+
 
 
 def send_wake_on_lan(
@@ -110,6 +256,16 @@ class OllamaServerNode:
     @property
     def label(self) -> str:
         return self.name or self.url
+
+    @property
+    def target_url(self) -> str:
+        """
+        URL to use for actual HTTP/network requests.
+        On macOS Sequoia, if direct connection to LAN IP is blocked by Local Network Privacy (Errno 65),
+        this returns an automated localhost forwarder URL (http://127.0.0.1:<port>).
+        Otherwise returns self.url directly.
+        """
+        return get_effective_server_url(self.url)
 
     @property
     def consecutive_failures(self) -> int:
@@ -541,7 +697,7 @@ class OllamaPool:
                                     n.mark_failure(f"Watchdog: task exceeded {max_task_duration:.1f}s")
                                 else:
                                     n.release_without_cooldown(f"Watchdog: task exceeded {max_task_duration:.1f}s")
-                                self.reset_server(n.url, model=model_name)
+                                self.reset_server(n.target_url, model=model_name)
                                 self._condition.notify_all()
 
                     # 1. Eligible servers not yet tried in this invocation (supporting required capability)
@@ -609,7 +765,7 @@ class OllamaPool:
                     try:
                         _thread_local.last_used_server = selected_node.label
                         _thread_local.last_used_server_url = selected_node.url
-                        result = operation(selected_node.url)
+                        result = operation(selected_node.target_url)
                         dur = time.perf_counter() - t_attempt_start
                         with self._condition:
                             selected_node.mark_success()
@@ -638,7 +794,7 @@ class OllamaPool:
 
                         # If attempt failed or timed out, attempt to unstick runner only if server is reachable
                         if not conn_err:
-                            self.reset_server(selected_node.url, model=model_name)
+                            self.reset_server(selected_node.target_url, model=model_name)
 
                         if attempt < max_attempts - 1:
                             sleep_time = min(3.0, backoff_base * (1.5 ** attempt))

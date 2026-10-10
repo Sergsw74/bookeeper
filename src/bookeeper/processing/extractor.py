@@ -626,10 +626,11 @@ class KnowledgeExtractor:
                 raise
 
         def _inspect_node(node) -> Dict[str, Any]:
+            target_endpoint = getattr(node, "target_url", node.url)
             # 1. Warmup ping
             try:
                 _fetch_server_json(
-                    node.url,
+                    target_endpoint,
                     "/api/generate",
                     {"model": self.model_name, "prompt": "warmup ping", "options": {"num_predict": 1}, "stream": False},
                 )
@@ -638,7 +639,7 @@ class KnowledgeExtractor:
 
             # 2. Query /api/ps
             try:
-                ps_data = _fetch_server_json(node.url, "/api/ps")
+                ps_data = _fetch_server_json(target_endpoint, "/api/ps")
                 models = ps_data.get("models", [])
 
                 matched = None

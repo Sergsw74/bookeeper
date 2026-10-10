@@ -37,7 +37,35 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import yaml
+
+# Auto-re-execute using repository .venv/bin/python if running outside venv or if dependencies missing
+def _ensure_venv() -> None:
+    if os.environ.get("BOOKEEPER_VENV_AUTO_EXEC"):
+        return
+    try:
+        import yaml  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    candidates = [
+        Path(__file__).resolve().parent.parent / ".venv" / "bin" / "python",
+        Path.cwd() / ".venv" / "bin" / "python",
+    ]
+    for cand in candidates:
+        if cand.is_file() and os.access(cand, os.X_OK):
+            if cand.resolve() != Path(sys.executable).resolve():
+                env = dict(os.environ)
+                env["BOOKEEPER_VENV_AUTO_EXEC"] = "1"
+                os.execve(str(cand), [str(cand)] + sys.argv, env)
+
+
+_ensure_venv()
+
+try:
+    import yaml
+except ImportError:
+    yaml = None  # type: ignore
 
 
 # Terminal ANSI styling helpers
@@ -388,6 +416,10 @@ class ABTestRunner:
         3. If overlay exists, applies deep merge over base config (overwriting base values).
         4. Saves merged configuration to branch_dir / "config.yaml" and returns the path.
         """
+        if yaml is None:
+            log_warning("PyYAML is not available; skipping config overlay merging.")
+            return None
+
         # 1. Resolve base config file
         base_path = None
         if self.base_config_path and self.base_config_path.is_file():

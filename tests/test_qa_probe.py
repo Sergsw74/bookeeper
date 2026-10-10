@@ -41,7 +41,21 @@ def test_format_ideas_as_claims():
     assert "Claim 2: Metadata Tagging" in claims_text
     assert "Summary: Tags book genres" in claims_text
 
-    # 2. String fallback
+    # 2. Concept with quote and category
+    c3 = Concept(
+        name="DRM Protection",
+        category="Security",
+        brief_description="Digital rights management restricts reading.",
+        detailed_explanation="Encrypted keys prevent unauthorized copying.",
+        supporting_quote="DRM was used to restrict user freedom.",
+    )
+    claims_text3 = format_ideas_as_claims([c3])
+    assert "Claim 1: DRM Protection [Security]" in claims_text3
+    assert "Summary: Digital rights management restricts reading." in claims_text3
+    assert "Details: Encrypted keys prevent unauthorized copying." in claims_text3
+    assert 'Supporting Text: "DRM was used to restrict user freedom."' in claims_text3
+
+    # 3. String fallback
     assert "Claim 1: Simple Idea" in format_ideas_as_claims(["Simple Idea"])
 
     # 3. Empty list

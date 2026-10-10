@@ -310,6 +310,12 @@ def test_run_cross_check_e2e(sample_graphs, mock_pool):
     assert report.summary.mean_old_fail_ratio >= 0.0
     assert report.summary.mean_new_fail_ratio >= 0.0
     assert report.samples[0].delta_fail_ratio is not None
+    # Verify candidate ideas contain full Concept info (not just names)
+    assert len(report.samples[0].candidate_ideas_old) > 0
+    first_old_idea = report.samples[0].candidate_ideas_old[0]
+    assert isinstance(first_old_idea, Concept)
+    assert first_old_idea.name != ""
+    assert first_old_idea.category != ""
 
 
 def test_cross_check_cli_command(tmp_path, sample_graphs):

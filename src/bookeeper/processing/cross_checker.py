@@ -17,7 +17,7 @@ import re
 import time
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import numpy as np
 from pydantic import BaseModel, Field
@@ -97,8 +97,8 @@ class CrossCheckBlockResult(BaseModel):
 
     block_a_text: str = ""
     block_b_text: str = ""
-    candidate_ideas_old: List[str] = Field(default_factory=list)
-    candidate_ideas_new: List[str] = Field(default_factory=list)
+    candidate_ideas_old: List[Union[Concept, Dict[str, Any], str]] = Field(default_factory=list)
+    candidate_ideas_new: List[Union[Concept, Dict[str, Any], str]] = Field(default_factory=list)
     oracle_ideas: List[str] = Field(default_factory=list)
 
     # QA Probe Metrics
@@ -337,7 +337,7 @@ def compute_chunk_disproportion(
 
 
 def get_ideas_for_chunks(graph_store: ConceptGraphStore, chunk_node_ids: List[str]) -> List[Concept]:
-    """Retrieve all Concept objects associated with a list of Chunk node IDs."""
+    """Retrieve all Concept objects with complete metadata associated with a list of Chunk node IDs."""
     ideas: List[Concept] = []
     seen_names: Set[str] = set()
 
@@ -353,12 +353,40 @@ def get_ideas_for_chunks(graph_store: ConceptGraphStore, chunk_node_ids: List[st
                 cname = cattrs.get("name") or neighbor.replace("concept:", "")
                 if cname not in seen_names:
                     seen_names.add(cname)
+                    # Also inspect edge attributes between Chunk and Concept for supporting quotes and explanations
+                    edge_fwd = graph_store.graph.get_edge_data(nid, neighbor) or {}
+                    edge_rev = graph_store.graph.get_edge_data(neighbor, nid) or {}
+                    edge_attrs = {**edge_rev, **edge_fwd}
+
+                    brief = (
+                        cattrs.get("brief_description")
+                        or edge_attrs.get("brief_description")
+                        or cattrs.get("summary")
+                        or edge_attrs.get("summary")
+                        or ""
+                    )
+                    detailed = (
+                        cattrs.get("detailed_explanation")
+                        or edge_attrs.get("detailed_explanation")
+                        or ""
+                    )
+                    quote = (
+                        cattrs.get("supporting_quote")
+                        or edge_attrs.get("quote")
+                        or edge_attrs.get("supporting_quote")
+                        or None
+                    )
+                    category = cattrs.get("category") or edge_attrs.get("category") or "Idea"
+                    weight = int(cattrs.get("weight") or edge_attrs.get("weight") or 5)
+
                     ideas.append(
                         Concept(
                             name=cname,
-                            category=cattrs.get("category", "Concept"),
-                            brief_description=cattrs.get("brief_description", "") or cattrs.get("summary", ""),
-                            detailed_explanation=cattrs.get("detailed_explanation", ""),
+                            category=category,
+                            brief_description=brief,
+                            detailed_explanation=detailed,
+                            supporting_quote=quote,
+                            weight=weight,
                         )
                     )
     return ideas
@@ -911,8 +939,8 @@ def run_cross_check(
             duration_seconds=dur,
             block_a_text=w_raw[:2000],
             block_b_text=w_b[:2000],
-            candidate_ideas_old=[c.name for c in dedup_ideas_old],
-            candidate_ideas_new=[c.name for c in dedup_ideas_new],
+            candidate_ideas_old=dedup_ideas_old,
+            candidate_ideas_new=dedup_ideas_new,
             oracle_ideas=[p.question for p in probes],
             probes=probes,
             delta_qa_recall=delta_rec,

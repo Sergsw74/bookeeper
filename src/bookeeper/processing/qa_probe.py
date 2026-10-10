@@ -77,21 +77,37 @@ def format_ideas_as_claims(ideas: List[Any]) -> str:
     for idx, item in enumerate(ideas, 1):
         if isinstance(item, Concept):
             title = item.name.strip()
-            summary = (item.summary or item.brief_description or "").strip()
-            details = (item.detailed_explanation or "").strip()
+            summary = (getattr(item, "brief_description", "") or getattr(item, "summary", "") or "").strip()
+            details = (getattr(item, "detailed_explanation", "") or "").strip()
+            quote = (getattr(item, "supporting_quote", "") or "").strip()
+            category = (getattr(item, "category", "") or "").strip()
 
             claim_text = f"Claim {idx}: {title}"
+            if category and category != "Idea":
+                claim_text += f" [{category}]"
             if summary:
                 claim_text += f"\nSummary: {summary}"
             if details and details != summary:
                 claim_text += f"\nDetails: {details}"
+            if quote:
+                claim_text += f"\nSupporting Text: \"{quote}\""
             claims.append(claim_text)
         elif isinstance(item, dict):
             title = str(item.get("name", "")).strip()
-            summary = str(item.get("summary") or item.get("brief_description", "")).strip()
+            summary = str(item.get("brief_description") or item.get("summary", "")).strip()
+            details = str(item.get("detailed_explanation", "")).strip()
+            quote = str(item.get("supporting_quote") or item.get("quote", "")).strip()
+            category = str(item.get("category", "")).strip()
+
             claim_text = f"Claim {idx}: {title}"
+            if category and category != "Idea":
+                claim_text += f" [{category}]"
             if summary:
                 claim_text += f"\nSummary: {summary}"
+            if details and details != summary:
+                claim_text += f"\nDetails: {details}"
+            if quote:
+                claim_text += f"\nSupporting Text: \"{quote}\""
             claims.append(claim_text)
         else:
             claims.append(f"Claim {idx}: {str(item).strip()}")

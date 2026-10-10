@@ -3640,6 +3640,7 @@ def verify_command(
                 branch_b_name=branch_b_label,
                 seed=seed,
                 print_chunks=int(print_chunks or 0),
+                console=console,
                 progress_callback=_on_cc_progress,
             )
 

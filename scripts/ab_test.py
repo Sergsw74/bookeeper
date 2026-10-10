@@ -959,6 +959,25 @@ class ABTestRunner:
                     "delta_recall": delta_rec,
                     "duration_seconds": 0.8,
                 })
+                if self.print_chunks > 0 and b_idx <= self.print_chunks:
+                    from bookeeper.processing.cross_checker import SystemBlockMetrics, print_block_comparison
+                    from bookeeper.processing.extractor import Concept
+                    print_block_comparison(
+                        sample_index=b_idx,
+                        book_title="Simulated Book",
+                        section_title=f"Chapter {b_idx}",
+                        old_chunk_ids=[f"b1_c{b_idx}_p1", f"b1_c{b_idx}_p2", f"b1_c{b_idx}_p3"],
+                        new_chunk_ids=[f"b1_c{b_idx}_p1", f"b1_c{b_idx}_p2", f"b1_c{b_idx}_p3", f"b1_c{b_idx}_p4"],
+                        w_raw="Simulated unbroken passage for Block A representing contiguous narrative context across the chapters.",
+                        w_b="Simulated unbroken passage for Block B representing contiguous narrative context across the chapters with slight variation.",
+                        disproportion=disprop,
+                        union_len=union_len,
+                        ideas_old=[Concept(name="Core Idea 1", brief_description="Key concept present in Baseline", category="Sim", summary="s")],
+                        ideas_new=[Concept(name="Core Idea 1", brief_description="Key concept present in Candidate", category="Sim", summary="s"), Concept(name="Core Idea 3", brief_description="Candidate exclusive concept", category="Sim", summary="s")],
+                        oracle_ideas=[Concept(name="Core Idea 1", brief_description="Oracle truth 1", category="Sim", summary="s"), Concept(name="Core Idea 2", brief_description="Oracle truth 2", category="Sim", summary="s")],
+                        eval_old=SystemBlockMetrics(system="old", oracle_recall=old_rec, fail_ratio=0.0, retained_oracle_ideas=["Core Idea 1"], dropped_oracle_ideas=["Core Idea 2"]),
+                        eval_new=SystemBlockMetrics(system="new", oracle_recall=new_rec, fail_ratio=0.0, retained_oracle_ideas=["Core Idea 1", "Core Idea 2"], dropped_oracle_ideas=[]),
+                    )
 
             mean_old_rec = round(float(sum(s["old_system"]["oracle_recall"] for s in mock_samples) / num_blocks), 4)
             mean_new_rec = round(float(sum(s["new_system"]["oracle_recall"] for s in mock_samples) / num_blocks), 4)

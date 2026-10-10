@@ -577,49 +577,57 @@ def print_block_comparison(
     oracle_ideas: List[Concept],
     eval_old: SystemBlockMetrics,
     eval_new: SystemBlockMetrics,
+    console: Optional[Any] = None,
 ) -> None:
-    """Print formatted comparative analysis of a single block when disproportion < 1.0."""
+    """Print formatted comparative analysis of a single block."""
+    def _out(msg: str = "") -> None:
+        if console is not None and hasattr(console, "print"):
+            console.print(msg)
+        else:
+            print(msg)
+
     sep = "=" * 80
     sub_sep = "-" * 80
-    print(f"\n{sep}")
-    print(f"🔍 Block #{sample_index} Alignment Comparison [Disproportion = {disproportion:.4f}]")
-    print(f"📖 Book: {book_title} | Section: {section_title}")
-    print(sub_sep)
-    print(f"📦 BLOCK A ({len(old_chunk_ids)} chunks: {', '.join(old_chunk_ids)})")
-    print(f"   Total Chars: {len(w_raw)} | Text Preview:")
+    disp_status = "Boundary Discrepancy" if disproportion < 0.999 else "Aligned"
+    _out(f"\n{sep}")
+    _out(f"🔍 Block #{sample_index} Alignment Comparison [Disproportion = {disproportion:.4f} ({disp_status})]")
+    _out(f"📖 Book: {book_title} | Section: {section_title}")
+    _out(sub_sep)
+    _out(f"📦 BLOCK A ({len(old_chunk_ids)} chunks: {', '.join(old_chunk_ids)})")
+    _out(f"   Total Chars: {len(w_raw)} | Text Preview:")
     excerpt_a = w_raw[:350].replace('\n', ' ')
-    print(f"   \"{excerpt_a}...\"")
+    _out(f"   \"{excerpt_a}...\"")
 
-    print(f"\n📦 BLOCK B ({len(new_chunk_ids)} chunks: {', '.join(new_chunk_ids)})")
-    print(f"   Total Chars: {len(w_b)} | Text Preview:")
+    _out(f"\n📦 BLOCK B ({len(new_chunk_ids)} chunks: {', '.join(new_chunk_ids)})")
+    _out(f"   Total Chars: {len(w_b)} | Text Preview:")
     excerpt_b = w_b[:350].replace('\n', ' ')
-    print(f"   \"{excerpt_b}...\"")
+    _out(f"   \"{excerpt_b}...\"")
 
-    print(f"\n📏 ALIGNMENT: Disproportion = {disproportion:.4f} | Union = {union_len} chars")
+    _out(f"\n📏 ALIGNMENT: Disproportion = {disproportion:.4f} | Union = {union_len} chars")
 
-    print(f"\n💡 IDEAS IN BLOCK A ({len(ideas_old)} unique):")
+    _out(f"\n💡 IDEAS IN BLOCK A ({len(ideas_old)} unique):")
     for idx, c in enumerate(ideas_old, 1):
         desc = f" - {c.brief_description[:75]}..." if c.brief_description else ""
-        print(f"   {idx}. {c.name}{desc}")
+        _out(f"   {idx}. {c.name}{desc}")
 
-    print(f"\n💡 IDEAS IN BLOCK B ({len(ideas_new)} unique):")
+    _out(f"\n💡 IDEAS IN BLOCK B ({len(ideas_new)} unique):")
     for idx, c in enumerate(ideas_new, 1):
         desc = f" - {c.brief_description[:75]}..." if c.brief_description else ""
-        print(f"   {idx}. {c.name}{desc}")
+        _out(f"   {idx}. {c.name}{desc}")
 
-    print(f"\n🔮 ORACLE IDEAS ON PASSAGE ({len(oracle_ideas)}):")
+    _out(f"\n🔮 ORACLE IDEAS ON PASSAGE ({len(oracle_ideas)}):")
     for idx, o in enumerate(oracle_ideas, 1):
         o_name = getattr(o, "name", str(o))
         desc = f" - {o.brief_description[:75]}..." if getattr(o, "brief_description", "") else ""
         in_a = "RETAINED" if o_name in eval_old.retained_oracle_ideas else "DROPPED"
         in_b = "RETAINED" if o_name in eval_new.retained_oracle_ideas else "DROPPED"
-        print(f"   {idx}. {o_name}{desc} -> [A: {in_a} | B: {in_b}]")
+        _out(f"   {idx}. {o_name}{desc} -> [A: {in_a} | B: {in_b}]")
 
-    print(f"\n📊 BLOCK METRICS:")
-    print(f"   • Baseline Recall:  {eval_old.oracle_recall * 100:.1f}% (Fail Ratio: {eval_old.fail_ratio * 100:.1f}%)")
-    print(f"   • Candidate Recall: {eval_new.oracle_recall * 100:.1f}% (Fail Ratio: {eval_new.fail_ratio * 100:.1f}%)")
-    print(f"   • Recall Delta:     {(eval_new.oracle_recall - eval_old.oracle_recall) * 100:+.1f}% pts")
-    print(f"{sep}\n")
+    _out(f"\n📊 BLOCK METRICS:")
+    _out(f"   • Baseline Recall:  {eval_old.oracle_recall * 100:.1f}% (Fail Ratio: {eval_old.fail_ratio * 100:.1f}%)")
+    _out(f"   • Candidate Recall: {eval_new.oracle_recall * 100:.1f}% (Fail Ratio: {eval_new.fail_ratio * 100:.1f}%)")
+    _out(f"   • Recall Delta:     {(eval_new.oracle_recall - eval_old.oracle_recall) * 100:+.1f}% pts")
+    _out(f"{sep}\n")
 
 
 # ==============================================================================
@@ -638,6 +646,7 @@ def run_cross_check(
     branch_b_name: str = "Candidate",
     seed: Optional[int] = None,
     print_chunks: int = 0,
+    console: Optional[Any] = None,
     progress_callback: Optional[Callable[[int, int, str, Optional[CrossCheckBlockResult]], None]] = None,
 ) -> CrossCheckReport:
     """
@@ -780,8 +789,16 @@ def run_cross_check(
         )
         samples.append(block_result)
 
-        # Print detailed block comparison if requested when disproportion < 1.0
-        if print_chunks > 0 and disproportion < 1.0 and printed_chunks_count < print_chunks:
+        # Determine whether to print detailed block comparison:
+        # 1. If print_chunks > 0, print up to print_chunks analyzed blocks.
+        # 2. If print_chunks == 0, auto-print up to 3 blocks if disproportion < 1.0.
+        should_print = False
+        if print_chunks > 0 and printed_chunks_count < print_chunks:
+            should_print = True
+        elif print_chunks == 0 and disproportion < 0.999 and printed_chunks_count < 3:
+            should_print = True
+
+        if should_print:
             printed_chunks_count += 1
             print_block_comparison(
                 sample_index=curr_idx,
@@ -798,6 +815,7 @@ def run_cross_check(
                 oracle_ideas=i_oracle,
                 eval_old=eval_old,
                 eval_new=eval_new,
+                console=console,
             )
 
         if progress_callback:

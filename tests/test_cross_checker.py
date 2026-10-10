@@ -196,10 +196,10 @@ def test_find_overlapping_chunks(sample_graphs):
     _, store_b = sample_graphs
     reference = "The quick brown fox jumps over the lazy dog. It was a bright sunny morning."
 
-    matched = find_overlapping_chunks(store_b, book_id=1, w_raw=reference, min_overlap=0.35)
-    assert len(matched) >= 1
+    matched = find_overlapping_chunks(store_b, book_id=1, w_raw=reference, min_overlap=0.80)
+    assert len(matched) == 1
     chunk_ids = [m.get("chunk_id") for m in matched]
-    assert "chunk_b1" in chunk_ids
+    assert chunk_ids == ["chunk_b1"]
 
 
 def test_tiered_deduplicate_ideas():

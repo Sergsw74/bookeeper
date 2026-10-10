@@ -379,8 +379,20 @@ class EntityDeduplicator:
                         return True, sim, "llm_disambiguated", decision.canonical_name or name1, decision.reasoning
                     else:
                         return False, sim, "none", None, decision.reasoning
-                else:
-                    return True, sim, "high_vector", name1, f"Vector similarity match ({sim:.3f}, no LLM)"
+        # 3. Fallback when embeddings are unavailable but an LLM extractor is configured
+        if (vec1 is None or vec2 is None) and self.extractor is not None:
+            t1 = set(norm1.split())
+            t2 = set(norm2.split())
+            if (t1 & t2) or (norm1 in norm2) or (norm2 in norm1):
+                concept_obj1 = c1 if isinstance(c1, Concept) else Concept(name=name1)
+                concept_obj2 = c2 if isinstance(c2, Concept) else Concept(name=name2)
+                try:
+                    decision = self._ask_llm_disambiguation(concept_obj1, concept_obj2, 0.85)
+                    if decision.is_same_concept:
+                        return True, 0.85, "llm_disambiguated", decision.canonical_name or name1, decision.reasoning
+                    return False, 0.0, "none", None, decision.reasoning
+                except Exception as e:
+                    logger.debug(f"Fallback LLM disambiguation failed: {e}")
 
         return False, sim, "none", None, "Concepts differ below similarity threshold"
 

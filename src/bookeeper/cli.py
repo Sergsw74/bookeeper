@@ -3546,6 +3546,7 @@ def verify_command(
 
         effective_blocks = blocks if blocks is not None else 20
         effective_model = model or cfg.resolved_verifier_model
+        effective_embedding_model = embedding_model or getattr(cfg, "embedding_model", "nomic-embed-text")
 
         verifier_servers = cfg.resolved_verification_servers
         pool = OllamaPool(
@@ -3627,6 +3628,7 @@ def verify_command(
                 num_blocks=effective_blocks,
                 pool=pool,
                 model_name=effective_model,
+                embedding_model=effective_embedding_model,
                 branch_a_name=branch_a_label,
                 branch_b_name=branch_b_label,
                 seed=seed,

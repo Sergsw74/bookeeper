@@ -15,6 +15,7 @@ import logging
 import random
 import re
 import time
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple
 
@@ -25,7 +26,7 @@ from bookeeper.calibre.parser import BookParser
 from bookeeper.graph.store import ConceptGraphStore
 from bookeeper.processing.deduplicator import EntityDeduplicator
 from bookeeper.processing.extractor import Concept, KnowledgeExtractor
-from bookeeper.processing.ollama_pool import OllamaPool
+from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings, OllamaPool
 
 logger = logging.getLogger(__name__)
 
@@ -161,16 +162,16 @@ def find_overlapping_chunks(
     graph_b: ConceptGraphStore,
     book_id: int,
     w_raw: str,
-    min_overlap: float = 0.35,
+    min_overlap: float = 0.80,
 ) -> List[Dict[str, Any]]:
     """
-    Locate all chunks in Graph B from the same book whose content overlaps with W_raw.
+    Locate all chunks in Graph B from the same book whose contiguous text overlaps with W_raw.
+    Requires at least `min_overlap` (default: 0.80) contiguous character coverage.
     Returns sorted list of chunk attribute dicts.
     """
     w_raw_norm = " ".join(w_raw.lower().split())
-    w_tokens = set(re.findall(r"\w{4,}", w_raw_norm))
-    if not w_tokens:
-        w_tokens = set(re.findall(r"\w{2,}", w_raw_norm))
+    if not w_raw_norm:
+        return []
 
     candidates: List[Tuple[int, int, Dict[str, Any], float]] = []
 
@@ -188,21 +189,22 @@ def find_overlapping_chunks(
         ch_idx = int(attrs.get("chapter_idx") or 0)
         c_idx = int(attrs.get("chunk_idx") or 0)
 
-        # 1. Exact substring check
+        # 1. Exact substring check (chunk text completely within W_raw)
         if t_norm in w_raw_norm:
             candidates.append((ch_idx, c_idx, dict(attrs), 1.0))
             continue
 
-        # 2. Token overlap check
-        t_tokens = set(re.findall(r"\w{4,}", t_norm))
-        if not t_tokens:
-            t_tokens = set(re.findall(r"\w{2,}", t_norm))
+        # 2. W_raw completely within chunk text
+        if w_raw_norm in t_norm:
+            candidates.append((ch_idx, c_idx, dict(attrs), 1.0))
+            continue
 
-        if t_tokens and w_tokens:
-            inter = len(t_tokens & w_tokens)
-            ratio = inter / len(t_tokens)
-            if ratio >= min_overlap:
-                candidates.append((ch_idx, c_idx, dict(attrs), ratio))
+        # 3. Contiguous sequence overlap via SequenceMatcher
+        sm = SequenceMatcher(None, w_raw_norm, t_norm)
+        match = sm.find_longest_match(0, len(w_raw_norm), 0, len(t_norm))
+        ratio = match.size / max(1, len(t_norm))
+        if ratio >= min_overlap:
+            candidates.append((ch_idx, c_idx, dict(attrs), ratio))
 
     # Sort candidates by chapter and chunk index
     candidates.sort(key=lambda x: (x[0], x[1]))
@@ -512,6 +514,7 @@ def run_cross_check(
     num_blocks: int = 20,
     pool: Optional[OllamaPool] = None,
     model_name: str = "llama3.1:8b",
+    embedding_model: str = "nomic-embed-text",
     branch_a_name: str = "Baseline",
     branch_b_name: str = "Candidate",
     seed: Optional[int] = None,
@@ -527,8 +530,23 @@ def run_cross_check(
     if pool is None:
         pool = OllamaPool.from_urls(["http://localhost:11434"])
 
+    embeddings: Optional[FailoverOllamaEmbeddings] = None
+    try:
+        embeddings = FailoverOllamaEmbeddings(
+            model=embedding_model,
+            pool=pool,
+            request_timeout=60,
+        )
+    except Exception as exc:
+        logger.warning(f"Could not initialize FailoverOllamaEmbeddings: {exc}")
+
     extractor = KnowledgeExtractor(pool=pool, model=model_name)
-    deduplicator = EntityDeduplicator(extractor=extractor)
+    deduplicator = EntityDeduplicator(
+        embeddings=embeddings,
+        extractor=extractor,
+        similarity_threshold=0.80,
+        high_similarity_threshold=0.95,
+    )
 
     # 1. Discover common books between Graph A and Graph B
     books_a = {d.get("book_id"): d for n, d in store_a.graph.nodes(data=True) if d.get("type") == "Book"}
@@ -556,8 +574,11 @@ def run_cross_check(
 
     samples: List[CrossCheckBlockResult] = []
     t_global_start = time.time()
+    max_attempts = num_blocks * 5
+    attempts = 0
 
-    for block_idx in range(1, num_blocks + 1):
+    while len(samples) < num_blocks and attempts < max_attempts:
+        attempts += 1
         t0 = time.time()
         if not valid_books:
             break
@@ -576,11 +597,14 @@ def run_cross_check(
 
         # 2. Reconstruct seamless raw passage W_raw
         w_raw = stitch_chunks_dedup_text(old_chunk_texts)
-        if not w_raw:
+        if not w_raw or len(w_raw) < 100:
             continue
 
-        # 3. Locate matching new chunks in Graph B
-        new_chunk_dicts = find_overlapping_chunks(store_b, target_bid, w_raw)
+        # 3. Locate matching new chunks in Graph B with min_overlap >= 0.80
+        new_chunk_dicts = find_overlapping_chunks(store_b, target_bid, w_raw, min_overlap=0.80)
+        if not new_chunk_dicts:
+            continue
+
         new_chunk_ids = [d.get("chunk_id") or d.get("id", "") for d in new_chunk_dicts]
         new_chunk_texts = [d.get("text", "") for d in new_chunk_dicts]
 
@@ -608,9 +632,10 @@ def run_cross_check(
 
         delta_rec = round(eval_new.oracle_recall - eval_old.oracle_recall, 4)
         dur = round(time.time() - t0, 2)
+        curr_idx = len(samples) + 1
 
         block_result = CrossCheckBlockResult(
-            sample_index=block_idx,
+            sample_index=curr_idx,
             book_id=target_bid,
             book_title=b_title,
             section_title=sec_title,
@@ -630,7 +655,7 @@ def run_cross_check(
         samples.append(block_result)
 
         if progress_callback:
-            progress_callback(block_idx, num_blocks, f"Block #{block_idx} ({b_title[:20]})", block_result)
+            progress_callback(curr_idx, num_blocks, f"Block #{curr_idx} ({b_title[:20]})", block_result)
 
     # 8. Compute Summary & Decision Checklist
     tot = len(samples)

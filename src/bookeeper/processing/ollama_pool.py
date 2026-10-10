@@ -8,6 +8,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -642,8 +643,11 @@ class OllamaPool:
                         if attempt < max_attempts - 1:
                             sleep_time = min(3.0, backoff_base * (1.5 ** attempt))
                             err_tag = "connection refused / offline" if conn_err else "failed"
+                            mac_hint = ""
+                            if sys.platform == "darwin" and any(p in str(e).lower() for p in ["errno 65", "no route to host"]):
+                                mac_hint = " [macOS Tip: Check System Settings ➔ Privacy & Security ➔ Local Network to ensure your Terminal/iTerm2 app is allowed]"
                             logger.warning(
-                                f"Ollama server '{selected_node.url}' attempt {attempt + 1}/{max_attempts} {err_tag} ({e}). "
+                                f"Ollama server '{selected_node.url}' attempt {attempt + 1}/{max_attempts} {err_tag} ({e}){mac_hint}. "
                                 f"Retrying in {sleep_time:.1f}s..."
                             )
                             time.sleep(sleep_time)

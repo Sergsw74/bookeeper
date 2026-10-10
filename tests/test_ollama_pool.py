@@ -1072,6 +1072,32 @@ def test_aggregate_server_statistics_and_table_formatting():
     assert table.title == "Test Server Statistics"
 
 
+def test_ollama_pool_generate_convenience_method():
+    """Verify OllamaPool.generate invokes server via execute_with_failover."""
+    pool = OllamaPool.from_urls(["http://localhost:11434"])
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps({"message": {"content": "Generated text response"}}),
+        )
+        content, data = pool.generate("llama3.1", "Test prompt", temperature=0.0)
+        assert content == "Generated text response"
+        assert "message" in data
+
+
+def test_failover_embeddings_with_kwargs():
+    """Verify FailoverOllamaEmbeddings accepts request_timeout and kwargs without error."""
+    pool = OllamaPool.from_urls(["http://localhost:11434"])
+    embs = FailoverOllamaEmbeddings(
+        pool=pool,
+        model="nomic-embed-text",
+        request_timeout=60,
+        extra_param="custom",
+    )
+    assert embs.model == "nomic-embed-text"
+    assert embs.request_timeout == 60
+
+
 
 
 

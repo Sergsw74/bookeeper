@@ -938,6 +938,52 @@ class OllamaPool:
             for n in self.nodes:
                 n.reset_statistics()
 
+    def generate(
+        self,
+        model: str,
+        prompt: str,
+        temperature: float = 0.0,
+        timeout: int = 60,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Convenience method to generate text with failover across servers."""
+        def _invoke(url: str) -> Tuple[str, Dict[str, Any]]:
+            body = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "options": {"temperature": temperature},
+                "stream": False,
+            }
+            cmd = [
+                "curl",
+                "-s",
+                "--connect-timeout",
+                "5",
+                "--max-time",
+                str(timeout),
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                json.dumps(body),
+                f"{url.rstrip('/')}/api/chat",
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if res.returncode == 0 and res.stdout.strip():
+                data = json.loads(res.stdout)
+                if "error" in data:
+                    raise RuntimeError(f"Ollama server {url} error: {data['error']}")
+                content = data.get("message", {}).get("content", "")
+                return content, data
+            raise RuntimeError(f"Ollama curl failed with code {res.returncode}: {res.stderr}")
+
+        return self.execute_with_failover(
+            _invoke,
+            model_name=model,
+            input_chars=len(prompt),
+            task_type="generation",
+        )
+
 
 class FailoverOllamaEmbeddings(Embeddings):
     """
@@ -948,9 +994,12 @@ class FailoverOllamaEmbeddings(Embeddings):
         self,
         pool: OllamaPool,
         model: str = "nomic-embed-text",
+        request_timeout: int = 120,
+        **kwargs: Any,
     ):
         self.pool = pool
         self.model = model
+        self.request_timeout = request_timeout
         self._lock = threading.Lock()
         self.total_embedded_texts: int = 0
         self.total_embedded_chars: int = 0

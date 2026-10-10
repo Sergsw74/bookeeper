@@ -394,6 +394,7 @@ def audit_unmatched_idea(
     w_raw: str,
     pool: OllamaPool,
     model_name: str,
+    extractor: Optional[KnowledgeExtractor] = None,
 ) -> CrossCheckAuditItem:
     """
     Classify an idea not matched to Oracle into:
@@ -445,6 +446,7 @@ def evaluate_system_against_oracle(
     deduplicator: EntityDeduplicator,
     pool: OllamaPool,
     model_name: str,
+    extractor: Optional[KnowledgeExtractor] = None,
 ) -> SystemBlockMetrics:
     """
     Compare candidate ideas against Oracle ground truth to compute Recall,
@@ -483,7 +485,7 @@ def evaluate_system_against_oracle(
     audited_items: List[CrossCheckAuditItem] = []
 
     for u_cand in unmatched_candidates:
-        item = audit_unmatched_idea(u_cand, w_raw, pool, model_name)
+        item = audit_unmatched_idea(u_cand, w_raw, pool, model_name, extractor)
         audited_items.append(item)
 
     valid_detail_count = sum(1 for it in audited_items if it.verdict == "VALID_DETAIL")
@@ -641,8 +643,8 @@ def run_cross_check(
         i_oracle = extract_oracle_ideas_from_passage(w_raw, pool, model_name, extractor)
 
         # 7. Evaluate both systems against Oracle
-        eval_old = evaluate_system_against_oracle(e_old, i_oracle, w_raw, "old", deduplicator, pool, model_name)
-        eval_new = evaluate_system_against_oracle(e_new, i_oracle, w_raw, "new", deduplicator, pool, model_name)
+        eval_old = evaluate_system_against_oracle(e_old, i_oracle, w_raw, "old", deduplicator, pool, model_name, extractor)
+        eval_new = evaluate_system_against_oracle(e_new, i_oracle, w_raw, "new", deduplicator, pool, model_name, extractor)
 
         delta_rec = round(eval_new.oracle_recall - eval_old.oracle_recall, 4)
         delta_fail = round(eval_new.fail_ratio - eval_old.fail_ratio, 4)

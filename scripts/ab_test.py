@@ -91,6 +91,7 @@ class ABTestRunner:
         output_dir: Optional[str] = None,
         extra_args: Optional[str] = None,
         dry_run: bool = False,
+        print_chunks: int = 0,
     ):
         self.branch2 = branch2
         self.num_books = num_books
@@ -100,6 +101,7 @@ class ABTestRunner:
         self.timeout = timeout
         self.extra_args = extra_args or ""
         self.dry_run = dry_run
+        self.print_chunks = print_chunks
         self.is_cross_check_mode = bool(cross_check_src_dir)
 
         # Handle Cross-check / Reverify mode with pre-existing A/B test run directory
@@ -1004,6 +1006,7 @@ class ABTestRunner:
                 num_blocks=num_blocks,
                 branch_a_name=self.branch1,
                 branch_b_name=self.branch2,
+                print_chunks=self.print_chunks,
             )
             report_data = rep_obj.model_dump()
 
@@ -1606,6 +1609,12 @@ Examples:
         help="Number of contiguous chunk blocks for cross-check comparative audit (default: 20).",
     )
     parser.add_argument(
+        "--print-chunks",
+        type=int,
+        default=0,
+        help="Print text & ideas comparison for up to X blocks when disproportion < 1.0 (default: 0).",
+    )
+    parser.add_argument(
         "--books",
         "-b",
         type=int,
@@ -1758,6 +1767,7 @@ Examples:
                 output_dir=args.output_dir,
                 extra_args=args.extra_args,
                 dry_run=args.dry_run,
+                print_chunks=args.print_chunks,
             )
             runner.cross_check_flow(dir_a, dir_b, num_blocks=num_blocks)
         except KeyboardInterrupt:

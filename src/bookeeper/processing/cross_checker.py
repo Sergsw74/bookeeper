@@ -82,6 +82,12 @@ class CrossCheckBlockResult(BaseModel):
     delta_fail_ratio: float = 0.0  # fail_ratio_B - fail_ratio_A
     duration_seconds: float = 0.0
 
+    block_a_text: str = ""
+    block_b_text: str = ""
+    candidate_ideas_old: List[str] = Field(default_factory=list)
+    candidate_ideas_new: List[str] = Field(default_factory=list)
+    oracle_ideas: List[str] = Field(default_factory=list)
+
 
 class CrossCheckSummary(BaseModel):
     """Aggregated benchmark statistics and decision gating across all audited blocks."""
@@ -172,50 +178,82 @@ def find_overlapping_chunks(
     min_overlap: float = 0.80,
 ) -> List[Dict[str, Any]]:
     """
-    Locate all chunks in Graph B from the same book whose contiguous text overlaps with W_raw.
-    Requires at least `min_overlap` (default: 0.80) contiguous character coverage.
-    Returns sorted list of chunk attribute dicts.
+    Locate contiguous candidate chunks in Graph B matching W_raw.
+    Selects BLOCK_B with min(dedup(CHUNK_B[n..n+k]), dedup(CHUNK_B[n..n+k+1]))
+    that minimizes length deviation / disproportion gap relative to W_raw.
     """
-    w_raw_norm = " ".join(w_raw.lower().split())
-    if not w_raw_norm:
+    chunks = [
+        dict(attrs)
+        for _, attrs in graph_b.graph.nodes(data=True)
+        if attrs.get("type") == "Chunk" and attrs.get("book_id") == book_id
+    ]
+    if not chunks or not w_raw.strip():
         return []
 
-    candidates: List[Tuple[int, int, Dict[str, Any], float]] = []
+    chunks.sort(key=lambda x: (int(x.get("chapter_idx") or 0), int(x.get("chunk_idx") or 0)))
 
-    for nid, attrs in graph_b.graph.nodes(data=True):
-        if attrs.get("type") != "Chunk":
+    w_raw_norm = " ".join(w_raw.lower().split())
+    prefix = w_raw_norm[:300]
+
+    # Find starting chunk in B with strongest prefix match
+    best_start = -1
+    best_score = 0
+    for idx, c in enumerate(chunks):
+        t_norm = " ".join(c.get("text", "").lower().split())
+        if not t_norm:
             continue
-        if attrs.get("book_id") != book_id:
-            continue
+        sm = SequenceMatcher(None, prefix, t_norm[:500])
+        m = sm.find_longest_match(0, len(prefix), 0, min(500, len(t_norm)))
+        if m.size > best_score:
+            best_score = m.size
+            best_start = idx
 
-        t = attrs.get("text", "")
-        if not t:
-            continue
+    # Fallback to general sequence / substring matching if prefix match was weak
+    if best_start == -1 or best_score < 30:
+        for idx, c in enumerate(chunks):
+            t_norm = " ".join(c.get("text", "").lower().split())
+            if t_norm and (t_norm[:80] in w_raw_norm or w_raw_norm[:80] in t_norm):
+                best_start = idx
+                break
 
-        t_norm = " ".join(t.lower().split())
-        ch_idx = int(attrs.get("chapter_idx") or 0)
-        c_idx = int(attrs.get("chunk_idx") or 0)
+    if best_start == -1:
+        # Fallback to independent overlap filtering
+        fallback_candidates = []
+        for c in chunks:
+            t_norm = " ".join(c.get("text", "").lower().split())
+            if not t_norm:
+                continue
+            sm = SequenceMatcher(None, w_raw_norm, t_norm)
+            match = sm.find_longest_match(0, len(w_raw_norm), 0, len(t_norm))
+            ratio = match.size / max(1, len(t_norm))
+            if ratio >= min_overlap:
+                fallback_candidates.append(c)
+        return fallback_candidates
 
-        # 1. Exact substring check (chunk text completely within W_raw)
-        if t_norm in w_raw_norm:
-            candidates.append((ch_idx, c_idx, dict(attrs), 1.0))
-            continue
+    # Contiguous slice expansion: accumulate chunks until stitched length reaches or exceeds w_raw
+    max_k = min(40, len(chunks) - best_start)
+    candidates = []
+    for k in range(1, max_k + 1):
+        slice_k = chunks[best_start : best_start + k]
+        w_k = stitch_chunks_dedup_text([c.get("text", "") for c in slice_k])
+        candidates.append((slice_k, w_k, len(w_k)))
+        if len(w_k) >= len(w_raw):
+            break
 
-        # 2. W_raw completely within chunk text
-        if w_raw_norm in t_norm:
-            candidates.append((ch_idx, c_idx, dict(attrs), 1.0))
-            continue
+    if not candidates:
+        return []
+    if len(candidates) == 1:
+        return candidates[0][0]
 
-        # 3. Contiguous sequence overlap via SequenceMatcher
-        sm = SequenceMatcher(None, w_raw_norm, t_norm)
-        match = sm.find_longest_match(0, len(w_raw_norm), 0, len(t_norm))
-        ratio = match.size / max(1, len(t_norm))
-        if ratio >= min_overlap:
-            candidates.append((ch_idx, c_idx, dict(attrs), ratio))
+    # Boundary comparison: min(dedup(CHUNK_B[n..n+k]), dedup(CHUNK_B[n..n+k+1]))
+    cand_prev = candidates[-2]
+    cand_curr = candidates[-1]
 
-    # Sort candidates by chapter and chunk index
-    candidates.sort(key=lambda x: (x[0], x[1]))
-    return [c[2] for c in candidates]
+    diff_prev = abs(cand_prev[2] - len(w_raw))
+    diff_curr = abs(cand_curr[2] - len(w_raw))
+
+    chosen = cand_prev[0] if diff_prev <= diff_curr else cand_curr[0]
+    return chosen
 
 
 def compute_chunk_disproportion(
@@ -226,6 +264,7 @@ def compute_chunk_disproportion(
     """
     Compute chunk lengths and chunk disproportion metric:
       sum(block_A.len) / sum(block_A ∪ block_B.len)
+    Using exact SequenceMatcher matching blocks across deduplicated passages.
     Returns:
       (sum_len_a, sum_len_b, union_len, chunk_disproportion)
     """
@@ -240,25 +279,15 @@ def compute_chunk_disproportion(
         return sum_len_a, sum_len_b, sum_len_a, 1.0
 
     w_b = stitch_chunks_dedup_text(chunks_b_texts)
+    w_a_norm = " ".join(w_raw.lower().split())
+    w_b_norm = " ".join(w_b.lower().split())
 
-    # Union length represents unique character span covered across both block sets
-    # Max of stitched lengths plus non-overlapping boundary extensions
-    w_a_norm = " ".join(w_raw.split())
-    w_b_norm = " ".join(w_b.split())
-
-    if w_b_norm in w_a_norm:
-        union_len = len(w_raw)
-    elif w_a_norm in w_b_norm:
-        union_len = len(w_b)
-    else:
-        # Approximate union length by overlapping character set or lengths
-        # Avoid double-counting mutual intersection
-        overlap_est = max(0, min(len(w_raw), len(w_b)) * 0.75)
-        union_len = max(len(w_raw), len(w_b), int(len(w_raw) + len(w_b) - overlap_est))
-
+    sm = SequenceMatcher(None, w_a_norm, w_b_norm)
+    match_len = sum(b.size for b in sm.get_matching_blocks())
+    union_len = len(w_raw) + len(w_b) - match_len
     union_len = max(1, union_len)
-    disproportion = round(sum_len_a / union_len, 4)
 
+    disproportion = round(len(w_raw) / union_len, 4)
     return sum_len_a, sum_len_b, union_len, disproportion
 
 
@@ -337,28 +366,25 @@ def extract_oracle_ideas_from_passage(
     pool: OllamaPool,
     model_name: str,
     extractor: Optional[KnowledgeExtractor] = None,
-) -> List[str]:
+) -> List[Concept]:
     """
-    Extract core standalone ideas directly from the unbroken passage W_raw using the Oracle model.
+    Extract core standalone domain ideas and concepts directly from the unbroken
+    passage W_raw using the Oracle model matching the production concept ontology.
     """
-    if extractor is not None:
-        try:
-            concepts = extractor.extract_ideas(passage, model=model_name)
-            if concepts:
-                return [c.name for c in concepts]
-        except Exception as e:
-            logger.warning(f"KnowledgeExtractor.extract_ideas failed on passage: {e}")
-
     prompt = (
         "You are an expert knowledge extractor, domain ontologist, and conceptual analyst.\n"
-        "Read the following unbroken passage and extract all core standalone ideas, facts, "
-        "principles, conditions, and causal relations.\n"
-        "Ensure each extracted idea is self-contained with its necessary conditions intact.\n\n"
-        f"Passage:\n\"\"\"\n{passage[:6000]}\n\"\"\"\n\n"
+        "Your objective is to extract all canonical domain concepts, principles, strategic mechanisms, "
+        "and standalone ideas discussed in the provided unbroken passage.\n\n"
+        "EXTRACTION GUIDELINES:\n"
+        "1. Extract ALL key technical, organizational, or domain concepts present (typically 3 to 10 concepts).\n"
+        "2. 'name': Concise canonical title (2-4 words, capitalized noun phrase, e.g. 'eBook Conversion', 'Format Lock-In', 'EPUB Standard').\n"
+        "3. 'brief_description': 1-2 sentence self-contained definition of the concept in context.\n"
+        "4. 'category': Domain category (e.g. Technology, Architecture, Mechanism, Standard, Strategy).\n\n"
+        f"Passage:\n\"\"\"\n{passage[:7000]}\n\"\"\"\n\n"
         "Return strictly valid JSON with this format:\n"
         "{\n"
-        '  "ideas": [\n'
-        '    {"name": "Concise Idea Title", "reasoning": "Self-contained assertion or principle"}\n'
+        '  "concepts": [\n'
+        '    {"name": "Canonical Title", "brief_description": "1-2 sentence definition", "category": "General"}\n'
         "  ]\n"
         "}\n"
     )
@@ -377,16 +403,32 @@ def extract_oracle_ideas_from_passage(
             clean_text = "\n".join(lines).strip()
 
         data = json.loads(clean_text)
-        ideas = []
-        for item in data.get("ideas", []):
+        concepts: List[Concept] = []
+        raw_list = data.get("concepts", []) or data.get("ideas", [])
+        for item in raw_list:
             if isinstance(item, dict) and item.get("name"):
-                ideas.append(item["name"].strip())
-            elif isinstance(item, str):
-                ideas.append(item.strip())
-        return ideas
+                concepts.append(
+                    Concept(
+                        name=item["name"].strip(),
+                        brief_description=item.get("brief_description", item.get("reasoning", "")).strip(),
+                        category=item.get("category", "Concept"),
+                    )
+                )
+            elif isinstance(item, str) and item.strip():
+                concepts.append(Concept(name=item.strip(), brief_description="", category="Concept"))
+        if concepts:
+            return concepts
     except Exception as exc:
         logger.warning(f"Direct Oracle idea extraction failed: {exc}")
-        return []
+
+    # Fallback to extractor.extract_ideas if direct prompt failed
+    if extractor is not None:
+        try:
+            return extractor.extract_ideas(passage, model=model_name)
+        except Exception as e:
+            logger.warning(f"KnowledgeExtractor.extract_ideas failed on passage: {e}")
+
+    return []
 
 
 def audit_unmatched_idea(
@@ -439,8 +481,8 @@ def audit_unmatched_idea(
 
 
 def evaluate_system_against_oracle(
-    candidate_ideas: List[str],
-    oracle_ideas: List[str],
+    candidate_ideas: List[Any],
+    oracle_ideas: List[Any],
     w_raw: str,
     system_label: Literal["old", "new"],
     deduplicator: EntityDeduplicator,
@@ -475,8 +517,8 @@ def evaluate_system_against_oracle(
                 matched_candidate.add(c_idx)
                 break
 
-    retained = [oracle_ideas[i] for i in matched_oracle]
-    dropped = [oracle_ideas[i] for i in range(len(oracle_ideas)) if i not in matched_oracle]
+    retained = [getattr(oracle_ideas[i], "name", str(oracle_ideas[i])) for i in matched_oracle]
+    dropped = [getattr(oracle_ideas[i], "name", str(oracle_ideas[i])) for i in range(len(oracle_ideas)) if i not in matched_oracle]
 
     recall = round(len(retained) / max(1, len(oracle_ideas)), 4) if oracle_ideas else 1.0
 
@@ -485,7 +527,8 @@ def evaluate_system_against_oracle(
     audited_items: List[CrossCheckAuditItem] = []
 
     for u_cand in unmatched_candidates:
-        item = audit_unmatched_idea(u_cand, w_raw, pool, model_name, extractor)
+        u_name = getattr(u_cand, "name", str(u_cand))
+        item = audit_unmatched_idea(u_name, w_raw, pool, model_name, extractor)
         audited_items.append(item)
 
     valid_detail_count = sum(1 for it in audited_items if it.verdict == "VALID_DETAIL")
@@ -519,6 +562,66 @@ def evaluate_system_against_oracle(
     )
 
 
+def print_block_comparison(
+    sample_index: int,
+    book_title: str,
+    section_title: str,
+    old_chunk_ids: List[str],
+    new_chunk_ids: List[str],
+    w_raw: str,
+    w_b: str,
+    disproportion: float,
+    union_len: int,
+    ideas_old: List[Concept],
+    ideas_new: List[Concept],
+    oracle_ideas: List[Concept],
+    eval_old: SystemBlockMetrics,
+    eval_new: SystemBlockMetrics,
+) -> None:
+    """Print formatted comparative analysis of a single block when disproportion < 1.0."""
+    sep = "=" * 80
+    sub_sep = "-" * 80
+    print(f"\n{sep}")
+    print(f"🔍 Block #{sample_index} Alignment Comparison [Disproportion = {disproportion:.4f}]")
+    print(f"📖 Book: {book_title} | Section: {section_title}")
+    print(sub_sep)
+    print(f"📦 BLOCK A ({len(old_chunk_ids)} chunks: {', '.join(old_chunk_ids)})")
+    print(f"   Total Chars: {len(w_raw)} | Text Preview:")
+    excerpt_a = w_raw[:350].replace('\n', ' ')
+    print(f"   \"{excerpt_a}...\"")
+
+    print(f"\n📦 BLOCK B ({len(new_chunk_ids)} chunks: {', '.join(new_chunk_ids)})")
+    print(f"   Total Chars: {len(w_b)} | Text Preview:")
+    excerpt_b = w_b[:350].replace('\n', ' ')
+    print(f"   \"{excerpt_b}...\"")
+
+    print(f"\n📏 ALIGNMENT: Disproportion = {disproportion:.4f} | Union = {union_len} chars")
+
+    print(f"\n💡 IDEAS IN BLOCK A ({len(ideas_old)} unique):")
+    for idx, c in enumerate(ideas_old, 1):
+        desc = f" - {c.brief_description[:75]}..." if c.brief_description else ""
+        print(f"   {idx}. {c.name}{desc}")
+
+    print(f"\n💡 IDEAS IN BLOCK B ({len(ideas_new)} unique):")
+    for idx, c in enumerate(ideas_new, 1):
+        desc = f" - {c.brief_description[:75]}..." if c.brief_description else ""
+        print(f"   {idx}. {c.name}{desc}")
+
+    print(f"\n🔮 ORACLE IDEAS ON PASSAGE ({len(oracle_ideas)}):")
+    for idx, o in enumerate(oracle_ideas, 1):
+        o_name = getattr(o, "name", str(o))
+        desc = f" - {o.brief_description[:75]}..." if getattr(o, "brief_description", "") else ""
+        in_a = "RETAINED" if o_name in eval_old.retained_oracle_ideas else "DROPPED"
+        in_b = "RETAINED" if o_name in eval_new.retained_oracle_ideas else "DROPPED"
+        print(f"   {idx}. {o_name}{desc} -> [A: {in_a} | B: {in_b}]")
+
+    print(f"\n📊 BLOCK METRICS:")
+    print(f"   • Baseline Recall:  {eval_old.oracle_recall * 100:.1f}% (Fail Ratio: {eval_old.fail_ratio * 100:.1f}%)")
+    print(f"   • Candidate Recall: {eval_new.oracle_recall * 100:.1f}% (Fail Ratio: {eval_new.fail_ratio * 100:.1f}%)")
+    print(f"   • Recall Delta:     {(eval_new.oracle_recall - eval_old.oracle_recall) * 100:+.1f}% pts")
+    print(f"{sep}\n")
+
+
 # ==============================================================================
 # 4. Main Cross-Check Orchestrator
 # ==============================================================================
@@ -534,6 +637,7 @@ def run_cross_check(
     branch_a_name: str = "Baseline",
     branch_b_name: str = "Candidate",
     seed: Optional[int] = None,
+    print_chunks: int = 0,
     progress_callback: Optional[Callable[[int, int, str, Optional[CrossCheckBlockResult]], None]] = None,
 ) -> CrossCheckReport:
     """
@@ -592,6 +696,7 @@ def run_cross_check(
     t_global_start = time.time()
     max_attempts = num_blocks * 5
     attempts = 0
+    printed_chunks_count = 0
 
     while len(samples) < num_blocks and attempts < max_attempts:
         attempts += 1
@@ -616,13 +721,14 @@ def run_cross_check(
         if not w_raw or len(w_raw) < 100:
             continue
 
-        # 3. Locate matching new chunks in Graph B with min_overlap >= 0.80
+        # 3. Locate matching new chunks in Graph B with optimal slice boundary
         new_chunk_dicts = find_overlapping_chunks(store_b, target_bid, w_raw, min_overlap=0.80)
         if not new_chunk_dicts:
             continue
 
         new_chunk_ids = [d.get("chunk_id") or d.get("id", "") for d in new_chunk_dicts]
         new_chunk_texts = [d.get("text", "") for d in new_chunk_dicts]
+        w_b = stitch_chunks_dedup_text(new_chunk_texts)
 
         # 4. Compute chunk disproportion: sum(block_A.len) / sum(block_A ∪ block_B.len)
         sum_len_a, sum_len_b, union_len, disproportion = compute_chunk_disproportion(
@@ -636,15 +742,12 @@ def run_cross_check(
         dedup_ideas_old = tiered_deduplicate_ideas(raw_ideas_old, deduplicator)
         dedup_ideas_new = tiered_deduplicate_ideas(raw_ideas_new, deduplicator)
 
-        e_old = [c.name for c in dedup_ideas_old]
-        e_new = [c.name for c in dedup_ideas_new]
-
-        # 6. Oracle extraction on contiguous passage
+        # 6. Oracle extraction on contiguous passage (returns List[Concept])
         i_oracle = extract_oracle_ideas_from_passage(w_raw, pool, model_name, extractor)
 
-        # 7. Evaluate both systems against Oracle
-        eval_old = evaluate_system_against_oracle(e_old, i_oracle, w_raw, "old", deduplicator, pool, model_name, extractor)
-        eval_new = evaluate_system_against_oracle(e_new, i_oracle, w_raw, "new", deduplicator, pool, model_name, extractor)
+        # 7. Evaluate both systems against Oracle (passing Concept objects directly)
+        eval_old = evaluate_system_against_oracle(dedup_ideas_old, i_oracle, w_raw, "old", deduplicator, pool, model_name, extractor)
+        eval_new = evaluate_system_against_oracle(dedup_ideas_new, i_oracle, w_raw, "new", deduplicator, pool, model_name, extractor)
 
         delta_rec = round(eval_new.oracle_recall - eval_old.oracle_recall, 4)
         delta_fail = round(eval_new.fail_ratio - eval_old.fail_ratio, 4)
@@ -669,8 +772,33 @@ def run_cross_check(
             delta_recall=delta_rec,
             delta_fail_ratio=delta_fail,
             duration_seconds=dur,
+            block_a_text=w_raw[:2000],
+            block_b_text=w_b[:2000],
+            candidate_ideas_old=[c.name for c in dedup_ideas_old],
+            candidate_ideas_new=[c.name for c in dedup_ideas_new],
+            oracle_ideas=[getattr(o, "name", str(o)) for o in i_oracle],
         )
         samples.append(block_result)
+
+        # Print detailed block comparison if requested when disproportion < 1.0
+        if print_chunks > 0 and disproportion < 1.0 and printed_chunks_count < print_chunks:
+            printed_chunks_count += 1
+            print_block_comparison(
+                sample_index=curr_idx,
+                book_title=b_title,
+                section_title=sec_title,
+                old_chunk_ids=old_chunk_ids,
+                new_chunk_ids=new_chunk_ids,
+                w_raw=w_raw,
+                w_b=w_b,
+                disproportion=disproportion,
+                union_len=union_len,
+                ideas_old=dedup_ideas_old,
+                ideas_new=dedup_ideas_new,
+                oracle_ideas=i_oracle,
+                eval_old=eval_old,
+                eval_new=eval_new,
+            )
 
         if progress_callback:
             progress_callback(curr_idx, num_blocks, f"Block #{curr_idx} ({b_title[:20]})", block_result)

@@ -2969,6 +2969,11 @@ def verify_command(
     seed: Optional[int] = typer.Option(
         None, "--seed", help="Random seed for reproducible idea/book sampling."
     ),
+    print_chunks: Optional[int] = typer.Option(
+        None,
+        "--print-chunks",
+        help="Print text & ideas comparison for up to X blocks when disproportion < 1.0 (cross-check mode).",
+    ),
     max_tasks: Optional[int] = typer.Option(
         None, "--max-tasks", "-t", help="Max concurrent verification worker tasks across Ollama servers."
     ),
@@ -3000,6 +3005,7 @@ def verify_command(
     max_examples = _resolve_opt(max_examples)
     output_report = _resolve_opt(output_report)
     seed = _resolve_opt(seed)
+    print_chunks = _resolve_opt(print_chunks)
     max_tasks = _resolve_opt(max_tasks)
 
     cfg = _get_effective_settings(
@@ -3568,7 +3574,8 @@ def verify_command(
                 f"[bold cyan]Contiguous Blocks to Audit:[/bold cyan] {effective_blocks}\n"
                 f"[bold cyan]Oracle Model:[/bold cyan] [bold magenta]{effective_model}[/bold magenta]\n"
                 f"[bold cyan]Disproportion Metric:[/bold cyan] sum(block_A.len) / sum(block_A ∪ block_B.len)\n"
-                f"[bold cyan]Concurrency:[/bold cyan] {pool_concurrency} tasks across {num_servers} Ollama server(s)",
+                + (f"[bold cyan]Print Blocks (< 1.0):[/bold cyan] Up to {print_chunks}\n" if print_chunks else "")
+                + f"[bold cyan]Concurrency:[/bold cyan] {pool_concurrency} tasks across {num_servers} Ollama server(s)",
                 title="Cross-Check Verification Plan",
             )
         )
@@ -3632,6 +3639,7 @@ def verify_command(
                 branch_a_name=branch_a_label,
                 branch_b_name=branch_b_label,
                 seed=seed,
+                print_chunks=int(print_chunks or 0),
                 progress_callback=_on_cc_progress,
             )
 

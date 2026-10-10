@@ -22,6 +22,7 @@ from bookeeper.processing.cross_checker import (
     compute_chunk_disproportion,
     evaluate_system_against_oracle,
     find_overlapping_chunks,
+    print_block_comparison,
     run_cross_check,
     stitch_chunks_dedup_text,
     tiered_deduplicate_ideas,
@@ -428,4 +429,155 @@ def test_cross_check_cli_with_ab_test_run_dir(tmp_path, sample_graphs):
         call_kwargs = mock_run.call_args.kwargs
         assert call_kwargs["branch_a_name"] == "master"
         assert call_kwargs["branch_b_name"] == "candidate"
+
+
+def test_print_block_comparison(capsys):
+    """Test print_block_comparison outputs structured block data without errors."""
+    c_a = Concept(name="Concept Alpha", category="C", summary="A", brief_description="Desc A")
+    c_b = Concept(name="Concept Beta", category="C", summary="B", brief_description="Desc B")
+    oracle = [Concept(name="Concept Alpha", category="C", summary="A", brief_description="Oracle A")]
+
+    eval_a = SystemBlockMetrics(
+        system="old",
+        oracle_recall=1.0,
+        grounded_precision=1.0,
+        truncation_rate=0.0,
+        fail_ratio=0.0,
+        retained_oracle_ideas=["Concept Alpha"],
+        dropped_oracle_ideas=[],
+    )
+    eval_b = SystemBlockMetrics(
+        system="new",
+        oracle_recall=0.0,
+        grounded_precision=0.0,
+        truncation_rate=0.0,
+        fail_ratio=1.0,
+        retained_oracle_ideas=[],
+        dropped_oracle_ideas=["Concept Alpha"],
+    )
+
+    print_block_comparison(
+        sample_index=1,
+        book_title="Test Book",
+        section_title="Chapter 1",
+        old_chunk_ids=["chunk_a1", "chunk_a2"],
+        new_chunk_ids=["chunk_b1"],
+        w_raw="This is reference text for Block A.",
+        w_b="This is matching text for Block B.",
+        disproportion=0.95,
+        union_len=150,
+        ideas_old=[c_a],
+        ideas_new=[c_b],
+        oracle_ideas=oracle,
+        eval_old=eval_a,
+        eval_new=eval_b,
+    )
+
+    captured = capsys.readouterr()
+    assert "Block #1 Alignment Comparison" in captured.out
+    assert "Disproportion = 0.9500" in captured.out
+    assert "BLOCK A" in captured.out
+    assert "BLOCK B" in captured.out
+    assert "Concept Alpha" in captured.out
+    assert "Concept Beta" in captured.out
+    assert "RETAINED" in captured.out
+
+
+def test_run_cross_check_with_print_chunks(sample_graphs, mock_pool, capsys):
+    """Verify run_cross_check with print_chunks prints comparison when disproportion < 1.0."""
+    store_a, store_b = sample_graphs
+    # Add extra short sentence to store_b chunk so disproportion is < 1.0
+    store_b.graph.nodes["chunk:chunk_b2"]["text"] += " Owls watched."
+
+    def fake_generate(model, prompt, **kwargs):
+        if "extract all core standalone ideas" in prompt.lower() or "knowledge extractor" in prompt.lower():
+            return (
+                json.dumps({
+                    "ideas": [
+                        {"name": "Fox Agility", "brief_description": "Fox jumping over dog"},
+                    ]
+                }),
+                {},
+            )
+        else:
+            return (
+                json.dumps({
+                    "verdict": "VALID_DETAIL",
+                    "rationale": "Accurate detail",
+                }),
+                {},
+            )
+
+    mock_pool.generate = MagicMock(side_effect=fake_generate)
+
+    report = run_cross_check(
+        store_a=store_a,
+        store_b=store_b,
+        num_blocks=1,
+        branch_a_name="Baseline",
+        branch_b_name="Candidate",
+        model_name="test-model",
+        pool=mock_pool,
+        print_chunks=1,
+    )
+
+    assert isinstance(report, CrossCheckReport)
+    captured = capsys.readouterr()
+    assert "Alignment Comparison" in captured.out
+
+
+def test_cross_check_cli_print_chunks_option(tmp_path, sample_graphs):
+    """Test CLI passing --print-chunks passes the argument to run_cross_check."""
+    store_a, store_b = sample_graphs
+    path_a = tmp_path / "graph_a.json"
+    path_b = tmp_path / "graph_b.json"
+
+    store_a.save(path_a)
+    store_b.save(path_b)
+
+    runner = CliRunner()
+
+    with patch("bookeeper.cli.run_cross_check") as mock_run:
+        summary_obj = CrossCheckSummary(
+            total_samples=1,
+            mean_old_recall=0.85,
+            mean_new_recall=0.90,
+            mean_delta_recall=0.05,
+            mean_old_precision=0.95,
+            mean_new_precision=0.97,
+            mean_old_truncation_rate=0.0,
+            mean_new_truncation_rate=0.01,
+            mean_chunk_disproportion=0.92,
+            decision_pass=True,
+            pass_reason="All gates passed.",
+        )
+        mock_rep = CrossCheckReport(
+            model_name="test-model",
+            baseline_branch="graph_a.json",
+            candidate_branch="graph_b.json",
+            summary=summary_obj,
+            samples=[],
+        )
+        mock_run.return_value = mock_rep
+
+        result = runner.invoke(
+            app,
+            [
+                "verify",
+                "--mode",
+                "cross-check",
+                "--graph-file",
+                str(path_a),
+                "--compare-graph",
+                str(path_b),
+                "--blocks",
+                "1",
+                "--print-chunks",
+                "3",
+            ],
+        )
+
+        assert result.exit_code == 0
+        call_kwargs = mock_run.call_args.kwargs
+        assert call_kwargs["print_chunks"] == 3
 

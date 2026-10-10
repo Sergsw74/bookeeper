@@ -187,6 +187,10 @@ def build_generator_prompt(w_raw: str, num_questions: int = 5) -> str:
         "   - STRUCTURAL RULES & THEMATIC MECHANISMS: Explicit operational rules, lore constraints, or tactical configurations.\n"
         "2. At least 3 questions MUST be CROSS-BOUNDARY:\n"
         "   - They must require synthesizing facts that span across multiple sentences (e.g., premise or condition in Sentence A, outcome or qualification in Sentence B).\n\n"
+        "### STRICT REQUIREMENT FOR QUESTIONS:\n"
+        "- Every question MUST explicitly name at least ONE specific entity, tool, action, or setting from the text "
+        '(e.g., "What happened to the e-book reader?", "Why did Brogalaw stay to the clifftops?").\n'
+        '- NEVER ask abstract questions like "What initial premise was established?", "What condition was set?", or "What outcome followed the initial condition?".\n\n'
         "### CRITICAL PROBE REQUIREMENTS:\n"
         "- DO NOT quote raw sentences in the question (e.g., NEVER ask \"What relationship connects 'Quote A' and 'Quote B'?\").\n"
         '- Frame all questions around entities, actions, or decisions in natural language (e.g., "Why did X decide to do Y?" or "What consequence occurred after Z?").\n'
@@ -204,7 +208,7 @@ def build_generator_prompt(w_raw: str, num_questions: int = 5) -> str:
         "[\n"
         "  {\n"
         '    "question_id": 1,\n'
-        '    "question": "<specific, non-trivial relational or causal question in natural language>",\n'
+        '    "question": "<specific, non-trivial relational or causal question explicitly naming a specific entity, action, or setting>",\n'
         '    "gold_answer": "<concise 1-2 sentence ground truth containing the necessary facts>",\n'
         '    "is_cross_sentence": true,\n'
         '    "source_sentence_references": [\n'
@@ -279,30 +283,36 @@ def generate_qa_probes(
     except Exception as exc:
         logger.warning(f"QA Probe generation failed: {exc}")
 
-    # Fallback minimal probe based on passage content without quoting raw sentences or chronological order
+    # Fallback minimal probe with entity-anchored questions (avoiding abstract labels)
     sentences = [s.strip() for s in re.split(r"[.!?]", w_raw) if len(s.strip()) > 15]
     if len(sentences) >= 2:
+        words_0 = [w for w in re.findall(r"[A-Z][a-z]+|\b\w{4,}\b", sentences[0]) if w.lower() not in ("what", "that", "this", "there", "they", "then", "with", "from")]
+        words_1 = [w for w in re.findall(r"[A-Z][a-z]+|\b\w{4,}\b", sentences[1]) if w.lower() not in ("what", "that", "this", "there", "they", "then", "with", "from")]
+        anchor_0 = words_0[0] if words_0 else "the subject"
+        anchor_1 = words_1[0] if words_1 else "the action"
         return [
             QAProbeItem(
                 question_id=1,
-                question="What initial premise or condition is established in the passage?",
+                question=f"What fact or event involves {anchor_0} in the passage?",
                 gold_answer=sentences[0],
                 is_cross_sentence=False,
                 source_sentence_references=[sentences[0]],
             ),
             QAProbeItem(
                 question_id=2,
-                question="What outcome or consequence followed the initial condition?",
+                question=f"How does the situation regarding {anchor_0} lead to {anchor_1}?",
                 gold_answer=sentences[1],
                 is_cross_sentence=True,
                 source_sentence_references=[sentences[0], sentences[1]],
             ),
         ]
 
+    words = [w for w in re.findall(r"[A-Z][a-z]+|\b\w{4,}\b", w_raw) if w.lower() not in ("what", "that", "this", "there", "they", "then")]
+    anchor = words[0] if words else "the central entity"
     return [
         QAProbeItem(
             question_id=1,
-            question="What core fact is stated in the passage?",
+            question=f"What fact is stated regarding {anchor}?",
             gold_answer=w_raw[:150],
             is_cross_sentence=False,
             source_sentence_references=[w_raw[:150]],
@@ -316,13 +326,13 @@ def generate_qa_probes(
 
 
 def build_answering_prompt(claims_context: str, question: str) -> str:
-    """Construct prompt sent to the answering model constrained strictly to extracted claims."""
+    """Construct prompt sent to the answering model allowing reasonable semantic synthesis."""
     return (
-        "Answer the question below using ONLY the provided verified claims and supporting context.\n"
-        "Do not assume or invent facts outside these claims.\n"
-        'If the claims do not contain sufficient evidence to answer the question, output EXACTLY: "INSUFFICIENT_INFORMATION".\n\n'
+        "Answer the question based on the verified claims and supporting context below.\n"
+        "Synthesize the provided concepts, explanations, and direct quotes to answer the question concisely and accurately.\n"
+        'Only output "INSUFFICIENT_INFORMATION" if the claims completely lack any relevant entities, actions, or context related to the question.\n\n'
         f"Extracted Knowledge Base:\n\"\"\"\n{claims_context}\n\"\"\"\n\n"
-        f"Question: {question}\n\n"
+        f"Question: {question}\n"
         "Concise Answer:"
     )
 
@@ -360,8 +370,8 @@ def answer_probe(
 
 def build_judge_prompt(gold_answer: str, candidate_answer: str, w_raw: str) -> str:
     """
-    Construct the judge arbitration prompt evaluating core semantic entailment
-    instead of verbatim sub-fact matching.
+    Construct the judge arbitration prompt evaluating substantive semantic answers
+    and grading consequences without requiring redundant premise repetition.
     """
     return (
         "You are an objective judge evaluating whether a candidate answer accurately conveys ground truth facts.\n\n"
@@ -369,11 +379,10 @@ def build_judge_prompt(gold_answer: str, candidate_answer: str, w_raw: str) -> s
         f'Candidate Answer: "{candidate_answer}"\n\n'
         f"Passage Context (for reference):\n\"\"\"\n{w_raw[:4000]}\n\"\"\"\n\n"
         "Judge Verdict Guidelines:\n"
-        "- If Candidate Answer is \"INSUFFICIENT_INFORMATION\" or indicates lack of evidence, mark as \"FAIL\".\n"
-        "- If Candidate Answer directly contradicts the ground truth or hallucinates untrue facts, mark as \"FAIL\".\n"
-        "- If Candidate Answer conveys the primary causal mechanism or core entity fact, mark as \"PASS\" "
-        "(even if secondary details from other sentences are missing).\n"
-        "- Do not require verbatim token matching. Evaluate whether the semantic proposition is asserted.\n\n"
+        "- If Candidate Answer conveys the substantive answer to the question asked, mark as \"PASS\".\n"
+        "- DO NOT penalize the Candidate Answer for omitting the premise or condition if the question already stated that condition "
+        "(e.g., if asked \"What happens if X?\", an answer stating \"Y happens\" is a PASS; repeating \"If X, then Y\" is not required).\n"
+        "- Mark as \"FAIL\" ONLY if the answer is \"INSUFFICIENT_INFORMATION\", directly contradicts the ground truth, or asserts a hallucinated fact.\n\n"
         "Return strictly valid JSON:\n"
         "{\n"
         '  "verdict": "PASS" | "FAIL",\n'

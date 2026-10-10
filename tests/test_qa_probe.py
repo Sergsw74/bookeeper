@@ -235,17 +235,27 @@ def test_evaluate_block_qa_probes():
 
 def test_prompt_builders_and_guidelines():
     """Verify prompt templates enforce critical probe requirements and relaxed judge guidelines."""
-    # 1. Generator prompt requirements
+    # 1. Generator prompt requirements (Fix 3)
     gen_p = build_generator_prompt("Some passage about King Arthur.", 5)
+    assert "STRICT REQUIREMENT FOR QUESTIONS:" in gen_p
+    assert "Every question MUST explicitly name at least ONE specific entity, tool, action, or setting" in gen_p
+    assert 'NEVER ask abstract questions like "What initial premise was established?"' in gen_p
     assert "DO NOT quote raw sentences in the question" in gen_p
     assert "Frame all questions around entities, actions, or decisions in natural language" in gen_p
     assert 'no "precedes" or chronological sentence order questions' in gen_p
     assert "source_sentence_references" in gen_p
 
-    # 2. Judge prompt guidelines
+    # 2. Answering prompt requirements (Fix 1)
+    ans_p = build_answering_prompt("Claim context", "What happened to Excalibur?")
+    assert "Answer the question based on the verified claims and supporting context below." in ans_p
+    assert "Synthesize the provided concepts, explanations, and direct quotes to answer the question concisely and accurately." in ans_p
+    assert 'Only output "INSUFFICIENT_INFORMATION" if the claims completely lack any relevant entities' in ans_p
+
+    # 3. Judge prompt guidelines (Fix 2)
     judge_p = build_judge_prompt("Arthur became king.", "Arthur assumed the crown.", "Context")
-    assert 'If Candidate Answer conveys the primary causal mechanism or core entity fact, mark as "PASS"' in judge_p
-    assert "Do not require verbatim token matching. Evaluate whether the semantic proposition is asserted." in judge_p
+    assert 'If Candidate Answer conveys the substantive answer to the question asked, mark as "PASS"' in judge_p
+    assert "DO NOT penalize the Candidate Answer for omitting the premise or condition if the question already stated that condition" in judge_p
+    assert 'Mark as "FAIL" ONLY if the answer is "INSUFFICIENT_INFORMATION"' in judge_p
 
 
 def test_judge_no_token_overlap_fallback():

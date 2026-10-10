@@ -4,7 +4,9 @@ Multi-server smart proxy and failover client for Ollama with priority routing an
 
 import json
 import logging
+import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -21,6 +23,51 @@ from bookeeper.config import DEFAULT_CAPABILITIES, OllamaServerConfig
 logger = logging.getLogger(__name__)
 
 
+def send_wake_on_lan(
+    mac_address: str,
+    broadcast_ip: str = "255.255.255.255",
+    port: int = 9,
+    secret: Optional[str] = None,
+) -> bool:
+    """
+    Send Wake-on-LAN magic packet over UDP broadcast to power on a remote Ollama server.
+    Magic packet consists of 6 bytes of 0xFF followed by 16 repetitions of the target MAC address (102 bytes total),
+    plus an optional SecureOn password/secret appended at the end (4 or 6 bytes).
+    """
+    clean_mac = re.sub(r"[^0-9a-fA-F]", "", mac_address or "")
+    if len(clean_mac) != 12:
+        raise ValueError(f"Invalid MAC address for Wake-on-LAN: '{mac_address}'")
+
+    mac_bytes = bytes.fromhex(clean_mac)
+    packet = bytearray(b"\xff" * 6 + mac_bytes * 16)
+
+    if secret:
+        # Check IPv4 dotted-quad format (4 bytes)
+        if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", secret.strip()):
+            packet.extend(socket.inet_aton(secret.strip()))
+        else:
+            clean_secret = re.sub(r"[^0-9a-fA-F]", "", secret)
+            if len(clean_secret) == 12:  # 6-byte hex password (standard SecureOn)
+                packet.extend(bytes.fromhex(clean_secret))
+            elif len(clean_secret) == 8:  # 4-byte hex password
+                packet.extend(bytes.fromhex(clean_secret))
+            else:
+                raw = secret.encode("utf-8")
+                if len(raw) <= 6:
+                    packet.extend(raw.ljust(6, b"\x00"))
+                else:
+                    raise ValueError(
+                        f"Invalid WOL secret '{secret}': expected 6 hex bytes (12 hex chars), "
+                        f"4 hex bytes (8 hex chars), or up to 6 ASCII characters."
+                    )
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.sendto(bytes(packet), (broadcast_ip, port))
+    logger.info(f"Broadcasted Wake-on-LAN magic packet for MAC {mac_address} to {broadcast_ip}:{port}")
+    return True
+
+
 @dataclass
 class OllamaServerNode:
     """Tracks dynamic health, priority, capabilities, active tasks, and cooldown for an individual Ollama endpoint."""
@@ -29,6 +76,10 @@ class OllamaServerNode:
     priority: int = 1
     name: Optional[str] = None
     capabilities: List[str] = field(default_factory=lambda: list(DEFAULT_CAPABILITIES))
+    mac: Optional[str] = None
+    wol_broadcast: str = "255.255.255.255"
+    wol_port: int = 9
+    wol_secret: Optional[str] = None
     failed_at: Optional[float] = None
     failure_count: int = 0
     last_error: Optional[str] = None
@@ -43,6 +94,17 @@ class OllamaServerNode:
     total_duration: float = 0.0
     success_duration: float = 0.0
     stats_by_type: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    def wake(self) -> bool:
+        """Trigger Wake-on-LAN if node has a MAC address configured."""
+        if not self.mac:
+            return False
+        return send_wake_on_lan(
+            self.mac,
+            broadcast_ip=self.wol_broadcast,
+            port=self.wol_port,
+            secret=self.wol_secret,
+        )
 
     @property
     def label(self) -> str:
@@ -235,6 +297,10 @@ class OllamaPool:
                 priority=s.priority,
                 name=s.name or f"node-{idx + 1}",
                 capabilities=list(getattr(s, "capability", None) or getattr(s, "capabilities", None) or DEFAULT_CAPABILITIES),
+                mac=getattr(s, "mac", None),
+                wol_broadcast=getattr(s, "wol_broadcast", "255.255.255.255"),
+                wol_port=getattr(s, "wol_port", 9),
+                wol_secret=getattr(s, "wol_secret", None),
             )
             for idx, s in enumerate(servers)
         ]

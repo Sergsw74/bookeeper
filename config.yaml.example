@@ -41,6 +41,8 @@ ollama_servers:
   - url: "http://192.168.50.118:11434"
     priority: 1
     name: "mypc-gpu-node"
+    mac: "D8:43:AE:FA:44:95"        # Optional MAC address for Wake-on-LAN (WOL)
+    wol_secret: null               # Optional WOL password/secret (e.g. 6-byte hex '01:02:03:04:05:06' or 4-byte/ASCII)
     capability: ["llm", "embedding", "verification"]
   - url: "http://192.168.50.15:11434"
     priority: 2
@@ -56,6 +58,15 @@ ollama_servers:
     capability: ["embedding"]
 
 failover_cooldown_seconds: 600
+
+# Wake-on-LAN (WOL) Configuration
+# If an Ollama server is unreachable during warmup and has a configured MAC address,
+# send a WOL magic packet and wait up to wol_wait_seconds (probing every wol_probe_interval) for it to boot.
+wol_enabled: true
+wol_wait_seconds: 120         # Up to 2 minutes waiting for machine to boot
+wol_probe_interval: 5         # Poll every 5 seconds while waiting
+wol_broadcast: "255.255.255.255"
+wol_port: 9
 
 # Parallel Task Pool across available Ollama servers
 # Concurrency auto-scales across all alive servers (sequential 1 task per server):

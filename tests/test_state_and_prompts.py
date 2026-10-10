@@ -53,7 +53,17 @@ def test_progress_tracker_lifecycle():
         assert tracker2.get_failed_ids("clean_metadata") == {2}
         assert tracker2.get_skipped_ids("clean_metadata") == {3}
 
-        # Clear operation
+        # Clear operation with preserve_skipped=True
+        tracker2.mark_completed("clean_metadata", 1, title="Test Book 1")
+        tracker2.mark_failed("clean_metadata", 2, title="Test Book 2", error="Network timeout")
+        tracker2.mark_skipped("clean_metadata", 3, title="Comic Book 3", reason="graphical: CBR")
+        tracker2.clear("clean_metadata", preserve_skipped=True)
+        assert not tracker2.is_completed("clean_metadata", 1)
+        assert tracker2.get_completed_ids("clean_metadata") == {3}  # 3 is skipped so still in completed_ids for bypass
+        assert tracker2.get_failed_ids("clean_metadata") == set()
+        assert tracker2.get_skipped_ids("clean_metadata") == {3}
+
+        # Clear operation without preserve_skipped
         tracker2.clear("clean_metadata")
         assert not tracker2.is_completed("clean_metadata", 1)
         assert tracker2.get_completed_ids("clean_metadata") == set()
@@ -698,8 +708,8 @@ def test_build_graph_from_scratch(tmp_path):
         assert "Ingesting Book #2" in res.stdout and "Book Two" in res.stdout
 
         # Book 3 was preserved as skipped and bypassed without rescan
-        assert "preserving 1 memorized skipped book(s)" in res.stdout
-        assert "Bypassed 1 memorized skipped book(s)" in res.stdout
+        assert "preserving 1 skipped books in skip list" in res.stdout
+        assert "Preserved Skip List: Bypassed 1 previously skipped book(s)" in res.stdout
         assert "⚡ Memorized skipped book #3" not in res.stdout
 
         # Verify final tracker preserved skipped book 3
@@ -711,6 +721,106 @@ def test_build_graph_from_scratch(tmp_path):
         final_store.load(out_dir / "knowledge_graph.json")
         bids = {d["book_id"] for _, d in final_store.graph.nodes(data=True) if d.get("type") == "Book"}
         assert bids == {1, 2}
+
+
+def test_build_graph_from_scratch_preserves_skipped_list(tmp_path):
+    """Verify that --from-scratch preserves memorized skipped books and bypasses them upfront."""
+    import sqlite3
+    from typer.testing import CliRunner
+    from bookeeper.cli import app
+    from bookeeper.graph.store import ConceptGraphStore
+    from bookeeper.processing.extractor import Concept, SectionExtraction
+    from bookeeper.processing.state import ProgressTracker
+
+    lib_dir = tmp_path / "calibre_lib"
+    lib_dir.mkdir(parents=True)
+    db_file = lib_dir / "metadata.db"
+    conn = sqlite3.connect(str(db_file))
+    conn.executescript("""
+        CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, sort TEXT, author_sort TEXT, pubdate TIMESTAMP, path TEXT);
+        CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE books_authors_link (id INTEGER PRIMARY KEY, book INTEGER, author INTEGER);
+        CREATE TABLE data (id INTEGER PRIMARY KEY, book INTEGER, format TEXT, name TEXT);
+        CREATE TABLE comments (id INTEGER PRIMARY KEY, book INTEGER UNIQUE, text TEXT);
+    """)
+    conn.execute("INSERT INTO books (id, title, path) VALUES (1, 'Book One', 'Author/B1')")
+    conn.execute("INSERT INTO books (id, title, path) VALUES (2, 'Skipped Comic Book', 'Author/B2')")
+    conn.execute("INSERT INTO books (id, title, path) VALUES (3, 'Book Three', 'Author/B3')")
+    conn.execute("INSERT INTO authors (id, name) VALUES (1, 'Author')")
+    conn.execute("INSERT INTO books_authors_link (book, author) VALUES (1, 1), (2, 1), (3, 1)")
+    conn.execute("INSERT INTO data (book, format, name) VALUES (1, 'EPUB', 'Book One'), (2, 'CBR', 'Skipped Comic Book'), (3, 'EPUB', 'Book Three')")
+    conn.commit()
+    conn.close()
+
+    (lib_dir / "Author" / "B1").mkdir(parents=True)
+    (lib_dir / "Author" / "B1" / "Book One.epub").write_text("EPUB 1", encoding="utf-8")
+    (lib_dir / "Author" / "B3").mkdir(parents=True)
+    (lib_dir / "Author" / "B3" / "Book Three.epub").write_text("EPUB 3", encoding="utf-8")
+
+    out_dir = tmp_path / "output"
+    out_dir.mkdir(parents=True)
+    state_file = out_dir / "state.json"
+
+    # Pre-seed state: Book 1 was completed, Book 2 was skipped
+    tracker = ProgressTracker(state_file)
+    tracker.mark_completed("build_graph", 1, title="Book One")
+    tracker.mark_skipped("build_graph", 2, title="Skipped Comic Book", reason="graphical: CBR")
+    assert tracker.get_skipped_ids("build_graph") == {2}
+    assert 1 in tracker.get_completed_ids("build_graph")
+
+    chunks_dir = tmp_path / "chunks"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(f"output_dir: {out_dir}\n", encoding="utf-8")
+
+    runner = CliRunner()
+    mock_concept = Concept(name="Concept S", category="Idea", summary="Test idea", weight=5, related_concepts=[])
+
+    with patch("bookeeper.processing.extractor.ChatOllama") as mock_chat_cls, \
+         patch("bookeeper.calibre.parser.BookParser.parse") as mock_parse, \
+         patch("bookeeper.calibre.parser.BookParser.is_graphical_format", return_value=False):
+
+        from bookeeper.calibre.parser import Section
+        mock_parse.return_value = [Section(title="Ch 1", chapter_idx=1, text="Sample text " * 10)]
+        mock_instance = MagicMock()
+        mock_instance.with_structured_output.return_value.invoke.return_value = SectionExtraction(concepts=[mock_concept])
+        mock_chat_cls.return_value = mock_instance
+
+        res = runner.invoke(
+            app,
+            [
+                "build-graph",
+                "--from-scratch",
+                "--state-file", str(state_file),
+                "--calibre-path", str(lib_dir),
+                "--config", str(cfg_file),
+                "--skip-warmup",
+                "--chunks-dir", str(chunks_dir),
+            ],
+            catch_exceptions=False,
+        )
+
+        assert res.exit_code == 0
+        assert "Restarting build entirely from scratch" in res.stdout
+        # Verify skip list was preserved in state file and message displayed
+        assert "preserving 1 skipped books in skip list" in res.stdout
+        assert "Preserved Skip List: Bypassed 1 previously skipped book(s)" in res.stdout
+        # Book 1 and Book 3 ingested, Book 2 bypassed
+        assert "Ingesting Book #1" in res.stdout
+        assert "Ingesting Book #3" in res.stdout
+        assert "Ingesting Book #2" not in res.stdout
+
+        # Verify state file still has Book 2 in skipped list
+        reloaded_tracker = ProgressTracker(state_file)
+        assert reloaded_tracker.get_skipped_ids("build_graph") == {2}
+        assert 1 in reloaded_tracker.get_completed_ids("build_graph")
+        assert 3 in reloaded_tracker.get_completed_ids("build_graph")
+
+        # Verify graph contains only Book 1 and 3
+        final_store = ConceptGraphStore()
+        final_store.load(out_dir / "knowledge_graph.json")
+        bids = {d["book_id"] for _, d in final_store.graph.nodes(data=True) if d.get("type") == "Book"}
+        assert bids == {1, 3}
 
 
 def test_build_graph_manual_deletion_recovery(tmp_path):

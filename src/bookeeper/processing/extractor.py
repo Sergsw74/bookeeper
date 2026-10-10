@@ -7,8 +7,9 @@ import logging
 import re
 import shutil
 import subprocess
+import time
 import urllib.request
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
@@ -224,6 +225,9 @@ class KnowledgeExtractor:
         request_timeout: int = 30,
         max_retries: int = 1,
         fallback_model: Optional[str] = None,
+        wol_enabled: bool = True,
+        wol_wait_seconds: int = 120,
+        wol_probe_interval: float = 5.0,
     ):
         self.model_name = model
         self.fallback_model = fallback_model
@@ -231,6 +235,9 @@ class KnowledgeExtractor:
         self.cooldown_seconds = cooldown_seconds
         self.request_timeout = request_timeout
         self.max_retries = max_retries
+        self.wol_enabled = wol_enabled
+        self.wol_wait_seconds = wol_wait_seconds
+        self.wol_probe_interval = wol_probe_interval
 
         if pool is not None:
             self.pool = pool
@@ -271,6 +278,9 @@ class KnowledgeExtractor:
             cooldown_seconds=settings.failover_cooldown_seconds,
             request_timeout=getattr(settings, "request_timeout", 30),
             max_retries=getattr(settings, "max_retries", 1),
+            wol_enabled=getattr(settings, "wol_enabled", True),
+            wol_wait_seconds=getattr(settings, "wol_wait_seconds", 120),
+            wol_probe_interval=getattr(settings, "wol_probe_interval", 5.0),
         )
 
     def _execute_structured_invoke(
@@ -583,10 +593,16 @@ class KnowledgeExtractor:
             logger.warning(f"Section extraction LLM call failed across all pool servers for '{section_title}': {e}")
             return SectionExtraction(concepts=[])
 
-    def warmup_and_check_device(self, timeout: int = 15) -> Dict[str, Any]:
+    def warmup_and_check_device(
+        self,
+        timeout: int = 15,
+        on_status_callback: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
         """
         Trigger warmup requests and query /api/ps across all configured Ollama servers in the pool.
         Returns metrics for each server, identifying GPU (VRAM) vs CPU execution and failover priority.
+        If any server is unreachable and has a configured MAC address, Wake-on-LAN packet is broadcast,
+        followed by a wait period (up to wol_wait_seconds) to allow the machine to boot and retry warmup.
         """
         def _fetch_server_json(base_url: str, endpoint: str, post_body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             url = f"{base_url.rstrip('/')}{endpoint}"
@@ -724,6 +740,72 @@ class KnowledgeExtractor:
                 }
 
         server_reports = [_inspect_node(n) for n in self.pool.nodes]
+
+        # Wake-on-LAN: If any server is unreachable and has a configured MAC address, attempt wakeup
+        if getattr(self, "wol_enabled", True):
+            unreachable_nodes = [
+                n
+                for r, n in zip(server_reports, self.pool.nodes)
+                if r.get("status") == "unreachable" and getattr(n, "mac", None)
+            ]
+            woken_nodes = []
+            for n in unreachable_nodes:
+                msg = f"Server '{n.label}' ({n.url}) unreachable. Sending Wake-on-LAN magic packet to {n.mac}..."
+                if on_status_callback:
+                    on_status_callback(msg)
+                logger.info(msg)
+                try:
+                    if n.wake():
+                        woken_nodes.append(n)
+                except Exception as ex:
+                    err_msg = f"Failed to send Wake-on-LAN magic packet to {n.label} ({n.mac}): {ex}"
+                    logger.warning(err_msg)
+                    if on_status_callback:
+                        on_status_callback(err_msg)
+
+            if woken_nodes:
+                wait_seconds = getattr(self, "wol_wait_seconds", 120)
+                probe_interval = getattr(self, "wol_probe_interval", 5.0)
+                wait_msg = f"Wake-on-LAN sent to {len(woken_nodes)} server(s). Waiting up to {wait_seconds}s for boot..."
+                if on_status_callback:
+                    on_status_callback(wait_msg)
+                logger.info(wait_msg)
+
+                start_time = time.time()
+                responsive_urls = set()
+                while (time.time() - start_time) < wait_seconds:
+                    time.sleep(probe_interval)
+                    elapsed = int(time.time() - start_time)
+                    for n in woken_nodes:
+                        if n.url in responsive_urls:
+                            continue
+                        try:
+                            _fetch_server_json(n.url, "/api/version")
+                            responsive_urls.add(n.url)
+                            rec_msg = f"Server '{n.label}' ({n.url}) is awake and responding ({elapsed}s)! Retrying warmup..."
+                            if on_status_callback:
+                                on_status_callback(rec_msg)
+                            logger.info(rec_msg)
+                        except Exception:
+                            pass
+
+                    if len(responsive_urls) == len(woken_nodes):
+                        break
+
+                if responsive_urls:
+                    new_reports = []
+                    for r, n in zip(server_reports, self.pool.nodes):
+                        if n.url in responsive_urls:
+                            new_reports.append(_inspect_node(n))
+                        else:
+                            new_reports.append(r)
+                    server_reports = new_reports
+                else:
+                    timeout_msg = f"Woken server(s) did not respond within {wait_seconds}s. Continuing with available servers."
+                    if on_status_callback:
+                        on_status_callback(timeout_msg)
+                    logger.warning(timeout_msg)
+
         primary_node = self.pool.primary_server
         primary_report = next((r for r in server_reports if r["url"] == primary_node.url), server_reports[0])
 

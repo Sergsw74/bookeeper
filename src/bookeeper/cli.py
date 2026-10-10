@@ -31,6 +31,8 @@ from rich.progress import (
 from rich.table import Table
 from rich.text import Text
 
+logger = logging.getLogger(__name__)
+
 from bookeeper.calibre.client import CalibreClient
 from bookeeper.calibre.parser import BookParser
 from bookeeper.config import Settings, get_settings
@@ -250,10 +252,15 @@ def _perform_ollama_warmup(extractor: KnowledgeExtractor, console: Console) -> D
     """Execute warmup ping to load model and report CPU vs GPU acceleration status across server pool."""
     pool_nodes = extractor.pool.nodes
     node_cap_map = {n.url.rstrip("/"): ", ".join(n.capabilities) for n in pool_nodes}
+    node_mac_map = {n.url.rstrip("/"): n.mac for n in pool_nodes}
+
+    def _status_cb(msg: str):
+        console.print(f"[bold yellow]⚡ {msg}[/bold yellow]")
+
     with console.status(
         f"[bold blue]Checking Ollama acceleration across server pool ({len(pool_nodes)} node(s))...[/bold blue]"
     ):
-        status = extractor.warmup_and_check_device()
+        status = extractor.warmup_and_check_device(on_status_callback=_status_cb)
 
     servers = status.get("servers", [])
     primary = status.get("primary", {})
@@ -268,6 +275,7 @@ def _perform_ollama_warmup(extractor: KnowledgeExtractor, console: Console) -> D
         table.add_column("Priority", justify="center", width=8)
         table.add_column("Endpoint", style="bold white", min_width=25)
         table.add_column("Capabilities", style="yellow")
+        table.add_column("WOL MAC", style="dim cyan")
         table.add_column("Device / Mode", style="magenta")
         table.add_column("VRAM Offload", justify="right")
         table.add_column("Pool State", style="green")
@@ -285,7 +293,8 @@ def _perform_ollama_warmup(extractor: KnowledgeExtractor, console: Console) -> D
             if st != "ok":
                 pool_state = f"[red]{st}[/red]"
             caps = node_cap_map.get(url.rstrip("/"), "llm, embedding, verification")
-            table.add_row(pri, url, caps, dev, vram_str, pool_state)
+            wol_mac = node_mac_map.get(url.rstrip("/")) or "[dim]-[/dim]"
+            table.add_row(pri, url, caps, wol_mac, dev, vram_str, pool_state)
 
         console.print(table)
 
@@ -363,16 +372,20 @@ def config(
     for s in cfg.resolved_ollama_servers:
         name_tag = f" ({s.name})" if s.name else ""
         cap_tag = f" [{s.capability_str}]"
-        servers_desc.append(f"    • [cyan]{s.url}[/cyan]{name_tag}{cap_tag} [dim](priority: {s.priority})[/dim]")
+        mac_tag = f" [yellow](WOL MAC: {s.mac}{' + secret' if s.wol_secret else ''})[/yellow]" if s.mac else ""
+        servers_desc.append(f"    • [cyan]{s.url}[/cyan]{name_tag}{cap_tag}{mac_tag} [dim](priority: {s.priority})[/dim]")
     servers_block = "\n".join(servers_desc)
 
     emb_endpoint_str = "[dim]shares LLM pool[/dim]" if cfg.uses_llm_pool_for_embeddings else f"[cyan]{cfg.embedding_base_url}[/cyan] [bold green](dedicated local)[/bold green]"
+
+    wol_status_str = f"[bold green]Enabled[/bold green] (timeout: {cfg.wol_wait_seconds}s, interval: {cfg.wol_probe_interval}s)" if cfg.wol_enabled else "[dim]Disabled[/dim]"
 
     console.print(
         Panel.fit(
             f"[bold green]Calibre Library / SMB Share:[/bold green] {cfg.calibre_library_path}\n"
             f"[bold green]Calibre Auth:[/bold green] user={cfg.calibre_user or '[dim]none[/dim]'}\n"
             f"[bold green]Ollama Failover Pool ({len(cfg.resolved_ollama_servers)} server(s)):[/bold green]\n{servers_block}\n"
+            f"[bold green]Wake-on-LAN (WOL):[/bold green] {wol_status_str}\n"
             f"[bold green]Failover Cooldown:[/bold green] {cfg.failover_cooldown_seconds}s\n"
             f"[bold green]LLM Model:[/bold green] {cfg.llm_model}\n"
             f"[bold green]Embedding Model:[/bold green] {cfg.embedding_model}\n"
@@ -1197,12 +1210,11 @@ def build_graph(
     tracker = ProgressTracker(tracker_path)
 
     if from_scratch:
-        num_skipped_before = len(tracker.get_skipped_ids("build_graph")) if not retry_skipped else 0
-        tracker.clear("build_graph", keep_skipped=not retry_skipped)
-        skipped_suffix = f" (preserving {num_skipped_before} memorized skipped book(s))" if num_skipped_before else ""
+        tracker.clear("build_graph", preserve_skipped=not retry_skipped)
+        preserved_cnt = len(tracker.get_skipped_ids("build_graph")) if not retry_skipped else 0
+        preserved_str = f" (preserving {preserved_cnt} skipped books in skip list)" if preserved_cnt > 0 else ""
         console.print(
-            f"[bold yellow]Restarting build entirely from scratch{skipped_suffix}: clearing progress tracker checkpoint, "
-            "resetting knowledge graph, deleting all book states and cached chunks...[/bold yellow]"
+            f"[bold yellow]Restarting build entirely from scratch: clearing progress tracker checkpoint, resetting knowledge graph, deleting all book states and cached chunks{preserved_str}...[/bold yellow]"
         )
         reset_progress = True
         resume = False
@@ -1373,8 +1385,8 @@ def build_graph(
             lightrag_engine = None
 
     if reset_progress and not from_scratch:
-        tracker.clear("build_graph")
-        console.print("[dim yellow]Reset progress checkpoint for build_graph.[/dim yellow]")
+        tracker.clear("build_graph", preserve_skipped=True)
+        console.print("[dim yellow]Reset progress checkpoint for build_graph (preserving skipped books in skip list).[/dim yellow]")
 
     books_to_process = []
 
@@ -1527,12 +1539,12 @@ def build_graph(
             target_list = [b for b in target_list if b.get("id") not in tracker_skipped]
             bypassed = orig_len - len(target_list)
             if bypassed > 0:
-                next_bid_str = f"Next book: #{target_list[0]['id']} ('{target_list[0].get('title', '')}')" if target_list else "None (all books processed or skipped)"
-                from_scratch_label = " (from scratch)" if from_scratch else ""
-                console.print(
-                    f"[dim cyan]Knowledge Graph Build{from_scratch_label}: Bypassed {bypassed} memorized skipped book(s) "
-                    f"(graphical/unsupported formats). {len(target_list)} remaining to process. {next_bid_str}[/dim cyan]"
+                next_bid_str = f"Next book: #{target_list[0]['id']} ('{target_list[0].get('title', '')}')" if target_list else "None (all books skipped)"
+                msg = (
+                    f"Preserved Skip List: Bypassed {bypassed} previously skipped book(s) "
+                    f"(graphical or unsupported formats). {len(target_list)} remaining to process. {next_bid_str}"
                 )
+                console.print(f"[dim cyan]{msg}[/dim cyan]")
 
         export_dir = output_dir / "calibre_ingest"
         for b in target_list:

@@ -192,16 +192,125 @@ def stitch_chunks_dedup_text(chunk_texts: List[str]) -> str:
     return result.strip()
 
 
+def find_interval_in_text(doc_text: str, query: str, search_from: int = 0) -> Tuple[int, int]:
+    """
+    Find [start, end] character interval of query within doc_text.
+    Uses exact search, anchor search, and normalized fallback.
+    """
+    q_clean = query.strip()
+    if not q_clean or not doc_text:
+        return -1, -1
+
+    # 1. Exact find starting at search_from
+    pos = doc_text.find(q_clean, max(0, search_from))
+    if pos != -1:
+        return pos, pos + len(q_clean)
+
+    # If search_from was > 0, try searching from 0 as well
+    if search_from > 0:
+        pos = doc_text.find(q_clean, 0)
+        if pos != -1:
+            return pos, pos + len(q_clean)
+
+    # 2. Anchor matching using first 50 chars and last 50 chars for long chunks
+    if len(q_clean) > 80:
+        pref = q_clean[:50]
+        suff = q_clean[-50:]
+        p_start = doc_text.find(pref, max(0, search_from))
+        if p_start == -1 and search_from > 0:
+            p_start = doc_text.find(pref, 0)
+        if p_start != -1:
+            exp_end = p_start + len(q_clean) - len(suff)
+            p_end = doc_text.find(suff, max(p_start, exp_end - 150))
+            if p_end != -1 and abs((p_end + len(suff) - p_start) - len(q_clean)) < 300:
+                return p_start, p_end + len(suff)
+            p_end = doc_text.find(suff, p_start)
+            if p_end != -1 and abs((p_end + len(suff) - p_start) - len(q_clean)) < 500:
+                return p_start, p_end + len(suff)
+
+    # 3. Normalized whitespace fallback
+    q_norm = " ".join(q_clean.split())
+    doc_norm = " ".join(doc_text.split())
+    norm_pos = doc_norm.find(q_norm)
+    if norm_pos != -1:
+        pref30 = q_norm[:30]
+        suff30 = q_norm[-30:]
+        p1 = doc_text.find(pref30)
+        if p1 != -1:
+            p2 = doc_text.find(suff30, p1)
+            if p2 != -1:
+                return p1, p2 + len(suff30)
+        ratio = len(doc_text) / max(1, len(doc_norm))
+        approx_start = max(0, round(norm_pos * ratio))
+        approx_end = min(len(doc_text), round((norm_pos + len(q_norm)) * ratio))
+        return approx_start, approx_end
+
+    return -1, -1
+
+
+def find_aligned_candidate_chunks(
+    raw_doc_text: str,
+    old_chunks: List[Dict[str, Any]],
+    new_chunks: List[Dict[str, Any]],
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Match candidate chunks using absolute document character offsets or exact token intervals:
+    1. Determine absolute character bounds of the old chunks in the full text [start_char, end_char].
+    2. Select ONLY new chunks whose text intersects with [start_char, end_char] (c_start < end_char and c_end > start_char).
+    Enforces strict character-interval intersection to ensure block_b_text always encompasses
+    the identical passage as block_a_text, preventing union_len drift and disproportion collapse.
+    """
+    if not raw_doc_text or not old_chunks or not new_chunks:
+        return "", []
+
+    def _text(c: Dict[str, Any]) -> str:
+        return (c.get("content") or c.get("text") or "").strip()
+
+    # 1. Determine absolute character bounds of the old chunks in the full text
+    start_anchor = _text(old_chunks[0])
+    start_char, _ = find_interval_in_text(raw_doc_text, start_anchor, 0)
+    if start_char == -1:
+        start_char = 0
+
+    end_anchor = _text(old_chunks[-1])
+    end_pos, end_len = find_interval_in_text(raw_doc_text, end_anchor, start_char)
+    if end_pos != -1:
+        end_char = end_len
+    else:
+        end_char = len(raw_doc_text)
+
+    target_span = raw_doc_text[start_char:end_char]
+
+    # 2. Select ONLY new chunks whose text intersects with [start_char, end_char]
+    aligned_new = []
+    last_search = 0
+    for chunk in new_chunks:
+        chunk_text = _text(chunk)
+        if not chunk_text:
+            continue
+        c_start, c_end = find_interval_in_text(raw_doc_text, chunk_text, max(0, last_search - 200))
+        if c_start == -1:
+            continue
+        last_search = max(last_search, c_start)
+
+        # Overlap condition: chunk begins before target ends, and ends after target begins
+        if c_start < end_char and c_end > start_char:
+            aligned_new.append(chunk)
+
+    return target_span, aligned_new
+
+
 def find_overlapping_chunks(
     graph_b: ConceptGraphStore,
     book_id: int,
     w_raw: str,
     min_overlap: float = 0.80,
+    raw_doc_text: Optional[str] = None,
+    old_chunks: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Locate contiguous candidate chunks in Graph B matching W_raw.
-    Selects BLOCK_B with min(dedup(CHUNK_B[n..n+k]), dedup(CHUNK_B[n..n+k+1]))
-    that minimizes length deviation / disproportion gap relative to W_raw.
+    Locate contiguous candidate chunks in Graph B matching W_raw or [start_char, end_char] interval.
+    Uses strict character interval intersection against raw_doc_text.
     """
     chunks = [
         dict(attrs)
@@ -213,82 +322,43 @@ def find_overlapping_chunks(
 
     chunks.sort(key=lambda x: (int(x.get("chapter_idx") or 0), int(x.get("chunk_idx") or 0)))
 
-    w_raw_norm = " ".join(w_raw.lower().split())
-    prefix = w_raw_norm[:350]
+    if raw_doc_text and old_chunks:
+        _, aligned = find_aligned_candidate_chunks(raw_doc_text, old_chunks, chunks)
+        if aligned:
+            return aligned
 
-    # Find starting chunk in B with strongest match at the beginning of prefix
-    start_candidates = []
-    for idx, c in enumerate(chunks):
-        t_norm = " ".join(c.get("text", "").lower().split())
-        if not t_norm:
+    # If raw_doc_text not provided, construct reference document from Graph B chunks
+    doc_ref = raw_doc_text if raw_doc_text else stitch_chunks_dedup_text([c.get("text", "") for c in chunks])
+    if not doc_ref:
+        doc_ref = w_raw
+
+    start_char, _ = find_interval_in_text(doc_ref, w_raw[:200], 0)
+    if start_char == -1:
+        start_char = 0
+
+    end_pos, end_len = find_interval_in_text(doc_ref, w_raw[-200:], start_char)
+    end_char = end_len if end_pos != -1 else (start_char + len(w_raw))
+
+    aligned = []
+    for c in chunks:
+        c_text = (c.get("content") or c.get("text") or "").strip()
+        if not c_text:
             continue
-        sm = SequenceMatcher(None, prefix, t_norm, autojunk=False)
-        m = sm.find_longest_match(0, len(prefix), 0, len(t_norm))
-        if m.size >= 25:
-            # Score prioritizing matches that start at the beginning of w_raw (m.a near 0)
-            score = m.size - (m.a * 3)
-            start_candidates.append((score, m.a, m.size, idx))
+        c_start, c_end = find_interval_in_text(doc_ref, c_text)
+        if c_start != -1 and c_end != -1:
+            if c_start < end_char and c_end > start_char:
+                aligned.append(c)
 
-    if start_candidates:
-        start_candidates.sort(key=lambda x: x[0], reverse=True)
-        best_start = start_candidates[0][3]
-    else:
-        best_start = -1
+    if aligned:
+        return aligned
 
-    # Fallback to general sequence / substring matching if prefix match was weak
-    if best_start == -1:
-        for idx, c in enumerate(chunks):
-            t_norm = " ".join(c.get("text", "").lower().split())
-            if t_norm and (t_norm[:60] in w_raw_norm or w_raw_norm[:60] in t_norm):
-                best_start = idx
-                break
-
-    if best_start == -1:
-        # Fallback to independent overlap filtering
-        fallback_candidates = []
-        for c in chunks:
-            t_norm = " ".join(c.get("text", "").lower().split())
-            if not t_norm:
-                continue
-            sm = SequenceMatcher(None, w_raw_norm, t_norm, autojunk=False)
-            match = sm.find_longest_match(0, len(w_raw_norm), 0, len(t_norm))
-            ratio = match.size / max(1, len(t_norm))
-            if ratio >= min_overlap:
-                fallback_candidates.append(c)
-        return fallback_candidates
-
-    # Contiguous slice expansion: accumulate chunks that overlap w_raw
-    max_k = min(50, len(chunks) - best_start)
-    candidates = []
-    for k in range(1, max_k + 1):
-        c_k = chunks[best_start + k - 1]
-        t_norm_k = " ".join(c_k.get("text", "").lower().split())
-        # Check overlap of chunk k with w_raw to stop expanding when passage in B ends
-        if k > 1:
-            sm_k = SequenceMatcher(None, w_raw_norm, t_norm_k, autojunk=False)
-            m_k = sm_k.find_longest_match(0, len(w_raw_norm), 0, len(t_norm_k))
-            if m_k.size < 20:
-                break
-        slice_k = chunks[best_start : best_start + k]
-        w_k = stitch_chunks_dedup_text([c.get("text", "") for c in slice_k])
-        candidates.append((slice_k, w_k, len(w_k)))
-        if len(w_k) >= len(w_raw):
-            break
-
-    if not candidates:
-        return []
-    if len(candidates) == 1:
-        return candidates[0][0]
-
-    # Boundary comparison: min(dedup(CHUNK_B[n..n+k]), dedup(CHUNK_B[n..n+k+1]))
-    cand_prev = candidates[-2]
-    cand_curr = candidates[-1]
-
-    diff_prev = abs(cand_prev[2] - len(w_raw))
-    diff_curr = abs(cand_curr[2] - len(w_raw))
-
-    chosen = cand_prev[0] if diff_prev <= diff_curr else cand_curr[0]
-    return chosen
+    # Fallback to direct substring matching
+    fallback = []
+    for c in chunks:
+        t = (c.get("content") or c.get("text") or "").strip()
+        if t and (t in w_raw or w_raw in t or t[:60] in w_raw or w_raw[:60] in t):
+            fallback.append(c)
+    return fallback
 
 
 def compute_chunk_disproportion(
@@ -811,10 +881,26 @@ def run_cross_check(
     for nid, attrs in store_a.graph.nodes(data=True):
         if attrs.get("type") == "Chunk":
             b_id = attrs.get("book_id", 0)
-            chunks_by_book_a.setdefault(b_id, []).append((nid, dict(attrs)))
+            d = dict(attrs)
+            if "chunk_id" not in d:
+                d["chunk_id"] = nid
+            chunks_by_book_a.setdefault(b_id, []).append((nid, d))
 
     for b_id in chunks_by_book_a:
         chunks_by_book_a[b_id].sort(key=lambda x: (int(x[1].get("chapter_idx") or 0), int(x[1].get("chunk_idx") or 0)))
+
+    # Collect chunks by book in Graph B
+    chunks_by_book_b: Dict[int, List[Tuple[str, Dict[str, Any]]]] = {}
+    for nid, attrs in store_b.graph.nodes(data=True):
+        if attrs.get("type") == "Chunk":
+            b_id = attrs.get("book_id", 0)
+            d = dict(attrs)
+            if "chunk_id" not in d:
+                d["chunk_id"] = nid
+            chunks_by_book_b.setdefault(b_id, []).append((nid, d))
+
+    for b_id in chunks_by_book_b:
+        chunks_by_book_b[b_id].sort(key=lambda x: (int(x[1].get("chapter_idx") or 0), int(x[1].get("chunk_idx") or 0)))
 
     # Filter books with at least 3 chunks
     valid_books = [bid for bid in common_book_ids if len(chunks_by_book_a.get(bid, [])) >= 3]
@@ -841,18 +927,43 @@ def run_cross_check(
         old_slice = c_list[start_idx : start_idx + 3]
 
         old_chunk_ids = [c[0] for c in old_slice]
+        old_chunk_dicts = [c[1] for c in old_slice]
         old_chunk_texts = [c[1].get("text", "") for c in old_slice]
         b_title = old_slice[0][1].get("book_title", f"Book #{target_bid}")
         sec_title = old_slice[0][1].get("section_title", "Section")
+        target_chap_idx = old_slice[0][1].get("chapter_idx")
 
-        # 2. Reconstruct seamless raw passage W_raw
-        w_raw = stitch_chunks_dedup_text(old_chunk_texts)
-        if not w_raw or len(w_raw) < 100:
+        # Skip cross-chapter boundaries if chapter has multiple chunks
+        chaps_in_slice = set(c[1].get("chapter_idx") for c in old_slice)
+        if len(chaps_in_slice) > 1 and len(c_list) > 3:
             continue
 
-        # 3. Locate matching new chunks in Graph B with optimal slice boundary
-        new_chunk_dicts = find_overlapping_chunks(store_b, target_bid, w_raw, min_overlap=0.80)
+        # Reconstruct chapter reference text
+        chap_chunks_a = [c[1] for c in c_list if c[1].get("chapter_idx") == target_chap_idx]
+        if not chap_chunks_a or len(chap_chunks_a) < len(old_slice):
+            chap_chunks_a = [c[1] for c in c_list]
+        raw_doc_text = stitch_chunks_dedup_text([c.get("text", "") for c in chap_chunks_a])
+        if not raw_doc_text:
+            raw_doc_text = stitch_chunks_dedup_text(old_chunk_texts)
+
+        # Filter candidate chunks in Graph B
+        c_list_b = [c[1] for c in chunks_by_book_b.get(target_bid, [])]
+        chap_chunks_b = [c for c in c_list_b if c.get("chapter_idx") == target_chap_idx]
+        candidate_new_chunks = chap_chunks_b if len(chap_chunks_b) >= 1 else c_list_b
+        if not candidate_new_chunks:
+            continue
+
+        # 2 & 3. Align candidate chunks using character intervals
+        target_span, new_chunk_dicts = find_aligned_candidate_chunks(
+            raw_doc_text=raw_doc_text,
+            old_chunks=old_chunk_dicts,
+            new_chunks=candidate_new_chunks,
+        )
         if not new_chunk_dicts:
+            continue
+
+        w_raw = target_span if target_span and len(target_span) >= 50 else stitch_chunks_dedup_text(old_chunk_texts)
+        if not w_raw or len(w_raw) < 50:
             continue
 
         new_chunk_ids = [d.get("chunk_id") or d.get("id", "") for d in new_chunk_dicts]

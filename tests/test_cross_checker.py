@@ -21,6 +21,8 @@ from bookeeper.processing.cross_checker import (
     audit_unmatched_idea,
     compute_chunk_disproportion,
     evaluate_system_against_oracle,
+    find_aligned_candidate_chunks,
+    find_interval_in_text,
     find_overlapping_chunks,
     print_block_comparison,
     run_cross_check,
@@ -637,5 +639,110 @@ def test_compute_chunk_disproportion_repetitive_text():
     assert disp > 0.80
     # Union length must be close to len(text_a), not 2x
     assert union_len < len(text_a) * 1.2
+
+
+def test_find_interval_in_text():
+    """Test exact, offset, anchor, and whitespace matching in find_interval_in_text."""
+    doc = "The quick brown fox jumps over the lazy dog. Bright sunny day in the green woods."
+
+    # 1. Exact match
+    start, end = find_interval_in_text(doc, "brown fox")
+    assert start == 10
+    assert end == 19
+    assert doc[start:end] == "brown fox"
+
+    # 2. Match with search_from
+    start2, end2 = find_interval_in_text(doc, "the", search_from=20)
+    assert start2 > 20
+    assert doc[start2:end2] == "the"
+
+    # 3. Normalized whitespace
+    start3, end3 = find_interval_in_text(doc, "fox   jumps \n over")
+    assert start3 != -1
+    assert "jumps" in doc[start3:end3]
+
+
+def test_find_aligned_candidate_chunks():
+    """Verify strict character-interval intersection in find_aligned_candidate_chunks."""
+    raw_doc = (
+        "Sentence 1. The foundation was laid in spring. "
+        "Sentence 2. The walls went up during summer. "
+        "Sentence 3. The roof was completed before autumn rains. "
+        "Sentence 4. Interior decoration started in winter. "
+        "Sentence 5. The family moved in by next spring."
+    )
+
+    # Old chunks: window covers Sentence 2 and Sentence 3
+    old_chunks = [
+        {"chunk_id": "old_2", "text": "Sentence 2. The walls went up during summer."},
+        {"chunk_id": "old_3", "text": "Sentence 3. The roof was completed before autumn rains."},
+    ]
+
+    # New chunks: 0.5x chunks with overlap from the actual document
+    new_chunks = [
+        {"chunk_id": "new_1", "text": "Sentence 1. The foundation was laid in spring."},
+        {"chunk_id": "new_2", "text": "laid in spring. Sentence 2. The walls went up"},
+        {"chunk_id": "new_3", "text": "Sentence 2. The walls went up during summer. Sentence 3. The roof was"},
+        {"chunk_id": "new_4", "text": "Sentence 3. The roof was completed before autumn rains. Sentence 4. Interior"},
+        {"chunk_id": "new_5", "text": "Sentence 4. Interior decoration started in winter. Sentence 5. The family moved in"},
+    ]
+
+    target_span, aligned = find_aligned_candidate_chunks(raw_doc, old_chunks, new_chunks)
+
+    # Target span must cover Sentence 2 through Sentence 3
+    assert "Sentence 2. The walls went up during summer." in target_span
+    assert "Sentence 3. The roof was completed before autumn rains." in target_span
+    assert "Sentence 1." not in target_span
+    assert "Sentence 5." not in target_span
+
+    # Aligned candidate chunks must strictly intersect [start_char, end_char]
+    aligned_ids = [c["chunk_id"] for c in aligned]
+    assert "new_1" not in aligned_ids
+    assert "new_2" in aligned_ids
+    assert "new_3" in aligned_ids
+    assert "new_4" in aligned_ids
+    assert "new_5" not in aligned_ids
+
+
+def test_aligned_chunks_disproportion_and_union():
+    """Verify that aligned candidate chunks produce high disproportion and tight union length."""
+    raw_doc = (
+        "Poor mother was so forgetful, She put a plum pudden in bed, "
+        "An' covered my brother with custard, 'That'll do us for supper,' she said! "
+        "Oh woe is me, what a family, There used t'be just six of us, "
+        "The day Grandma took up knitting, She couldn't tell yarn from fur, "
+        "But she clacked her needles all evening, An' knitted herself to the chair!"
+    )
+    old_chunks = [
+        {"chunk_id": "chunk_a1", "text": "Poor mother was so forgetful, She put a plum pudden in bed, An' covered my brother with custard,"},
+        {"chunk_id": "chunk_a2", "text": "An' covered my brother with custard, 'That'll do us for supper,' she said! Oh woe is me, what a family, There used t'be just six of us,"},
+        {"chunk_id": "chunk_a3", "text": "The day Grandma took up knitting, She couldn't tell yarn from fur, But she clacked her needles all evening, An' knitted herself to the chair!"},
+    ]
+
+    # Smaller chunks in B covering the same document
+    new_chunks = [
+        {"chunk_id": "b_pre", "text": "Prologue: Long ago in a distant valley."},
+        {"chunk_id": "b_1", "text": "Poor mother was so forgetful, She put a plum pudden in bed,"},
+        {"chunk_id": "b_2", "text": "She put a plum pudden in bed, An' covered my brother with custard,"},
+        {"chunk_id": "b_3", "text": "An' covered my brother with custard, 'That'll do us for supper,' she said!"},
+        {"chunk_id": "b_4", "text": "'That'll do us for supper,' she said! Oh woe is me, what a family,"},
+        {"chunk_id": "b_5", "text": "Oh woe is me, what a family, There used t'be just six of us,"},
+        {"chunk_id": "b_6", "text": "The day Grandma took up knitting, She couldn't tell yarn from fur,"},
+        {"chunk_id": "b_7", "text": "She couldn't tell yarn from fur, But she clacked her needles all evening,"},
+        {"chunk_id": "b_8", "text": "But she clacked her needles all evening, An' knitted herself to the chair!"},
+        {"chunk_id": "b_post", "text": "Epilogue: And so the story ends peacefully."},
+    ]
+
+    target_span, aligned = find_aligned_candidate_chunks(raw_doc, old_chunks, new_chunks)
+    assert "b_pre" not in [c["chunk_id"] for c in aligned]
+    assert "b_post" not in [c["chunk_id"] for c in aligned]
+    assert len(aligned) == 8
+
+    old_texts = [c["text"] for c in old_chunks]
+    new_texts = [c["text"] for c in aligned]
+    sum_a, sum_b, union_len, disp = compute_chunk_disproportion(old_texts, new_texts, target_span)
+
+    assert disp >= 0.95
+    assert abs(union_len - len(target_span)) < 50
 
 

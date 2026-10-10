@@ -7,6 +7,9 @@ Performs automated end-to-end A/B testing:
    Branch B, runs `bookeeper test-run`, and compares results.
 2. VS Mode: Ingests an existing baseline `verification_report.json` path as Branch A,
    checks out only Branch B to run `bookeeper test-run`, and compares results.
+3. Re-verify Mode: Reuses existing knowledge graphs from a prior A/B test run folder,
+   re-runs `bookeeper verify` on both branches with a specified sample percentage,
+   and compares results.
 
 Usage:
     # 1. Standard Branch vs Branch Mode
@@ -15,6 +18,10 @@ Usage:
     # 2. VS Mode (Existing Baseline Report vs Candidate Branch)
     ./ab_test.py vs <baseline_report_path> <branch2> [--books 5] [--percent 1.0]
     ./ab_test.py --vs <baseline_report_path> <branch2> [--books 5] [--percent 1.0]
+
+    # 3. Re-verify Mode (Reuse Existing Graphs with New Verification Sample %)
+    ./ab_test.py reverify <path_to_abtest_result> [percent]
+    ./ab_test.py --reverify <path_to_abtest_result> [--percent 5.0]
 """
 
 import argparse
@@ -72,6 +79,7 @@ class ABTestRunner:
         branch1: str,
         branch2: str,
         baseline_report: Optional[str] = None,
+        reverify_src_dir: Optional[str] = None,
         num_books: int = 5,
         percent: float = 1.0,
         mode: str = "ideas",
@@ -89,8 +97,18 @@ class ABTestRunner:
         self.extra_args = extra_args or ""
         self.dry_run = dry_run
 
-        # Handle VS mode with pre-existing baseline report
-        if baseline_report:
+        # Handle Reverify mode with pre-existing A/B test run directory
+        if reverify_src_dir:
+            self.reverify_src_dir: Optional[Path] = Path(reverify_src_dir).expanduser().resolve()
+            if not self.dry_run and not self.reverify_src_dir.is_dir():
+                raise FileNotFoundError(f"Run directory not found at {self.reverify_src_dir}")
+            self.is_reverify_mode = True
+            self.is_vs_mode = False
+            self.baseline_report_path = None
+            self.branch1 = branch1
+        elif baseline_report:
+            self.reverify_src_dir = None
+            self.is_reverify_mode = False
             self.baseline_report_path: Optional[Path] = Path(baseline_report).expanduser().resolve()
             if not self.dry_run and not self.baseline_report_path.is_file():
                 raise FileNotFoundError(f"Baseline report not found at {self.baseline_report_path}")
@@ -101,6 +119,8 @@ class ABTestRunner:
             desc_tag = parent_name if parent_name not in ("output", ".") else stem
             self.branch1 = branch1 or f"Report ({desc_tag})"
         else:
+            self.reverify_src_dir = None
+            self.is_reverify_mode = False
             self.baseline_report_path = None
             self.is_vs_mode = False
             self.branch1 = branch1
@@ -136,8 +156,12 @@ class ABTestRunner:
         # Resolve archive directory
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         base_archive = Path(output_dir).expanduser().resolve() if output_dir else self.repo_dir / "ab_test_runs"
-        mode_prefix = "vs" if self.is_vs_mode else "run"
-        self.session_dir = base_archive / f"{mode_prefix}_{timestamp}_{self._sanitize(self.branch1)}_vs_{self._sanitize(self.branch2)}"
+        if self.is_reverify_mode:
+            pct_tag = f"p{str(self.percent).replace('.', '_')}"
+            self.session_dir = base_archive / f"reverify_{timestamp}_{self._sanitize(self.branch1)}_vs_{self._sanitize(self.branch2)}_{pct_tag}"
+        else:
+            mode_prefix = "vs" if self.is_vs_mode else "run"
+            self.session_dir = base_archive / f"{mode_prefix}_{timestamp}_{self._sanitize(self.branch1)}_vs_{self._sanitize(self.branch2)}"
         self.session_dir.mkdir(parents=True, exist_ok=True)
 
         self.initial_branch: Optional[str] = None
@@ -174,6 +198,58 @@ class ABTestRunner:
         if cur != branch:
             raise RuntimeError(f"Failed to switch branch. Expected '{branch}', currently on '{cur}'.")
         log_success(f"Successfully checked out {Colors.BOLD}{branch}{Colors.RESET}")
+
+    def _branch_exists(self, branch: str) -> bool:
+        """Check if branch exists in local git repository."""
+        if not branch:
+            return False
+        res = self._run_cmd(["git", "show-ref", "--verify", f"refs/heads/{branch}"], check=False)
+        return res.returncode == 0
+
+    @classmethod
+    def discover_branches_from_run(
+        cls, run_dir: Path
+    ) -> Tuple[Path, Path, str, str, bool, bool]:
+        """
+        Inspect a prior A/B test run directory and discover Branch A and Branch B directories,
+        branch names, and whether each is an imported baseline.
+        """
+        if not run_dir.is_dir():
+            raise FileNotFoundError(f"Directory not found: {run_dir}")
+
+        subdirs = sorted([p for p in run_dir.iterdir() if p.is_dir()])
+        branch_a_dirs = [p for p in subdirs if p.name.startswith("branch_A")]
+        branch_b_dirs = [p for p in subdirs if p.name.startswith("branch_B")]
+
+        if branch_a_dirs and branch_b_dirs:
+            dir_a = branch_a_dirs[0]
+            dir_b = branch_b_dirs[0]
+        else:
+            candidate_dirs = [
+                p
+                for p in subdirs
+                if (p / "knowledge_graph.json").is_file()
+                or (p / "run_meta.json").is_file()
+                or (p / "verification_report.json").is_file()
+            ]
+            if len(candidate_dirs) >= 2:
+                dir_a, dir_b = candidate_dirs[0], candidate_dirs[1]
+            else:
+                raise ValueError(
+                    f"Prior run directory '{run_dir}' does not contain two branch subdirectories. "
+                    f"Found subdirectories: {[d.name for d in subdirs]}. "
+                    "Re-verify requires both Branch A and Branch B directories."
+                )
+
+        meta_a = cls._load_json(dir_a / "run_meta.json") or {}
+        name_a = meta_a.get("branch") or re.sub(r"^branch_A_", "", dir_a.name)
+        is_baseline_a = bool(meta_a.get("is_imported_baseline", False))
+
+        meta_b = cls._load_json(dir_b / "run_meta.json") or {}
+        name_b = meta_b.get("branch") or re.sub(r"^branch_B_", "", dir_b.name)
+        is_baseline_b = bool(meta_b.get("is_imported_baseline", False))
+
+        return dir_a, dir_b, name_a, name_b, is_baseline_a, is_baseline_b
 
     def import_baseline_report(self, dest_dir: Path) -> Dict[str, Any]:
         """Import pre-existing baseline verification report (VS mode)."""
@@ -230,6 +306,15 @@ class ABTestRunner:
             if nearby_kg.is_file():
                 shutil.copy2(nearby_kg, dest_dir / "knowledge_graph.json")
                 copied_artifacts.append("knowledge_graph.json")
+
+            # Check for adjacent chunks
+            nearby_chunks = self.baseline_report_path.parent / "chunks"
+            if nearby_chunks.is_dir():
+                dest_chunks = dest_dir / "chunks"
+                if dest_chunks.exists():
+                    shutil.rmtree(dest_chunks)
+                shutil.copytree(nearby_chunks, dest_chunks)
+                copied_artifacts.append("chunks/")
 
             rep_data = self._load_json(dest_report) or {}
             st = rep_data.get("stats", {})
@@ -319,6 +404,19 @@ class ABTestRunner:
                 json.dump(mock_report, f, indent=2)
             with open(log_file, "w", encoding="utf-8") as f:
                 f.write(f"Dry-run executed successfully for {branch}\n")
+            copied_artifacts = ["verification_report.json"]
+            duration = time.time() - t0
+            run_meta = {
+                "branch": branch,
+                "exit_code": exit_code,
+                "duration_seconds": round(duration, 2),
+                "timestamp": datetime.datetime.now().isoformat(),
+                "copied_artifacts": copied_artifacts,
+                "error": error_msg,
+            }
+            with open(meta_file, "w", encoding="utf-8") as mf:
+                json.dump(run_meta, mf, indent=2)
+            return run_meta
         else:
             with open(log_file, "w", encoding="utf-8") as lf:
                 try:
@@ -336,42 +434,55 @@ class ABTestRunner:
                         lf.write(line)
                     proc.wait()
                     exit_code = proc.returncode
+                except KeyboardInterrupt:
+                    exit_code = 130
+                    error_msg = "Interrupted by user (SIGINT)"
+                    lf.write(f"\nExecution interrupted by user.\n")
+                    raise
                 except Exception as exc:
                     exit_code = -1
                     error_msg = str(exc)
                     lf.write(f"\nExecution failed with error: {exc}\n")
+                finally:
+                    duration = time.time() - t0
 
-        duration = time.time() - t0
+                    # Archive artifacts from repos/bookeeper/output
+                    repo_output_dir = self.repo_dir / "output"
+                    copied_artifacts = []
 
-        # Archive artifacts from repos/bookeeper/output
-        repo_output_dir = self.repo_dir / "output"
-        copied_artifacts = []
+                    for fname in ["verification_report.json", "knowledge_graph.json", ".bookeeper_state.json"]:
+                        src = repo_output_dir / fname
+                        if src.is_file():
+                            dest = branch_dir / fname
+                            shutil.copy2(src, dest)
+                            copied_artifacts.append(fname)
 
-        for fname in ["verification_report.json", "knowledge_graph.json", ".bookeeper_state.json"]:
-            src = repo_output_dir / fname
-            if src.is_file():
-                dest = branch_dir / fname
-                shutil.copy2(src, dest)
-                copied_artifacts.append(fname)
+                    chunks_src = repo_output_dir / "chunks"
+                    if chunks_src.is_dir():
+                        chunks_dest = branch_dir / "chunks"
+                        if chunks_dest.exists():
+                            shutil.rmtree(chunks_dest)
+                        shutil.copytree(chunks_src, chunks_dest)
+                        copied_artifacts.append("chunks/")
 
-        run_meta = {
-            "branch": branch,
-            "exit_code": exit_code,
-            "duration_seconds": round(duration, 2),
-            "timestamp": datetime.datetime.now().isoformat(),
-            "copied_artifacts": copied_artifacts,
-            "error": error_msg,
-        }
-        with open(meta_file, "w", encoding="utf-8") as mf:
-            json.dump(run_meta, mf, indent=2)
+                    run_meta = {
+                        "branch": branch,
+                        "exit_code": exit_code,
+                        "duration_seconds": round(duration, 2),
+                        "timestamp": datetime.datetime.now().isoformat(),
+                        "copied_artifacts": copied_artifacts,
+                        "error": error_msg,
+                    }
+                    with open(meta_file, "w", encoding="utf-8") as mf:
+                        json.dump(run_meta, mf, indent=2)
 
-        if exit_code != 0:
-            log_error(f"test-run exited with code {exit_code} on branch '{branch}'.")
-        else:
-            log_success(f"test-run completed on branch '{branch}' in {duration:.1f}s.")
-            log_info(f"Archived artifacts: {', '.join(copied_artifacts) if copied_artifacts else 'none'}")
+                    if exit_code != 0:
+                        log_error(f"test-run exited with code {exit_code} on branch '{branch}'.")
+                    else:
+                        log_success(f"test-run completed on branch '{branch}' in {duration:.1f}s.")
+                        log_info(f"Archived artifacts: {', '.join(copied_artifacts) if copied_artifacts else 'none'}")
 
-        return run_meta
+            return run_meta
 
     def execute_flow(self) -> Path:
         """Run complete A/B workflow across both baseline and candidate."""
@@ -427,6 +538,226 @@ class ABTestRunner:
 
         # 5. Compare verification results
         self.compare_results(branch1_dir, branch2_dir)
+        return self.session_dir
+
+    def run_verify(self, branch: str, branch_dir: Path) -> Dict[str, Any]:
+        """Execute `bookeeper verify` on the existing knowledge graph and archive report."""
+        log_header(f"Re-verifying Knowledge Graph for: {branch} ({self.percent}%)")
+        branch_dir.mkdir(parents=True, exist_ok=True)
+
+        kg_file = branch_dir / "knowledge_graph.json"
+        out_file = branch_dir / "verification_report.json"
+        log_file = branch_dir / "reverify.log"
+        meta_file = branch_dir / "run_meta.json"
+
+        cmd = [
+            self.bookeeper_cmd,
+            "verify",
+            "--graph-file",
+            str(kg_file),
+            "--percent",
+            str(self.percent),
+            "--mode",
+            str(self.mode),
+            "--output",
+            str(out_file),
+        ]
+        chunks_dir = branch_dir / "chunks"
+        if chunks_dir.is_dir():
+            cmd.extend(["--chunks-dir", str(chunks_dir)])
+        elif (self.repo_dir / "output" / "chunks").is_dir():
+            cmd.extend(["--chunks-dir", str(self.repo_dir / "output" / "chunks")])
+
+        if self.extra_args:
+            cmd.extend(self.extra_args.split())
+
+        log_info(f"Executing command: {Colors.DIM}{' '.join(cmd)}{Colors.RESET}")
+        t0 = time.time()
+        exit_code = 0
+        error_msg = None
+
+        if self.dry_run:
+            log_warning("Dry-run mode enabled: simulating verification report.")
+            time.sleep(0.3)
+            graph_data = self._load_json(kg_file) or {}
+            c_nodes = len([n for n in graph_data.get("nodes", []) if n.get("type") == "Concept"]) or 120
+            sampled = max(1, int(round(c_nodes * (self.percent / 100.0))))
+            v_cnt = max(1, int(sampled * 0.9))
+            d_cnt = sampled - v_cnt
+            mock_rep = {
+                "stats": {
+                    "total_ideas_in_graph": c_nodes,
+                    "candidate_ideas_with_chunks": c_nodes,
+                    "sampled_ideas": sampled,
+                    "sample_percentage": self.percent,
+                    "mode": self.mode,
+                    "model_name": f"verifier-{branch}",
+                    "total_evaluations": sampled,
+                    "verified_count": v_cnt,
+                    "discrepancy_count": d_cnt,
+                    "verified_percentage": round(v_cnt / sampled * 100.0, 2),
+                    "discrepancy_percentage": round(d_cnt / sampled * 100.0, 2),
+                    "total_duration_seconds": round(sampled * 0.8, 2),
+                },
+                "discrepancies": [
+                    {
+                        "idea_name": f"Discrepancy sample on {branch}",
+                        "idea_weight": 5,
+                        "book_title": "Audited Book",
+                        "section_title": "Chapter 1",
+                        "chunk_id": "b1_c1_p1",
+                        "explanation": f"Simulated verification discrepancy for {branch}.",
+                        "is_supported": False,
+                        "confidence": 0.88,
+                    }
+                ]
+                if d_cnt > 0
+                else [],
+                "verified_samples": [],
+            }
+            with open(out_file, "w", encoding="utf-8") as f:
+                json.dump(mock_rep, f, indent=2)
+            with open(log_file, "w", encoding="utf-8") as f:
+                f.write(f"Dry-run reverify executed successfully for {branch} at {self.percent}%\n")
+        else:
+            with open(log_file, "a", encoding="utf-8") as lf:
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        cwd=self.repo_dir,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                    )
+                    for line in proc.stdout:  # type: ignore
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                        lf.write(line)
+                    proc.wait()
+                    exit_code = proc.returncode
+                except Exception as exc:
+                    exit_code = -1
+                    error_msg = str(exc)
+                    lf.write(f"\nExecution failed with error: {exc}\n")
+
+        duration = time.time() - t0
+
+        meta = self._load_json(meta_file) or {}
+        meta["reverify"] = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "percent": self.percent,
+            "mode": self.mode,
+            "duration_seconds": round(duration, 2),
+            "exit_code": exit_code,
+            "error": error_msg,
+        }
+        with open(meta_file, "w", encoding="utf-8") as mf:
+            json.dump(meta, mf, indent=2)
+
+        if exit_code != 0:
+            log_error(f"verify exited with code {exit_code} on '{branch}'.")
+        else:
+            log_success(f"verify completed for '{branch}' ({self.percent}%) in {duration:.1f}s.")
+
+        return meta
+
+    def reverify_flow(
+        self,
+        src_dir_a: Path,
+        src_dir_b: Path,
+        is_baseline_a: bool = False,
+        is_baseline_b: bool = False,
+    ) -> Path:
+        """Execute reverify workflow across existing knowledge graphs."""
+        log_header(f"A/B Testing Re-verification Pipeline Initialized ({self.percent}%)")
+        print(f"• Source Archive:   {Colors.BOLD}{self.reverify_src_dir}{Colors.RESET}")
+        print(f"• New Output Dir:   {Colors.BOLD}{self.session_dir}{Colors.RESET}")
+        print(f"• Branch A:         {Colors.BOLD}{self.branch1}{Colors.RESET}")
+        print(f"• Branch B:         {Colors.BOLD}{self.branch2}{Colors.RESET}")
+        print(f"• Verification %:   {Colors.BOLD}{self.percent}%{Colors.RESET} (mode: {self.mode})")
+        print(f"• Request Timeout:  {self.timeout}s")
+        print(f"• Repository Path:  {self.repo_dir}\n")
+
+        # 1. Copy source run to new session dir
+        log_info(f"Copying prior run artifacts to: {self.session_dir}...")
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        assert self.reverify_src_dir is not None
+        for item in self.reverify_src_dir.iterdir():
+            dest = self.session_dir / item.name
+            if item.is_dir():
+                shutil.copytree(item, dest, dirs_exist_ok=True)
+            elif item.is_file():
+                if item.name.startswith("comparison_summary"):
+                    shutil.copy2(item, self.session_dir / f"prior_{item.name}")
+                else:
+                    shutil.copy2(item, dest)
+
+        new_dir_a = self.session_dir / src_dir_a.name
+        new_dir_b = self.session_dir / src_dir_b.name
+
+        # Preserve prior verification reports
+        for d in (new_dir_a, new_dir_b):
+            old_rep = d / "verification_report.json"
+            if old_rep.is_file():
+                shutil.copy2(old_rep, d / "prior_verification_report.json")
+
+        # Ensure chunks directory is copied if available
+        repo_chunks = self.repo_dir / "output" / "chunks"
+        if repo_chunks.is_dir():
+            for d in (new_dir_a, new_dir_b):
+                if not (d / "chunks").is_dir():
+                    try:
+                        shutil.copytree(repo_chunks, d / "chunks")
+                    except Exception:
+                        pass
+
+        # Validate knowledge_graph.json
+        for branch_lbl, d in [(self.branch1, new_dir_a), (self.branch2, new_dir_b)]:
+            kg = d / "knowledge_graph.json"
+            if not kg.is_file():
+                fallback_kg = self.repo_dir / "output" / "knowledge_graph.json"
+                if fallback_kg.is_file():
+                    shutil.copy2(fallback_kg, kg)
+                    log_warning(f"knowledge_graph.json was missing in {d.name}; recovered from {fallback_kg}")
+                else:
+                    raise FileNotFoundError(
+                        f"Missing knowledge_graph.json for {branch_lbl} at {kg}. Cannot verify without a knowledge graph."
+                    )
+
+        # 2. Git handling
+        self.initial_branch = self.get_current_branch()
+        is_clean = self.check_repo_clean() if not self.dry_run else True
+        if not is_clean:
+            log_warning("Git repository has uncommitted changes; running verification with current active branch.")
+
+        try:
+            # Re-verify Branch A
+            if is_clean and not self.dry_run and not is_baseline_a and self._branch_exists(self.branch1):
+                try:
+                    self.checkout_branch(self.branch1)
+                except Exception as e:
+                    log_warning(f"Could not switch to {self.branch1}: {e}. Proceeding on {self.initial_branch}.")
+            self.run_verify(self.branch1, new_dir_a)
+
+            # Re-verify Branch B
+            if is_clean and not self.dry_run and not is_baseline_b and self._branch_exists(self.branch2):
+                try:
+                    self.checkout_branch(self.branch2)
+                except Exception as e:
+                    log_warning(f"Could not switch to {self.branch2}: {e}. Proceeding on {self.initial_branch}.")
+            self.run_verify(self.branch2, new_dir_b)
+
+        finally:
+            if not self.dry_run and self.initial_branch and self.get_current_branch() != self.initial_branch:
+                log_info(f"Restoring initial branch: {Colors.BOLD}{self.initial_branch}{Colors.RESET}...")
+                try:
+                    self.checkout_branch(self.initial_branch)
+                except Exception as e:
+                    log_warning(f"Could not restore initial branch: {e}")
+
+        # 3. Side-by-side comparison
+        self.compare_results(new_dir_a, new_dir_b)
         return self.session_dir
 
     def compare_results(self, dir_a: Path, dir_b: Path) -> Dict[str, Any]:
@@ -657,6 +988,8 @@ class ABTestRunner:
         # Save structured comparison JSON and Markdown report
         comparison_record = {
             "is_vs_mode": self.is_vs_mode,
+            "is_reverify_mode": getattr(self, "is_reverify_mode", False),
+            "reverify_src_dir": str(self.reverify_src_dir) if getattr(self, "reverify_src_dir", None) else None,
             "baseline": self.branch1,
             "candidate": self.branch2,
             "baseline_report_path": str(self.baseline_report_path) if self.baseline_report_path else None,
@@ -685,10 +1018,21 @@ class ABTestRunner:
         return comparison_record
 
     def _write_markdown_report(self, dest: Path, data: Dict[str, Any]) -> None:
+        if data.get("is_reverify_mode"):
+            mode_desc = f"Re-verify Mode (Re-audited at {data['sample_percent']}%)"
+        elif data.get("is_vs_mode"):
+            mode_desc = "VS Mode (Report vs Branch)"
+        else:
+            mode_desc = "Standard Branch vs Branch"
+
         lines = [
             "# A/B Testing Verification Comparison Report",
             "",
-            f"- **Mode:** `{'VS Mode (Report vs Branch)' if data['is_vs_mode'] else 'Standard Branch vs Branch'}`",
+            f"- **Mode:** `{mode_desc}`",
+        ]
+        if data.get("reverify_src_dir"):
+            lines.append(f"- **Source Run Directory:** `{data['reverify_src_dir']}`")
+        lines.extend([
             f"- **Baseline:** `{data['baseline']}`" + (f" (`{data['baseline_report_path']}`)" if data.get('baseline_report_path') else ""),
             f"- **Candidate:** `{data['candidate']}`",
             f"- **Target Books:** `{data['num_books']}`",
@@ -702,7 +1046,7 @@ class ABTestRunner:
             "",
             "| Metric | Baseline | Candidate | Delta (Candidate - Baseline) |",
             "| :--- | :--- | :--- | :--- |",
-        ]
+        ])
         for m in data.get("metrics", []):
             lines.append(f"| {m['metric']} | {m['branch_a']} | {m['branch_b']} | {m['delta']} |")
 
@@ -730,7 +1074,7 @@ class ABTestRunner:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Independent A/B testing runner for Bookeeper branches or Report vs Branch.",
+        description="Independent A/B testing runner for Bookeeper branches, Report vs Branch, or Re-verification.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -742,23 +1086,27 @@ Examples:
   ./ab_test.py vs /path/to/verification_report.json feature-model-adgustments
   ./ab_test.py --vs /path/to/verification_report.json feature-model-adgustments
   ./ab_test.py /path/to/verification_report.json feature-model-adgustments
+
+  # 3. Re-verify Mode (Reuse Existing Knowledge Graphs with New Sample %):
+  ./ab_test.py reverify ./ab_test_runs/run_20261009_190157_master_vs_feature-model-adjustments 5.0
+  ./ab_test.py --reverify ./ab_test_runs/run_20261009_190157_master_vs_feature-model-adjustments --percent 5.0
         """,
     )
     parser.add_argument(
         "arg1",
-        help="Name of Branch A (baseline), OR mode keyword 'vs', OR path to baseline verification report.",
+        help="Name of Branch A (baseline), OR mode keyword 'vs'/'reverify', OR path to baseline verification report.",
     )
     parser.add_argument(
         "arg2",
         nargs="?",
         default=None,
-        help="Name of Branch B (candidate), OR path to baseline report if arg1 is 'vs'.",
+        help="Name of Branch B (candidate), OR path to baseline report if arg1 is 'vs', OR path to run if arg1 is 'reverify'.",
     )
     parser.add_argument(
         "arg3",
         nargs="?",
         default=None,
-        help="Name of Branch B if 'vs <report> <branch2>' format is used.",
+        help="Name of Branch B if 'vs <report> <branch2>' format is used, OR percent if 'reverify <run> [percent]' is used.",
     )
     parser.add_argument(
         "--vs",
@@ -767,6 +1115,13 @@ Examples:
         type=str,
         default=None,
         help="Path to pre-existing baseline verification_report.json (skips Branch A test-run, only tests Branch B).",
+    )
+    parser.add_argument(
+        "--reverify",
+        dest="reverify_path",
+        type=str,
+        default=None,
+        help="Path to pre-existing A/B test run directory to re-verify with new sample percent.",
     )
     parser.add_argument(
         "--books",
@@ -824,12 +1179,29 @@ Examples:
 
     args = parser.parse_args()
 
-    # Determine execution mode and target branch/report
+    # Determine execution mode and target branch/report/run
+    reverify_path: Optional[str] = None
     baseline_report: Optional[str] = None
     branch1: str = ""
     branch2: str = ""
 
-    if args.vs_report:
+    if args.reverify_path:
+        reverify_path = args.reverify_path
+        if args.arg1 and not args.percent:
+            try:
+                args.percent = float(args.arg1)
+            except ValueError:
+                pass
+    elif args.arg1.lower() in ("reverify", "--reverify"):
+        if not args.arg2:
+            parser.error("In 'reverify' mode, specify previous A/B test run directory: 'reverify <path_to_abtest_result> [percent]'")
+        reverify_path = args.arg2
+        if args.arg3:
+            try:
+                args.percent = float(args.arg3)
+            except ValueError:
+                parser.error(f"Invalid verification percentage: '{args.arg3}'")
+    elif args.vs_report:
         # Invoked with --vs <report> <branch2>
         baseline_report = args.vs_report
         branch2 = args.arg1
@@ -854,6 +1226,43 @@ Examples:
             parser.error("Specify both branches: '<branch1> <branch2>' (or use 'vs <report_path> <branch2>')")
         branch1 = args.arg1
         branch2 = args.arg2
+
+    if reverify_path:
+        # Resolve source run directory
+        src_cand = Path(reverify_path).expanduser()
+        if not src_cand.is_dir() and not src_cand.is_absolute():
+            target_repo = Path(args.repo_dir or ".").resolve()
+            alt_cand = target_repo / "ab_test_runs" / reverify_path
+            if alt_cand.is_dir():
+                src_cand = alt_cand
+        src_run_dir = src_cand.resolve()
+        if not src_run_dir.is_dir():
+            parser.error(f"Previous A/B test run directory not found: '{reverify_path}' (resolved: '{src_run_dir}')")
+
+        try:
+            dir_a, dir_b, name_a, name_b, is_base_a, is_base_b = ABTestRunner.discover_branches_from_run(src_run_dir)
+            runner = ABTestRunner(
+                branch1=name_a,
+                branch2=name_b,
+                baseline_report=None,
+                reverify_src_dir=str(src_run_dir),
+                num_books=args.books,
+                percent=args.percent,
+                mode=args.mode,
+                timeout=args.timeout,
+                repo_dir=args.repo_dir,
+                output_dir=args.output_dir,
+                extra_args=args.extra_args,
+                dry_run=args.dry_run,
+            )
+            runner.reverify_flow(dir_a, dir_b, is_base_a, is_base_b)
+        except KeyboardInterrupt:
+            log_warning("\nExecution aborted by user.")
+            sys.exit(130)
+        except Exception as exc:
+            log_error(f"Re-verification execution failed: {exc}")
+            sys.exit(1)
+        return
 
     try:
         runner = ABTestRunner(

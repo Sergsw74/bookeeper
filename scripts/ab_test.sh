@@ -9,6 +9,10 @@
 #   # 2. VS Mode (Existing Baseline Report vs Candidate Branch):
 #   ./ab_test.sh vs <baseline_report_path> <branch2> [num_books=5] [percent=1.0] [extra_args...]
 #   ./ab_test.sh --vs <baseline_report_path> <branch2> [num_books=5] [percent=1.0] [extra_args...]
+#
+#   # 3. Re-verify Mode (Reuse Knowledge Graphs & Re-run Verification with New Percent):
+#   ./ab_test.sh reverify <path_to_abtest_result> [percent=5.0] [extra_args...]
+#   ./ab_test.sh --reverify <path_to_abtest_result> [percent=5.0] [extra_args...]
 # ==============================================================================
 
 set -euo pipefail
@@ -27,6 +31,20 @@ fi
 
 if [ $# -eq 0 ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     exec "$PYTHON_EXEC" "${SCRIPT_DIR}/ab_test.py" --help
+fi
+
+# Check for reverify mode keyword or flag
+if [ "${1:-}" = "reverify" ] || [ "${1:-}" = "--reverify" ]; then
+    if [ $# -lt 2 ]; then
+        echo "Error: In 'reverify' mode, specify path to previous A/B test run directory."
+        echo "Usage: $0 reverify <path_to_abtest_result> [percent=5.0] [extra_args...]"
+        exit 1
+    fi
+    RUN_PATH="$2"
+    PERCENT="${3:-5.0}"
+    shift 2
+    if [ $# -ge 1 ]; then shift; fi
+    exec "$PYTHON_EXEC" "${SCRIPT_DIR}/ab_test.py" reverify "$RUN_PATH" --percent "$PERCENT" "$@"
 fi
 
 # Check for VS mode keyword or flag

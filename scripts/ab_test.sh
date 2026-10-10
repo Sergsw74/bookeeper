@@ -33,6 +33,20 @@ if [ $# -eq 0 ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     exec "$PYTHON_EXEC" "${SCRIPT_DIR}/ab_test.py" --help
 fi
 
+# Check for cross-check mode keyword or flag
+if [ "${1:-}" = "cross-check" ] || [ "${1:-}" = "--cross-check" ]; then
+    if [ $# -lt 2 ]; then
+        echo "Error: In 'cross-check' mode, specify path to previous A/B test run directory."
+        echo "Usage: $0 cross-check <path_to_abtest_result> [number_blocks=20] [extra_args...]"
+        exit 1
+    fi
+    RUN_PATH="$2"
+    BLOCKS="${3:-20}"
+    shift 2
+    if [ $# -ge 1 ]; then shift; fi
+    exec "$PYTHON_EXEC" "${SCRIPT_DIR}/ab_test.py" cross-check "$RUN_PATH" --blocks "$BLOCKS" "$@"
+fi
+
 # Check for reverify mode keyword or flag
 if [ "${1:-}" = "reverify" ] || [ "${1:-}" = "--reverify" ]; then
     if [ $# -lt 2 ]; then

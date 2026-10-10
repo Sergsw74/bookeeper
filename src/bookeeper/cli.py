@@ -63,6 +63,9 @@ from bookeeper.processing.verifier import (
     ChunkingVerificationReport,
     ChunkVerificationReport,
     ChunkAuditItem,
+    run_cross_check,
+    CrossCheckReport,
+    CrossCheckBlockResult,
 )
 from bookeeper.rag.lightrag_engine import LightRAGEngine
 
@@ -2923,7 +2926,13 @@ def verify_command(
         None, "--percent", "-p", help="Percentage of ideas to randomly verify (default: 1.0 for 1%)."
     ),
     mode: Optional[str] = typer.Option(
-        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', or 'chunk' (default: 'ideas')."
+        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', 'chunk', or 'cross-check' (default: 'ideas')."
+    ),
+    compare_graph: Optional[str] = typer.Option(
+        None, "--compare-graph", help="Second knowledge_graph.json to compare against in cross-check mode."
+    ),
+    blocks: Optional[int] = typer.Option(
+        None, "--blocks", help="Number of contiguous chunk blocks to audit in cross-check mode (default: 20)."
     ),
     book_id: Optional[int] = typer.Option(
         None, "--book-id", "-b", help="Specific book ID to verify (in chunking mode)."
@@ -2976,6 +2985,8 @@ def verify_command(
       the EntityDeduplicator, and computes Success Rate (matched / Oracle) and Fail Rate (missed / original).
     """
     graph_file = _resolve_opt(graph_file)
+    compare_graph = _resolve_opt(compare_graph)
+    blocks = _resolve_opt(blocks)
     percent = _resolve_opt(percent)
     mode = _resolve_opt(mode)
     book_id = _resolve_opt(book_id)
@@ -3420,6 +3431,218 @@ def verify_command(
             f"[dim green]✓ Full chunk verification report saved to: [bold]{report_dest}[/bold][/dim green]\n"
         )
         _print_ollama_server_stats([pool], console=console, title="Ollama Server Chunk Verification Effort Statistics")
+        return
+
+    # Mode: 'cross-check' (Dual Knowledge Base Seam & Recall Comparative Audit)
+    if effective_mode in ("cross-check", "cross_check"):
+        target_graph_a = Path(graph_file).expanduser().resolve() if graph_file else None
+        target_graph_b = Path(compare_graph).expanduser().resolve() if compare_graph else None
+
+        # Auto-discovery if a directory or run folder was passed
+        if target_graph_a and target_graph_a.is_dir() and not target_graph_b:
+            subdirs = sorted([p for p in target_graph_a.iterdir() if p.is_dir()])
+            cand_a = [p for p in subdirs if p.name.startswith("branch_A")]
+            cand_b = [p for p in subdirs if p.name.startswith("branch_B")]
+            if cand_a and cand_b:
+                target_graph_a = cand_a[0] / "knowledge_graph.json"
+                target_graph_b = cand_b[0] / "knowledge_graph.json"
+
+        if not target_graph_a or not target_graph_a.is_file():
+            default_kg = cfg.resolved_output_dir / "knowledge_graph.json"
+            if default_kg.is_file():
+                target_graph_a = default_kg
+            else:
+                console.print(
+                    f"[bold red]Primary knowledge graph file not found at '{target_graph_a}'.[/bold red]\n"
+                    f"[yellow]Specify --graph-file <path_to_baseline_kg.json> and --compare-graph <path_to_candidate_kg.json>.[/yellow]"
+                )
+                raise typer.Exit(1)
+
+        if not target_graph_b or not target_graph_b.is_file():
+            console.print(
+                f"[bold red]Comparison knowledge graph file (--compare-graph) not found.[/bold red]\n"
+                f"[yellow]Specify --compare-graph <path_to_candidate_kg.json> to run cross-check mode.[/yellow]"
+            )
+            raise typer.Exit(1)
+
+        store_a = ConceptGraphStore()
+        store_b = ConceptGraphStore()
+        with console.status(f"[bold cyan]Loading Graph A from {target_graph_a}...[/bold cyan]"):
+            store_a.load(target_graph_a)
+        with console.status(f"[bold cyan]Loading Graph B from {target_graph_b}...[/bold cyan]"):
+            store_b.load(target_graph_b)
+
+        effective_blocks = blocks if blocks is not None else 20
+        effective_model = model or cfg.resolved_verifier_model
+
+        verifier_servers = cfg.resolved_verification_servers
+        pool = OllamaPool(
+            servers=verifier_servers,
+            cooldown_seconds=cfg.failover_cooldown_seconds,
+            max_tasks_per_server=1,
+        )
+        num_servers = len(pool.alive_nodes) or len(pool.nodes)
+        pool_concurrency = max_tasks if max_tasks is not None else cfg.calculate_pool_concurrency(num_servers)
+
+        chunks_a_cnt = len([n for n, d in store_a.graph.nodes(data=True) if d.get("type") == "Chunk"])
+        chunks_b_cnt = len([n for n, d in store_b.graph.nodes(data=True) if d.get("type") == "Chunk"])
+
+        console.print(
+            Panel.fit(
+                f"[bold]Baseline Graph A:[/bold] {target_graph_a} ({chunks_a_cnt} chunks)\n"
+                f"[bold]Candidate Graph B:[/bold] {target_graph_b} ({chunks_b_cnt} chunks)\n\n"
+                f"[bold cyan]Verification Mode:[/bold cyan] CROSS-CHECK (Dual Seam & Recall Comparative Audit)\n"
+                f"[bold cyan]Contiguous Blocks to Audit:[/bold cyan] {effective_blocks}\n"
+                f"[bold cyan]Oracle Model:[/bold cyan] [bold magenta]{effective_model}[/bold magenta]\n"
+                f"[bold cyan]Disproportion Metric:[/bold cyan] sum(block_A.len) / sum(block_A ∪ block_B.len)\n"
+                f"[bold cyan]Concurrency:[/bold cyan] {pool_concurrency} tasks across {num_servers} Ollama server(s)",
+                title="Cross-Check Verification Plan",
+            )
+        )
+
+        with console.status(
+            f"[bold blue]Preloading and warming up verifier model '{effective_model}' across Ollama pool...[/bold blue]"
+        ):
+            warmup_verifier = IdeaVerifier(pool=pool, model_name=effective_model)
+            warmup_verifier.warmup(timeout=90)
+
+        t_start = time.perf_counter()
+        tot_delta = 0.0
+        tot_trunc = 0.0
+
+        cc_progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]Cross-Check Progress:[/bold cyan]"),
+            BarColumn(bar_width=25),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TextColumn("{task.fields[stats_line]}"),
+            console=console,
+        )
+        tot_cc_task = cc_progress.add_task("cc_total", total=effective_blocks, completed=0, stats_line="")
+        cur_cc_line = Text.from_markup("[bold blue]Current Block:[/bold blue] Initializing cross-check auditor...")
+
+        with Live(Group(cur_cc_line, cc_progress), console=console, refresh_per_second=10) as live:
+            def _on_cc_progress(completed: int, total: int, block_info: str, item: Optional[CrossCheckBlockResult] = None):
+                nonlocal tot_delta, tot_trunc
+                if item is not None:
+                    tot_delta += item.delta_recall
+                    tot_trunc += item.new_system.truncation_rate
+                    avg_d = tot_delta / completed if completed > 0 else 0.0
+                    cur_text = (
+                        f"[bold blue]Current Block:[/bold blue] {block_info} | "
+                        f"ΔRecall: [{'green' if avg_d >= 0 else 'red'}]{avg_d * 100:+.1f}% pts[/] | "
+                        f"Disprop: [cyan]{item.chunk_disproportion:.2f}[/cyan]"
+                    )
+                else:
+                    cur_text = f"[bold blue]Current Block:[/bold blue] {block_info} | [bold yellow]Auditing...[/bold yellow]"
+
+                elapsed = time.perf_counter() - t_start
+                rate = (completed / elapsed) if elapsed > 0 else 0.0
+                if completed > 0 and total > completed and rate > 0:
+                    rem_sec = (total - completed) / rate
+                    eta_str = f"{int(rem_sec // 60)}m {int(rem_sec % 60):02d}s" if rem_sec >= 60 else f"{rem_sec:.0f}s"
+                else:
+                    eta_str = "--"
+
+                stats_str = f"[cyan]{rate:.1f} blk/s[/cyan] | [yellow]ETA: {eta_str}[/yellow]"
+                cc_progress.update(tot_cc_task, completed=completed, total=total, stats_line=stats_str)
+                live.update(Group(Text.from_markup(cur_text), cc_progress))
+
+            report = run_cross_check(
+                store_a=store_a,
+                store_b=store_b,
+                num_blocks=effective_blocks,
+                pool=pool,
+                model_name=effective_model,
+                branch_a_name=target_graph_a.parent.name or "Branch A",
+                branch_b_name=target_graph_b.parent.name or "Branch B",
+                seed=seed,
+                progress_callback=_on_cc_progress,
+            )
+
+        # 1. Summary Metrics Table
+        sm = report.summary
+        summary_table = Table(title="Cross-Check Verification Summary & Decision Gates", border_style="cyan")
+        summary_table.add_column("Metric", style="bold")
+        summary_table.add_column("Baseline (Old / A)", justify="right", style="cyan")
+        summary_table.add_column("Candidate (New / B)", justify="right", style="magenta")
+        summary_table.add_column("Delta (B - A)", justify="right")
+
+        summary_table.add_row("Total Contiguous Blocks Audited", str(sm.total_samples), str(sm.total_samples), "-")
+        summary_table.add_row(
+            "Mean Oracle Recall (%)",
+            f"{sm.mean_old_recall * 100:.2f}%",
+            f"{sm.mean_new_recall * 100:.2f}%",
+            f"[{'green' if sm.mean_delta_recall >= -0.03 else 'red'}]{sm.mean_delta_recall * 100:+.2f}% pts[/]",
+        )
+        summary_table.add_row(
+            "Mean Grounded Precision (%)",
+            f"{sm.mean_old_precision * 100:.2f}%",
+            f"{sm.mean_new_precision * 100:.2f}%",
+            f"{(sm.mean_new_precision - sm.mean_old_precision) * 100:+.2f}% pts",
+        )
+        summary_table.add_row(
+            "Boundary Truncation Artifact Rate (%)",
+            f"{sm.mean_old_truncation_rate * 100:.2f}%",
+            f"[{'green' if sm.mean_new_truncation_rate < 0.02 else 'red'}]{sm.mean_new_truncation_rate * 100:.2f}%[/]",
+            f"{(sm.mean_new_truncation_rate - sm.mean_old_truncation_rate) * 100:+.2f}% pts",
+        )
+        summary_table.add_section()
+        summary_table.add_row(
+            "Mean Chunk Disproportion [sum(A)/sum(A∪B)]",
+            "-",
+            f"[bold cyan]{sm.mean_chunk_disproportion:.4f}[/bold cyan]",
+            "-",
+        )
+        summary_table.add_row(
+            "Decision Gating Checklist",
+            "-",
+            "[bold green]PASS[/bold green]" if sm.decision_pass else "[bold red]FAIL[/bold red]",
+            f"[dim]{sm.pass_reason}[/dim]",
+        )
+        console.print(summary_table)
+
+        # 2. Block Sample Detail Breakdown Table
+        if report.samples:
+            sample_table = Table(title="Audited Block Samples Breakdown (Top 10)", border_style="yellow")
+            sample_table.add_column("#", justify="right", style="bold")
+            sample_table.add_column("Book / Section", style="dim")
+            sample_table.add_column("Passage Len", justify="right")
+            sample_table.add_column("Disproportion", justify="right", style="cyan")
+            sample_table.add_column("Recall A", justify="right")
+            sample_table.add_column("Recall B", justify="right")
+            sample_table.add_column("ΔRecall", justify="right")
+            sample_table.add_column("B Truncation", justify="right")
+
+            for s in report.samples[:10]:
+                d_color = "green" if s.delta_recall >= 0 else ("yellow" if s.delta_recall >= -0.03 else "red")
+                t_color = "green" if s.new_system.truncation_rate == 0 else "red"
+                sample_table.add_row(
+                    str(s.sample_index),
+                    f"{s.book_title[:16]} ({s.section_title[:14]})",
+                    f"{s.passage_length_chars} chars",
+                    f"{s.chunk_disproportion:.3f}",
+                    f"{s.old_system.oracle_recall * 100:.1f}%",
+                    f"{s.new_system.oracle_recall * 100:.1f}%",
+                    f"[{d_color}]{s.delta_recall * 100:+.1f}%[/]",
+                    f"[{t_color}]{s.new_system.truncation_rate * 100:.1f}%[/]",
+                )
+            console.print(sample_table)
+
+        # 3. Save JSON Report
+        report_dest = (
+            Path(output_report).expanduser().resolve()
+            if output_report
+            else cfg.resolved_output_dir / "cross_check_report.json"
+        )
+        report_dest.parent.mkdir(parents=True, exist_ok=True)
+        with open(report_dest, "w", encoding="utf-8") as f:
+            json.dump(report.model_dump(), f, indent=2, ensure_ascii=False)
+        console.print(
+            f"[dim green]✓ Full cross-check verification report saved to: [bold]{report_dest}[/bold][/dim green]\n"
+        )
+        _print_ollama_server_stats([pool], console=console, title="Ollama Server Cross-Check Verification Effort Statistics")
         return
 
     # Mode: 'ideas'

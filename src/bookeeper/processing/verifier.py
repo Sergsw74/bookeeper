@@ -21,6 +21,14 @@ from pydantic import BaseModel, Field
 
 from bookeeper.graph.store import ConceptGraphStore
 from bookeeper.processing.chunker import ChunkStore, HierarchicalChunk
+from bookeeper.processing.cross_checker import (
+    CrossCheckAuditItem,
+    CrossCheckBlockResult,
+    CrossCheckReport,
+    CrossCheckSummary,
+    SystemBlockMetrics,
+    run_cross_check,
+)
 from bookeeper.processing.ollama_pool import OllamaPool, _thread_local
 
 logger = logging.getLogger(__name__)

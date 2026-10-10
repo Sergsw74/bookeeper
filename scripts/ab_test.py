@@ -28,6 +28,7 @@ import argparse
 import datetime
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -80,8 +81,10 @@ class ABTestRunner:
         branch2: str,
         baseline_report: Optional[str] = None,
         reverify_src_dir: Optional[str] = None,
+        cross_check_src_dir: Optional[str] = None,
         num_books: int = 5,
         percent: float = 1.0,
+        blocks: int = 20,
         mode: str = "ideas",
         timeout: int = 60,
         repo_dir: Optional[str] = None,
@@ -92,22 +95,35 @@ class ABTestRunner:
         self.branch2 = branch2
         self.num_books = num_books
         self.percent = percent
+        self.blocks = blocks
         self.mode = mode
         self.timeout = timeout
         self.extra_args = extra_args or ""
         self.dry_run = dry_run
+        self.is_cross_check_mode = bool(cross_check_src_dir)
 
-        # Handle Reverify mode with pre-existing A/B test run directory
-        if reverify_src_dir:
+        # Handle Cross-check / Reverify mode with pre-existing A/B test run directory
+        if cross_check_src_dir:
+            self.cross_check_src_dir: Optional[Path] = Path(cross_check_src_dir).expanduser().resolve()
+            if not self.dry_run and not self.cross_check_src_dir.is_dir():
+                raise FileNotFoundError(f"Run directory not found at {self.cross_check_src_dir}")
+            self.reverify_src_dir = self.cross_check_src_dir
+            self.is_reverify_mode = False
+            self.is_vs_mode = False
+            self.baseline_report_path = None
+            self.branch1 = branch1
+        elif reverify_src_dir:
             self.reverify_src_dir: Optional[Path] = Path(reverify_src_dir).expanduser().resolve()
             if not self.dry_run and not self.reverify_src_dir.is_dir():
                 raise FileNotFoundError(f"Run directory not found at {self.reverify_src_dir}")
+            self.cross_check_src_dir = None
             self.is_reverify_mode = True
             self.is_vs_mode = False
             self.baseline_report_path = None
             self.branch1 = branch1
         elif baseline_report:
             self.reverify_src_dir = None
+            self.cross_check_src_dir = None
             self.is_reverify_mode = False
             self.baseline_report_path: Optional[Path] = Path(baseline_report).expanduser().resolve()
             if not self.dry_run and not self.baseline_report_path.is_file():
@@ -120,6 +136,7 @@ class ABTestRunner:
             self.branch1 = branch1 or f"Report ({desc_tag})"
         else:
             self.reverify_src_dir = None
+            self.cross_check_src_dir = None
             self.is_reverify_mode = False
             self.baseline_report_path = None
             self.is_vs_mode = False
@@ -156,7 +173,9 @@ class ABTestRunner:
         # Resolve archive directory
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         base_archive = Path(output_dir).expanduser().resolve() if output_dir else self.repo_dir / "ab_test_runs"
-        if self.is_reverify_mode:
+        if getattr(self, "is_cross_check_mode", False):
+            self.session_dir = base_archive / f"cross_check_{timestamp}_{self._sanitize(self.branch1)}_vs_{self._sanitize(self.branch2)}_b{self.blocks}"
+        elif self.is_reverify_mode:
             pct_tag = f"p{str(self.percent).replace('.', '_')}"
             self.session_dir = base_archive / f"reverify_{timestamp}_{self._sanitize(self.branch1)}_vs_{self._sanitize(self.branch2)}_{pct_tag}"
         else:
@@ -855,6 +874,209 @@ class ABTestRunner:
         self.compare_results(new_dir_a, new_dir_b)
         return self.session_dir
 
+    def cross_check_flow(
+        self,
+        src_dir_a: Path,
+        src_dir_b: Path,
+        num_blocks: int = 20,
+    ) -> Path:
+        """Execute cross-check comparative audit across contiguous chunk blocks in two graphs."""
+        log_header(f"A/B Testing Cross-Check Comparative Audit Initialized ({num_blocks} blocks)")
+        src_info = self.reverify_src_dir or getattr(self, "cross_check_src_dir", None) or "Direct Input"
+        print(f"• Source Archive:   {Colors.BOLD}{src_info}{Colors.RESET}")
+        print(f"• Output Archive:   {Colors.BOLD}{self.session_dir}{Colors.RESET}")
+        print(f"• Baseline (Old):   {Colors.BOLD}{self.branch1}{Colors.RESET}")
+        print(f"• Candidate (New):  {Colors.BOLD}{self.branch2}{Colors.RESET}")
+        print(f"• Target Blocks:    {Colors.BOLD}{num_blocks}{Colors.RESET} contiguous chunk blocks")
+        print(f"• Disproportion:    sum(block_A.len) / sum(block_A ∪ block_B.len)")
+        print(f"• Request Timeout:  {self.timeout}s")
+        print(f"• Repository Path:  {self.repo_dir}\n")
+
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        kg_a = src_dir_a / "knowledge_graph.json"
+        kg_b = src_dir_b / "knowledge_graph.json"
+
+        if not kg_a.is_file():
+            raise FileNotFoundError(f"Missing knowledge_graph.json in {src_dir_a}")
+        if not kg_b.is_file():
+            raise FileNotFoundError(f"Missing knowledge_graph.json in {src_dir_b}")
+
+        t0 = time.time()
+        if self.dry_run:
+            log_warning("Dry-run mode enabled: simulating cross-check comparative audit.")
+            time.sleep(0.4)
+
+            # Generate realistic synthetic blocks
+            mock_samples = []
+            for b_idx in range(1, num_blocks + 1):
+                p_len = random.randint(2200, 3200)
+                len_a = p_len + random.randint(100, 300)
+                len_b = p_len + random.randint(200, 500)
+                union_len = max(len_a, len_b) + random.randint(50, 150)
+                disprop = round(len_a / union_len, 4)
+
+                old_rec = round(random.uniform(0.80, 0.90), 4)
+                new_rec = round(min(1.0, old_rec + random.uniform(0.01, 0.05)), 4)
+                delta_rec = round(new_rec - old_rec, 4)
+
+                mock_samples.append({
+                    "sample_index": b_idx,
+                    "book_id": 1,
+                    "book_title": "Simulated Book",
+                    "section_title": f"Chapter {b_idx}",
+                    "old_chunk_ids": [f"b1_c{b_idx}_p1", f"b1_c{b_idx}_p2", f"b1_c{b_idx}_p3"],
+                    "new_chunk_ids": [f"b1_c{b_idx}_p1", f"b1_c{b_idx}_p2", f"b1_c{b_idx}_p3", f"b1_c{b_idx}_p4"],
+                    "passage_length_chars": p_len,
+                    "block_a_total_len": len_a,
+                    "block_b_total_len": len_b,
+                    "union_len": union_len,
+                    "chunk_disproportion": disprop,
+                    "oracle_ideas_count": 5,
+                    "old_system": {
+                        "system": "old",
+                        "raw_ideas_count": 5,
+                        "deduped_ideas_count": 5,
+                        "oracle_recall": old_rec,
+                        "grounded_precision": 0.95,
+                        "truncation_rate": 0.0,
+                        "retained_oracle_ideas": ["Core Idea 1", "Core Idea 2"],
+                        "dropped_oracle_ideas": [],
+                        "audited_items": [],
+                    },
+                    "new_system": {
+                        "system": "new",
+                        "raw_ideas_count": 6,
+                        "deduped_ideas_count": 6,
+                        "oracle_recall": new_rec,
+                        "grounded_precision": 0.97,
+                        "truncation_rate": 0.005,
+                        "retained_oracle_ideas": ["Core Idea 1", "Core Idea 2", "Core Idea 3"],
+                        "dropped_oracle_ideas": [],
+                        "audited_items": [],
+                    },
+                    "delta_recall": delta_rec,
+                    "duration_seconds": 0.8,
+                })
+
+            mean_old_rec = round(float(sum(s["old_system"]["oracle_recall"] for s in mock_samples) / num_blocks), 4)
+            mean_new_rec = round(float(sum(s["new_system"]["oracle_recall"] for s in mock_samples) / num_blocks), 4)
+            mean_delta_rec = round(float(sum(s["delta_recall"] for s in mock_samples) / num_blocks), 4)
+            mean_old_prec = 0.95
+            mean_new_prec = 0.97
+            mean_old_trunc = 0.0
+            mean_new_trunc = 0.005
+            mean_disprop = round(float(sum(s["chunk_disproportion"] for s in mock_samples) / num_blocks), 4)
+            decision_pass = mean_delta_rec >= -0.03 and mean_new_trunc < 0.02
+
+            report_data = {
+                "mode": "cross-check",
+                "model_name": "oracle-verifier",
+                "baseline_branch": self.branch1,
+                "candidate_branch": self.branch2,
+                "summary": {
+                    "total_samples": num_blocks,
+                    "mean_old_recall": mean_old_rec,
+                    "mean_new_recall": mean_new_rec,
+                    "mean_delta_recall": mean_delta_rec,
+                    "mean_old_precision": mean_old_prec,
+                    "mean_new_precision": mean_new_prec,
+                    "mean_old_truncation_rate": mean_old_trunc,
+                    "mean_new_truncation_rate": mean_new_trunc,
+                    "mean_chunk_disproportion": mean_disprop,
+                    "decision_pass": decision_pass,
+                    "pass_reason": "All decision gates passed: Recall delta >= -3% and Truncation Rate < 2%",
+                    "total_duration_seconds": round(time.time() - t0, 2),
+                },
+                "samples": mock_samples,
+            }
+        else:
+            from bookeeper.graph.store import ConceptGraphStore
+            from bookeeper.processing.cross_checker import run_cross_check
+
+            store_a = ConceptGraphStore()
+            store_b = ConceptGraphStore()
+            store_a.load(kg_a)
+            store_b.load(kg_b)
+
+            rep_obj = run_cross_check(
+                store_a=store_a,
+                store_b=store_b,
+                num_blocks=num_blocks,
+                branch_a_name=self.branch1,
+                branch_b_name=self.branch2,
+            )
+            report_data = rep_obj.model_dump()
+
+        # Save JSON & Markdown report
+        json_out = self.session_dir / "cross_check_report.json"
+        with open(json_out, "w", encoding="utf-8") as f:
+            json.dump(report_data, f, indent=2, ensure_ascii=False)
+
+        md_out = self.session_dir / "cross_check_report.md"
+        self._write_cross_check_markdown(md_out, report_data)
+
+        # Print terminal summary table
+        sm = report_data["summary"]
+        col_w_m = 44
+        col_w_v = 20
+
+        header = f"{'METRIC':<{col_w_m}} {'BASELINE (' + self.branch1 + ')':<{col_w_v}} {'CANDIDATE (' + self.branch2 + ')':<{col_w_v}} {'DELTA (B - A)':<{col_w_v}}"
+        sep = "=" * (col_w_m + col_w_v * 3 + 3)
+        print("\n" + sep)
+        print(f"{Colors.BOLD}{header}{Colors.RESET}")
+        print("-" * len(sep))
+
+        print(f"{'Total Contiguous Blocks Audited':<{col_w_m}} {sm['total_samples']:<{col_w_v}} {sm['total_samples']:<{col_w_v}} {'-':<{col_w_v}}")
+        delta_rec_color = Colors.GREEN if sm['mean_delta_recall'] >= -0.03 else Colors.RED
+        print(f"{'Mean Oracle Recall (%)':<{col_w_m}} {sm['mean_old_recall']*100:.2f}%{'':<{col_w_v-8}} {sm['mean_new_recall']*100:.2f}%{'':<{col_w_v-8}} {delta_rec_color}{sm['mean_delta_recall']*100:+.2f}% pts{Colors.RESET}")
+        print(f"{'Mean Grounded Precision (%)':<{col_w_m}} {sm['mean_old_precision']*100:.2f}%{'':<{col_w_v-8}} {sm['mean_new_precision']*100:.2f}%{'':<{col_w_v-8}} {(sm['mean_new_precision']-sm['mean_old_precision'])*100:+.2f}% pts")
+        trunc_color = Colors.GREEN if sm['mean_new_truncation_rate'] < 0.02 else Colors.RED
+        print(f"{'Boundary Truncation Artifact Rate (%)':<{col_w_m}} {sm['mean_old_truncation_rate']*100:.2f}%{'':<{col_w_v-8}} {trunc_color}{sm['mean_new_truncation_rate']*100:.2f}%{Colors.RESET}{'':<{col_w_v-8}} {(sm['mean_new_truncation_rate']-sm['mean_old_truncation_rate'])*100:+.2f}% pts")
+        print("-" * len(sep))
+        print(f"{'Mean Chunk Disproportion [sum(A)/sum(A∪B)]':<{col_w_m}} {'-':<{col_w_v}} {Colors.BOLD}{Colors.CYAN}{sm['mean_chunk_disproportion']:.4f}{Colors.RESET}{'':<{col_w_v-8}} {'-':<{col_w_v}}")
+
+        gate_badge = f"{Colors.BOLD}{Colors.GREEN}PASS{Colors.RESET}" if sm['decision_pass'] else f"{Colors.BOLD}{Colors.RED}FAIL{Colors.RESET}"
+        print(f"{'Decision Gating Checklist':<{col_w_m}} {'-':<{col_w_v}} {gate_badge:<{col_w_v}} {sm['pass_reason']}")
+        print(sep + "\n")
+
+        log_success(f"Full cross-check JSON saved to: {Colors.BOLD}{json_out}{Colors.RESET}")
+        log_success(f"Full cross-check Markdown report saved to: {Colors.BOLD}{md_out}{Colors.RESET}\n")
+
+        return self.session_dir
+
+    def _write_cross_check_markdown(self, dest: Path, data: Dict[str, Any]) -> None:
+        sm = data.get("summary", {})
+        lines = [
+            "# A/B Testing Cross-Check Comparative Audit Report",
+            "",
+            f"- **Mode:** `cross-check` (Dual Knowledge Base Seam & Recall Comparison)",
+            f"- **Baseline:** `{data.get('baseline_branch', self.branch1)}`",
+            f"- **Candidate:** `{data.get('candidate_branch', self.branch2)}`",
+            f"- **Audited Blocks:** `{sm.get('total_samples', 0)}`",
+            f"- **Decision Verdict:** **{'PASS' if sm.get('decision_pass') else 'FAIL'}** (`{sm.get('pass_reason', '')}`)",
+            "",
+            "### 🎯 Benchmark Summary & Decision Gates",
+            "",
+            "| Metric | Baseline (A) | Candidate (B) | Delta (B - A) | Passing Criteria |",
+            "| :--- | :--- | :--- | :--- | :--- |",
+            f"| Mean Oracle Recall | {sm.get('mean_old_recall', 0.0)*100:.2f}% | {sm.get('mean_new_recall', 0.0)*100:.2f}% | {sm.get('mean_delta_recall', 0.0)*100:+.2f}% pts | Mean ΔRecall >= -3% |",
+            f"| Mean Grounded Precision | {sm.get('mean_old_precision', 0.0)*100:.2f}% | {sm.get('mean_new_precision', 0.0)*100:.2f}% | {(sm.get('mean_new_precision', 0.0)-sm.get('mean_old_precision', 0.0))*100:+.2f}% pts | Contextually Supported |",
+            f"| Boundary Truncation Artifact Rate | {sm.get('mean_old_truncation_rate', 0.0)*100:.2f}% | {sm.get('mean_new_truncation_rate', 0.0)*100:.2f}% | {(sm.get('mean_new_truncation_rate', 0.0)-sm.get('mean_old_truncation_rate', 0.0))*100:+.2f}% pts | Mean Artifact Rate < 2% |",
+            f"| Chunk Disproportion [sum(A)/sum(A∪B)] | - | **{sm.get('mean_chunk_disproportion', 0.0):.4f}** | - | Ratio sum(A.len)/sum(A∪B.len) |",
+            "",
+            "### 📊 Audited Block Samples Breakdown (Top 10)",
+            "",
+            "| Block # | Book / Section | Passage Chars | Disproportion | Recall (A) | Recall (B) | ΔRecall | Truncation Rate (B) |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        ]
+        for s in data.get("samples", [])[:10]:
+            lines.append(
+                f"| {s['sample_index']} | {s['book_title'][:18]} ({s['section_title'][:16]}) | {s['passage_length_chars']} | {s['chunk_disproportion']:.3f} | {s['old_system']['oracle_recall']*100:.1f}% | {s['new_system']['oracle_recall']*100:.1f}% | {s['delta_recall']*100:+.1f}% | {s['new_system']['truncation_rate']*100:.1f}% |"
+            )
+
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
     def compare_results(self, dir_a: Path, dir_b: Path) -> Dict[str, Any]:
         """Compute side-by-side comparison between the two verification reports."""
         log_header("Verification A/B Comparison Analysis")
@@ -1330,23 +1552,27 @@ Examples:
   # 3. Re-verify Mode (Reuse Existing Knowledge Graphs with New Sample %):
   ./ab_test.py reverify ./ab_test_runs/run_20261009_190157_master_vs_feature-model-adjustments 5.0
   ./ab_test.py --reverify ./ab_test_runs/run_20261009_190157_master_vs_feature-model-adjustments --percent 5.0
+
+  # 4. Cross-check Mode (Contiguous Chunk Seam & Recall Comparative Audit):
+  ./ab_test.py cross-check ./ab_test_runs/run_20261009_190157_master_vs_feature-model-adjustments 20
+  ./ab_test.py --cross-check ./ab_test_runs/run_20261009_190157_master_vs_feature-model-adjustments --blocks 20
         """,
     )
     parser.add_argument(
         "arg1",
-        help="Name of Branch A (baseline), OR mode keyword 'vs'/'reverify', OR path to baseline verification report.",
+        help="Name of Branch A (baseline), OR mode keyword 'vs'/'reverify'/'cross-check', OR path to baseline verification report.",
     )
     parser.add_argument(
         "arg2",
         nargs="?",
         default=None,
-        help="Name of Branch B (candidate), OR path to baseline report if arg1 is 'vs', OR path to run if arg1 is 'reverify'.",
+        help="Name of Branch B (candidate), OR path to baseline report if arg1 is 'vs', OR path to run if arg1 is 'reverify'/'cross-check'.",
     )
     parser.add_argument(
         "arg3",
         nargs="?",
         default=None,
-        help="Name of Branch B if 'vs <report> <branch2>' format is used, OR percent if 'reverify <run> [percent]' is used.",
+        help="Name of Branch B if 'vs <report> <branch2>' format is used, OR percent if 'reverify <run> [percent]' is used, OR blocks if 'cross-check <run> [blocks]' is used.",
     )
     parser.add_argument(
         "--vs",
@@ -1362,6 +1588,19 @@ Examples:
         type=str,
         default=None,
         help="Path to pre-existing A/B test run directory to re-verify with new sample percent.",
+    )
+    parser.add_argument(
+        "--cross-check",
+        dest="cross_check_path",
+        type=str,
+        default=None,
+        help="Path to pre-existing A/B test run directory to run cross-check comparative audit.",
+    )
+    parser.add_argument(
+        "--blocks",
+        type=int,
+        default=20,
+        help="Number of contiguous chunk blocks for cross-check comparative audit (default: 20).",
     )
     parser.add_argument(
         "--books",
@@ -1382,8 +1621,8 @@ Examples:
         "-m",
         type=str,
         default="ideas",
-        choices=["ideas", "chunking", "chunk"],
-        help="Verification mode: 'ideas', 'chunking', or 'chunk' (default: ideas).",
+        choices=["ideas", "chunking", "chunk", "cross-check"],
+        help="Verification mode: 'ideas', 'chunking', 'chunk', or 'cross-check' (default: ideas).",
     )
     parser.add_argument(
         "--timeout",
@@ -1420,12 +1659,32 @@ Examples:
     args = parser.parse_args()
 
     # Determine execution mode and target branch/report/run
+    cross_check_path: Optional[str] = None
     reverify_path: Optional[str] = None
     baseline_report: Optional[str] = None
     branch1: str = ""
     branch2: str = ""
+    num_blocks: int = args.blocks
 
-    if args.reverify_path:
+    if args.cross_check_path:
+        cross_check_path = args.cross_check_path
+        if args.arg1 and not args.blocks:
+            try:
+                num_blocks = int(args.arg1)
+            except ValueError:
+                pass
+    elif args.arg1.lower() in ("cross-check", "--cross-check", "cross_check"):
+        if not args.arg2:
+            parser.error("In 'cross-check' mode, specify previous A/B test run directory: 'cross-check <path_to_abtest_result> [number_blocks]'")
+        cross_check_path = args.arg2
+        if args.arg3:
+            try:
+                num_blocks = int(args.arg3)
+            except ValueError:
+                parser.error(f"Invalid number of blocks: '{args.arg3}'")
+        else:
+            num_blocks = args.blocks
+    elif args.reverify_path:
         reverify_path = args.reverify_path
         if args.arg1 and not args.percent:
             try:
@@ -1466,6 +1725,45 @@ Examples:
             parser.error("Specify both branches: '<branch1> <branch2>' (or use 'vs <report_path> <branch2>')")
         branch1 = args.arg1
         branch2 = args.arg2
+
+    if cross_check_path:
+        # Resolve source run directory
+        src_cand = Path(cross_check_path).expanduser()
+        if not src_cand.is_dir() and not src_cand.is_absolute():
+            target_repo = Path(args.repo_dir or ".").resolve()
+            alt_cand = target_repo / "ab_test_runs" / cross_check_path
+            if alt_cand.is_dir():
+                src_cand = alt_cand
+        src_run_dir = src_cand.resolve()
+        if not src_run_dir.is_dir():
+            parser.error(f"Previous A/B test run directory not found: '{cross_check_path}' (resolved: '{src_run_dir}')")
+
+        try:
+            dir_a, dir_b, name_a, name_b, _, _ = ABTestRunner.discover_branches_from_run(src_run_dir)
+            runner = ABTestRunner(
+                branch1=name_a,
+                branch2=name_b,
+                baseline_report=None,
+                reverify_src_dir=None,
+                cross_check_src_dir=str(src_run_dir),
+                num_books=args.books,
+                percent=args.percent,
+                blocks=num_blocks,
+                mode="cross-check",
+                timeout=args.timeout,
+                repo_dir=args.repo_dir,
+                output_dir=args.output_dir,
+                extra_args=args.extra_args,
+                dry_run=args.dry_run,
+            )
+            runner.cross_check_flow(dir_a, dir_b, num_blocks=num_blocks)
+        except KeyboardInterrupt:
+            log_warning("\nExecution aborted by user.")
+            sys.exit(130)
+        except Exception as exc:
+            log_error(f"Cross-check execution failed: {exc}")
+            sys.exit(1)
+        return
 
     if reverify_path:
         # Resolve source run directory

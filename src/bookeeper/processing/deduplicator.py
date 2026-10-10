@@ -334,6 +334,56 @@ class EntityDeduplicator:
             logger.debug(f"Failed to generate embedding for '{text}': {e}")
             return None
 
+    def is_same_concept(
+        self,
+        c1: Any,
+        c2: Any,
+    ) -> Tuple[bool, float, str, Optional[str], Optional[str]]:
+        """
+        Evaluate whether two concepts refer to the same underlying entity/idea.
+        Accepts either Concept objects or string concept names.
+        Returns:
+            (is_same, similarity_score, match_method, canonical_name, reasoning)
+            where match_method is in ("exact", "high_vector", "llm_disambiguated", "none").
+        """
+        raw_name1 = c1 if isinstance(c1, str) else getattr(c1, "name", str(c1))
+        raw_name2 = c2 if isinstance(c2, str) else getattr(c2, "name", str(c2))
+
+        name1 = BookParser.repair_mojibake(raw_name1.strip())
+        name2 = BookParser.repair_mojibake(raw_name2.strip())
+        norm1 = self._normalize_name(name1)
+        norm2 = self._normalize_name(name2)
+
+        # 1. Exact or case-insensitive string match
+        if norm1 == norm2:
+            return True, 1.0, "exact", name1, "Exact normalized name match"
+
+        # 2. Embedding-based semantic cosine similarity
+        sim = 0.0
+        vec1 = self._embed(name1)
+        vec2 = self._embed(name2)
+        if vec1 is not None and vec2 is not None:
+            sim = float(np.dot(vec1, vec2))
+
+            # Case A: High confidence vector match (>= 0.95)
+            if sim >= self.high_similarity_threshold:
+                return True, sim, "high_vector", name1, f"High confidence vector similarity ({sim:.3f})"
+
+            # Case B: Probable match (0.80 <= similarity < 0.95) -> Disambiguate with LLM
+            if sim >= self.similarity_threshold:
+                if self.extractor is not None:
+                    concept_obj1 = c1 if isinstance(c1, Concept) else Concept(name=name1)
+                    concept_obj2 = c2 if isinstance(c2, Concept) else Concept(name=name2)
+                    decision = self._ask_llm_disambiguation(concept_obj1, concept_obj2, sim)
+                    if decision.is_same_concept:
+                        return True, sim, "llm_disambiguated", decision.canonical_name or name1, decision.reasoning
+                    else:
+                        return False, sim, "none", None, decision.reasoning
+                else:
+                    return True, sim, "high_vector", name1, f"Vector similarity match ({sim:.3f}, no LLM)"
+
+        return False, sim, "none", None, "Concepts differ below similarity threshold"
+
     def get_canonical_concepts(self) -> List[Concept]:
         """Return all unique canonical concepts registered so far."""
         return [c for _, c in self._cache.values()]

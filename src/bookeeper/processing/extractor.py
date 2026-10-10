@@ -593,6 +593,24 @@ class KnowledgeExtractor:
             logger.warning(f"Section extraction LLM call failed across all pool servers for '{section_title}': {e}")
             return SectionExtraction(concepts=[])
 
+    def extract_ideas(
+        self,
+        text: str,
+        book_title: str = "Unknown",
+        section_title: str = "Unknown",
+        parent_context: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> List[Concept]:
+        """Convenience method to extract canonical concepts/ideas from text using the Oracle model."""
+        result = self.extract_concepts_from_section(
+            text=text,
+            book_title=book_title,
+            section_title=section_title,
+            parent_context=parent_context,
+            model=model,
+        )
+        return result.concepts
+
     def warmup_and_check_device(
         self,
         timeout: int = 15,

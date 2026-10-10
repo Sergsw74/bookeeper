@@ -371,35 +371,78 @@ class ABTestRunner:
         if self.dry_run:
             log_warning("Dry-run mode enabled: generating mock verification report.")
             time.sleep(0.5)
-            mock_report = {
-                "stats": {
-                    "total_ideas_in_graph": 155,
-                    "candidate_ideas_with_chunks": 150,
-                    "sampled_ideas": 15,
-                    "sample_percentage": self.percent,
-                    "mode": self.mode,
-                    "model_name": "candidate-model",
-                    "total_evaluations": 15,
-                    "verified_count": 14,
-                    "discrepancy_count": 1,
-                    "verified_percentage": 93.33,
-                    "discrepancy_percentage": 6.67,
-                    "total_duration_seconds": 12.0,
-                },
-                "discrepancies": [
-                    {
-                        "idea_name": "Candidate Discrepancy Sample",
-                        "idea_weight": 7,
-                        "book_title": "Candidate Book",
-                        "section_title": "Chapter 2",
-                        "chunk_id": "b1_c2_p1",
-                        "explanation": "Slight nuance mismatch with chunk text.",
-                        "is_supported": False,
-                        "confidence": 0.85,
-                    }
-                ],
-                "verified_samples": [],
-            }
+            if self.mode == "chunk":
+                mock_report = {
+                    "mode": "chunk",
+                    "stats": {
+                        "mode": "chunk",
+                        "model_name": f"oracle-{branch}",
+                        "embedding_model": "nomic-embed-text",
+                        "total_chunks_in_graph": 150,
+                        "sampled_chunks_count": 15,
+                        "sample_percentage": self.percent,
+                        "total_original_ideas": 42,
+                        "total_oracle_ideas": 45,
+                        "total_matched_ideas": 38,
+                        "total_missed_ideas": 7,
+                        "total_extra_original_ideas": 4,
+                        "overall_success_rate": 84.44,
+                        "overall_fail_rate": 16.67,
+                        "chunks_with_perfect_match": 10,
+                        "chunks_with_omissions": 5,
+                        "total_duration_seconds": 12.0,
+                    },
+                    "audited_chunks": [],
+                    "omission_examples": [
+                        {
+                            "chunk_id": "b1_c2_p1",
+                            "book_title": f"Book on {branch}",
+                            "section_title": "Chapter 2",
+                            "chunk_text_snippet": "Simulated chunk text snippet",
+                            "original_ideas": ["Main Idea A"],
+                            "oracle_ideas": ["Main Idea A", "Nuanced Strategy B"],
+                            "matched_pairs": [],
+                            "missed_oracle_ideas": ["Nuanced Strategy B"],
+                            "extra_original_ideas": [],
+                            "original_count": 1,
+                            "oracle_count": 2,
+                            "matched_count": 1,
+                            "missed_count": 1,
+                            "success_rate": 50.0,
+                            "fail_rate": 100.0,
+                        }
+                    ],
+                }
+            else:
+                mock_report = {
+                    "stats": {
+                        "total_ideas_in_graph": 155,
+                        "candidate_ideas_with_chunks": 150,
+                        "sampled_ideas": 15,
+                        "sample_percentage": self.percent,
+                        "mode": self.mode,
+                        "model_name": "candidate-model",
+                        "total_evaluations": 15,
+                        "verified_count": 14,
+                        "discrepancy_count": 1,
+                        "verified_percentage": 93.33,
+                        "discrepancy_percentage": 6.67,
+                        "total_duration_seconds": 12.0,
+                    },
+                    "discrepancies": [
+                        {
+                            "idea_name": "Candidate Discrepancy Sample",
+                            "idea_weight": 7,
+                            "book_title": "Candidate Book",
+                            "section_title": "Chapter 2",
+                            "chunk_id": "b1_c2_p1",
+                            "explanation": "Slight nuance mismatch with chunk text.",
+                            "is_supported": False,
+                            "confidence": 0.85,
+                        }
+                    ],
+                    "verified_samples": [],
+                }
             with open(branch_dir / "verification_report.json", "w", encoding="utf-8") as f:
                 json.dump(mock_report, f, indent=2)
             with open(log_file, "w", encoding="utf-8") as f:
@@ -580,41 +623,93 @@ class ABTestRunner:
             log_warning("Dry-run mode enabled: simulating verification report.")
             time.sleep(0.3)
             graph_data = self._load_json(kg_file) or {}
-            c_nodes = len([n for n in graph_data.get("nodes", []) if n.get("type") == "Concept"]) or 120
-            sampled = max(1, int(round(c_nodes * (self.percent / 100.0))))
-            v_cnt = max(1, int(sampled * 0.9))
-            d_cnt = sampled - v_cnt
-            mock_rep = {
-                "stats": {
-                    "total_ideas_in_graph": c_nodes,
-                    "candidate_ideas_with_chunks": c_nodes,
-                    "sampled_ideas": sampled,
-                    "sample_percentage": self.percent,
-                    "mode": self.mode,
-                    "model_name": f"verifier-{branch}",
-                    "total_evaluations": sampled,
-                    "verified_count": v_cnt,
-                    "discrepancy_count": d_cnt,
-                    "verified_percentage": round(v_cnt / sampled * 100.0, 2),
-                    "discrepancy_percentage": round(d_cnt / sampled * 100.0, 2),
-                    "total_duration_seconds": round(sampled * 0.8, 2),
-                },
-                "discrepancies": [
-                    {
-                        "idea_name": f"Discrepancy sample on {branch}",
-                        "idea_weight": 5,
-                        "book_title": "Audited Book",
-                        "section_title": "Chapter 1",
-                        "chunk_id": "b1_c1_p1",
-                        "explanation": f"Simulated verification discrepancy for {branch}.",
-                        "is_supported": False,
-                        "confidence": 0.88,
-                    }
-                ]
-                if d_cnt > 0
-                else [],
-                "verified_samples": [],
-            }
+            if self.mode == "chunk":
+                chunk_nodes = len([n for n in graph_data.get("nodes", []) if n.get("type") == "Chunk"]) or 60
+                sampled_chunks = max(1, int(round(chunk_nodes * (self.percent / 100.0))))
+                total_orig = sampled_chunks * 2
+                total_oracle = sampled_chunks * 2 + 1
+                total_matched = int(total_oracle * 0.85)
+                total_missed = max(0, total_oracle - total_matched)
+                s_rate = round(total_matched / total_oracle * 100.0, 2)
+                f_rate = round(total_missed / max(1, total_orig) * 100.0, 2)
+                mock_rep = {
+                    "mode": "chunk",
+                    "stats": {
+                        "mode": "chunk",
+                        "model_name": f"verifier-{branch}",
+                        "embedding_model": "embeddings",
+                        "total_chunks_in_graph": chunk_nodes,
+                        "sampled_chunks_count": sampled_chunks,
+                        "sample_percentage": self.percent,
+                        "total_original_ideas": total_orig,
+                        "total_oracle_ideas": total_oracle,
+                        "total_matched_ideas": total_matched,
+                        "total_missed_ideas": total_missed,
+                        "total_extra_original_ideas": max(0, total_orig - total_matched),
+                        "overall_success_rate": s_rate,
+                        "overall_fail_rate": f_rate,
+                        "chunks_with_perfect_match": max(0, sampled_chunks - 1),
+                        "chunks_with_omissions": 1 if total_missed > 0 else 0,
+                        "total_duration_seconds": round(sampled_chunks * 1.5, 2),
+                    },
+                    "audited_chunks": [],
+                    "omission_examples": [
+                        {
+                            "chunk_id": "chunk_mock_1",
+                            "book_id": 1,
+                            "book_title": "Simulated Book",
+                            "section_title": "Chapter 2",
+                            "chunk_text_snippet": "Simulated chunk text snippet",
+                            "original_ideas": ["Main Idea A"],
+                            "oracle_ideas": ["Main Idea A", "Nuanced Strategy B"],
+                            "matched_pairs": [],
+                            "missed_oracle_ideas": ["Nuanced Strategy B"],
+                            "extra_original_ideas": [],
+                            "original_count": 1,
+                            "oracle_count": 2,
+                            "matched_count": 1,
+                            "missed_count": 1,
+                            "success_rate": 50.0,
+                            "fail_rate": 100.0,
+                        }
+                    ] if total_missed > 0 else [],
+                }
+            else:
+                c_nodes = len([n for n in graph_data.get("nodes", []) if n.get("type") == "Concept"]) or 120
+                sampled = max(1, int(round(c_nodes * (self.percent / 100.0))))
+                v_cnt = max(1, int(sampled * 0.9))
+                d_cnt = sampled - v_cnt
+                mock_rep = {
+                    "stats": {
+                        "total_ideas_in_graph": c_nodes,
+                        "candidate_ideas_with_chunks": c_nodes,
+                        "sampled_ideas": sampled,
+                        "sample_percentage": self.percent,
+                        "mode": self.mode,
+                        "model_name": f"verifier-{branch}",
+                        "total_evaluations": sampled,
+                        "verified_count": v_cnt,
+                        "discrepancy_count": d_cnt,
+                        "verified_percentage": round(v_cnt / sampled * 100.0, 2),
+                        "discrepancy_percentage": round(d_cnt / sampled * 100.0, 2),
+                        "total_duration_seconds": round(sampled * 0.8, 2),
+                    },
+                    "discrepancies": [
+                        {
+                            "idea_name": f"Discrepancy sample on {branch}",
+                            "idea_weight": 5,
+                            "book_title": "Audited Book",
+                            "section_title": "Chapter 1",
+                            "chunk_id": "b1_c1_p1",
+                            "explanation": f"Simulated verification discrepancy for {branch}.",
+                            "is_supported": False,
+                            "confidence": 0.88,
+                        }
+                    ]
+                    if d_cnt > 0
+                    else [],
+                    "verified_samples": [],
+                }
             with open(out_file, "w", encoding="utf-8") as f:
                 json.dump(mock_rep, f, indent=2)
             with open(log_file, "w", encoding="utf-8") as f:
@@ -798,69 +893,156 @@ class ABTestRunner:
         nodes_a, edges_a = _count_graph(graph_a)
         nodes_b, edges_b = _count_graph(graph_b)
 
+        # Determine mode
+        mode_a = (data_a.get("mode") or stats_a.get("mode") or self.mode) if data_a else self.mode
+        mode_b = (data_b.get("mode") or stats_b.get("mode") or self.mode) if data_b else self.mode
+        is_chunk_mode = mode_a == "chunk" or mode_b == "chunk" or self.mode == "chunk"
+
         # Build comparison metrics table
-        metrics = [
-            (
-                "Total Ideas in Graph",
-                stats_a.get("total_ideas_in_graph", 0),
-                stats_b.get("total_ideas_in_graph", 0),
-                "count",
-            ),
-            (
-                "Candidate Ideas (with Chunks)",
-                stats_a.get("candidate_ideas_with_chunks", 0),
-                stats_b.get("candidate_ideas_with_chunks", 0),
-                "count",
-            ),
-            (
-                "Sampled Ideas Audited",
-                stats_a.get("sampled_ideas", 0),
-                stats_b.get("sampled_ideas", 0),
-                "count",
-            ),
-            (
-                "Verified Ideas (Factual Pass)",
-                stats_a.get("verified_count", 0),
-                stats_b.get("verified_count", 0),
-                "count",
-            ),
-            (
-                "Verification Pass Rate (%)",
-                stats_a.get("verified_percentage", 0.0),
-                stats_b.get("verified_percentage", 0.0),
-                "percent",
-            ),
-            (
-                "Discrepancies (Hallucination Fail)",
-                stats_a.get("discrepancy_count", 0),
-                stats_b.get("discrepancy_count", 0),
-                "count_lower_is_better",
-            ),
-            (
-                "Discrepancy Rate (%)",
-                stats_a.get("discrepancy_percentage", 0.0),
-                stats_b.get("discrepancy_percentage", 0.0),
-                "percent_lower_is_better",
-            ),
-            (
-                "Graph Nodes / Edges",
-                f"{nodes_a} / {edges_a}",
-                f"{nodes_b} / {edges_b}",
-                "raw",
-            ),
-            (
-                "End-to-End Pipeline Duration (s)",
-                meta_a.get("duration_seconds", 0.0),
-                meta_b.get("duration_seconds", 0.0),
-                "duration",
-            ),
-            (
-                "Verification Phase Duration (s)",
-                stats_a.get("total_duration_seconds", 0.0),
-                stats_b.get("total_duration_seconds", 0.0),
-                "duration",
-            ),
-        ]
+        if is_chunk_mode:
+            metrics = [
+                (
+                    "Total Chunks in Graph",
+                    stats_a.get("total_chunks_in_graph", 0),
+                    stats_b.get("total_chunks_in_graph", 0),
+                    "count",
+                ),
+                (
+                    "Sampled Chunks Audited",
+                    stats_a.get("sampled_chunks_count", 0),
+                    stats_b.get("sampled_chunks_count", 0),
+                    "count",
+                ),
+                (
+                    "Original Ideas in Sample",
+                    stats_a.get("total_original_ideas", 0),
+                    stats_b.get("total_original_ideas", 0),
+                    "count",
+                ),
+                (
+                    "Oracle Discovered Ideas",
+                    stats_a.get("total_oracle_ideas", 0),
+                    stats_b.get("total_oracle_ideas", 0),
+                    "count",
+                ),
+                (
+                    "Matched Ideas in Original",
+                    stats_a.get("total_matched_ideas", 0),
+                    stats_b.get("total_matched_ideas", 0),
+                    "count",
+                ),
+                (
+                    "Success Rate (Recall %)",
+                    stats_a.get("overall_success_rate", 0.0),
+                    stats_b.get("overall_success_rate", 0.0),
+                    "percent",
+                ),
+                (
+                    "Missed Ideas (Omissions)",
+                    stats_a.get("total_missed_ideas", 0),
+                    stats_b.get("total_missed_ideas", 0),
+                    "count_lower_is_better",
+                ),
+                (
+                    "Fail Rate (%)",
+                    stats_a.get("overall_fail_rate", 0.0),
+                    stats_b.get("overall_fail_rate", 0.0),
+                    "percent_lower_is_better",
+                ),
+                (
+                    "Chunks with Perfect Match",
+                    stats_a.get("chunks_with_perfect_match", 0),
+                    stats_b.get("chunks_with_perfect_match", 0),
+                    "count",
+                ),
+                (
+                    "Chunks with Omissions",
+                    stats_a.get("chunks_with_omissions", 0),
+                    stats_b.get("chunks_with_omissions", 0),
+                    "count_lower_is_better",
+                ),
+                (
+                    "Graph Nodes / Edges",
+                    f"{nodes_a} / {edges_a}",
+                    f"{nodes_b} / {edges_b}",
+                    "raw",
+                ),
+                (
+                    "End-to-End Pipeline Duration (s)",
+                    meta_a.get("duration_seconds", 0.0),
+                    meta_b.get("duration_seconds", 0.0),
+                    "duration",
+                ),
+                (
+                    "Verification Phase Duration (s)",
+                    stats_a.get("total_duration_seconds", 0.0),
+                    stats_b.get("total_duration_seconds", 0.0),
+                    "duration",
+                ),
+            ]
+        else:
+            metrics = [
+                (
+                    "Total Ideas in Graph",
+                    stats_a.get("total_ideas_in_graph", 0),
+                    stats_b.get("total_ideas_in_graph", 0),
+                    "count",
+                ),
+                (
+                    "Candidate Ideas (with Chunks)",
+                    stats_a.get("candidate_ideas_with_chunks", 0),
+                    stats_b.get("candidate_ideas_with_chunks", 0),
+                    "count",
+                ),
+                (
+                    "Sampled Ideas Audited",
+                    stats_a.get("sampled_ideas", 0),
+                    stats_b.get("sampled_ideas", 0),
+                    "count",
+                ),
+                (
+                    "Verified Ideas (Factual Pass)",
+                    stats_a.get("verified_count", 0),
+                    stats_b.get("verified_count", 0),
+                    "count",
+                ),
+                (
+                    "Verification Pass Rate (%)",
+                    stats_a.get("verified_percentage", 0.0),
+                    stats_b.get("verified_percentage", 0.0),
+                    "percent",
+                ),
+                (
+                    "Discrepancies (Hallucination Fail)",
+                    stats_a.get("discrepancy_count", 0),
+                    stats_b.get("discrepancy_count", 0),
+                    "count_lower_is_better",
+                ),
+                (
+                    "Discrepancy Rate (%)",
+                    stats_a.get("discrepancy_percentage", 0.0),
+                    stats_b.get("discrepancy_percentage", 0.0),
+                    "percent_lower_is_better",
+                ),
+                (
+                    "Graph Nodes / Edges",
+                    f"{nodes_a} / {edges_a}",
+                    f"{nodes_b} / {edges_b}",
+                    "raw",
+                ),
+                (
+                    "End-to-End Pipeline Duration (s)",
+                    meta_a.get("duration_seconds", 0.0),
+                    meta_b.get("duration_seconds", 0.0),
+                    "duration",
+                ),
+                (
+                    "Verification Phase Duration (s)",
+                    stats_a.get("total_duration_seconds", 0.0),
+                    stats_b.get("total_duration_seconds", 0.0),
+                    "duration",
+                ),
+            ]
 
         # Terminal output formatting
         col_w_metric = 36
@@ -942,8 +1124,29 @@ class ABTestRunner:
 
         print(sep_line)
 
-        # Print Discrepancy Sample Comparison
-        if disc_a or disc_b:
+        # Print Details Comparison
+        if is_chunk_mode:
+            omiss_a = data_a.get("omission_examples", []) if data_a else []
+            omiss_b = data_b.get("omission_examples", []) if data_b else []
+            if omiss_a or omiss_b:
+                print(f"\n{Colors.BOLD}Chunk Omission Details Comparison:{Colors.RESET}")
+                print(f"• Baseline ({self.branch1}) Chunks with Omissions: {len(omiss_a)}")
+                for idx, item in enumerate(omiss_a[:3], 1):
+                    cid = item.get("chunk_id", "Unknown")
+                    missed = ", ".join(item.get("missed_oracle_ideas", []))
+                    print(f"   [{idx}] {Colors.YELLOW}{cid}{Colors.RESET}: Missed {len(item.get('missed_oracle_ideas', []))} ideas -> {missed[:100]}")
+                if len(omiss_a) > 3:
+                    print(f"   ... and {len(omiss_a) - 3} more.")
+
+                print(f"• Candidate ({self.branch2}) Chunks with Omissions: {len(omiss_b)}")
+                for idx, item in enumerate(omiss_b[:3], 1):
+                    cid = item.get("chunk_id", "Unknown")
+                    missed = ", ".join(item.get("missed_oracle_ideas", []))
+                    print(f"   [{idx}] {Colors.YELLOW}{cid}{Colors.RESET}: Missed {len(item.get('missed_oracle_ideas', []))} ideas -> {missed[:100]}")
+                if len(omiss_b) > 3:
+                    print(f"   ... and {len(omiss_b) - 3} more.")
+                print()
+        elif disc_a or disc_b:
             print(f"\n{Colors.BOLD}Discrepancy Details Comparison:{Colors.RESET}")
             print(f"• Baseline ({self.branch1}) Discrepancies: {len(disc_a)}")
             for idx, d in enumerate(disc_a[:3], 1):
@@ -963,25 +1166,46 @@ class ABTestRunner:
             print()
 
         # Generate summary verdict
-        rate_a = float(stats_a.get("verified_percentage", 0.0))
-        rate_b = float(stats_b.get("verified_percentage", 0.0))
-        rate_diff = rate_b - rate_a
+        if is_chunk_mode:
+            rate_a = float(stats_a.get("overall_success_rate", 0.0))
+            rate_b = float(stats_b.get("overall_success_rate", 0.0))
+            rate_diff = rate_b - rate_a
 
-        if rate_diff > 0.01:
-            verdict = (
-                f"Candidate branch '{self.branch2}' outperformed baseline '{self.branch1}' with a "
-                f"+{rate_diff:.2f}% higher factual verification rate."
-            )
-            v_color = Colors.GREEN
-        elif rate_diff < -0.01:
-            verdict = (
-                f"Baseline '{self.branch1}' had a higher factual verification rate "
-                f"(+{abs(rate_diff):.2f}% over candidate '{self.branch2}')."
-            )
-            v_color = Colors.YELLOW
+            if rate_diff > 0.01:
+                verdict = (
+                    f"Candidate branch '{self.branch2}' outperformed baseline '{self.branch1}' with a "
+                    f"+{rate_diff:.2f}% higher Oracle success rate ({rate_b:.2f}% vs {rate_a:.2f}%)."
+                )
+                v_color = Colors.GREEN
+            elif rate_diff < -0.01:
+                verdict = (
+                    f"Baseline '{self.branch1}' had a higher Oracle success rate "
+                    f"(+{abs(rate_diff):.2f}% over candidate '{self.branch2}': {rate_a:.2f}% vs {rate_b:.2f}%)."
+                )
+                v_color = Colors.YELLOW
+            else:
+                verdict = f"Both configurations demonstrated identical Oracle success rates ({rate_a:.2f}%)."
+                v_color = Colors.CYAN
         else:
-            verdict = f"Both configurations demonstrated identical factual verification rates ({rate_a:.2f}%)."
-            v_color = Colors.CYAN
+            rate_a = float(stats_a.get("verified_percentage", 0.0))
+            rate_b = float(stats_b.get("verified_percentage", 0.0))
+            rate_diff = rate_b - rate_a
+
+            if rate_diff > 0.01:
+                verdict = (
+                    f"Candidate branch '{self.branch2}' outperformed baseline '{self.branch1}' with a "
+                    f"+{rate_diff:.2f}% higher factual verification rate."
+                )
+                v_color = Colors.GREEN
+            elif rate_diff < -0.01:
+                verdict = (
+                    f"Baseline '{self.branch1}' had a higher factual verification rate "
+                    f"(+{abs(rate_diff):.2f}% over candidate '{self.branch2}')."
+                )
+                v_color = Colors.YELLOW
+            else:
+                verdict = f"Both configurations demonstrated identical factual verification rates ({rate_a:.2f}%)."
+                v_color = Colors.CYAN
 
         print(f"{v_color}{Colors.BOLD}VERDICT: {verdict}{Colors.RESET}\n")
 
@@ -1004,6 +1228,13 @@ class ABTestRunner:
                 "candidate": len(disc_b),
             },
         }
+        if is_chunk_mode:
+            omiss_a = data_a.get("omission_examples", []) if data_a else []
+            omiss_b = data_b.get("omission_examples", []) if data_b else []
+            comparison_record["omissions_count"] = {
+                "baseline": len(omiss_a),
+                "candidate": len(omiss_b),
+            }
 
         json_out = self.session_dir / "comparison_summary.json"
         with open(json_out, "w", encoding="utf-8") as jf:
@@ -1050,13 +1281,22 @@ class ABTestRunner:
         for m in data.get("metrics", []):
             lines.append(f"| {m['metric']} | {m['branch_a']} | {m['branch_b']} | {m['delta']} |")
 
-        lines.extend([
-            "",
-            "### 🔍 Discrepancies Summary",
-            f"- **Baseline (`{data['baseline']}`):** {data['discrepancies_count']['baseline']} discrepancies",
-            f"- **Candidate (`{data['candidate']}`):** {data['discrepancies_count']['candidate']} discrepancies",
-            "",
-        ])
+        if data.get("omissions_count"):
+            lines.extend([
+                "",
+                "### 🔍 Chunk Omissions Summary",
+                f"- **Baseline (`{data['baseline']}`):** {data['omissions_count']['baseline']} chunks with omissions",
+                f"- **Candidate (`{data['candidate']}`):** {data['omissions_count']['candidate']} chunks with omissions",
+                "",
+            ])
+        else:
+            lines.extend([
+                "",
+                "### 🔍 Discrepancies Summary",
+                f"- **Baseline (`{data['baseline']}`):** {data['discrepancies_count']['baseline']} discrepancies",
+                f"- **Candidate (`{data['candidate']}`):** {data['discrepancies_count']['candidate']} discrepancies",
+                "",
+            ])
 
         with open(dest, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
@@ -1142,8 +1382,8 @@ Examples:
         "-m",
         type=str,
         default="ideas",
-        choices=["ideas", "chunking"],
-        help="Verification mode: 'ideas' or 'chunking' (default: ideas).",
+        choices=["ideas", "chunking", "chunk"],
+        help="Verification mode: 'ideas', 'chunking', or 'chunk' (default: ideas).",
     )
     parser.add_argument(
         "--timeout",

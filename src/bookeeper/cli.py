@@ -59,7 +59,10 @@ from bookeeper.processing.verifier import (
     VerificationReport,
     verify_graph,
     verify_chunking,
+    verify_chunks,
     ChunkingVerificationReport,
+    ChunkVerificationReport,
+    ChunkAuditItem,
 )
 from bookeeper.rag.lightrag_engine import LightRAGEngine
 
@@ -2920,7 +2923,7 @@ def verify_command(
         None, "--percent", "-p", help="Percentage of ideas to randomly verify (default: 1.0 for 1%)."
     ),
     mode: Optional[str] = typer.Option(
-        None, "--mode", "-m", help="Verification mode: 'ideas' or 'chunking' (default: 'ideas')."
+        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', or 'chunk' (default: 'ideas')."
     ),
     book_id: Optional[int] = typer.Option(
         None, "--book-id", "-b", help="Specific book ID to verify (in chunking mode)."
@@ -2960,7 +2963,7 @@ def verify_command(
     ),
 ):
     """
-    Verify Knowledge Graph factual integrity and chunking correctness.
+    Verify Knowledge Graph factual integrity, chunking correctness, or chunk Oracle alignment.
     - 'ideas' mode: randomly samples X% (default: 1%) of ideas from knowledge_graph.json,
       retrieves their assigned chunks, audits whether each chunk contains or supports the idea,
       and reports stats and discrepancy examples.
@@ -2968,6 +2971,9 @@ def verify_command(
       distances (smart chunking). Tests whether adding each subsequent sentence maintains distance
       within accepted thresholds, shows distance distribution across chunks within the book,
       and verifies that actual stored chunks match smart semantic boundaries.
+    - 'chunk' mode: randomly samples X% of chunks from knowledge_graph.json, re-extracts ideas
+      using the Oracle verifier model, aligns ideas against the original run extractions via
+      the EntityDeduplicator, and computes Success Rate (matched / Oracle) and Fail Rate (missed / original).
     """
     graph_file = _resolve_opt(graph_file)
     percent = _resolve_opt(percent)
@@ -3196,6 +3202,224 @@ def verify_command(
             json.dump(report.model_dump(), f, indent=2, ensure_ascii=False)
         console.print(f"[dim green]✓ Full chunking verification report saved to: [bold]{report_dest}[/bold][/dim green]\n")
         _print_ollama_server_stats([pool], console=console, title="Ollama Server Chunking Verification Effort Statistics")
+        return
+
+    # Mode: 'chunk' (Oracle Idea Extraction & Alignment)
+    if effective_mode in ("chunk", "oracle_chunk"):
+        target_graph_file = (
+            Path(graph_file).expanduser().resolve()
+            if graph_file
+            else cfg.resolved_output_dir / "knowledge_graph.json"
+        )
+        if not target_graph_file.is_file():
+            console.print(
+                f"[bold red]Knowledge graph file not found at {target_graph_file}[/bold red]\n"
+                f"[yellow]Please run 'bookeeper build-graph' first to generate knowledge_graph.json.[/yellow]"
+            )
+            raise typer.Exit(1)
+
+        store = ConceptGraphStore()
+        with console.status(f"[bold cyan]Loading graph from {target_graph_file}...[/bold cyan]"):
+            try:
+                store.load(target_graph_file)
+            except Exception as e:
+                console.print(f"[bold red]Failed to load knowledge graph:[/bold red] {e}")
+                raise typer.Exit(1)
+
+        effective_percent = cfg.verification.percent if percent is None else percent
+        effective_model = model or cfg.resolved_verifier_model
+        effective_max_ex = cfg.verification.max_examples if max_examples is None else max_examples
+
+        verifier_servers = cfg.resolved_verification_servers
+        pool = OllamaPool(
+            servers=verifier_servers,
+            cooldown_seconds=cfg.failover_cooldown_seconds,
+            max_tasks_per_server=1,
+        )
+        num_servers = len(pool.alive_nodes) or len(pool.nodes)
+        pool_concurrency = max_tasks if max_tasks is not None else cfg.calculate_pool_concurrency(num_servers)
+
+        raw_cdir = (
+            chunks_dir
+            or getattr(cfg, "chunks_dir", None)
+            or (cfg.resolved_output_dir / "chunks" if hasattr(cfg, "resolved_output_dir") else None)
+        )
+        chunks_storage_dir = Path(raw_cdir).expanduser().resolve() if raw_cdir else None
+        chunk_store = ChunkStore(chunks_storage_dir) if chunks_storage_dir and chunks_storage_dir.is_dir() else None
+
+        effective_emb_model = embedding_model or cfg.embedding_model
+        embeddings = FailoverOllamaEmbeddings.from_settings(cfg, model=effective_emb_model)
+
+        all_chunks_in_graph = len([n for n, d in store.graph.nodes(data=True) if d.get("type") == "Chunk"])
+
+        console.print(
+            Panel.fit(
+                f"[bold]Knowledge Graph:[/bold] {target_graph_file}\n"
+                f"[bold]Total Graph Chunks:[/bold] {all_chunks_in_graph}\n\n"
+                f"[bold cyan]Verification Mode:[/bold cyan] CHUNK (Oracle Idea Extraction & Alignment)\n"
+                f"[bold cyan]Sample Rate:[/bold cyan] {effective_percent}% of chunks\n"
+                f"[bold cyan]Oracle Model:[/bold cyan] [bold magenta]{effective_model}[/bold magenta]\n"
+                f"[bold cyan]Embedding Model (Dedup):[/bold cyan] [bold magenta]{effective_emb_model}[/bold magenta]\n"
+                f"[bold cyan]Concurrency:[/bold cyan] {pool_concurrency} tasks across {num_servers} Ollama server(s)",
+                title="Chunk Oracle Verification Plan",
+            )
+        )
+
+        with console.status(
+            f"[bold blue]Preloading and warming up verifier model '{effective_model}' across Ollama pool...[/bold blue]"
+        ):
+            warmup_verifier = IdeaVerifier(pool=pool, model_name=effective_model)
+            warmup_verifier.warmup(timeout=90)
+
+        t_start = time.perf_counter()
+        tot_matched = 0
+        tot_missed = 0
+
+        chunk_progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]Total Progress:[/bold cyan]"),
+            BarColumn(bar_width=25),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TextColumn("{task.fields[stats_line]}"),
+            console=console,
+        )
+        tot_chunk_task = chunk_progress.add_task("chunk_total", total=100, completed=0, stats_line="")
+        cur_chunk_line = Text.from_markup("[bold blue]Current Chunk:[/bold blue] Initializing chunk auditor...")
+
+        with Live(Group(cur_chunk_line, chunk_progress), console=console, refresh_per_second=10) as live:
+
+            def _on_chunk_progress(completed: int, total: int, chunk_id: str, item: Optional[ChunkAuditItem] = None):
+                nonlocal tot_matched, tot_missed
+                if item is not None:
+                    tot_matched += item.matched_count
+                    tot_missed += item.missed_count
+                    if item.missed_count == 0:
+                        badge = "[bold green]✓ Full Match[/bold green]"
+                    elif item.matched_count > 0:
+                        badge = f"[bold yellow]⚠ Partial ({item.matched_count}/{item.oracle_count})[/bold yellow]"
+                    else:
+                        badge = "[bold red]✗ Omission[/bold red]"
+
+                    book_str = f" | '{item.book_title[:18]}'" if item.book_title else ""
+                    sec_str = f" ({item.section_title[:16]})" if item.section_title else ""
+                    cur_text = (
+                        f"[bold blue]Current Chunk:[/bold blue] '{chunk_id[:24]}'{book_str}{sec_str} | {badge}"
+                    )
+                else:
+                    cur_text = f"[bold blue]Current Chunk:[/bold blue] '{chunk_id[:28]}' | [bold yellow]Auditing...[/bold yellow]"
+
+                elapsed = time.perf_counter() - t_start
+                rate = (completed / elapsed) if elapsed > 0 else 0.0
+                if completed > 0 and total > completed and rate > 0:
+                    rem_sec = (total - completed) / rate
+                    eta_str = format_eta_min_sec(rem_sec)
+                elif completed >= total:
+                    eta_str = "0m 00s"
+                else:
+                    eta_str = "--"
+
+                stats_str = (
+                    f"[cyan]{rate:.1f} chk/s[/cyan] | [yellow]ETA: {eta_str}[/yellow] | "
+                    f"[bold green]✓ {tot_matched} matched[/bold green] | "
+                    f"[bold red]✗ {tot_missed} missed[/bold red]"
+                )
+                chunk_progress.update(tot_chunk_task, completed=completed, total=total, stats_line=stats_str)
+                live.update(Group(Text.from_markup(cur_text), chunk_progress))
+
+            report = verify_chunks(
+                store=store,
+                pool=pool,
+                model_name=effective_model,
+                percent=effective_percent,
+                chunk_store=chunk_store,
+                embeddings=embeddings,
+                max_examples=effective_max_ex,
+                seed=seed,
+                concurrency=pool_concurrency,
+                progress_callback=_on_chunk_progress,
+            )
+
+        # 1. Summary Metrics Table
+        st = report.stats
+        summary_table = Table(
+            title="Chunk Verification Results Summary (Oracle Alignment)",
+            border_style="cyan",
+        )
+        summary_table.add_column("Metric", style="bold")
+        summary_table.add_column("Value", justify="right", style="cyan")
+
+        summary_table.add_row("Total Chunks in Graph", str(st.total_chunks_in_graph))
+        summary_table.add_row("Audited Chunks Sampled", f"{st.sampled_chunks_count} ({st.sample_percentage:.1f}%)")
+        summary_table.add_row("Original Model Extracted Ideas", str(st.total_original_ideas))
+        summary_table.add_row("Oracle Model Discovered Ideas", str(st.total_oracle_ideas))
+        summary_table.add_section()
+
+        succ_color = "green" if st.overall_success_rate >= 80.0 else "yellow"
+        summary_table.add_row(
+            "Matched Ideas (Verified in Both)",
+            f"[bold {succ_color}]{st.total_matched_ideas} ({st.overall_success_rate}%)[/bold {succ_color}]",
+        )
+        fail_color = "red" if st.overall_fail_rate > 15.0 else "green"
+        summary_table.add_row(
+            "Missed Ideas (Omitted by Candidate)",
+            f"[bold {fail_color}]{st.total_missed_ideas} ({st.overall_fail_rate}%)[/bold {fail_color}]",
+        )
+        summary_table.add_row("Extra Original Ideas (Candidate Exclusive)", str(st.total_extra_original_ideas))
+        summary_table.add_section()
+
+        summary_table.add_row("Chunks with 100% Idea Match", f"{st.chunks_with_perfect_match} / {st.sampled_chunks_count}")
+        summary_table.add_row("Chunks with Omissions", f"{st.chunks_with_omissions} / {st.sampled_chunks_count}")
+        summary_table.add_row("Total Audit Duration", f"{st.total_duration_seconds:.2f}s")
+        console.print(summary_table)
+
+        # 2. Omissions Discrepancy Table
+        if report.omission_examples:
+            disc_table = Table(
+                title=f"Top Idea Omission Discrepancies (Missed by Candidate, Found by Oracle '{st.model_name}')",
+                border_style="red",
+            )
+            disc_table.add_column("#", justify="center", style="dim")
+            disc_table.add_column("Chunk ID / Section", style="cyan")
+            disc_table.add_column("Missed Oracle Ideas", style="bold red")
+            disc_table.add_column("Original Ideas", style="dim")
+            disc_table.add_column("Fail Rate", justify="right", style="yellow")
+
+            for idx, item in enumerate(report.omission_examples, 1):
+                missed_str = "\n".join(f"• {name}" for name in item.missed_oracle_ideas[:3])
+                if len(item.missed_oracle_ideas) > 3:
+                    missed_str += f"\n... +{len(item.missed_oracle_ideas) - 3} more"
+
+                orig_str = "\n".join(f"• {name}" for name in item.original_ideas[:3]) if item.original_ideas else "(None)"
+                if len(item.original_ideas) > 3:
+                    orig_str += f"\n... +{len(item.original_ideas) - 3} more"
+
+                disc_table.add_row(
+                    str(idx),
+                    f"{item.chunk_id}\n[dim]{item.book_title} ({item.section_title})[/dim]",
+                    missed_str,
+                    orig_str,
+                    f"{item.fail_rate:.1f}%",
+                )
+            console.print(disc_table)
+        else:
+            console.print(
+                "\n[bold green]✓ Zero chunk omissions found! All Oracle ideas were successfully matched in the candidate run.[/bold green]\n"
+            )
+
+        # 3. Save JSON Report
+        report_dest = (
+            Path(output_report).expanduser().resolve()
+            if output_report
+            else cfg.resolved_output_dir / "verification_report.json"
+        )
+        report_dest.parent.mkdir(parents=True, exist_ok=True)
+        with open(report_dest, "w", encoding="utf-8") as f:
+            json.dump(report.model_dump(), f, indent=2, ensure_ascii=False)
+        console.print(
+            f"[dim green]✓ Full chunk verification report saved to: [bold]{report_dest}[/bold][/dim green]\n"
+        )
+        _print_ollama_server_stats([pool], console=console, title="Ollama Server Chunk Verification Effort Statistics")
         return
 
     # Mode: 'ideas'

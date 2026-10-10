@@ -65,6 +65,7 @@ calibre_test_db/
 
 # 7. Local Runtime, Logs & Export Output
 config.yaml
+config-*.yaml
 data/
 output/
 ab_test_runs/

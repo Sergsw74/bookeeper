@@ -87,6 +87,82 @@ class VerificationReport(BaseModel):
     verified_samples: List[VerificationItem]
 
 
+class ChunkMatchedPair(BaseModel):
+    """Pairing of an Oracle idea with an Original idea confirmed as the same concept."""
+
+    oracle_idea_name: str
+    original_idea_name: str
+    similarity_score: float = 1.0
+    match_method: str = "exact"  # "exact", "high_vector", "llm_disambiguated"
+    canonical_name: Optional[str] = None
+    reasoning: Optional[str] = None
+
+
+class ChunkAuditItem(BaseModel):
+    """Detailed audit record for a single chunk."""
+
+    chunk_id: str
+    book_id: Optional[int] = None
+    book_title: str = "Unknown"
+    section_title: str = "Unknown"
+    chunk_text_snippet: str = ""
+
+    # Idea names lists
+    original_ideas: List[str] = Field(default_factory=list)
+    oracle_ideas: List[str] = Field(default_factory=list)
+
+    # Alignment results
+    matched_pairs: List[ChunkMatchedPair] = Field(default_factory=list)
+    missed_oracle_ideas: List[str] = Field(default_factory=list)  # In Oracle, missing in Original
+    extra_original_ideas: List[str] = Field(default_factory=list)  # In Original, missing in Oracle
+
+    # Counts
+    original_count: int = 0
+    oracle_count: int = 0
+    matched_count: int = 0
+    missed_count: int = 0
+
+    # Rates
+    success_rate: float = 0.0  # Matched / Oracle %
+    fail_rate: float = 0.0  # Missed / Original %
+
+    duration_seconds: float = 0.0
+    server_node: Optional[str] = None
+
+
+class ChunkVerificationStats(BaseModel):
+    """Summary statistics across all audited chunks."""
+
+    mode: str = "chunk"
+    model_name: str
+    embedding_model: str = "embeddings"
+    total_chunks_in_graph: int
+    sampled_chunks_count: int
+    sample_percentage: float
+
+    total_original_ideas: int
+    total_oracle_ideas: int
+    total_matched_ideas: int
+    total_missed_ideas: int
+    total_extra_original_ideas: int
+
+    overall_success_rate: float
+    overall_fail_rate: float
+
+    chunks_with_perfect_match: int
+    chunks_with_omissions: int
+    total_duration_seconds: float
+
+
+class ChunkVerificationReport(BaseModel):
+    """Full serialization report for chunk verification mode."""
+
+    mode: str = "chunk"
+    stats: ChunkVerificationStats
+    audited_chunks: List[ChunkAuditItem]
+    omission_examples: List[ChunkAuditItem]
+
+
 def _clean_json_str(text: str) -> str:
     """Clean model response removing thinking tags and markdown backticks."""
     text = text.strip()
@@ -1235,4 +1311,333 @@ def verify_chunking(
         stats=primary_stats,
         discrepancies=all_discrepancies[:max_examples],
         all_books_summary=all_stats if len(all_stats) > 1 else None,
+    )
+
+
+def verify_chunks(
+    store: ConceptGraphStore,
+    pool: OllamaPool,
+    model_name: str = "llama3.1:8b",
+    percent: float = 1.0,
+    chunk_store: Optional[ChunkStore] = None,
+    embeddings: Optional[Embeddings] = None,
+    max_examples: int = 20,
+    seed: Optional[int] = None,
+    concurrency: int = 3,
+    timeout: int = 300,
+    progress_callback: Optional[Callable[..., None]] = None,
+) -> ChunkVerificationReport:
+    """
+    Verify Knowledge Graph idea extraction quality by auditing sampled chunks against an Oracle model.
+    1. Randomly samples `percent`% of chunks from knowledge_graph.json / chunk_store.
+    2. Runs Oracle idea extraction on each chunk's text using the verifier model.
+    3. Retrieves original run ideas for that chunk from knowledge graph edges.
+    4. Uses EntityDeduplicator to match Oracle ideas against original ideas.
+    5. Computes Success Rate (matched ideas vs Oracle) and Fail Rate (missed ideas vs original ideas).
+    """
+    from bookeeper.processing.deduplicator import EntityDeduplicator
+    from bookeeper.processing.extractor import Concept, KnowledgeExtractor
+
+    start_time = time.time()
+
+    all_chunk_nodes = [
+        (n, d)
+        for n, d in store.graph.nodes(data=True)
+        if d.get("type") == "Chunk"
+    ]
+
+    valid_chunks: List[Tuple[str, str, Optional[int], str, str]] = []
+    for cid, cattrs in all_chunk_nodes:
+        text = cattrs.get("text", "")
+        book_title = cattrs.get("book_title", "Unknown")
+        book_id = cattrs.get("book_id")
+        section_title = cattrs.get("section_title") or cattrs.get("chapter_title", "Unknown")
+
+        if (not text or len(text.strip()) < 20) and chunk_store is not None:
+            stored = chunk_store.get_chunk(cid)
+            if stored is not None:
+                text = getattr(stored, "text", text)
+                if getattr(stored, "book_title", None):
+                    book_title = stored.book_title
+                if getattr(stored, "section_title", None):
+                    section_title = stored.section_title
+                if getattr(stored, "book_id", None):
+                    book_id = stored.book_id
+
+        if text and len(text.strip()) >= 20:
+            valid_chunks.append((cid, text, book_id, book_title, section_title))
+
+    raw_emb = getattr(embeddings, "model", None)
+    emb_model_name = raw_emb if isinstance(raw_emb, str) else "embeddings"
+
+    if not valid_chunks:
+        empty_stats = ChunkVerificationStats(
+            mode="chunk",
+            model_name=model_name,
+            embedding_model=emb_model_name,
+            total_chunks_in_graph=len(all_chunk_nodes),
+            sampled_chunks_count=0,
+            sample_percentage=percent,
+            total_original_ideas=0,
+            total_oracle_ideas=0,
+            total_matched_ideas=0,
+            total_missed_ideas=0,
+            total_extra_original_ideas=0,
+            overall_success_rate=100.0,
+            overall_fail_rate=0.0,
+            chunks_with_perfect_match=0,
+            chunks_with_omissions=0,
+            total_duration_seconds=0.0,
+        )
+        return ChunkVerificationReport(
+            mode="chunk",
+            stats=empty_stats,
+            audited_chunks=[],
+            omission_examples=[],
+        )
+
+    clamped_percent = max(0.01, min(100.0, percent))
+    sample_size = max(1, int(round(len(valid_chunks) * (clamped_percent / 100.0))))
+    sample_size = min(sample_size, len(valid_chunks))
+
+    rng = random.Random(seed) if seed is not None else random.Random()
+    sampled_chunks = rng.sample(valid_chunks, sample_size)
+
+    extractor = KnowledgeExtractor(
+        model=model_name,
+        pool=pool,
+        request_timeout=timeout,
+    )
+    deduplicator = EntityDeduplicator(
+        embeddings=embeddings,
+        extractor=extractor,
+        similarity_threshold=0.80,
+        high_similarity_threshold=0.95,
+    )
+
+    def _audit_single_chunk(chunk_item: Tuple[str, str, Optional[int], str, str]) -> ChunkAuditItem:
+        cid, text, bid, btitle, stitle = chunk_item
+        t_start = time.time()
+
+        # 1. Retrieve Original Ideas from Knowledge Graph
+        orig_concepts: List[Concept] = []
+        seen_orig_names = set()
+
+        # Incoming edges: (:Concept) -[:SUPPORTED_BY]-> (:Chunk)
+        for src, _, edata in store.graph.in_edges(cid, data=True):
+            if edata.get("relation") == "SUPPORTED_BY" and store.graph.nodes[src].get("type") == "Concept":
+                cnode = store.graph.nodes[src]
+                cname = cnode.get("name", src.replace("concept:", ""))
+                if cname not in seen_orig_names:
+                    seen_orig_names.add(cname)
+                    orig_concepts.append(
+                        Concept(
+                            name=cname,
+                            category=cnode.get("category", "Concept"),
+                            brief_description=cnode.get("brief_description", "") or cnode.get("summary", ""),
+                            detailed_explanation=cnode.get("detailed_explanation", ""),
+                        )
+                    )
+
+        # Outgoing edges: (:Chunk) -[:SUPPORTS_IDEA]-> (:Concept)
+        for _, tgt, edata in store.graph.out_edges(cid, data=True):
+            if edata.get("relation") == "SUPPORTS_IDEA" and store.graph.nodes[tgt].get("type") == "Concept":
+                cnode = store.graph.nodes[tgt]
+                cname = cnode.get("name", tgt.replace("concept:", ""))
+                if cname not in seen_orig_names:
+                    seen_orig_names.add(cname)
+                    orig_concepts.append(
+                        Concept(
+                            name=cname,
+                            category=cnode.get("category", "Concept"),
+                            brief_description=cnode.get("brief_description", "") or cnode.get("summary", ""),
+                            detailed_explanation=cnode.get("detailed_explanation", ""),
+                        )
+                    )
+
+        # 2. Extract Oracle Ideas
+        try:
+            oracle_extracted = extractor.extract_ideas(
+                text=text,
+                book_title=btitle,
+                section_title=stitle,
+                model=model_name,
+            )
+            oracle_concepts = [item if isinstance(item, Concept) else item.to_concept() for item in oracle_extracted]
+        except Exception as exc:
+            logger.warning(f"Oracle idea extraction failed for chunk '{cid}': {exc}")
+            oracle_concepts = []
+
+        # 3. Match Oracle Ideas vs Original Ideas using EntityDeduplicator
+        matched_pairs: List[ChunkMatchedPair] = []
+        matched_oracle_indices = set()
+        matched_orig_indices = set()
+
+        for o_idx, o_c in enumerate(oracle_concepts):
+            best_match = None
+            best_orig_idx = None
+            best_score = -1.0
+            for r_idx, r_c in enumerate(orig_concepts):
+                if r_idx in matched_orig_indices:
+                    continue
+                is_same, score, method, canon, reason = deduplicator.is_same_concept(r_c, o_c)
+                if is_same and score > best_score:
+                    best_score = score
+                    best_orig_idx = r_idx
+                    best_match = (method, canon, reason)
+
+            if best_match is not None and best_orig_idx is not None:
+                matched_oracle_indices.add(o_idx)
+                matched_orig_indices.add(best_orig_idx)
+                r_c = orig_concepts[best_orig_idx]
+                matched_pairs.append(
+                    ChunkMatchedPair(
+                        oracle_idea_name=o_c.name,
+                        original_idea_name=r_c.name,
+                        similarity_score=round(best_score, 3),
+                        match_method=best_match[0],
+                        canonical_name=best_match[1],
+                        reasoning=best_match[2],
+                    )
+                )
+
+        missed_oracle = [
+            o_c.name for idx, o_c in enumerate(oracle_concepts) if idx not in matched_oracle_indices
+        ]
+        extra_original = [
+            r_c.name for idx, r_c in enumerate(orig_concepts) if idx not in matched_orig_indices
+        ]
+
+        orig_cnt = len(orig_concepts)
+        oracle_cnt = len(oracle_concepts)
+        matched_cnt = len(matched_pairs)
+        missed_cnt = max(0, oracle_cnt - matched_cnt)
+
+        # Success rate = matched / oracle %
+        if oracle_cnt > 0:
+            succ_rate = round((matched_cnt / oracle_cnt) * 100.0, 2)
+        else:
+            succ_rate = 100.0
+
+        # Fail rate = missed / original %
+        if orig_cnt > 0:
+            fail_rate = round((missed_cnt / orig_cnt) * 100.0, 2)
+        else:
+            fail_rate = 0.0 if missed_cnt == 0 else round(missed_cnt * 100.0, 2)
+
+        dur = round(time.time() - t_start, 2)
+
+        return ChunkAuditItem(
+            chunk_id=cid,
+            book_id=bid,
+            book_title=btitle,
+            section_title=stitle,
+            chunk_text_snippet=text[:150],
+            original_ideas=[c.name for c in orig_concepts],
+            oracle_ideas=[c.name for c in oracle_concepts],
+            matched_pairs=matched_pairs,
+            missed_oracle_ideas=missed_oracle,
+            extra_original_ideas=extra_original,
+            original_count=orig_cnt,
+            oracle_count=oracle_cnt,
+            matched_count=matched_cnt,
+            missed_count=missed_cnt,
+            success_rate=succ_rate,
+            fail_rate=fail_rate,
+            duration_seconds=dur,
+        )
+
+    audited_items: List[ChunkAuditItem] = []
+    completed_count = 0
+    total_count = len(sampled_chunks)
+
+    num_alive = len(pool.alive_nodes) if hasattr(pool, "alive_nodes") else 1
+    eff_concurrency = max(1, min(concurrency, num_alive or 1))
+
+    if eff_concurrency <= 1 or total_count <= 1:
+        for item in sampled_chunks:
+            res = _audit_single_chunk(item)
+            audited_items.append(res)
+            completed_count += 1
+            if progress_callback:
+                try:
+                    progress_callback(completed_count, total_count, item[0], res)
+                except Exception:
+                    pass
+    else:
+        with ThreadPoolExecutor(max_workers=eff_concurrency) as executor:
+            futures = {executor.submit(_audit_single_chunk, item): item for item in sampled_chunks}
+            for fut in as_completed(futures):
+                item = futures[fut]
+                try:
+                    res = fut.result()
+                except Exception as exc:
+                    logger.error(f"Error auditing chunk {item[0]}: {exc}")
+                    cid, txt, bid, bt, st = item
+                    res = ChunkAuditItem(
+                        chunk_id=cid,
+                        book_id=bid,
+                        book_title=bt,
+                        section_title=st,
+                        chunk_text_snippet=txt[:150],
+                    )
+                audited_items.append(res)
+                completed_count += 1
+                if progress_callback:
+                    try:
+                        progress_callback(completed_count, total_count, item[0], res)
+                    except Exception:
+                        pass
+
+    # Sort audited items by chunk_id
+    audited_items.sort(key=lambda x: x.chunk_id)
+
+    tot_orig = sum(it.original_count for it in audited_items)
+    tot_oracle = sum(it.oracle_count for it in audited_items)
+    tot_matched = sum(it.matched_count for it in audited_items)
+    tot_missed = sum(it.missed_count for it in audited_items)
+    tot_extra = sum(len(it.extra_original_ideas) for it in audited_items)
+
+    overall_succ = round((tot_matched / tot_oracle * 100.0), 2) if tot_oracle > 0 else 100.0
+    overall_fail = (
+        round((tot_missed / tot_orig * 100.0), 2)
+        if tot_orig > 0
+        else (0.0 if tot_missed == 0 else round(tot_missed * 100.0, 2))
+    )
+
+    perfect_cnt = sum(1 for it in audited_items if it.missed_count == 0 and it.oracle_count > 0)
+    omission_cnt = sum(1 for it in audited_items if it.missed_count > 0)
+
+    tot_dur = round(time.time() - start_time, 2)
+
+    stats = ChunkVerificationStats(
+        mode="chunk",
+        model_name=model_name,
+        embedding_model=emb_model_name,
+        total_chunks_in_graph=len(all_chunk_nodes),
+        sampled_chunks_count=len(audited_items),
+        sample_percentage=clamped_percent,
+        total_original_ideas=tot_orig,
+        total_oracle_ideas=tot_oracle,
+        total_matched_ideas=tot_matched,
+        total_missed_ideas=tot_missed,
+        total_extra_original_ideas=tot_extra,
+        overall_success_rate=overall_succ,
+        overall_fail_rate=overall_fail,
+        chunks_with_perfect_match=perfect_cnt,
+        chunks_with_omissions=omission_cnt,
+        total_duration_seconds=tot_dur,
+    )
+
+    omission_examples = sorted(
+        [it for it in audited_items if it.missed_count > 0],
+        key=lambda x: (x.missed_count, x.fail_rate),
+        reverse=True,
+    )[:max_examples]
+
+    return ChunkVerificationReport(
+        mode="chunk",
+        stats=stats,
+        audited_chunks=audited_items,
+        omission_examples=omission_examples,
     )

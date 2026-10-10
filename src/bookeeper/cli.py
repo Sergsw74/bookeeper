@@ -2929,7 +2929,9 @@ def verify_command(
         None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', 'chunk', or 'cross-check' (default: 'ideas')."
     ),
     compare_graph: Optional[str] = typer.Option(
-        None, "--compare-graph", help="Second knowledge_graph.json to compare against in cross-check mode."
+        None,
+        "--compare-graph",
+        help="Path to A/B test result directory OR candidate knowledge_graph.json to compare against in cross-check mode.",
     ),
     blocks: Optional[int] = typer.Option(
         None, "--blocks", help="Number of contiguous chunk blocks to audit in cross-check mode (default: 20)."
@@ -3435,35 +3437,105 @@ def verify_command(
 
     # Mode: 'cross-check' (Dual Knowledge Base Seam & Recall Comparative Audit)
     if effective_mode in ("cross-check", "cross_check"):
-        target_graph_a = Path(graph_file).expanduser().resolve() if graph_file else None
-        target_graph_b = Path(compare_graph).expanduser().resolve() if compare_graph else None
+        # Resolve candidate path helper: check direct, CWD/ab_test_runs, repo/ab_test_runs
+        def _resolve_candidate_path(p_str: Optional[str]) -> Optional[Path]:
+            if not p_str:
+                return None
+            cand = Path(p_str).expanduser()
+            if cand.exists():
+                return cand.resolve()
+            alt1 = Path.cwd() / "ab_test_runs" / p_str
+            if alt1.exists():
+                return alt1.resolve()
+            if cfg and getattr(cfg, "repo_dir", None):
+                alt2 = Path(cfg.repo_dir) / "ab_test_runs" / p_str
+                if alt2.exists():
+                    return alt2.resolve()
+            return cand.resolve()
 
-        # Auto-discovery if a directory or run folder was passed
-        if target_graph_a and target_graph_a.is_dir() and not target_graph_b:
-            subdirs = sorted([p for p in target_graph_a.iterdir() if p.is_dir()])
+        def _discover_graphs_from_run_dir(d: Path) -> Optional[Tuple[Path, Path, str, str]]:
+            """Locate branch A and branch B knowledge_graph.json within an A/B test run directory."""
+            if not d.is_dir():
+                return None
+            subdirs = sorted([p for p in d.iterdir() if p.is_dir()])
             cand_a = [p for p in subdirs if p.name.startswith("branch_A")]
             cand_b = [p for p in subdirs if p.name.startswith("branch_B")]
             if cand_a and cand_b:
-                target_graph_a = cand_a[0] / "knowledge_graph.json"
-                target_graph_b = cand_b[0] / "knowledge_graph.json"
+                kg_a = cand_a[0] / "knowledge_graph.json"
+                kg_b = cand_b[0] / "knowledge_graph.json"
+                if kg_a.is_file() and kg_b.is_file():
+                    name_a = cand_a[0].name.replace("branch_A_", "").replace("branch_A", "").strip("_") or cand_a[0].name
+                    name_b = cand_b[0].name.replace("branch_B_", "").replace("branch_B", "").strip("_") or cand_b[0].name
+                    return kg_a, kg_b, name_a, name_b
+
+            # Fallback: check any two subdirectories containing knowledge_graph.json
+            with_kg = [p for p in subdirs if (p / "knowledge_graph.json").is_file()]
+            if len(with_kg) >= 2:
+                kg_a = with_kg[0] / "knowledge_graph.json"
+                kg_b = with_kg[1] / "knowledge_graph.json"
+                name_a = with_kg[0].name.strip("_")
+                name_b = with_kg[1].name.strip("_")
+                return kg_a, kg_b, name_a, name_b
+
+            return None
+
+        cand_path_a = _resolve_candidate_path(graph_file)
+        cand_path_b = _resolve_candidate_path(compare_graph)
+
+        target_graph_a: Optional[Path] = None
+        target_graph_b: Optional[Path] = None
+        branch_a_label = "Baseline (A)"
+        branch_b_label = "Candidate (B)"
+
+        # 1. If compare_graph points to an A/B test result directory containing both branches:
+        if cand_path_b and cand_path_b.is_dir():
+            run_graphs = _discover_graphs_from_run_dir(cand_path_b)
+            if run_graphs:
+                target_graph_a, target_graph_b, branch_a_label, branch_b_label = run_graphs
+
+        # 2. If graph_file points to an A/B test result directory containing both branches:
+        if not target_graph_a and cand_path_a and cand_path_a.is_dir():
+            run_graphs = _discover_graphs_from_run_dir(cand_path_a)
+            if run_graphs:
+                target_graph_a, target_graph_b, branch_a_label, branch_b_label = run_graphs
+
+        # 3. If individual branch folders or files were passed:
+        if not target_graph_a:
+            if cand_path_a:
+                if cand_path_a.is_file():
+                    target_graph_a = cand_path_a
+                elif cand_path_a.is_dir() and (cand_path_a / "knowledge_graph.json").is_file():
+                    target_graph_a = cand_path_a / "knowledge_graph.json"
+            else:
+                default_kg = cfg.resolved_output_dir / "knowledge_graph.json"
+                if default_kg.is_file():
+                    target_graph_a = default_kg
+
+        if not target_graph_b:
+            if cand_path_b:
+                if cand_path_b.is_file():
+                    target_graph_b = cand_path_b
+                elif cand_path_b.is_dir() and (cand_path_b / "knowledge_graph.json").is_file():
+                    target_graph_b = cand_path_b / "knowledge_graph.json"
 
         if not target_graph_a or not target_graph_a.is_file():
-            default_kg = cfg.resolved_output_dir / "knowledge_graph.json"
-            if default_kg.is_file():
-                target_graph_a = default_kg
-            else:
-                console.print(
-                    f"[bold red]Primary knowledge graph file not found at '{target_graph_a}'.[/bold red]\n"
-                    f"[yellow]Specify --graph-file <path_to_baseline_kg.json> and --compare-graph <path_to_candidate_kg.json>.[/yellow]"
-                )
-                raise typer.Exit(1)
+            console.print(
+                f"[bold red]Primary knowledge graph file not found at '{graph_file or cfg.resolved_output_dir}'.[/bold red]\n"
+                f"[yellow]Specify --graph-file <path_to_baseline_kg.json> or an A/B test result directory via --compare-graph <path_to_ab_test_result>.[/yellow]"
+            )
+            raise typer.Exit(1)
 
         if not target_graph_b or not target_graph_b.is_file():
             console.print(
-                f"[bold red]Comparison knowledge graph file (--compare-graph) not found.[/bold red]\n"
-                f"[yellow]Specify --compare-graph <path_to_candidate_kg.json> to run cross-check mode.[/yellow]"
+                f"[bold red]Comparison knowledge graph or A/B test run directory (--compare-graph) not found at '{compare_graph}'.[/bold red]\n"
+                f"[yellow]Specify --compare-graph <path_to_ab_test_result_or_candidate_kg.json> to run cross-check mode.[/yellow]"
             )
             raise typer.Exit(1)
+
+        if branch_a_label == "Baseline (A)":
+            branch_a_label = target_graph_a.parent.name.replace("branch_A_", "").strip("_") or target_graph_a.name
+        if branch_b_label == "Candidate (B)":
+            branch_b_label = target_graph_b.parent.name.replace("branch_B_", "").strip("_") or target_graph_b.name
 
         store_a = ConceptGraphStore()
         store_b = ConceptGraphStore()
@@ -3489,8 +3561,8 @@ def verify_command(
 
         console.print(
             Panel.fit(
-                f"[bold]Baseline Graph A:[/bold] {target_graph_a} ({chunks_a_cnt} chunks)\n"
-                f"[bold]Candidate Graph B:[/bold] {target_graph_b} ({chunks_b_cnt} chunks)\n\n"
+                f"[bold]Baseline Graph A ({branch_a_label}):[/bold] {target_graph_a} ({chunks_a_cnt} chunks)\n"
+                f"[bold]Candidate Graph B ({branch_b_label}):[/bold] {target_graph_b} ({chunks_b_cnt} chunks)\n\n"
                 f"[bold cyan]Verification Mode:[/bold cyan] CROSS-CHECK (Dual Seam & Recall Comparative Audit)\n"
                 f"[bold cyan]Contiguous Blocks to Audit:[/bold cyan] {effective_blocks}\n"
                 f"[bold cyan]Oracle Model:[/bold cyan] [bold magenta]{effective_model}[/bold magenta]\n"
@@ -3555,8 +3627,8 @@ def verify_command(
                 num_blocks=effective_blocks,
                 pool=pool,
                 model_name=effective_model,
-                branch_a_name=target_graph_a.parent.name or "Branch A",
-                branch_b_name=target_graph_b.parent.name or "Branch B",
+                branch_a_name=branch_a_label,
+                branch_b_name=branch_b_label,
                 seed=seed,
                 progress_callback=_on_cc_progress,
             )

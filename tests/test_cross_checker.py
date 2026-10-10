@@ -316,7 +316,7 @@ def test_cross_check_cli_command(tmp_path, sample_graphs):
 
     runner = CliRunner()
 
-    with patch("bookeeper.processing.cross_checker.run_cross_check") as mock_run:
+    with patch("bookeeper.cli.run_cross_check") as mock_run:
         summary_obj = CrossCheckSummary(
             total_samples=1,
             mean_old_recall=0.85,
@@ -359,3 +359,67 @@ def test_cross_check_cli_command(tmp_path, sample_graphs):
         assert result.exit_code == 0
         assert "Cross-Check Verification Summary" in result.stdout
         assert out_rep.exists()
+
+
+def test_cross_check_cli_with_ab_test_run_dir(tmp_path, sample_graphs):
+    """Test CLI command `bookeeper verify --mode cross-check --compare-graph <run_dir>` discovers both branches."""
+    store_a, store_b = sample_graphs
+    run_dir = tmp_path / "ab_test_runs" / "run_20261010_000000_master_vs_candidate"
+    dir_a = run_dir / "branch_A_master"
+    dir_b = run_dir / "branch_B_candidate"
+    dir_a.mkdir(parents=True)
+    dir_b.mkdir(parents=True)
+
+    store_a.save(dir_a / "knowledge_graph.json")
+    store_b.save(dir_b / "knowledge_graph.json")
+    out_rep = tmp_path / "cross_check_run_out.json"
+
+    runner = CliRunner()
+
+    with patch("bookeeper.cli.run_cross_check") as mock_run:
+        summary_obj = CrossCheckSummary(
+            total_samples=1,
+            mean_old_recall=0.85,
+            mean_new_recall=0.90,
+            mean_delta_recall=0.05,
+            mean_old_precision=0.95,
+            mean_new_precision=0.97,
+            mean_old_truncation_rate=0.0,
+            mean_new_truncation_rate=0.01,
+            mean_chunk_disproportion=0.92,
+            decision_pass=True,
+            pass_reason="All gates passed.",
+        )
+        mock_rep = CrossCheckReport(
+            model_name="test-model",
+            baseline_branch="master",
+            candidate_branch="candidate",
+            summary=summary_obj,
+            samples=[],
+        )
+        mock_run.return_value = mock_rep
+
+        # Only pass --compare-graph with the run directory!
+        result = runner.invoke(
+            app,
+            [
+                "verify",
+                "--mode",
+                "cross-check",
+                "--compare-graph",
+                str(run_dir),
+                "--blocks",
+                "1",
+                "--output",
+                str(out_rep),
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert "Cross-Check Verification Summary" in result.stdout
+        assert out_rep.exists()
+        # Verify run_cross_check was called with discovered branch names
+        call_kwargs = mock_run.call_args.kwargs
+        assert call_kwargs["branch_a_name"] == "master"
+        assert call_kwargs["branch_b_name"] == "candidate"
+

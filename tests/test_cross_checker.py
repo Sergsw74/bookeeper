@@ -254,6 +254,9 @@ def test_evaluate_system_against_oracle():
     assert metrics.oracle_recall == pytest.approx(2 / 3, 0.01)
     assert len(metrics.retained_oracle_ideas) == 2
     assert len(metrics.dropped_oracle_ideas) == 1
+    assert metrics.retained_ideas_count == 2
+    assert metrics.dropped_ideas_count == 1
+    assert metrics.fail_ratio == pytest.approx(1 / 3, 0.01)
     assert metrics.truncation_rate == pytest.approx(1 / 3, 0.01)
 
 
@@ -302,6 +305,9 @@ def test_run_cross_check_e2e(sample_graphs, mock_pool):
     assert report.summary.mean_chunk_disproportion > 0.0
     assert report.summary.mean_old_recall >= 0.0
     assert report.summary.mean_new_recall >= 0.0
+    assert report.summary.mean_old_fail_ratio >= 0.0
+    assert report.summary.mean_new_fail_ratio >= 0.0
+    assert report.samples[0].delta_fail_ratio is not None
 
 
 def test_cross_check_cli_command(tmp_path, sample_graphs):

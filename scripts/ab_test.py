@@ -1029,6 +1029,8 @@ class ABTestRunner:
         print(f"{'Total Contiguous Blocks Audited':<{col_w_m}} {sm['total_samples']:<{col_w_v}} {sm['total_samples']:<{col_w_v}} {'-':<{col_w_v}}")
         delta_rec_color = Colors.GREEN if sm['mean_delta_recall'] >= -0.03 else Colors.RED
         print(f"{'Mean Oracle Recall (%)':<{col_w_m}} {sm['mean_old_recall']*100:.2f}%{'':<{col_w_v-8}} {sm['mean_new_recall']*100:.2f}%{'':<{col_w_v-8}} {delta_rec_color}{sm['mean_delta_recall']*100:+.2f}% pts{Colors.RESET}")
+        delta_fail_color = Colors.GREEN if sm.get('mean_delta_fail_ratio', 0.0) <= 0 else Colors.RED
+        print(f"{'Aggregate Fail Ratio [sum(Failed)/sum(Total)] (%)':<{col_w_m}} {sm.get('mean_old_fail_ratio', 0.0)*100:.2f}%{'':<{col_w_v-8}} {sm.get('mean_new_fail_ratio', 0.0)*100:.2f}%{'':<{col_w_v-8}} {delta_fail_color}{sm.get('mean_delta_fail_ratio', 0.0)*100:+.2f}% pts{Colors.RESET}")
         print(f"{'Mean Grounded Precision (%)':<{col_w_m}} {sm['mean_old_precision']*100:.2f}%{'':<{col_w_v-8}} {sm['mean_new_precision']*100:.2f}%{'':<{col_w_v-8}} {(sm['mean_new_precision']-sm['mean_old_precision'])*100:+.2f}% pts")
         trunc_color = Colors.GREEN if sm['mean_new_truncation_rate'] < 0.02 else Colors.RED
         print(f"{'Boundary Truncation Artifact Rate (%)':<{col_w_m}} {sm['mean_old_truncation_rate']*100:.2f}%{'':<{col_w_v-8}} {trunc_color}{sm['mean_new_truncation_rate']*100:.2f}%{Colors.RESET}{'':<{col_w_v-8}} {(sm['mean_new_truncation_rate']-sm['mean_old_truncation_rate'])*100:+.2f}% pts")
@@ -1060,18 +1062,19 @@ class ABTestRunner:
             "| Metric | Baseline (A) | Candidate (B) | Delta (B - A) | Passing Criteria |",
             "| :--- | :--- | :--- | :--- | :--- |",
             f"| Mean Oracle Recall | {sm.get('mean_old_recall', 0.0)*100:.2f}% | {sm.get('mean_new_recall', 0.0)*100:.2f}% | {sm.get('mean_delta_recall', 0.0)*100:+.2f}% pts | Mean ΔRecall >= -3% |",
+            f"| Aggregate Fail Ratio [sum(Failed)/sum(Total)] | {sm.get('mean_old_fail_ratio', 0.0)*100:.2f}% | {sm.get('mean_new_fail_ratio', 0.0)*100:.2f}% | {sm.get('mean_delta_fail_ratio', 0.0)*100:+.2f}% pts | Lower is better |",
             f"| Mean Grounded Precision | {sm.get('mean_old_precision', 0.0)*100:.2f}% | {sm.get('mean_new_precision', 0.0)*100:.2f}% | {(sm.get('mean_new_precision', 0.0)-sm.get('mean_old_precision', 0.0))*100:+.2f}% pts | Contextually Supported |",
             f"| Boundary Truncation Artifact Rate | {sm.get('mean_old_truncation_rate', 0.0)*100:.2f}% | {sm.get('mean_new_truncation_rate', 0.0)*100:.2f}% | {(sm.get('mean_new_truncation_rate', 0.0)-sm.get('mean_old_truncation_rate', 0.0))*100:+.2f}% pts | Mean Artifact Rate < 2% |",
             f"| Chunk Disproportion [sum(A)/sum(A∪B)] | - | **{sm.get('mean_chunk_disproportion', 0.0):.4f}** | - | Ratio sum(A.len)/sum(A∪B.len) |",
             "",
             "### 📊 Audited Block Samples Breakdown (Top 10)",
             "",
-            "| Block # | Book / Section | Passage Chars | Disproportion | Recall (A) | Recall (B) | ΔRecall | Truncation Rate (B) |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+            "| Block # | Book / Section | Passage Chars | Disproportion | Recall (A) | Recall (B) | ΔRecall | Fail (A) | Fail (B) | ΔFail | Truncation Rate (B) |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
         ]
         for s in data.get("samples", [])[:10]:
             lines.append(
-                f"| {s['sample_index']} | {s['book_title'][:18]} ({s['section_title'][:16]}) | {s['passage_length_chars']} | {s['chunk_disproportion']:.3f} | {s['old_system']['oracle_recall']*100:.1f}% | {s['new_system']['oracle_recall']*100:.1f}% | {s['delta_recall']*100:+.1f}% | {s['new_system']['truncation_rate']*100:.1f}% |"
+                f"| {s['sample_index']} | {s['book_title'][:18]} ({s['section_title'][:16]}) | {s['passage_length_chars']} | {s['chunk_disproportion']:.3f} | {s['old_system']['oracle_recall']*100:.1f}% | {s['new_system']['oracle_recall']*100:.1f}% | {s['delta_recall']*100:+.1f}% | {s['old_system'].get('fail_ratio', 0.0)*100:.1f}% | {s['new_system'].get('fail_ratio', 0.0)*100:.1f}% | {s.get('delta_fail_ratio', 0.0)*100:+.1f}% | {s['new_system']['truncation_rate']*100:.1f}% |"
             )
 
         with open(dest, "w", encoding="utf-8") as f:

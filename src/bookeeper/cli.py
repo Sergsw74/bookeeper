@@ -3651,6 +3651,12 @@ def verify_command(
             f"[{'green' if sm.mean_delta_recall >= -0.03 else 'red'}]{sm.mean_delta_recall * 100:+.2f}% pts[/]",
         )
         summary_table.add_row(
+            "Aggregate Fail Ratio [sum(Failed)/sum(Total Ideas)] (%)",
+            f"{sm.mean_old_fail_ratio * 100:.2f}%",
+            f"{sm.mean_new_fail_ratio * 100:.2f}%",
+            f"[{'green' if sm.mean_delta_fail_ratio <= 0 else 'red'}]{sm.mean_delta_fail_ratio * 100:+.2f}% pts[/]",
+        )
+        summary_table.add_row(
             "Mean Grounded Precision (%)",
             f"{sm.mean_old_precision * 100:.2f}%",
             f"{sm.mean_new_precision * 100:.2f}%",
@@ -3687,10 +3693,14 @@ def verify_command(
             sample_table.add_column("Recall A", justify="right")
             sample_table.add_column("Recall B", justify="right")
             sample_table.add_column("ΔRecall", justify="right")
+            sample_table.add_column("Fail A", justify="right")
+            sample_table.add_column("Fail B", justify="right")
+            sample_table.add_column("ΔFail", justify="right")
             sample_table.add_column("B Truncation", justify="right")
 
             for s in report.samples[:10]:
                 d_color = "green" if s.delta_recall >= 0 else ("yellow" if s.delta_recall >= -0.03 else "red")
+                f_color = "green" if s.delta_fail_ratio <= 0 else "red"
                 t_color = "green" if s.new_system.truncation_rate == 0 else "red"
                 sample_table.add_row(
                     str(s.sample_index),
@@ -3700,6 +3710,9 @@ def verify_command(
                     f"{s.old_system.oracle_recall * 100:.1f}%",
                     f"{s.new_system.oracle_recall * 100:.1f}%",
                     f"[{d_color}]{s.delta_recall * 100:+.1f}%[/]",
+                    f"{s.old_system.fail_ratio * 100:.1f}%",
+                    f"{s.new_system.fail_ratio * 100:.1f}%",
+                    f"[{f_color}]{s.delta_fail_ratio * 100:+.1f}%[/]",
                     f"[{t_color}]{s.new_system.truncation_rate * 100:.1f}%[/]",
                 )
             console.print(sample_table)

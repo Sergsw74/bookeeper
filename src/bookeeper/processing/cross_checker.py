@@ -47,6 +47,9 @@ class SystemBlockMetrics(BaseModel):
     system: Literal["old", "new"]
     raw_ideas_count: int = 0
     deduped_ideas_count: int = 0
+    retained_ideas_count: int = 0
+    dropped_ideas_count: int = 0
+    fail_ratio: float = 0.0  # Dropped / Total_Block_IDEA_CNT
     oracle_recall: float = 0.0
     grounded_precision: float = 1.0
     truncation_rate: float = 0.0
@@ -76,6 +79,7 @@ class CrossCheckBlockResult(BaseModel):
     old_system: SystemBlockMetrics
     new_system: SystemBlockMetrics
     delta_recall: float
+    delta_fail_ratio: float = 0.0  # fail_ratio_B - fail_ratio_A
     duration_seconds: float = 0.0
 
 
@@ -86,6 +90,9 @@ class CrossCheckSummary(BaseModel):
     mean_old_recall: float
     mean_new_recall: float
     mean_delta_recall: float
+    mean_old_fail_ratio: float = 0.0
+    mean_new_fail_ratio: float = 0.0
+    mean_delta_fail_ratio: float = 0.0
     mean_old_precision: float
     mean_new_precision: float
     mean_old_truncation_rate: float
@@ -483,6 +490,10 @@ def evaluate_system_against_oracle(
     truncation_count = sum(1 for it in audited_items if it.verdict == "TRUNCATION_ARTIFACT")
 
     tot_cand = len(candidate_ideas)
+    dropped_count = len(dropped)
+    retained_count = len(retained)
+    fail_ratio = round(dropped_count / tot_cand, 4) if tot_cand > 0 else (1.0 if dropped_count > 0 else 0.0)
+
     if tot_cand > 0:
         grounded_precision = round((len(matched_candidate) + valid_detail_count) / tot_cand, 4)
         truncation_rate = round(truncation_count / tot_cand, 4)
@@ -494,6 +505,9 @@ def evaluate_system_against_oracle(
         system=system_label,
         raw_ideas_count=tot_cand,
         deduped_ideas_count=tot_cand,
+        retained_ideas_count=retained_count,
+        dropped_ideas_count=dropped_count,
+        fail_ratio=fail_ratio,
         oracle_recall=recall,
         grounded_precision=grounded_precision,
         truncation_rate=truncation_rate,
@@ -631,6 +645,7 @@ def run_cross_check(
         eval_new = evaluate_system_against_oracle(e_new, i_oracle, w_raw, "new", deduplicator, pool, model_name)
 
         delta_rec = round(eval_new.oracle_recall - eval_old.oracle_recall, 4)
+        delta_fail = round(eval_new.fail_ratio - eval_old.fail_ratio, 4)
         dur = round(time.time() - t0, 2)
         curr_idx = len(samples) + 1
 
@@ -650,6 +665,7 @@ def run_cross_check(
             old_system=eval_old,
             new_system=eval_new,
             delta_recall=delta_rec,
+            delta_fail_ratio=delta_fail,
             duration_seconds=dur,
         )
         samples.append(block_result)
@@ -663,6 +679,17 @@ def run_cross_check(
         mean_old_rec = round(float(np.mean([s.old_system.oracle_recall for s in samples])), 4)
         mean_new_rec = round(float(np.mean([s.new_system.oracle_recall for s in samples])), 4)
         mean_delta_rec = round(float(np.mean([s.delta_recall for s in samples])), 4)
+
+        # Micro-aggregated fail ratios: sum(failed) / sum(total_block_ideas)
+        total_old_dropped = sum(s.old_system.dropped_ideas_count for s in samples)
+        total_old_ideas = sum(s.old_system.deduped_ideas_count for s in samples)
+        agg_old_fail = round(total_old_dropped / total_old_ideas, 4) if total_old_ideas > 0 else 0.0
+
+        total_new_dropped = sum(s.new_system.dropped_ideas_count for s in samples)
+        total_new_ideas = sum(s.new_system.deduped_ideas_count for s in samples)
+        agg_new_fail = round(total_new_dropped / total_new_ideas, 4) if total_new_ideas > 0 else 0.0
+
+        agg_delta_fail = round(agg_new_fail - agg_old_fail, 4)
         mean_old_prec = round(float(np.mean([s.old_system.grounded_precision for s in samples])), 4)
         mean_new_prec = round(float(np.mean([s.new_system.grounded_precision for s in samples])), 4)
         mean_old_trunc = round(float(np.mean([s.old_system.truncation_rate for s in samples])), 4)
@@ -670,6 +697,7 @@ def run_cross_check(
         mean_disprop = round(float(np.mean([s.chunk_disproportion for s in samples])), 4)
     else:
         mean_old_rec = mean_new_rec = mean_delta_rec = mean_old_prec = mean_new_prec = 0.0
+        agg_old_fail = agg_new_fail = agg_delta_fail = 0.0
         mean_old_trunc = mean_new_trunc = mean_disprop = 0.0
 
     # Decision Gates:
@@ -692,6 +720,9 @@ def run_cross_check(
         mean_old_recall=mean_old_rec,
         mean_new_recall=mean_new_rec,
         mean_delta_recall=mean_delta_rec,
+        mean_old_fail_ratio=agg_old_fail,
+        mean_new_fail_ratio=agg_new_fail,
+        mean_delta_fail_ratio=agg_delta_fail,
         mean_old_precision=mean_old_prec,
         mean_new_precision=mean_new_prec,
         mean_old_truncation_rate=mean_old_trunc,

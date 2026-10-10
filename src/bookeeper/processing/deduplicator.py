@@ -89,8 +89,8 @@ class EntityDeduplicator:
         )
         try:
             if base_url:
-                urls = [u.strip() for u in base_url.split(",") if u.strip()]
-                pool = OllamaPool.from_urls(urls, cooldown_seconds=settings.failover_cooldown_seconds)
+                cd = getattr(settings, "resolved_analysis_cooldown_seconds", getattr(settings, "failover_cooldown_seconds", 600))
+                pool = OllamaPool.from_urls(urls, cooldown_seconds=cd)
                 embeddings = FailoverOllamaEmbeddings(pool=pool, model=e_model)
             else:
                 embeddings = FailoverOllamaEmbeddings.from_settings(settings, model=e_model)

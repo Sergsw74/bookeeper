@@ -57,7 +57,20 @@ ollama_servers:
     name: "secondary-cpu-node"
     capability: ["embedding"]
 
+# ==============================================================================
+# Failover Cooldown Periods
+# ==============================================================================
+# Global default cooldown duration in seconds before retrying a failed server (default: 600s = 10 min)
 failover_cooldown_seconds: 600
+
+# Cooldown duration in seconds specifically for book analysis / extraction (default: 600s = 10 min).
+# A longer timeout provides greater tolerance for high-volume note extraction and heavy chapter processing.
+analysis_cooldown_seconds: 600
+
+# Cooldown duration in seconds specifically for verification steps (default: 60s = 1 min).
+# Verification involves fewer notes and quick audits, so retry attempts should be executed faster.
+# Can also be placed under the 'verification:' block as 'cooldown_seconds'.
+verification_cooldown_seconds: 60
 
 # Wake-on-LAN (WOL) Configuration
 # If an Ollama server is unreachable during warmup and has a configured MAC address,
@@ -124,3 +137,4 @@ verification:
   mode: "ideas"                     # Verification mode (default: 'ideas')
   temperature: 0.0                  # Low temperature for strict factual evaluation
   max_examples: 20                  # Maximum discrepancy examples to report
+  cooldown_seconds: 60              # Cooldown period in seconds for verification (default: 60s; retries faster)

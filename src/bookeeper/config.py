@@ -204,6 +204,15 @@ class VerificationConfig(BaseModel):
         default=0.20,
         description="Cosine distance threshold for semantic chunk expansion and coherence verification.",
     )
+    cooldown_seconds: Optional[int] = Field(
+        default=None,
+        description="Failover cooldown duration in seconds for verification tasks (default: 60s).",
+    )
+
+    def __init__(self, **data: Any):
+        if "failover_cooldown_seconds" in data and "cooldown_seconds" not in data:
+            data["cooldown_seconds"] = data["failover_cooldown_seconds"]
+        super().__init__(**data)
 
 
 class Settings(BaseSettings):
@@ -254,7 +263,15 @@ class Settings(BaseSettings):
     )
     failover_cooldown_seconds: int = Field(
         default=600,
-        description="Cooldown duration in seconds (default 600s = 10 min) before retrying a failed server.",
+        description="Global cooldown duration in seconds (default 600s = 10 min) before retrying a failed server.",
+    )
+    analysis_cooldown_seconds: Optional[int] = Field(
+        default=None,
+        description="Cooldown duration in seconds for book analysis / extraction (default: inherits failover_cooldown_seconds, e.g. 600s).",
+    )
+    verification_cooldown_seconds: Optional[int] = Field(
+        default=None,
+        description="Cooldown duration in seconds for verification tasks (default: inherits verification.cooldown_seconds or 60s).",
     )
     wol_enabled: bool = Field(
         default=True,
@@ -545,6 +562,29 @@ class Settings(BaseSettings):
         """Return dedicated verification model or fallback to llm_model."""
         return self.verification.model or self.llm_model
 
+    @property
+    def resolved_analysis_cooldown_seconds(self) -> int:
+        """
+        Return cooldown duration in seconds for book analysis / extraction.
+        Prioritizes analysis_cooldown_seconds if set, otherwise falls back to failover_cooldown_seconds.
+        """
+        if self.analysis_cooldown_seconds is not None:
+            return self.analysis_cooldown_seconds
+        return self.failover_cooldown_seconds
+
+    @property
+    def resolved_verification_cooldown_seconds(self) -> int:
+        """
+        Return cooldown duration in seconds for verification tasks.
+        Prioritizes verification.cooldown_seconds, then verification_cooldown_seconds.
+        If neither is explicitly configured, defaults to 60s (fast retry for verification).
+        """
+        if self.verification.cooldown_seconds is not None:
+            return self.verification.cooldown_seconds
+        if self.verification_cooldown_seconds is not None:
+            return self.verification_cooldown_seconds
+        return 60
+
     clean_export: bool = Field(
         default=False,
         description="Whether to perform a clean start on export targets (clearing existing notes or database content before export).",
@@ -595,6 +635,13 @@ class Settings(BaseSettings):
                     flat_data[sub_key] = sub_val
             else:
                 flat_data[key] = val
+
+        # Handle cooldown aliases at root
+        if "cooldown_seconds" in flat_data:
+            if "analysis_cooldown_seconds" not in flat_data:
+                flat_data["analysis_cooldown_seconds"] = flat_data["cooldown_seconds"]
+            if "failover_cooldown_seconds" not in flat_data:
+                flat_data["failover_cooldown_seconds"] = flat_data["cooldown_seconds"]
 
         return cls(**flat_data)
 

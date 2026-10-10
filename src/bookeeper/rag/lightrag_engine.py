@@ -74,15 +74,16 @@ class LightRAGEngine:
     ) -> "LightRAGEngine":
         """Instantiate LightRAGEngine from application Settings."""
         target_dir = working_dir or settings.resolved_lightrag_dir
+        cd = getattr(settings, "resolved_analysis_cooldown_seconds", getattr(settings, "failover_cooldown_seconds", 600))
         if pool is None:
             pool = OllamaPool(
                 servers=settings.resolved_ollama_servers,
-                cooldown_seconds=settings.failover_cooldown_seconds,
+                cooldown_seconds=cd,
             )
         if embedding_pool is None:
             embedding_pool = OllamaPool(
                 servers=settings.resolved_embedding_servers,
-                cooldown_seconds=settings.failover_cooldown_seconds,
+                cooldown_seconds=cd,
                 max_tasks_per_server=1,
             )
         return cls(

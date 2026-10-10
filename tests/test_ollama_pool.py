@@ -38,6 +38,56 @@ def test_ollama_server_config_and_settings_resolution():
     assert s2.resolved_ollama_servers[1].priority == 2
 
 
+def test_cooldown_settings_and_yaml_resolution(tmp_path):
+    """Verify separate cooldown periods for book analysis and verification from Settings and YAML."""
+    # 1. Defaults
+    s_default = Settings()
+    assert s_default.failover_cooldown_seconds == 600
+    assert s_default.resolved_analysis_cooldown_seconds == 600
+    assert s_default.resolved_verification_cooldown_seconds == 60
+
+    # 2. Explicit Settings arguments
+    s_custom = Settings(
+        failover_cooldown_seconds=500,
+        analysis_cooldown_seconds=800,
+        verification_cooldown_seconds=45,
+    )
+    assert s_custom.resolved_analysis_cooldown_seconds == 800
+    assert s_custom.resolved_verification_cooldown_seconds == 45
+
+    # 3. YAML with root cooldowns
+    cfg_file1 = tmp_path / "config_root.yaml"
+    cfg_file1.write_text(
+        "analysis_cooldown_seconds: 900\n"
+        "verification_cooldown_seconds: 30\n"
+    )
+    s_yaml1 = Settings.from_yaml(cfg_file1)
+    assert s_yaml1.resolved_analysis_cooldown_seconds == 900
+    assert s_yaml1.resolved_verification_cooldown_seconds == 30
+
+    # 4. YAML with nested verification.cooldown_seconds
+    cfg_file2 = tmp_path / "config_nested.yaml"
+    cfg_file2.write_text(
+        "failover_cooldown_seconds: 700\n"
+        "verification:\n"
+        "  enabled: true\n"
+        "  cooldown_seconds: 25\n"
+    )
+    s_yaml2 = Settings.from_yaml(cfg_file2)
+    assert s_yaml2.resolved_analysis_cooldown_seconds == 700
+    assert s_yaml2.resolved_verification_cooldown_seconds == 25
+
+    # 5. YAML with root cooldown_seconds alias
+    cfg_file3 = tmp_path / "config_alias.yaml"
+    cfg_file3.write_text(
+        "cooldown_seconds: 450\n"
+    )
+    s_yaml3 = Settings.from_yaml(cfg_file3)
+    assert s_yaml3.resolved_analysis_cooldown_seconds == 450
+    assert s_yaml3.failover_cooldown_seconds == 450
+    assert s_yaml3.resolved_verification_cooldown_seconds == 60
+
+
 def test_ollama_pool_priority_ordering():
     """Verify that pool always orders servers by priority ascending."""
     servers = [

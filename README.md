@@ -153,7 +153,10 @@ ollama_servers:
     name: "secondary-cpu-node"
     capability: ["embedding"]
 
-failover_cooldown_seconds: 600
+# Separate Failover Cooldowns for Analysis and Verification
+# Book analysis processes large batches of notes/chunks, supporting a longer timeout for nodes to recover.
+analysis_cooldown_seconds: 600       # Timeout in seconds for extraction/analysis failovers (alias: failover_cooldown_seconds)
+verification_cooldown_seconds: 60    # Timeout in seconds for verification retries (faster retry on small note batches)
 
 # High-Performance Neo4j Graph Database Export
 neo4j:
@@ -174,6 +177,7 @@ verification:
   model: "llama3.1:8b"
   percent: 1.0
   max_examples: 20
+  cooldown_seconds: 60               # Dedicated verification failover cooldown (overrides verification_cooldown_seconds)
 ```
 
 ---
@@ -187,7 +191,10 @@ verification:
   - `embedding`: Vector embeddings via `nomic-embed-text` for semantic chunking and entity deduplication.
   - `verification`: Factual grounding audits (`bookeeper verify`).
   - Tasks are dispatched strictly to alive nodes that support the required capability.
-- **Priority Failover**: Servers are ordered by priority (1 is highest). If a node fails, it enters a temporary cooldown (`failover_cooldown_seconds`), automatically diverting traffic to surviving nodes.
+- **Priority Failover & Differentiated Cooldowns**:
+  - Servers are ordered by priority (1 is highest). If a node fails, it enters a temporary cooldown, automatically diverting traffic to surviving nodes.
+  - **Analysis Cooldown (`analysis_cooldown_seconds`, default: 600s / 10m)**: During heavy book ingestion and concept extraction, nodes process extensive batches of text. A higher cooldown prevents repeatedly hammering a stalled GPU server and grants time for VRAM recovery or reboot.
+  - **Verification Cooldown (`verification_cooldown_seconds`, default: 60s / 1m)**: Verification audits evaluate small, focused batches of notes. Cooldowns are kept short so failover and retries occur swiftly without stalling the audit.
 - **Dedicated Offloading vs. Cluster Pool for Embeddings**:
   - **Dedicated Offloading (`embedding_base_url: "http://localhost:11434"`)**: Offloading embeddings to a dedicated endpoint (such as a local Apple Silicon Mac) prevents remote GPU servers from unloading their LLM from VRAM to run embedding models, eliminating model-swapping latency.
   - **Cluster Pool Mode (`embedding_base_url: "pool"`)**: If you prefer distributing embeddings across your network cluster, set `embedding_base_url: pool` (or pass `--embedding-url pool`). Embeddings will be load-balanced across all nodes advertising the `embedding` capability in `ollama_servers`.
@@ -268,6 +275,41 @@ bookeeper test-run 3 --model "qwen2.5:3b" --calibre-path "/path/to/calibre"
 1. **Stage 1 (Build Graph)**: Executes `build-graph` with `--from-scratch`, `--no-lightrag`, `--clean-export`, and `--timeout 60` (or configured value), processing books until exactly `{book-cnt}` books are successfully integrated into the knowledge graph.
 2. **Stage 2 (Verification)**: Automatically triggers `bookeeper verify` (default `--mode ideas`, `--percent 1.0%`) to validate factual grounding and report integrity statistics.
 
+---
+
+### 🔬 Automated A/B Testing & Branch Benchmarking (`scripts/ab_test.sh` / `scripts/ab_test.py`)
+
+`bookeeper` provides an automated harness to benchmark and compare two Git branches or an existing baseline against a candidate branch across extraction speed, idea counts, and factual grounding:
+
+```bash
+# 1. Standard Branch vs Branch comparison (ingests 5 books per branch from scratch):
+./scripts/ab_test.sh main feature-rolling-window 5
+
+# 2. Compare against an existing baseline verification report (skips re-indexing Branch A):
+./scripts/ab_test.sh vs ./ab_test_runs/run_20261010_120000/branch_A/verification_report.json feature-rolling-window 5
+
+# 3. Direct Python invocation with custom arguments:
+python3 scripts/ab_test.py main feature-rolling-window --books 5 --percent 2.0 --timeout 60
+```
+
+#### ⚙️ Configuration Customization Overlays (`config-a.yaml` & `config-b.yaml`)
+
+When running A/B tests to evaluate architectural, chunking, or prompt changes, you can customize configurations per branch without modifying `config.yaml` or dirtying your Git working tree:
+
+- **Base Configuration**: The runner reads `config.yaml` (or `--config <path>`).
+- **Branch A Overlay**: If `config-a.yaml` (or `--config-a <path>`) exists, it is automatically deep-merged on top of `config.yaml` for Branch A.
+- **Branch B Overlay**: If `config-b.yaml` (or `--config-b <path>`) exists, it is automatically deep-merged on top of `config.yaml` for Branch B.
+- **Deep Merge Semantics**: Overlays recursively overwrite specific keys (e.g. `llm_model`, `chunk_size`, `verification_cooldown_seconds`, or nested blocks under `verification:`) while preserving all unmentioned base settings.
+- **Reproducibility**: Merged configurations are written directly into the run session directory (`ab_test_runs/run_<timestamp>/branch_<X>/config.yaml`), ensuring clean git checkouts and deterministic reproducibility.
+
+```bash
+# Example with explicit overlay configs:
+python3 scripts/ab_test.py main feature-rolling-window \
+  --books 5 \
+  --config config.yaml \
+  --config-a config-a.yaml \
+  --config-b config-b.yaml
+```
 
 ---
 
@@ -343,7 +385,7 @@ This command automatically updates `knowledge_graph.json`, clears the book's com
 
 ### 🔬 Verification & Auditing (`bookeeper verify`)
 
-`bookeeper verify` supports **two distinct verification modes**:
+`bookeeper verify` supports **three distinct verification modes**:
 
 #### 1. Mode 1: Ideas Grounding Audit (`--mode ideas`, Default)
 Audits whether extracted concepts and relationships in `knowledge_graph.json` are factually grounded in their assigned text chunks using a dedicated, powerful LLM verifier model (e.g. `gemma4:12b`, `qwen2.5:14b-instruct`, `llama3.1:8b`).
@@ -394,6 +436,38 @@ bookeeper verify --mode chunking --book-id 42 --embedding-model "nomic-embed-tex
 - **Boundary Precision**: Confirms sentence-to-chunk cosine distances remain within the expected semantic threshold (`--threshold`, default: `0.20`).
 - **Distance Distribution**: Visualizes mean, min, max, and outlier semantic drift distances across chapters and chunks.
 - **Cache Consistency**: Verifies that serialized chunks in `output/chunks/` correspond directly to smart semantic boundaries.
+
+---
+
+#### 3. Mode 3: Dual Knowledge Base Cross-Check Audit (`--mode cross-check`)
+Audits and compares factual retention across chunking strategies or branches (e.g., comparing candidate chunking algorithms or benchmarking two knowledge graphs) using **Natural Language Inference (NLI) Atomic Assertion Entailment**:
+
+```bash
+# Compare candidate knowledge graph or A/B test run against baseline:
+bookeeper verify --mode cross-check --compare-graph ./ab_test_runs/run_20261010_120000/branch_B/knowledge_graph.json
+
+# Audit 20 contiguous chunk blocks with a custom verifier model:
+bookeeper verify --mode cross-check --compare-graph ./path/to/candidate_kg.json --blocks 20 --model "llama3.1:8b"
+
+# Print side-by-side QA & Assertion probes for the first 3 audited blocks:
+bookeeper verify --mode cross-check --compare-graph ./path/to/candidate_kg.json --print-blocks 3
+```
+
+**How NLI Cross-Check Verification Works:**
+- **Exact Document Clamping**: Aligns contiguous chunk blocks between old and new systems using forward-anchored exact character spans within the raw book text, eliminating text span drift and boundary distortion.
+- **Atomic Assertion Decomposition**: A high-capacity model analyzes the canonical raw passage and extracts 5 clear, factual, declarative statements (atomic claims) representing key events, entity actions, and conditions without relying on brittle surface quoting or trivia.
+- **Entailment Classification**: Evaluates each atomic assertion against the extracted knowledge base ($E_{\text{old}}$ vs $E_{\text{new}}$), classifying each as `SUPPORTED`, `CONTRADICTED`, or `NOT_MENTIONED`.
+
+**Metrics & Legend:**
+- **Recall (NLI / QA Recall)**:
+  Proportion of raw-passage factual assertions verified as `SUPPORTED` by the extracted knowledge base claims and entities.
+  $$\text{Recall} = \frac{\sum \text{Supported Assertions}}{\text{Total Assertions}}$$
+- **Seam Integrity (SIMINT / Seam Int)**:
+  Measures retention of relational propositions spanning multiple sentences across chunk seams/boundaries. Detects seam severance where Sentence A (cause) and Sentence B (consequence) land on separate sides of a chunk boundary and the relationship is lost.
+  $$\text{SIMINT} = \frac{\sum \text{Supported Cross-Boundary Assertions}}{\text{Total Cross-Boundary Assertions}}$$
+- **Chunk Disproportion**:
+  Normalized character overlap ratio between the candidate chunk span and canonical window:
+  $$\text{Disproportion} = \frac{|A \cap B|}{|A \cup B|}$$
 
 ---
 

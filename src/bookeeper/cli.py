@@ -272,9 +272,10 @@ def _perform_ollama_warmup(extractor: KnowledgeExtractor, console: Console) -> D
     primary = status.get("primary", {})
 
     # Display multi-server pool table if more than one server configured
+    cd_label = f"{extractor.cooldown_seconds // 60}m" if extractor.cooldown_seconds >= 60 else f"{extractor.cooldown_seconds}s"
     if len(servers) > 1:
         table = Table(
-            title=f"Ollama Multi-Server Pool ({len(servers)} servers, {extractor.cooldown_seconds // 60}m failover cooldown)",
+            title=f"Ollama Multi-Server Pool ({len(servers)} servers, {cd_label} failover cooldown)",
             show_header=True,
             header_style="bold cyan",
         )
@@ -314,7 +315,7 @@ def _perform_ollama_warmup(extractor: KnowledgeExtractor, console: Console) -> D
             f"[bold yellow]⚠️ Active Ollama server '[cyan]{primary.get('url')}[/cyan]' is executing model '[cyan]{primary.get('model', extractor.model_name)}[/cyan]' on [bold red]CPU[/bold red][/bold yellow]\n\n"
             f"• [bold]VRAM Allocated:[/bold] 0 MB / {size_mb:.0f} MB (0% offloaded)\n"
             f"• [bold]Inference Runner:[/bold] {primary.get('runner', 'llamacpp')}\n"
-            f"• [bold]Multi-Server Pool:[/bold] {len(servers)} server(s) configured (auto-retry cooldown: {extractor.cooldown_seconds // 60}m)\n\n"
+            f"• [bold]Multi-Server Pool:[/bold] {len(servers)} server(s) configured (auto-retry cooldown: {cd_label})\n\n"
             f"[dim]Note: Extraction will be slower on CPU. If this server fails, requests will automatically fail over to next server.[/dim]"
         )
         console.print(
@@ -392,7 +393,8 @@ def config(
             f"[bold green]Calibre Auth:[/bold green] user={cfg.calibre_user or '[dim]none[/dim]'}\n"
             f"[bold green]Ollama Failover Pool ({len(cfg.resolved_ollama_servers)} server(s)):[/bold green]\n{servers_block}\n"
             f"[bold green]Wake-on-LAN (WOL):[/bold green] {wol_status_str}\n"
-            f"[bold green]Failover Cooldown:[/bold green] {cfg.failover_cooldown_seconds}s\n"
+            f"[bold green]Analysis Failover Cooldown:[/bold green] {cfg.resolved_analysis_cooldown_seconds}s\n"
+            f"[bold green]Verification Failover Cooldown:[/bold green] {cfg.resolved_verification_cooldown_seconds}s\n"
             f"[bold green]LLM Model:[/bold green] {cfg.llm_model}\n"
             f"[bold green]Embedding Model:[/bold green] {cfg.embedding_model}\n"
             f"[bold green]Embedding Endpoint:[/bold green] {emb_endpoint_str}\n"
@@ -2977,6 +2979,9 @@ def verify_command(
     max_tasks: Optional[int] = typer.Option(
         None, "--max-tasks", "-t", help="Max concurrent verification worker tasks across Ollama servers."
     ),
+    cooldown: Optional[int] = typer.Option(
+        None, "--cooldown", help="Failover cooldown in seconds for verification tasks (overrides config.yaml)."
+    ),
 ):
     """
     Verify Knowledge Graph factual integrity, chunking correctness, or chunk Oracle alignment.
@@ -3007,12 +3012,14 @@ def verify_command(
     seed = _resolve_opt(seed)
     print_chunks = _resolve_opt(print_chunks)
     max_tasks = _resolve_opt(max_tasks)
+    cooldown = _resolve_opt(cooldown)
 
     cfg = _get_effective_settings(
         config_path=config_path,
         embedding_model=embedding_model,
         embedding_url=embedding_url,
     )
+    effective_cooldown = cooldown if cooldown is not None else cfg.resolved_verification_cooldown_seconds
     effective_mode = (mode or cfg.verification.mode).strip().lower()
 
     if effective_mode in ("chunking", "chunks"):
@@ -3252,7 +3259,7 @@ def verify_command(
         verifier_servers = cfg.resolved_verification_servers
         pool = OllamaPool(
             servers=verifier_servers,
-            cooldown_seconds=cfg.failover_cooldown_seconds,
+            cooldown_seconds=effective_cooldown,
             max_tasks_per_server=1,
         )
         num_servers = len(pool.alive_nodes) or len(pool.nodes)
@@ -3565,7 +3572,7 @@ def verify_command(
         verifier_servers = cfg.resolved_verification_servers
         pool = OllamaPool(
             servers=verifier_servers,
-            cooldown_seconds=cfg.failover_cooldown_seconds,
+            cooldown_seconds=effective_cooldown,
             max_tasks_per_server=1,
         )
         num_servers = len(pool.alive_nodes) or len(pool.nodes)
@@ -3800,7 +3807,7 @@ def verify_command(
     verifier_servers = cfg.resolved_verification_servers
     pool = OllamaPool(
         servers=verifier_servers,
-        cooldown_seconds=cfg.failover_cooldown_seconds,
+        cooldown_seconds=effective_cooldown,
         max_tasks_per_server=1,
     )
     num_servers = len(pool.alive_nodes) or len(pool.nodes)

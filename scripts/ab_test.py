@@ -37,6 +37,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import yaml
+
 
 # Terminal ANSI styling helpers
 class Colors:
@@ -92,6 +94,9 @@ class ABTestRunner:
         extra_args: Optional[str] = None,
         dry_run: bool = False,
         print_chunks: int = 0,
+        base_config: Optional[str] = None,
+        config_a: Optional[str] = None,
+        config_b: Optional[str] = None,
     ):
         self.branch2 = branch2
         self.num_books = num_books
@@ -102,6 +107,9 @@ class ABTestRunner:
         self.extra_args = extra_args or ""
         self.dry_run = dry_run
         self.print_chunks = print_chunks
+        self.base_config_path = Path(base_config).expanduser().resolve() if base_config else None
+        self.config_a_path = Path(config_a).expanduser().resolve() if config_a else None
+        self.config_b_path = Path(config_b).expanduser().resolve() if config_b else None
         self.is_cross_check_mode = bool(cross_check_src_dir)
 
         # Handle Cross-check / Reverify mode with pre-existing A/B test run directory
@@ -361,7 +369,103 @@ class ABTestRunner:
         log_info(f"Copied artifacts to: {dest_dir}")
         return meta
 
-    def run_test_run(self, branch: str, branch_dir: Path) -> Dict[str, Any]:
+    @staticmethod
+    def deep_merge_dicts(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+        """Deep merge overlay dictionary on top of base dictionary, recursively overwriting values."""
+        merged = dict(base)
+        for key, val in overlay.items():
+            if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
+                merged[key] = ABTestRunner.deep_merge_dicts(merged[key], val)
+            else:
+                merged[key] = val
+        return merged
+
+    def prepare_branch_config(self, branch_label: str, branch_dir: Path) -> Optional[Path]:
+        """
+        Build the effective configuration for a branch run:
+        1. Reads base config (from --config, repo_dir/config.yaml, or repo_dir/config.yaml.example).
+        2. Detects overlay file (from --config-a/--config-b, or repo_dir/config-a.yaml, repo_dir/config-b.yaml).
+        3. If overlay exists, applies deep merge over base config (overwriting base values).
+        4. Saves merged configuration to branch_dir / "config.yaml" and returns the path.
+        """
+        # 1. Resolve base config file
+        base_path = None
+        if self.base_config_path and self.base_config_path.is_file():
+            base_path = self.base_config_path
+        elif (self.repo_dir / "config.yaml").is_file():
+            base_path = self.repo_dir / "config.yaml"
+        elif (self.repo_dir / "config.yml").is_file():
+            base_path = self.repo_dir / "config.yml"
+        elif (self.repo_dir / "config.yaml.example").is_file():
+            base_path = self.repo_dir / "config.yaml.example"
+
+        base_data: Dict[str, Any] = {}
+        if base_path and base_path.is_file():
+            try:
+                with open(base_path, "r", encoding="utf-8") as f:
+                    base_data = yaml.safe_load(f) or {}
+            except Exception as e:
+                log_warning(f"Could not load base config '{base_path}': {e}")
+
+        # 2. Resolve overlay config file for this branch
+        overlay_path = None
+        target_overlay = self.config_a_path if branch_label.upper() == "A" else self.config_b_path
+        if target_overlay and target_overlay.is_file():
+            overlay_path = target_overlay
+        else:
+            cand_names = [
+                f"config-{branch_label.lower()}.yaml",
+                f"config-{branch_label.lower()}.yml",
+                f"config_{branch_label.lower()}.yaml",
+                f"config_{branch_label.lower()}.yml",
+            ]
+            for cand in cand_names:
+                p = self.repo_dir / cand
+                if p.is_file():
+                    overlay_path = p
+                    break
+
+        overlay_data: Dict[str, Any] = {}
+        if overlay_path and overlay_path.is_file():
+            try:
+                with open(overlay_path, "r", encoding="utf-8") as f:
+                    overlay_data = yaml.safe_load(f) or {}
+            except Exception as e:
+                log_warning(f"Could not load overlay config '{overlay_path}': {e}")
+
+        # If neither base nor overlay exists, return None
+        if not base_path and not overlay_path:
+            return None
+
+        # 3. Merge overlay onto base
+        merged = self.deep_merge_dicts(base_data, overlay_data) if overlay_data else base_data
+
+        # 4. Save to branch_dir / "config.yaml"
+        branch_dir.mkdir(parents=True, exist_ok=True)
+        dest_config = branch_dir / "config.yaml"
+        try:
+            with open(dest_config, "w", encoding="utf-8") as f:
+                yaml.safe_dump(merged, f, sort_keys=False, default_flow_style=False)
+
+            base_desc = base_path.name if base_path else "default"
+            if overlay_path:
+                log_success(
+                    f"Branch {branch_label}: Applied '{overlay_path.name}' over '{base_desc}' "
+                    f"({len(overlay_data)} customization keys) -> {dest_config}"
+                )
+            else:
+                log_info(f"Branch {branch_label}: Inherited '{base_desc}' -> {dest_config}")
+            return dest_config
+        except Exception as e:
+            log_warning(f"Could not write merged config to '{dest_config}': {e}")
+            return base_path
+
+    def run_test_run(
+        self,
+        branch: str,
+        branch_dir: Path,
+        config_file: Optional[Path] = None,
+    ) -> Dict[str, Any]:
         """Execute test-run for the currently checked-out branch and archive results."""
         log_header(f"Running Test-Run on Branch: {branch}")
         branch_dir.mkdir(parents=True, exist_ok=True)
@@ -381,6 +485,8 @@ class ABTestRunner:
             "--timeout",
             str(self.timeout),
         ]
+        if config_file and config_file.is_file():
+            cmd.extend(["--config", str(config_file)])
         if self.extra_args:
             cmd.extend(self.extra_args.split())
 
@@ -534,6 +640,7 @@ class ABTestRunner:
                         "exit_code": exit_code,
                         "duration_seconds": round(duration, 2),
                         "timestamp": datetime.datetime.now().isoformat(),
+                        "config_file": str(config_file) if config_file else None,
                         "copied_artifacts": copied_artifacts,
                         "error": error_msg,
                     }
@@ -562,7 +669,25 @@ class ABTestRunner:
         print(f"• Verification %:   {Colors.BOLD}{self.percent}%{Colors.RESET} (mode: {self.mode})")
         print(f"• Request Timeout:  {self.timeout}s")
         print(f"• Repository Path:  {self.repo_dir}")
-        print(f"• Output Archive:   {self.session_dir}\n")
+        print(f"• Output Archive:   {self.session_dir}")
+
+        # Display config overlay info if detected
+        if self.base_config_path and self.base_config_path.is_file():
+            print(f"• Base Config:      {Colors.BOLD}{self.base_config_path}{Colors.RESET}")
+        elif (self.repo_dir / "config.yaml").is_file():
+            print(f"• Base Config:      {Colors.BOLD}{self.repo_dir / 'config.yaml'}{Colors.RESET} (auto-detected)")
+
+        if self.config_a_path and self.config_a_path.is_file():
+            print(f"• Config Overlay A: {Colors.BOLD}{self.config_a_path}{Colors.RESET}")
+        elif (self.repo_dir / "config-a.yaml").is_file():
+            print(f"• Config Overlay A: {Colors.BOLD}{self.repo_dir / 'config-a.yaml'}{Colors.RESET} (auto-detected)")
+
+        if self.config_b_path and self.config_b_path.is_file():
+            print(f"• Config Overlay B: {Colors.BOLD}{self.config_b_path}{Colors.RESET}")
+        elif (self.repo_dir / "config-b.yaml").is_file():
+            print(f"• Config Overlay B: {Colors.BOLD}{self.repo_dir / 'config-b.yaml'}{Colors.RESET} (auto-detected)")
+
+        print("")
 
         # 1. Guard git clean state
         if not self.dry_run and not self.check_repo_clean():
@@ -582,14 +707,16 @@ class ABTestRunner:
             if self.is_vs_mode:
                 self.import_baseline_report(branch1_dir)
             else:
+                config_a = self.prepare_branch_config("A", branch1_dir)
                 if not self.dry_run:
                     self.checkout_branch(self.branch1)
-                self.run_test_run(self.branch1, branch1_dir)
+                self.run_test_run(self.branch1, branch1_dir, config_file=config_a)
 
             # 3. Process Candidate (Branch B)
+            config_b = self.prepare_branch_config("B", branch2_dir)
             if not self.dry_run:
                 self.checkout_branch(self.branch2)
-            self.run_test_run(self.branch2, branch2_dir)
+            self.run_test_run(self.branch2, branch2_dir, config_file=config_b)
 
         finally:
             # 4. Always restore initial branch
@@ -631,6 +758,10 @@ class ABTestRunner:
             cmd.extend(["--chunks-dir", str(chunks_dir)])
         elif (self.repo_dir / "output" / "chunks").is_dir():
             cmd.extend(["--chunks-dir", str(self.repo_dir / "output" / "chunks")])
+
+        branch_cfg = branch_dir / "config.yaml"
+        if branch_cfg.is_file():
+            cmd.extend(["--config", str(branch_cfg)])
 
         if self.extra_args:
             cmd.extend(self.extra_args.split())
@@ -1685,6 +1816,28 @@ Examples:
         help="Optional additional arguments to pass to 'bookeeper test-run' (e.g. '--skip-warmup').",
     )
     parser.add_argument(
+        "--config",
+        "-c",
+        dest="base_config",
+        type=str,
+        default=None,
+        help="Path to base config.yaml file (default: config.yaml in repository root).",
+    )
+    parser.add_argument(
+        "--config-a",
+        dest="config_a",
+        type=str,
+        default=None,
+        help="Path to Case A config overlay (default: auto-detects config-a.yaml in repository root if present).",
+    )
+    parser.add_argument(
+        "--config-b",
+        dest="config_b",
+        type=str,
+        default=None,
+        help="Path to Case B config overlay (default: auto-detects config-b.yaml in repository root if present).",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Simulate the workflow and produce comparison reports without running Ollama LLM queries.",
@@ -1850,6 +2003,9 @@ Examples:
             output_dir=args.output_dir,
             extra_args=args.extra_args,
             dry_run=args.dry_run,
+            base_config=args.base_config,
+            config_a=args.config_a,
+            config_b=args.config_b,
         )
         runner.execute_flow()
     except KeyboardInterrupt:

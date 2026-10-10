@@ -257,25 +257,26 @@ class KnowledgeExtractor:
         model: Optional[str] = None,
         fallback_model: Optional[str] = None,
     ) -> "KnowledgeExtractor":
+        cooldown = getattr(settings, "resolved_analysis_cooldown_seconds", getattr(settings, "failover_cooldown_seconds", 600))
         if base_url:
             urls = [u.strip() for u in base_url.split(",") if u.strip()]
             pool = OllamaPool.from_urls(
                 urls,
-                cooldown_seconds=settings.failover_cooldown_seconds,
+                cooldown_seconds=cooldown,
                 max_tasks_per_server=1,  # Strictly sequential per Ollama server: no mutual execution
             )
         else:
             servers = getattr(settings, "resolved_llm_servers", None) or settings.resolved_ollama_servers
             pool = OllamaPool(
                 servers=servers,
-                cooldown_seconds=settings.failover_cooldown_seconds,
+                cooldown_seconds=cooldown,
                 max_tasks_per_server=1,  # Strictly sequential per Ollama server: no mutual execution
             )
         return cls(
             pool=pool,
             model=model or settings.llm_model,
             fallback_model=fallback_model or settings.llm_model_fallback,
-            cooldown_seconds=settings.failover_cooldown_seconds,
+            cooldown_seconds=cooldown,
             request_timeout=getattr(settings, "request_timeout", 30),
             max_retries=getattr(settings, "max_retries", 1),
             wol_enabled=getattr(settings, "wol_enabled", True),

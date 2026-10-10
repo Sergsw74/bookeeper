@@ -285,7 +285,7 @@ class IdeaVerifier:
     ) -> "IdeaVerifier":
         """Instantiate IdeaVerifier using Ollama pool configured for verification capability."""
         servers = getattr(settings, "resolved_verification_servers", None) or getattr(settings, "resolved_ollama_servers", [])
-        cooldown = getattr(settings, "failover_cooldown_seconds", 600)
+        cooldown = getattr(settings, "resolved_verification_cooldown_seconds", getattr(settings, "failover_cooldown_seconds", 60))
         pool = OllamaPool(
             servers=servers,
             cooldown_seconds=cooldown,

@@ -13,6 +13,12 @@
 #   # 3. Re-verify Mode (Reuse Knowledge Graphs & Re-run Verification with New Percent):
 #   ./ab_test.sh reverify <path_to_abtest_result> [percent=5.0] [extra_args...]
 #   ./ab_test.sh --reverify <path_to_abtest_result> [percent=5.0] [extra_args...]
+#
+#   # 4. Config Customization (Auto-applied or explicit):
+#   #   Places config-a.yaml and config-b.yaml in repo root to automatically overlay
+#   #   over config.yaml for Branch A and Branch B respectively.
+#   #   Or pass explicitly:
+#   ./ab_test.sh <branch1> <branch2> 5 1.0 --config-a ./custom-a.yaml --config-b ./custom-b.yaml
 # ==============================================================================
 
 set -euo pipefail

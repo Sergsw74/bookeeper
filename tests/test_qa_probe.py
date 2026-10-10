@@ -1,5 +1,5 @@
 """
-Unit tests for QA Probe Oracle module (qa_probe.py).
+Unit tests for NLI Atomic Assertion Oracle module (qa_probe.py).
 """
 
 import json
@@ -8,6 +8,9 @@ import pytest
 
 from bookeeper.processing.extractor import Concept
 from bookeeper.processing.qa_probe import (
+    AtomicAssertionItem,
+    NLIAssertionEvaluation,
+    NLISystemBlockMetrics,
     QAProbeItem,
     QAProbeEvaluation,
     QASystemBlockMetrics,
@@ -15,11 +18,16 @@ from bookeeper.processing.qa_probe import (
     format_ideas_for_context,
     clean_llm_json_response,
     parse_json_array_safely,
+    generate_atomic_assertions,
     generate_qa_probes,
+    verify_assertion_entailment,
     answer_probe,
     judge_probe_answer,
+    evaluate_block_atomic_assertions,
     evaluate_block_qa_probes,
+    build_assertion_generator_prompt,
     build_generator_prompt,
+    build_nli_verifier_prompt,
     build_answering_prompt,
     build_judge_prompt,
 )
@@ -67,10 +75,10 @@ def test_format_ideas_for_context():
 def test_json_parsing_and_cleaning():
     # Markdown code blocks and thinking tags
     raw = (
-        "<think>Generating 2 questions...</think>\n"
+        "<think>Generating 2 assertions...</think>\n"
         "```json\n"
-        '[\n  {"question": "Q1", "gold_answer": "A1", "is_cross_sentence": true},\n'
-        '  {"question": "Q2", "gold_answer": "A2", "is_cross_sentence": false}\n]\n'
+        '[\n  {"assertion": "A1", "is_cross_boundary": true, "source_quote": "Q1"},\n'
+        '  {"assertion": "A2", "is_cross_boundary": false, "source_quote": "Q2"}\n]\n'
         "```"
     )
     clean = clean_llm_json_response(raw)
@@ -79,191 +87,213 @@ def test_json_parsing_and_cleaning():
 
     items = parse_json_array_safely(raw)
     assert len(items) == 2
-    assert items[0]["question"] == "Q1"
-    assert items[0]["is_cross_sentence"] is True
+    assert items[0]["assertion"] == "A1"
+    assert items[0]["is_cross_boundary"] is True
 
     # Dict containing array key
-    wrapped = '{"questions": [{"question": "Q_wrapped", "gold_answer": "A_wrapped"}]}'
+    wrapped = '{"assertions": [{"assertion": "A_wrapped", "source_quote": "Q_wrapped"}]}'
     items_wrapped = parse_json_array_safely(wrapped)
     assert len(items_wrapped) == 1
-    assert items_wrapped[0]["question"] == "Q_wrapped"
+    assert items_wrapped[0]["assertion"] == "A_wrapped"
 
 
-def test_generate_qa_probes():
+def test_atomic_assertion_data_model_compat():
+    """Verify bidirectional compatibility between AtomicAssertionItem and QAProbeItem."""
+    # Instantiated with new assertion fields
+    item1 = AtomicAssertionItem(
+        claim_id=1,
+        assertion="Sircolo is a male marsh harrier who agreed to carry the group.",
+        is_cross_boundary=True,
+        source_quote="Sircolo agreed to carry them.",
+    )
+    assert item1.claim_id == 1
+    assert item1.question_id == 1
+    assert item1.assertion == "Sircolo is a male marsh harrier who agreed to carry the group."
+    assert item1.question == "Sircolo is a male marsh harrier who agreed to carry the group."
+    assert item1.is_cross_boundary is True
+    assert item1.is_cross_sentence is True
+    assert item1.source_quote == "Sircolo agreed to carry them."
+    assert item1.gold_answer == "Sircolo agreed to carry them."
+
+    # Instantiated with legacy question fields
+    item2 = QAProbeItem(
+        question_id=2,
+        question="What format is used?",
+        gold_answer="EPUB format.",
+        is_cross_sentence=False,
+    )
+    assert item2.claim_id == 2
+    assert item2.question_id == 2
+    assert item2.assertion == "What format is used?"
+    assert item2.is_cross_boundary is False
+    assert item2.source_quote == "EPUB format."
+
+
+def test_generate_atomic_assertions():
     mock_pool = MagicMock()
     mock_resp = json.dumps([
         {
-            "question_id": 1,
-            "question": "Why did X fail?",
-            "gold_answer": "Because Y happened.",
-            "is_cross_sentence": True,
-            "source_sentence_references": ["X failed because Y happened.", "Y happened."],
+            "claim_id": 1,
+            "assertion": "Sircolo is a male marsh harrier who agreed to carry the group across the marsh.",
+            "is_cross_boundary": True,
+            "source_quote": "Sircolo agreed to carry them to firm ground.",
         },
         {
-            "question_id": 2,
-            "question": "What is Z?",
-            "gold_answer": "Z is a standard format.",
-            "is_cross_sentence": False,
-            "source_sentence_references": ["Z is a standard format maintained by the community."],
+            "claim_id": 2,
+            "assertion": "Rekaby called Sircolo using a whistle.",
+            "is_cross_boundary": False,
+            "source_quote": "Rekaby blew his whistle.",
         },
     ])
     mock_pool.generate.return_value = (mock_resp, {})
 
-    probes = generate_qa_probes(
-        w_raw="X failed because Y happened. Z is a standard format maintained by the community.",
+    assertions = generate_atomic_assertions(
+        canonical_window="Rekaby blew his whistle. Sircolo agreed to carry them to firm ground.",
         pool=mock_pool,
         model_name="mock-model",
-        num_questions=2,
+        num_assertions=2,
     )
 
-    assert len(probes) == 2
-    assert probes[0].question == "Why did X fail?"
-    assert probes[0].is_cross_sentence is True
-    assert len(probes[0].source_sentence_references) == 2
-    assert probes[0].source_sentence_references[0] == "X failed because Y happened."
-    assert probes[1].gold_answer == "Z is a standard format."
-    assert len(probes[1].source_sentence_references) == 1
+    assert len(assertions) == 2
+    assert assertions[0].claim_id == 1
+    assert "Sircolo is a male marsh harrier" in assertions[0].assertion
+    assert assertions[0].is_cross_boundary is True
+    assert assertions[0].source_quote == "Sircolo agreed to carry them to firm ground."
+    assert assertions[1].claim_id == 2
+    assert assertions[1].is_cross_boundary is False
 
 
-def test_answer_probe():
+def test_verify_assertion_entailment():
     mock_pool = MagicMock()
-    mock_pool.generate.return_value = ("The conversion is done automatically.", {})
-
-    claims = "Claim 1: eBook Conversion\nSummary: Converts books automatically."
-    ans = answer_probe(claims, "How is conversion done?", mock_pool, "mock-model")
-    assert ans == "The conversion is done automatically."
 
     # Empty context fast return
-    insufficient = answer_probe("", "Any question?", mock_pool, "mock-model")
-    assert insufficient == "INSUFFICIENT_INFORMATION"
+    cls_empty, rat_empty = verify_assertion_entailment("", "Any claim?", mock_pool, "mock-model")
+    assert cls_empty == "NOT_MENTIONED"
+    assert "no claims" in rat_empty.lower()
+
+    # Empty assertion fast return
+    cls_blank, rat_blank = verify_assertion_entailment("Some context", "", mock_pool, "mock-model")
+    assert cls_blank == "NOT_MENTIONED"
+
+    # SUPPORTED classification
+    mock_pool.generate.return_value = (
+        json.dumps({"classification": "SUPPORTED", "rationale": "Directly stated in Concept 1."}),
+        {},
+    )
+    cls1, rat1 = verify_assertion_entailment("Claims context", "Target claim", mock_pool, "mock-model")
+    assert cls1 == "SUPPORTED"
+    assert "Directly stated" in rat1
+
+    # CONTRADICTED classification
+    mock_pool.generate.return_value = (
+        json.dumps({"classification": "CONTRADICTED", "rationale": "The claims state the exact opposite."}),
+        {},
+    )
+    cls2, rat2 = verify_assertion_entailment("Claims context", "Target claim", mock_pool, "mock-model")
+    assert cls2 == "CONTRADICTED"
+
+    # NOT_MENTIONED classification
+    mock_pool.generate.return_value = (
+        json.dumps({"classification": "NOT_MENTIONED", "rationale": "No facts mention this entity."}),
+        {},
+    )
+    cls3, rat3 = verify_assertion_entailment("Claims context", "Target claim", mock_pool, "mock-model")
+    assert cls3 == "NOT_MENTIONED"
 
 
-def test_judge_probe_answer():
+def test_evaluate_block_atomic_assertions():
     mock_pool = MagicMock()
 
-    # Fast short-circuit for INSUFFICIENT_INFORMATION (0 LLM calls)
-    verdict, reason = judge_probe_answer("EPUB format.", "INSUFFICIENT_INFORMATION", "Context", mock_pool, "mock-model")
-    assert verdict == "FAIL"
-    assert mock_pool.generate.call_count == 0
-
-    # Short-circuit for empty string
-    verdict_empty, _ = judge_probe_answer("EPUB format.", "", "Context", mock_pool, "mock-model")
-    assert verdict_empty == "FAIL"
-
-    # PASS verdict from LLM
-    mock_pool.generate.return_value = (json.dumps({"verdict": "PASS", "reason": "Accurately conveys facts."}), {})
-    verdict_pass, reason_pass = judge_probe_answer("EPUB format.", "It is the EPUB format.", "Context", mock_pool, "mock-model")
-    assert verdict_pass == "PASS"
-    assert "Accurately conveys facts." in reason_pass
-
-    # FAIL verdict from LLM
-    mock_pool.generate.return_value = (json.dumps({"verdict": "FAIL", "reason": "Hallucinates PDF format."}), {})
-    verdict_fail, reason_fail = judge_probe_answer("EPUB format.", "PDF format.", "Context", mock_pool, "mock-model")
-    assert verdict_fail == "FAIL"
-
-
-def test_evaluate_block_qa_probes():
-    mock_pool = MagicMock()
-
-    probes = [
-        QAProbeItem(
-            question_id=1,
-            question="Why did X happen?",
-            gold_answer="Due to reason R.",
-            is_cross_sentence=True,
+    assertions = [
+        AtomicAssertionItem(
+            claim_id=1,
+            assertion="Rekaby used a whistle to summon Sircolo.",
+            is_cross_boundary=True,
+            source_quote="Rekaby whistled.",
         ),
-        QAProbeItem(
-            question_id=2,
-            question="What is item Y?",
-            gold_answer="Item Y is a widget.",
-            is_cross_sentence=False,
+        AtomicAssertionItem(
+            claim_id=2,
+            assertion="Sircolo is a harrier.",
+            is_cross_boundary=False,
+            source_quote="Sircolo the harrier.",
         ),
     ]
 
-    # Model returns:
-    # 1. Answer Q1 for Old: "Due to reason R."
-    # 2. Judge Q1 for Old: PASS
-    # 3. Answer Q1 for New: "INSUFFICIENT_INFORMATION" (Judge short-circuits to FAIL)
-    # 4. Answer Q2 for Old: "INSUFFICIENT_INFORMATION" (Judge short-circuits to FAIL)
-    # 5. Answer Q2 for New: "Item Y is a widget."
-    # 6. Judge Q2 for New: PASS
-
+    # Baseline (Old) claims entail Claim 1 (cross-boundary), but NOT Claim 2
+    # Candidate (New) claims entail Claim 2, but NOT Claim 1
     def fake_generate(model, prompt, **kwargs):
-        if "Concise Answer:" in prompt:
-            if "Why did X happen?" in prompt and "Old Claim" in prompt:
-                return ("Due to reason R.", {})
-            if "What is item Y?" in prompt and "New Claim" in prompt:
-                return ("Item Y is a widget.", {})
-            return ("INSUFFICIENT_INFORMATION", {})
-        if "Ground Truth Answer:" in prompt:
-            return (json.dumps({"verdict": "PASS", "reason": "Correct match."}), {})
-        return ("", {})
+        if 'Target Assertion: "Rekaby used a whistle' in prompt:
+            if "Old Claim" in prompt:
+                return (json.dumps({"classification": "SUPPORTED", "rationale": "Found in Old Claim"}), {})
+            else:
+                return (json.dumps({"classification": "NOT_MENTIONED", "rationale": "Missing in New Claim"}), {})
+        elif 'Target Assertion: "Sircolo is a harrier.' in prompt:
+            if "New Claim" in prompt:
+                return (json.dumps({"classification": "SUPPORTED", "rationale": "Found in New Claim"}), {})
+            else:
+                return (json.dumps({"classification": "NOT_MENTIONED", "rationale": "Missing in Old Claim"}), {})
+        return (json.dumps({"classification": "NOT_MENTIONED", "rationale": "Unknown"}), {})
 
     mock_pool.generate.side_effect = fake_generate
 
-    ideas_old = [Concept(name="Old Claim", summary="Due to reason R.")]
-    ideas_new = [Concept(name="New Claim", summary="Item Y is a widget.")]
+    ideas_old = [Concept(name="Old Claim", summary="Rekaby used a whistle to summon Sircolo.")]
+    ideas_new = [Concept(name="New Claim", summary="Sircolo is a harrier.")]
 
-    probes_res, m_old, m_new = evaluate_block_qa_probes(
-        w_raw="Passage text here.",
+    res_assertions, m_old, m_new = evaluate_block_atomic_assertions(
+        w_raw="Rekaby whistled for Sircolo the harrier.",
         ideas_old=ideas_old,
         ideas_new=ideas_new,
         pool=mock_pool,
         model_name="mock-model",
-        probes=probes,
+        assertions=assertions,
     )
 
-    assert len(probes_res) == 2
-    # Old passed Q1 (cross-sentence), failed Q2
+    assert len(res_assertions) == 2
+    # Old: passed Claim 1 (cross-boundary), failed Claim 2
     assert m_old.passed_probes == 1
     assert m_old.failed_probes == 1
     assert m_old.qa_recall == 0.5
-    assert m_old.seam_integrity_rate == 1.0  # 1/1 cross-sentence passed
+    assert m_old.seam_integrity_rate == 1.0  # 1/1 cross-boundary supported
 
-    # New failed Q1, passed Q2 (single-sentence)
+    # New: failed Claim 1 (cross-boundary), passed Claim 2
     assert m_new.passed_probes == 1
     assert m_new.failed_probes == 1
     assert m_new.qa_recall == 0.5
-    assert m_new.seam_integrity_rate == 0.0  # 0/1 cross-sentence passed
+    assert m_new.seam_integrity_rate == 0.0  # 0/1 cross-boundary supported
 
-    # Verify answering_prompt and judge_prompt are captured on evaluations
-    assert len(m_old.evaluations[0].answering_prompt) > 20
-    assert "Extracted Knowledge Base:" in m_old.evaluations[0].answering_prompt
-    assert len(m_old.evaluations[0].judge_prompt) > 20
-    assert "Judge Verdict Guidelines:" in m_old.evaluations[0].judge_prompt
-
-
-def test_prompt_builders_and_guidelines():
-    """Verify prompt templates enforce critical probe requirements and relaxed judge guidelines."""
-    # 1. Generator prompt requirements (Fix 3)
-    gen_p = build_generator_prompt("Some passage about King Arthur.", 5)
-    assert "STRICT REQUIREMENT FOR QUESTIONS:" in gen_p
-    assert "Every question MUST explicitly name at least ONE specific entity, tool, action, or setting" in gen_p
-    assert 'NEVER ask abstract questions like "What initial premise was established?"' in gen_p
-    assert "DO NOT quote raw sentences in the question" in gen_p
-    assert "Frame all questions around entities, actions, or decisions in natural language" in gen_p
-    assert 'no "precedes" or chronological sentence order questions' in gen_p
-    assert "source_sentence_references" in gen_p
-
-    # 2. Answering prompt requirements (Fix 1)
-    ans_p = build_answering_prompt("Claim context", "What happened to Excalibur?")
-    assert "Answer the question based on the verified claims and supporting context below." in ans_p
-    assert "Synthesize the provided concepts, explanations, and direct quotes to answer the question concisely and accurately." in ans_p
-    assert 'Only output "INSUFFICIENT_INFORMATION" if the claims completely lack any relevant entities' in ans_p
-
-    # 3. Judge prompt guidelines (Fix 2)
-    judge_p = build_judge_prompt("Arthur became king.", "Arthur assumed the crown.", "Context")
-    assert 'If Candidate Answer conveys the substantive answer to the question asked, mark as "PASS"' in judge_p
-    assert "DO NOT penalize the Candidate Answer for omitting the premise or condition if the question already stated that condition" in judge_p
-    assert 'Mark as "FAIL" ONLY if the answer is "INSUFFICIENT_INFORMATION"' in judge_p
+    # Check that verifier_prompt is preserved on evaluations
+    assert len(m_old.evaluations[0].verifier_prompt) > 20
+    assert "Target Assertion:" in m_old.evaluations[0].verifier_prompt
+    assert m_old.evaluations[0].classification == "SUPPORTED"
+    assert m_old.evaluations[0].verdict == "PASS"
+    assert m_old.evaluations[1].classification == "NOT_MENTIONED"
+    assert m_old.evaluations[1].verdict == "FAIL"
 
 
-def test_judge_no_token_overlap_fallback():
-    """Verify that failed LLM judge calls fail without token overlap fallback."""
-    mock_pool = MagicMock()
-    mock_pool.generate.side_effect = RuntimeError("Connection timed out")
+def test_prompt_builders_and_constraints():
+    """Verify prompt templates enforce strict constraints from NLI architecture."""
+    # 1. Assertion Generator prompt constraints
+    gen_p = build_assertion_generator_prompt("Some passage about King Arthur.", 5)
+    assert "You are an expert NLP benchmark engineer." in gen_p
+    assert "extract exactly 5 clear, factual, declarative statements" in gen_p
+    assert "Every claim must be an independent, self-contained declarative sentence" in gen_p
+    assert "At least 3 claims MUST be CROSS-SENTENCE" in gen_p
+    assert "DO NOT output questions. Output ONLY declarative assertions." in gen_p
+    assert 'DO NOT make statements about sentence order, grammar, or punctuation (no "Sentence A precedes Sentence B").' in gen_p
+    assert "claim_id" in gen_p
+    assert "is_cross_boundary" in gen_p
+    assert "source_quote" in gen_p
 
-    # Even with identical text (100% token overlap), must NOT pass via fallback token overlap
-    verdict, reason = judge_probe_answer("The quick brown fox", "The quick brown fox", "Passage", mock_pool, "model")
-    assert verdict == "FAIL"
-    assert "Judge evaluation error" in reason
+    # Backward compatible alias
+    gen_p_alias = build_generator_prompt("Passage", 5)
+    assert gen_p_alias == gen_p.replace("Some passage about King Arthur.", "Passage")
+
+    # 2. NLI Verifier prompt constraints
+    ver_p = build_nli_verifier_prompt("Formatted claims context", "Sircolo is a harrier.")
+    assert "You are an objective Natural Language Inference (NLI) evaluator." in ver_p
+    assert "Target Assertion: \"Sircolo is a harrier.\"" in ver_p
+    assert "SUPPORTED" in ver_p
+    assert "CONTRADICTED" in ver_p
+    assert "NOT_MENTIONED" in ver_p
+    assert "classification" in ver_p
+    assert "rationale" in ver_p

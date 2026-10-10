@@ -28,10 +28,16 @@ from bookeeper.processing.deduplicator import EntityDeduplicator
 from bookeeper.processing.extractor import Concept, KnowledgeExtractor
 from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings, OllamaPool
 from bookeeper.processing.qa_probe import (
+    AtomicAssertionItem,
+    NLIAssertionEvaluation,
+    NLISystemBlockMetrics,
     QAProbeEvaluation,
     QAProbeItem,
     QASystemBlockMetrics,
+    build_assertion_generator_prompt,
     build_generator_prompt,
+    build_nli_verifier_prompt,
+    evaluate_block_atomic_assertions,
     evaluate_block_qa_probes,
     format_ideas_for_context,
 )
@@ -806,46 +812,54 @@ def print_block_comparison(
     if len(ideas_new) > 5:
         _out(f"     ... and {len(ideas_new) - 5} more ideas")
 
-    _out(f"\n🎯 QA PROBES & SEAM INTEGRITY AUDIT ({len(probes)} Probes):")
+    _out(f"\n🎯 NLI ATOMIC ASSERTIONS & SEAM INTEGRITY AUDIT ({len(probes)} Assertions):")
     eval_old_map = {e.question_id: e for e in eval_old.evaluations}
     eval_new_map = {e.question_id: e for e in eval_new.evaluations}
 
     for p in probes:
         probe_tag = "[Cross-Sentence]" if p.is_cross_sentence else "[Single-Fact]"
-        _out(f"   {p.question_id}. {probe_tag} {p.question}")
-        _out(f"      • Gold: {p.gold_answer}")
-        if getattr(p, "source_sentence_references", None):
-            for r_idx, ref in enumerate(p.source_sentence_references, 1):
-                ref_preview = ref[:120].replace("\n", " ")
-                if len(ref) > 120:
-                    ref_preview += "..."
-                _out(f"        [Source Ref {r_idx}]: \"{ref_preview}\"")
+        assertion_text = getattr(p, "assertion", None) or p.question
+        _out(f"   {p.question_id}. {probe_tag} {assertion_text}")
+        source_quote = getattr(p, "source_quote", "")
+        if not source_quote and getattr(p, "source_sentence_references", None):
+            source_quote = " | ".join(p.source_sentence_references)
+        if not source_quote and p.gold_answer:
+            source_quote = p.gold_answer
+        if source_quote:
+            ref_preview = source_quote[:120].replace("\n", " ")
+            if len(source_quote) > 120:
+                ref_preview += "..."
+            _out(f"      • Source Quote: \"{ref_preview}\"")
 
         e_a = eval_old_map.get(p.question_id)
         if e_a:
-            pred_a = e_a.predicted_answer[:70].replace("\n", " ")
-            _out(f"      • Baseline (A): \"{pred_a}\" -> [{e_a.verdict}]")
+            cls_a = getattr(e_a, "classification", e_a.verdict)
+            rat_a = getattr(e_a, "rationale", getattr(e_a, "reason", ""))
+            rat_a_str = f" ({rat_a[:60]})" if rat_a else ""
+            _out(f"      • Baseline (A):  [{cls_a} | {e_a.verdict}]{rat_a_str}")
 
         e_b = eval_new_map.get(p.question_id)
         if e_b:
-            pred_b = e_b.predicted_answer[:70].replace("\n", " ")
-            status_b = e_b.verdict
-            if e_b.verdict == "FAIL" and p.is_cross_sentence and (e_a and e_a.verdict == "PASS"):
-                status_b = "FAIL - Seam Lost"
-            _out(f"      • Candidate (B): \"{pred_b}\" -> [{status_b}]")
+            cls_b = getattr(e_b, "classification", e_b.verdict)
+            rat_b = getattr(e_b, "rationale", getattr(e_b, "reason", ""))
+            status_b = cls_b
+            if cls_b != "SUPPORTED" and p.is_cross_sentence and (e_a and getattr(e_a, "classification", e_a.verdict) == "SUPPORTED"):
+                status_b = f"{cls_b} - Seam Lost"
+            rat_b_str = f" ({rat_b[:60]})" if rat_b else ""
+            _out(f"      • Candidate (B): [{status_b} | {e_b.verdict}]{rat_b_str}")
         _out("")
 
-    _out(f"📊 BLOCK QA METRICS:")
+    _out(f"📊 BLOCK NLI ENTAILMENT METRICS:")
     _out(
-        f"   • Baseline QA Recall:  {eval_old.qa_recall * 100:.1f}% ({eval_old.passed_probes_count}/{eval_old.total_probes_count} passed) | "
+        f"   • Baseline NLI Recall:  {eval_old.qa_recall * 100:.1f}% ({eval_old.passed_probes_count}/{eval_old.total_probes_count} supported) | "
         f"Seam Integrity: {eval_old.seam_integrity_rate * 100:.1f}%"
     )
     _out(
-        f"   • Candidate QA Recall: {eval_new.qa_recall * 100:.1f}% ({eval_new.passed_probes_count}/{eval_new.total_probes_count} passed) | "
+        f"   • Candidate NLI Recall: {eval_new.qa_recall * 100:.1f}% ({eval_new.passed_probes_count}/{eval_new.total_probes_count} supported) | "
         f"Seam Integrity: {eval_new.seam_integrity_rate * 100:.1f}%"
     )
     delta_pts = (eval_new.qa_recall - eval_old.qa_recall) * 100
-    _out(f"   • Recall Delta:        {delta_pts:+.1f}% pts")
+    _out(f"   • Recall Delta:         {delta_pts:+.1f}% pts")
     _out(f"{sep}\n")
 
 

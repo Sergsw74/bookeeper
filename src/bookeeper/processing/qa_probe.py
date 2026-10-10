@@ -1,17 +1,18 @@
 """
-QA Probe Oracle for Knowledge Graph Cross-Check Verification.
+Natural Language Inference (NLI) Atomic Assertion Oracle for Knowledge Graph Cross-Check Verification.
 
 Evaluates retrieval utility and seam integrity by:
-1. Generating fact-based QA probes directly from unbroken passage W_raw,
-   with mandatory multi-sentence/cross-boundary probes.
-2. Executing constrained closed-book answering using ONLY candidate claims as context.
-3. Conducting objective arbitration with an Oracle judge against gold ground-truth answers.
+1. Extracting 5 factual atomic declarative assertions directly from unbroken passage W_raw,
+   with mandatory multi-sentence/cross-boundary assertions.
+2. Directly evaluating semantic entailment against candidate claims context using ternary NLI:
+   SUPPORTED, CONTRADICTED, NOT_MENTIONED.
+3. Computing deterministic Recall and Seam Integrity without free-form answering drift.
 """
 
 import json
 import logging
 import re
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from pydantic import BaseModel, Field
 
 from bookeeper.processing.extractor import Concept
@@ -25,32 +26,112 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 
 
-class QAProbeItem(BaseModel):
-    """A probe question-answer pair grounded in the raw passage."""
+class AtomicAssertionItem(BaseModel):
+    """An atomic declarative assertion grounded in the raw passage."""
 
-    question_id: int
-    question: str
-    gold_answer: str
-    is_cross_sentence: bool = False
+    claim_id: int = 1
+    assertion: str = ""
+    is_cross_boundary: bool = False
+    source_quote: str = ""
+
+    # Backwards compatibility fields for QA probe callers
+    question_id: Optional[int] = None
+    question: Optional[str] = None
+    gold_answer: Optional[str] = None
+    is_cross_sentence: Optional[bool] = None
     source_sentence_references: List[str] = Field(default_factory=list)
 
+    def __init__(self, **data: Any):
+        # Sync legacy question fields if provided
+        if "question_id" in data and "claim_id" not in data:
+            data["claim_id"] = data["question_id"]
+        if "question" in data and "assertion" not in data:
+            data["assertion"] = data["question"]
+        if "is_cross_sentence" in data and "is_cross_boundary" not in data:
+            data["is_cross_boundary"] = data["is_cross_sentence"]
+        if "gold_answer" in data and "source_quote" not in data:
+            data["source_quote"] = data["gold_answer"]
+        if "source_sentence_references" in data and data["source_sentence_references"] and not data.get("source_quote"):
+            data["source_quote"] = data["source_sentence_references"][0]
 
-class QAProbeEvaluation(BaseModel):
-    """Evaluation of a single system's response to a probe question."""
+        # Sync forward
+        if "claim_id" in data and "question_id" not in data:
+            data["question_id"] = data["claim_id"]
+        if "assertion" in data and "question" not in data:
+            data["question"] = data["assertion"]
+        if "is_cross_boundary" in data and "is_cross_sentence" not in data:
+            data["is_cross_sentence"] = data["is_cross_boundary"]
+        if "source_quote" in data and "gold_answer" not in data:
+            data["gold_answer"] = data["source_quote"]
+        if "source_quote" in data and not data.get("source_sentence_references"):
+            data["source_sentence_references"] = [data["source_quote"]] if data["source_quote"] else []
 
-    question_id: int
-    question: str
-    gold_answer: str
-    is_cross_sentence: bool
-    predicted_answer: str
-    verdict: Literal["PASS", "FAIL"]
+        super().__init__(**data)
+
+
+QAProbeItem = AtomicAssertionItem
+
+
+class NLIAssertionEvaluation(BaseModel):
+    """NLI entailment classification of an atomic assertion against knowledge base claims."""
+
+    claim_id: int = 1
+    assertion: str = ""
+    is_cross_boundary: bool = False
+    classification: Literal["SUPPORTED", "CONTRADICTED", "NOT_MENTIONED"] = "NOT_MENTIONED"
+    verdict: Literal["PASS", "FAIL"] = "FAIL"
+    rationale: str = ""
+    verifier_prompt: str = ""
+
+    # Backwards compatibility fields for QA probe callers
+    question_id: Optional[int] = None
+    question: Optional[str] = None
+    gold_answer: Optional[str] = None
+    is_cross_sentence: Optional[bool] = None
+    predicted_answer: str = ""
     reason: str = ""
     answering_prompt: str = ""
     judge_prompt: str = ""
 
+    def __init__(self, **data: Any):
+        if "question_id" in data and "claim_id" not in data:
+            data["claim_id"] = data["question_id"]
+        if "question" in data and "assertion" not in data:
+            data["assertion"] = data["question"]
+        if "is_cross_sentence" in data and "is_cross_boundary" not in data:
+            data["is_cross_boundary"] = data["is_cross_sentence"]
+        if "reason" in data and "rationale" not in data:
+            data["rationale"] = data["reason"]
+        if "classification" in data and "verdict" not in data:
+            data["verdict"] = "PASS" if data["classification"] == "SUPPORTED" else "FAIL"
+        elif "verdict" in data and "classification" not in data:
+            data["classification"] = "SUPPORTED" if data["verdict"] == "PASS" else "NOT_MENTIONED"
 
-class QASystemBlockMetrics(BaseModel):
-    """QA evaluation results for a single system on an audited block."""
+        # Sync forward
+        if "claim_id" in data and "question_id" not in data:
+            data["question_id"] = data["claim_id"]
+        if "assertion" in data and "question" not in data:
+            data["question"] = data["assertion"]
+        if "is_cross_boundary" in data and "is_cross_sentence" not in data:
+            data["is_cross_sentence"] = data["is_cross_boundary"]
+        if "rationale" in data and "reason" not in data:
+            data["reason"] = data["rationale"]
+        if "classification" in data and not data.get("predicted_answer"):
+            data["predicted_answer"] = data["classification"]
+        if "verifier_prompt" in data:
+            if not data.get("answering_prompt"):
+                data["answering_prompt"] = data["verifier_prompt"]
+            if not data.get("judge_prompt"):
+                data["judge_prompt"] = data["verifier_prompt"]
+
+        super().__init__(**data)
+
+
+QAProbeEvaluation = NLIAssertionEvaluation
+
+
+class NLISystemBlockMetrics(BaseModel):
+    """NLI entailment results for a single system on an audited block."""
 
     system: Literal["old", "new"]
     total_probes: int = 0
@@ -60,7 +141,10 @@ class QASystemBlockMetrics(BaseModel):
     cross_sentence_total: int = 0
     cross_sentence_passed: int = 0
     seam_integrity_rate: float = 0.0  # cross_sentence_passed / cross_sentence_total
-    evaluations: List[QAProbeEvaluation] = Field(default_factory=list)
+    evaluations: List[NLIAssertionEvaluation] = Field(default_factory=list)
+
+
+QASystemBlockMetrics = NLISystemBlockMetrics
 
 
 # ==============================================================================
@@ -144,8 +228,7 @@ def parse_json_array_safely(text: str) -> List[Dict[str, Any]]:
         if isinstance(data, list):
             return data
         if isinstance(data, dict):
-            # Check for keys like 'probes', 'questions', 'items'
-            for key in ("probes", "questions", "items", "qa_pairs"):
+            for key in ("assertions", "claims", "probes", "questions", "items", "qa_pairs"):
                 if key in data and isinstance(data[key], list):
                     return data[key]
             return [data]
@@ -166,58 +249,138 @@ def parse_json_array_safely(text: str) -> List[Dict[str, Any]]:
 
 
 # ==============================================================================
-# 1. Targeted QA Probe Generation
+# 1. Atomic Assertion Generation
 # ==============================================================================
 
 
-# ==============================================================================
-# 1. Targeted QA Probe Generation
-# ==============================================================================
-
-
-def build_generator_prompt(w_raw: str, num_questions: int = 5) -> str:
-    """Construct the complete prompt sent to the Oracle model to generate relational QA probes."""
+def build_assertion_generator_prompt(canonical_window: str, num_assertions: int = 5) -> str:
+    """
+    Construct prompt sent to model to decompose passage into factual atomic assertions.
+    Enforces independent declarative statements, cross-sentence dependencies, and forbids
+    sentence-order/grammar probes.
+    """
     return (
-        "You are an expert NLP benchmark engineer evaluating a conceptual Knowledge Base and Knowledge Graph.\n"
-        f"Read the passage below and construct {num_questions} fact-based Question-Answer probes testing the retention of core knowledge.\n\n"
-        "### PROBE SELECTION CRITERIA (WHAT TO ASK):\n"
-        "1. Focus strictly on:\n"
-        "   - ENTITY RELATIONSHIPS: Functional, hierarchical, causal, or social links between characters, groups, systems, or components.\n"
-        "   - CAUSAL CHAINS & STATE CHANGES: Why an action occurred, what decision was made, what condition was triggered, and the direct consequence.\n"
-        "   - STRUCTURAL RULES & THEMATIC MECHANISMS: Explicit operational rules, lore constraints, or tactical configurations.\n"
-        "2. At least 3 questions MUST be CROSS-BOUNDARY:\n"
-        "   - They must require synthesizing facts that span across multiple sentences (e.g., premise or condition in Sentence A, outcome or qualification in Sentence B).\n\n"
-        "### STRICT REQUIREMENT FOR QUESTIONS:\n"
-        "- Every question MUST explicitly name at least ONE specific entity, tool, action, or setting from the text "
-        '(e.g., "What happened to the e-book reader?", "Why did Brogalaw stay to the clifftops?").\n'
-        '- NEVER ask abstract questions like "What initial premise was established?", "What condition was set?", or "What outcome followed the initial condition?".\n\n'
-        "### CRITICAL PROBE REQUIREMENTS:\n"
-        "- DO NOT quote raw sentences in the question (e.g., NEVER ask \"What relationship connects 'Quote A' and 'Quote B'?\").\n"
-        '- Frame all questions around entities, actions, or decisions in natural language (e.g., "Why did X decide to do Y?" or "What consequence occurred after Z?").\n'
-        '- Do NOT generate questions testing the physical order of sentences in the text (e.g., no "precedes" or chronological sentence order questions).\n\n'
-        "### NEGATIVE CONSTRAINTS (STRICTLY FORBIDDEN):\n"
-        "- NO TRIVIA: Do not ask about superficial, incidental dialogue details, single-use slang, minor character quips, or verbatim insult nicknames "
-        '(e.g., do NOT ask "What did X call Y?", "What was the exact phrase shouted?", or "What specific insult was used?").\n'
-        '- NO GENERIC QUESTIONS: Avoid high-level vagueness like "What is the main topic of this paragraph?", "What are the characters doing?", or "Summarize the text".\n'
-        "- NO UNSUPPORTED INFERENCES: Every probe must have unambiguous, objective factual ground truth directly stated in the text.\n\n"
-        "### CITATION / REFERENCE REQUIREMENT:\n"
-        "For every generated probe, you MUST provide the exact verbatim excerpt or sentence(s) from the passage that supply the ground truth. "
-        "If the probe is cross-sentence, you must provide the separate excerpts that are being bridged.\n\n"
-        f"Passage:\n\"\"\"\n{w_raw[:7000]}\n\"\"\"\n\n"
-        "Return strictly valid JSON matching this schema:\n"
+        "You are an expert NLP benchmark engineer.\n"
+        f"Analyze the passage below and extract exactly {num_assertions} clear, factual, declarative statements "
+        "(atomic claims) that represent the key events, entity actions, and conditions described.\n\n"
+        "CONSTRAINTS:\n"
+        "1. Every claim must be an independent, self-contained declarative sentence "
+        '(e.g., "Sircolo is a male marsh harrier who agreed to carry the group to firm ground").\n'
+        "2. At least 3 claims MUST be CROSS-SENTENCE (connecting a premise or condition with an outcome).\n"
+        "3. DO NOT output questions. Output ONLY declarative assertions.\n"
+        '4. DO NOT make statements about sentence order, grammar, or punctuation (no "Sentence A precedes Sentence B").\n\n'
+        f"Passage:\n\"\"\"\n{canonical_window[:7000]}\n\"\"\"\n\n"
+        "Return strictly valid JSON:\n"
         "[\n"
         "  {\n"
-        '    "question_id": 1,\n'
-        '    "question": "<specific, non-trivial relational or causal question explicitly naming a specific entity, action, or setting>",\n'
-        '    "gold_answer": "<concise 1-2 sentence ground truth containing the necessary facts>",\n'
-        '    "is_cross_sentence": true,\n'
-        '    "source_sentence_references": [\n'
-        '      "<exact verbatim quote of premise or first fact from passage>",\n'
-        '      "<exact verbatim quote of consequence or second fact from passage (if cross-sentence)>"\n'
-        "    ]\n"
+        '    "claim_id": 1,\n'
+        '    "assertion": "<factual declarative statement>",\n'
+        '    "is_cross_boundary": true,\n'
+        '    "source_quote": "<verbatim sentence from passage>"\n'
         "  }\n"
         "]\n"
     )
+
+
+def build_generator_prompt(w_raw: str, num_questions: int = 5) -> str:
+    """Backward-compatible alias for build_assertion_generator_prompt."""
+    return build_assertion_generator_prompt(canonical_window=w_raw, num_assertions=num_questions)
+
+
+def generate_atomic_assertions(
+    canonical_window: str,
+    pool: OllamaPool,
+    model_name: str,
+    num_assertions: int = 5,
+) -> List[AtomicAssertionItem]:
+    """
+    Extract factual atomic assertions directly from unbroken passage canonical_window.
+    Targets key events, entity actions, and conditions with mandatory cross-sentence claims.
+    """
+    prompt = build_assertion_generator_prompt(canonical_window, num_assertions=num_assertions)
+
+    try:
+        raw_text, _ = pool.generate(model_name, prompt, temperature=0.0)
+        items = parse_json_array_safely(raw_text)
+
+        assertions: List[AtomicAssertionItem] = []
+        for idx, item in enumerate(items, 1):
+            if not isinstance(item, dict):
+                continue
+            cid = item.get("claim_id", item.get("question_id", idx))
+            try:
+                cid = int(cid)
+            except (ValueError, TypeError):
+                cid = idx
+
+            assertion_text = str(
+                item.get("assertion") or item.get("claim") or item.get("question", "")
+            ).strip()
+
+            is_cross = bool(
+                item.get("is_cross_boundary", item.get("is_cross_sentence", False))
+            )
+
+            source_quote = str(item.get("source_quote") or item.get("gold_answer") or "").strip()
+            if not source_quote:
+                refs = item.get("source_sentence_references", [])
+                if isinstance(refs, list) and refs:
+                    source_quote = str(refs[0]).strip()
+                elif isinstance(refs, str) and refs.strip():
+                    source_quote = refs.strip()
+
+            if assertion_text:
+                assertions.append(
+                    AtomicAssertionItem(
+                        claim_id=cid,
+                        assertion=assertion_text,
+                        is_cross_boundary=is_cross,
+                        source_quote=source_quote,
+                    )
+                )
+
+        if assertions:
+            # Enforce at least some cross-boundary assertions if model omitted flags
+            if not any(a.is_cross_boundary for a in assertions) and len(assertions) >= 2:
+                for idx, a in enumerate(assertions):
+                    # Flag assertions containing causal or conditional markers
+                    text_lower = a.assertion.lower()
+                    if any(w in text_lower for w in ("because", "when", "after", "in order to", "led to", "resulting in", "so that", "if")):
+                        a.is_cross_boundary = True
+                if not any(a.is_cross_boundary for a in assertions):
+                    for a in assertions[: min(3, len(assertions))]:
+                        a.is_cross_boundary = True
+            return assertions
+    except Exception as exc:
+        logger.warning(f"Atomic assertion generation failed: {exc}")
+
+    # Deterministic fallback extracting factual sentences directly from passage
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", canonical_window) if len(s.strip()) > 15]
+    if len(sentences) >= 2:
+        return [
+            AtomicAssertionItem(
+                claim_id=1,
+                assertion=sentences[0],
+                is_cross_boundary=False,
+                source_quote=sentences[0],
+            ),
+            AtomicAssertionItem(
+                claim_id=2,
+                assertion=f"{sentences[0]} and {sentences[1]}",
+                is_cross_boundary=True,
+                source_quote=sentences[1],
+            ),
+        ]
+
+    fallback_text = canonical_window.strip()[:200]
+    return [
+        AtomicAssertionItem(
+            claim_id=1,
+            assertion=fallback_text,
+            is_cross_boundary=False,
+            source_quote=fallback_text,
+        )
+    ]
 
 
 def generate_qa_probes(
@@ -225,116 +388,102 @@ def generate_qa_probes(
     pool: OllamaPool,
     model_name: str,
     num_questions: int = 5,
-) -> List[QAProbeItem]:
+) -> List[AtomicAssertionItem]:
+    """Backward-compatible alias for generate_atomic_assertions."""
+    return generate_atomic_assertions(
+        canonical_window=w_raw,
+        pool=pool,
+        model_name=model_name,
+        num_assertions=num_questions,
+    )
+
+
+# ==============================================================================
+# 2. Ternary Entailment Verifier Prompt & Classification
+# ==============================================================================
+
+
+def build_nli_verifier_prompt(formatted_claims: str, assertion: str) -> str:
     """
-    Generate fact-based QA probes directly from unbroken passage W_raw (canonical_window).
-    Targets structural concepts, actions, and causal relationships with explicit negative constraints
-    and verbatim sentence references.
+    Construct prompt for Natural Language Inference entailment verification against knowledge base claims.
     """
-    prompt = build_generator_prompt(w_raw, num_questions=num_questions)
+    return (
+        "You are an objective Natural Language Inference (NLI) evaluator.\n"
+        "Given the Extracted Knowledge Base below, determine whether the Target Assertion is supported by the verified claims.\n\n"
+        f"Extracted Knowledge Base:\n\"\"\"\n{formatted_claims}\n\"\"\"\n\n"
+        f'Target Assertion: "{assertion}"\n\n'
+        "Choose exactly ONE classification:\n"
+        "- SUPPORTED: The assertion's core facts and relationships are explicitly stated or logically entailed by the knowledge base.\n"
+        "- CONTRADICTED: The knowledge base explicitly states something that conflicts with the assertion.\n"
+        "- NOT_MENTIONED: The knowledge base lacks sufficient facts to verify whether the assertion is true.\n\n"
+        "Return strictly valid JSON:\n"
+        "{\n"
+        '  "classification": "SUPPORTED" | "CONTRADICTED" | "NOT_MENTIONED",\n'
+        '  "rationale": "<brief 1-sentence reason>"\n'
+        "}\n"
+    )
+
+
+def verify_assertion_entailment(
+    claims_context: str,
+    assertion: str,
+    pool: OllamaPool,
+    model_name: str,
+) -> Tuple[Literal["SUPPORTED", "CONTRADICTED", "NOT_MENTIONED"], str]:
+    """
+    Classify whether Target Assertion is SUPPORTED, CONTRADICTED, or NOT_MENTIONED
+    by the extracted knowledge base context.
+    Returns (classification, rationale).
+    """
+    if not claims_context.strip() or "(No knowledge claims extracted" in claims_context:
+        return "NOT_MENTIONED", "Knowledge base contains no claims for this block."
+
+    if not assertion.strip():
+        return "NOT_MENTIONED", "Target assertion is empty."
+
+    prompt = build_nli_verifier_prompt(claims_context, assertion)
 
     try:
         raw_text, _ = pool.generate(model_name, prompt, temperature=0.0)
-        items = parse_json_array_safely(raw_text)
+        clean = clean_llm_json_response(raw_text)
+        data = {}
+        try:
+            data = json.loads(clean)
+        except Exception:
+            m = re.search(r"\{.*\}", clean, re.DOTALL)
+            if m:
+                try:
+                    data = json.loads(m.group(0))
+                except Exception:
+                    pass
 
-        probes: List[QAProbeItem] = []
-        for idx, item in enumerate(items, 1):
-            if not isinstance(item, dict):
-                continue
-            qid = item.get("question_id", idx)
-            try:
-                qid = int(qid)
-            except (ValueError, TypeError):
-                qid = idx
-            q = str(item.get("question", "")).strip()
-            a = str(item.get("gold_answer", item.get("answer", ""))).strip()
-            is_cross = bool(item.get("is_cross_sentence", False))
-            refs = item.get("source_sentence_references", [])
-            if isinstance(refs, str):
-                refs = [refs]
-            elif not isinstance(refs, list):
-                refs = []
-            refs = [str(r).strip() for r in refs if str(r).strip()]
+        raw_cls = str(data.get("classification", "")).strip().upper()
+        rationale = str(data.get("rationale", "")).strip()
 
-            if q and a:
-                probes.append(
-                    QAProbeItem(
-                        question_id=qid,
-                        question=q,
-                        gold_answer=a,
-                        is_cross_sentence=is_cross,
-                        source_sentence_references=refs,
-                    )
-                )
+        if "SUPPORTED" in raw_cls and "NOT_MENTIONED" not in raw_cls and "NOT SUPPORTED" not in raw_cls and "UNSUPPORTED" not in raw_cls:
+            return "SUPPORTED", rationale or "Entailed by claims."
+        elif "CONTRADICT" in raw_cls:
+            return "CONTRADICTED", rationale or "Contradicts claims."
+        elif "NOT_MENTIONED" in raw_cls or "UNSUPPORTED" in raw_cls:
+            return "NOT_MENTIONED", rationale or "Not mentioned in claims."
 
-        if probes:
-            # Enforce at least some cross-sentence probes if model didn't set flags
-            if not any(p.is_cross_sentence for p in probes) and len(probes) >= 2:
-                # Mark questions starting with Why / How / What caused as cross-sentence
-                for p in probes:
-                    q_lower = p.question.lower()
-                    if any(q_lower.startswith(w) for w in ("why", "how", "what caused", "under what", "when")):
-                        p.is_cross_sentence = True
-                # If still none, mark the first 3
-                if not any(p.is_cross_sentence for p in probes):
-                    for p in probes[:3]:
-                        p.is_cross_sentence = True
-            return probes
+        # Heuristic fallback
+        clean_upper = clean.upper()
+        if "SUPPORTED" in clean_upper and "NOT_MENTIONED" not in clean_upper and "NOT SUPPORTED" not in clean_upper and "UNSUPPORTED" not in clean_upper:
+            return "SUPPORTED", rationale or clean[:120]
+        elif "CONTRADICT" in clean_upper:
+            return "CONTRADICTED", rationale or clean[:120]
+        else:
+            return "NOT_MENTIONED", rationale or clean[:120]
     except Exception as exc:
-        logger.warning(f"QA Probe generation failed: {exc}")
-
-    # Fallback minimal probe with entity-anchored questions (avoiding abstract labels)
-    sentences = [s.strip() for s in re.split(r"[.!?]", w_raw) if len(s.strip()) > 15]
-    if len(sentences) >= 2:
-        words_0 = [w for w in re.findall(r"[A-Z][a-z]+|\b\w{4,}\b", sentences[0]) if w.lower() not in ("what", "that", "this", "there", "they", "then", "with", "from")]
-        words_1 = [w for w in re.findall(r"[A-Z][a-z]+|\b\w{4,}\b", sentences[1]) if w.lower() not in ("what", "that", "this", "there", "they", "then", "with", "from")]
-        anchor_0 = words_0[0] if words_0 else "the subject"
-        anchor_1 = words_1[0] if words_1 else "the action"
-        return [
-            QAProbeItem(
-                question_id=1,
-                question=f"What fact or event involves {anchor_0} in the passage?",
-                gold_answer=sentences[0],
-                is_cross_sentence=False,
-                source_sentence_references=[sentences[0]],
-            ),
-            QAProbeItem(
-                question_id=2,
-                question=f"How does the situation regarding {anchor_0} lead to {anchor_1}?",
-                gold_answer=sentences[1],
-                is_cross_sentence=True,
-                source_sentence_references=[sentences[0], sentences[1]],
-            ),
-        ]
-
-    words = [w for w in re.findall(r"[A-Z][a-z]+|\b\w{4,}\b", w_raw) if w.lower() not in ("what", "that", "this", "there", "they", "then")]
-    anchor = words[0] if words else "the central entity"
-    return [
-        QAProbeItem(
-            question_id=1,
-            question=f"What fact is stated regarding {anchor}?",
-            gold_answer=w_raw[:150],
-            is_cross_sentence=False,
-            source_sentence_references=[w_raw[:150]],
-        )
-    ]
+        logger.warning(f"NLI classification failed for assertion '{assertion[:40]}': {exc}")
+        return "NOT_MENTIONED", f"Evaluation error: {exc}"
 
 
-# ==============================================================================
-# 2. Constrained Closed-Book Answering
-# ==============================================================================
-
-
+# Legacy helper functions preserved for backward compatibility
 def build_answering_prompt(claims_context: str, question: str) -> str:
-    """Construct prompt sent to the answering model allowing reasonable semantic synthesis."""
-    return (
-        "Answer the question based on the verified claims and supporting context below.\n"
-        "Synthesize the provided concepts, explanations, and direct quotes to answer the question concisely and accurately.\n"
-        'Only output "INSUFFICIENT_INFORMATION" if the claims completely lack any relevant entities, actions, or context related to the question.\n\n'
-        f"Extracted Knowledge Base:\n\"\"\"\n{claims_context}\n\"\"\"\n\n"
-        f"Question: {question}\n"
-        "Concise Answer:"
-    )
+    """Legacy helper preserved for backward compatibility."""
+    return build_nli_verifier_prompt(claims_context, question)
 
 
 def answer_probe(
@@ -343,46 +492,22 @@ def answer_probe(
     pool: OllamaPool,
     model_name: str,
 ) -> str:
-    """
-    Answer the question using ONLY the provided list of extracted claims.
-    If information is missing, respond with exactly 'INSUFFICIENT_INFORMATION'.
-    """
-    if not claims_context.strip() or "(No knowledge claims extracted" in claims_context:
-        return "INSUFFICIENT_INFORMATION"
-
-    prompt = build_answering_prompt(claims_context, question)
-
-    try:
-        raw_text, _ = pool.generate(model_name, prompt, temperature=0.0)
-        clean = raw_text.strip()
-        if "<think>" in clean and "</think>" in clean:
-            clean = clean.split("</think>")[-1].strip()
-        return clean
-    except Exception as exc:
-        logger.warning(f"Answering probe '{question[:40]}' failed: {exc}")
-        return "INSUFFICIENT_INFORMATION"
-
-
-# ==============================================================================
-# 3. Objective Arbitration / Oracle Scoring LLM
-# ==============================================================================
+    """Legacy helper preserved for backward compatibility."""
+    cls, _ = verify_assertion_entailment(claims_context, question, pool, model_name)
+    return "INSUFFICIENT_INFORMATION" if cls == "NOT_MENTIONED" else cls
 
 
 def build_judge_prompt(gold_answer: str, candidate_answer: str, w_raw: str) -> str:
-    """
-    Construct the judge arbitration prompt evaluating substantive semantic answers
-    and grading consequences without requiring redundant premise repetition.
-    """
+    """Legacy helper preserved for backward compatibility."""
     return (
         "You are an objective judge evaluating whether a candidate answer accurately conveys ground truth facts.\n\n"
         f'Ground Truth Answer: "{gold_answer}"\n'
         f'Candidate Answer: "{candidate_answer}"\n\n'
         f"Passage Context (for reference):\n\"\"\"\n{w_raw[:4000]}\n\"\"\"\n\n"
         "Judge Verdict Guidelines:\n"
-        "- If Candidate Answer conveys the substantive answer to the question asked, mark as \"PASS\".\n"
-        "- DO NOT penalize the Candidate Answer for omitting the premise or condition if the question already stated that condition "
-        "(e.g., if asked \"What happens if X?\", an answer stating \"Y happens\" is a PASS; repeating \"If X, then Y\" is not required).\n"
-        "- Mark as \"FAIL\" ONLY if the answer is \"INSUFFICIENT_INFORMATION\", directly contradicts the ground truth, or asserts a hallucinated fact.\n\n"
+        '- If Candidate Answer conveys the substantive answer to the question asked, mark as "PASS".\n'
+        "- DO NOT penalize the Candidate Answer for omitting the premise or condition if the question already stated that condition.\n"
+        '- Mark as "FAIL" ONLY if the answer is "INSUFFICIENT_INFORMATION", directly contradicts the ground truth, or asserts a hallucinated fact.\n\n'
         "Return strictly valid JSON:\n"
         "{\n"
         '  "verdict": "PASS" | "FAIL",\n'
@@ -398,21 +523,14 @@ def judge_probe_answer(
     pool: OllamaPool,
     model_name: str,
 ) -> Tuple[Literal["PASS", "FAIL"], str]:
-    """
-    Compare Candidate Answer against Ground Truth Answer.
-    Uses core semantic entailment guidelines and stops using raw token overlap fallback.
-    Returns (verdict, reason).
-    """
+    """Legacy helper preserved for backward compatibility."""
     pred_clean = predicted_answer.strip()
-
-    # Fast short-circuits
     if not pred_clean:
         return "FAIL", "Candidate answer is empty."
     if pred_clean.upper().startswith("INSUFFICIENT_INFORMATION") or "INSUFFICIENT_INFORMATION" in pred_clean.upper():
         return "FAIL", "Candidate indicated insufficient information in extracted claims."
 
     prompt = build_judge_prompt(gold_answer, pred_clean, w_raw)
-
     try:
         raw_text, _ = pool.generate(model_name, prompt, temperature=0.0)
         clean = clean_llm_json_response(raw_text)
@@ -428,78 +546,93 @@ def judge_probe_answer(
 
 
 # ==============================================================================
-# 4. End-to-End Block QA Evaluation Orchestration
+# 3. End-to-End Block Atomic Assertion NLI Evaluation
 # ==============================================================================
 
 
-def evaluate_block_qa_probes(
+def evaluate_block_atomic_assertions(
     w_raw: str,
     ideas_old: List[Any],
     ideas_new: List[Any],
     pool: OllamaPool,
     model_name: str,
-    probes: Optional[List[QAProbeItem]] = None,
-) -> Tuple[List[QAProbeItem], QASystemBlockMetrics, QASystemBlockMetrics]:
+    assertions: Optional[List[AtomicAssertionItem]] = None,
+) -> Tuple[List[AtomicAssertionItem], NLISystemBlockMetrics, NLISystemBlockMetrics]:
     """
-    Generate probes for W_raw, query both systems (Old and New claims), and arbitrate verdicts.
+    Generate atomic assertions for W_raw (or use provided ones), classify entailment against
+    Old and New claims knowledge bases, and compute recall & seam integrity metrics.
     Returns:
-      (probes, old_system_metrics, new_system_metrics)
+      (assertions, old_system_metrics, new_system_metrics)
     """
-    if probes is None:
-        probes = generate_qa_probes(w_raw, pool, model_name)
+    if assertions is None:
+        assertions = generate_atomic_assertions(w_raw, pool, model_name)
 
     claims_old = format_ideas_as_claims(ideas_old)
     claims_new = format_ideas_as_claims(ideas_new)
 
-    evals_old: List[QAProbeEvaluation] = []
-    evals_new: List[QAProbeEvaluation] = []
+    evals_old: List[NLIAssertionEvaluation] = []
+    evals_new: List[NLIAssertionEvaluation] = []
 
-    for p in probes:
-        # 1. Old / Baseline evaluation
-        prompt_ans_old = build_answering_prompt(claims_old, p.question)
-        pred_old = answer_probe(claims_old, p.question, pool, model_name)
-        prompt_judge_old = build_judge_prompt(p.gold_answer, pred_old, w_raw)
-        verdict_old, reason_old = judge_probe_answer(p.gold_answer, pred_old, w_raw, pool, model_name)
+    for a in assertions:
+        # 1. Baseline (Old) entailment
+        prompt_old = build_nli_verifier_prompt(claims_old, a.assertion)
+        cls_old, rat_old = verify_assertion_entailment(claims_old, a.assertion, pool, model_name)
+        verdict_old: Literal["PASS", "FAIL"] = "PASS" if cls_old == "SUPPORTED" else "FAIL"
+
         evals_old.append(
-            QAProbeEvaluation(
-                question_id=p.question_id,
-                question=p.question,
-                gold_answer=p.gold_answer,
-                is_cross_sentence=p.is_cross_sentence,
-                predicted_answer=pred_old,
+            NLIAssertionEvaluation(
+                claim_id=a.claim_id,
+                assertion=a.assertion,
+                is_cross_boundary=a.is_cross_boundary,
+                classification=cls_old,
                 verdict=verdict_old,
-                reason=reason_old,
-                answering_prompt=prompt_ans_old,
-                judge_prompt=prompt_judge_old,
+                rationale=rat_old,
+                verifier_prompt=prompt_old,
+                # compatibility
+                question_id=a.claim_id,
+                question=a.assertion,
+                gold_answer=a.source_quote or a.assertion,
+                is_cross_sentence=a.is_cross_boundary,
+                predicted_answer=cls_old,
+                reason=rat_old,
+                answering_prompt=prompt_old,
+                judge_prompt=prompt_old,
             )
         )
 
-        # 2. New / Candidate evaluation
-        prompt_ans_new = build_answering_prompt(claims_new, p.question)
-        pred_new = answer_probe(claims_new, p.question, pool, model_name)
-        prompt_judge_new = build_judge_prompt(p.gold_answer, pred_new, w_raw)
-        verdict_new, reason_new = judge_probe_answer(p.gold_answer, pred_new, w_raw, pool, model_name)
+        # 2. Candidate (New) entailment
+        prompt_new = build_nli_verifier_prompt(claims_new, a.assertion)
+        cls_new, rat_new = verify_assertion_entailment(claims_new, a.assertion, pool, model_name)
+        verdict_new: Literal["PASS", "FAIL"] = "PASS" if cls_new == "SUPPORTED" else "FAIL"
+
         evals_new.append(
-            QAProbeEvaluation(
-                question_id=p.question_id,
-                question=p.question,
-                gold_answer=p.gold_answer,
-                is_cross_sentence=p.is_cross_sentence,
-                predicted_answer=pred_new,
+            NLIAssertionEvaluation(
+                claim_id=a.claim_id,
+                assertion=a.assertion,
+                is_cross_boundary=a.is_cross_boundary,
+                classification=cls_new,
                 verdict=verdict_new,
-                reason=reason_new,
-                answering_prompt=prompt_ans_new,
-                judge_prompt=prompt_judge_new,
+                rationale=rat_new,
+                verifier_prompt=prompt_new,
+                # compatibility
+                question_id=a.claim_id,
+                question=a.assertion,
+                gold_answer=a.source_quote or a.assertion,
+                is_cross_sentence=a.is_cross_boundary,
+                predicted_answer=cls_new,
+                reason=rat_new,
+                answering_prompt=prompt_new,
+                judge_prompt=prompt_new,
             )
         )
 
-    tot = len(probes)
-    cross_tot = sum(1 for p in probes if p.is_cross_sentence)
+    tot = len(assertions)
+    cross_tot = sum(1 for a in assertions if a.is_cross_boundary)
 
     # Metrics Baseline (Old)
     passed_old = sum(1 for e in evals_old if e.verdict == "PASS")
-    cross_passed_old = sum(1 for e in evals_old if e.is_cross_sentence and e.verdict == "PASS")
-    metrics_old = QASystemBlockMetrics(
+    cross_passed_old = sum(1 for e in evals_old if e.is_cross_boundary and e.verdict == "PASS")
+    metrics_old = NLISystemBlockMetrics(
         system="old",
         total_probes=tot,
         passed_probes=passed_old,
@@ -513,8 +646,8 @@ def evaluate_block_qa_probes(
 
     # Metrics Candidate (New)
     passed_new = sum(1 for e in evals_new if e.verdict == "PASS")
-    cross_passed_new = sum(1 for e in evals_new if e.is_cross_sentence and e.verdict == "PASS")
-    metrics_new = QASystemBlockMetrics(
+    cross_passed_new = sum(1 for e in evals_new if e.is_cross_boundary and e.verdict == "PASS")
+    metrics_new = NLISystemBlockMetrics(
         system="new",
         total_probes=tot,
         passed_probes=passed_new,
@@ -526,4 +659,23 @@ def evaluate_block_qa_probes(
         evaluations=evals_new,
     )
 
-    return probes, metrics_old, metrics_new
+    return assertions, metrics_old, metrics_new
+
+
+def evaluate_block_qa_probes(
+    w_raw: str,
+    ideas_old: List[Any],
+    ideas_new: List[Any],
+    pool: OllamaPool,
+    model_name: str,
+    probes: Optional[List[AtomicAssertionItem]] = None,
+) -> Tuple[List[AtomicAssertionItem], NLISystemBlockMetrics, NLISystemBlockMetrics]:
+    """Backward-compatible wrapper for evaluate_block_atomic_assertions."""
+    return evaluate_block_atomic_assertions(
+        w_raw=w_raw,
+        ideas_old=ideas_old,
+        ideas_new=ideas_new,
+        pool=pool,
+        model_name=model_name,
+        assertions=probes,
+    )

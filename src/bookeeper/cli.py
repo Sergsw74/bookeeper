@@ -3338,8 +3338,16 @@ def verify_command(
                 else:
                     eta_str = "--"
 
+                if rate >= 1.0:
+                    speed_str = f"{rate:.2f} chk/s"
+                elif rate > 0:
+                    sec_per_chk = 1.0 / rate
+                    speed_str = f"{sec_per_chk:.1f} s/chk ({rate:.3f} chk/s)"
+                else:
+                    speed_str = "-- chk/s"
+
                 stats_str = (
-                    f"[cyan]{rate:.1f} chk/s[/cyan] | [yellow]ETA: {eta_str}[/yellow] | "
+                    f"[cyan]{speed_str}[/cyan] | [yellow]ETA: {eta_str}[/yellow] | "
                     f"[bold green]✓ {tot_matched} matched[/bold green] | "
                     f"[bold red]✗ {tot_missed} missed[/bold red]"
                 )
@@ -3621,11 +3629,21 @@ def verify_command(
                 rate = (completed / elapsed) if elapsed > 0 else 0.0
                 if completed > 0 and total > completed and rate > 0:
                     rem_sec = (total - completed) / rate
-                    eta_str = f"{int(rem_sec // 60)}m {int(rem_sec % 60):02d}s" if rem_sec >= 60 else f"{rem_sec:.0f}s"
+                    eta_str = format_eta_min_sec(rem_sec)
+                elif completed >= total:
+                    eta_str = "0m 00s"
                 else:
                     eta_str = "--"
 
-                stats_str = f"[cyan]{rate:.1f} blk/s[/cyan] | [yellow]ETA: {eta_str}[/yellow]"
+                if rate >= 1.0:
+                    speed_str = f"{rate:.2f} blk/s"
+                elif rate > 0:
+                    sec_per_blk = 1.0 / rate
+                    speed_str = f"{sec_per_blk:.1f} s/blk ({rate:.3f} blk/s)"
+                else:
+                    speed_str = "-- blk/s"
+
+                stats_str = f"[cyan]{speed_str}[/cyan] | [yellow]ETA: {eta_str}[/yellow]"
                 cc_progress.update(tot_cc_task, completed=completed, total=total, stats_line=stats_str)
                 live.update(Group(Text.from_markup(cur_text), cc_progress))
 

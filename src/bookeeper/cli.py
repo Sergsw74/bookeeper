@@ -3750,7 +3750,17 @@ def verify_command(
                 )
             console.print(sample_table)
 
-        # 3. Save JSON Report
+        # 3. Metrics Legend Panel
+        legend_content = (
+            "[bold cyan]• Recall (QA / NLI Recall):[/bold cyan] Proportion of raw-passage factual assertions verified as SUPPORTED by the knowledge base.\n"
+            "  [dim]Formula: Recall = (Supported Assertions) / (Total Assertions)[/dim]\n\n"
+            "[bold cyan]• Seam Integrity (Seam Int / SIMINT):[/bold cyan] Retention rate of cross-boundary assertions spanning multiple sentences.\n"
+            "  [dim]Formula: Seam Int = (Supported Cross-Boundary Assertions) / (Total Cross-Boundary Assertions)[/dim]\n"
+            "  [dim]Detects seam failure: when Sentence A (cause) and Sentence B (effect) land on separate sides of a chunk boundary and the relationship is severed.[/dim]"
+        )
+        console.print(Panel(legend_content, title="[bold]📖 Metrics Legend[/bold]", border_style="dim", expand=False))
+
+        # 4. Save JSON Report
         report_dest = (
             Path(output_report).expanduser().resolve()
             if output_report

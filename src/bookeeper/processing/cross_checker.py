@@ -860,6 +860,10 @@ def print_block_comparison(
     )
     delta_pts = (eval_new.qa_recall - eval_old.qa_recall) * 100
     _out(f"   • Recall Delta:         {delta_pts:+.1f}% pts")
+    _out(
+        f"   [Legend] Recall = Supported / Total | "
+        f"Seam Int (SIMINT) = Supported Cross-Boundary / Total Cross-Boundary"
+    )
     _out(f"{sep}\n")
 
 

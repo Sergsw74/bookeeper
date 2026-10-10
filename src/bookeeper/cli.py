@@ -2972,7 +2972,7 @@ def verify_command(
     print_chunks: Optional[int] = typer.Option(
         None,
         "--print-chunks",
-        help="Print text & ideas comparison for up to X blocks when disproportion < 1.0 (cross-check mode).",
+        help="Print text & QA probes comparison for up to X blocks (cross-check mode).",
     ),
     max_tasks: Optional[int] = typer.Option(
         None, "--max-tasks", "-t", help="Max concurrent verification worker tasks across Ollama servers."
@@ -3573,7 +3573,7 @@ def verify_command(
                 f"[bold cyan]Verification Mode:[/bold cyan] CROSS-CHECK (Dual Seam & Recall Comparative Audit)\n"
                 f"[bold cyan]Contiguous Blocks to Audit:[/bold cyan] {effective_blocks}\n"
                 f"[bold cyan]Oracle Model:[/bold cyan] [bold magenta]{effective_model}[/bold magenta]\n"
-                f"[bold cyan]Disproportion Metric:[/bold cyan] sum(block_A.len) / sum(block_A ∪ block_B.len)\n"
+                f"[bold cyan]Disproportion Metric:[/bold cyan] intersect(block_A, block_B) / union(block_A, block_B)\n"
                 + (f"[bold cyan]Print Blocks (< 1.0):[/bold cyan] Up to {print_chunks}\n" if print_chunks else "")
                 + f"[bold cyan]Concurrency:[/bold cyan] {pool_concurrency} tasks across {num_servers} Ollama server(s)",
                 title="Cross-Check Verification Plan",
@@ -3611,7 +3611,7 @@ def verify_command(
                     avg_d = tot_delta / completed if completed > 0 else 0.0
                     cur_text = (
                         f"[bold blue]Current Block:[/bold blue] {block_info} | "
-                        f"ΔRecall: [{'green' if avg_d >= 0 else 'red'}]{avg_d * 100:+.1f}% pts[/] | "
+                        f"ΔQA Recall: [{'green' if avg_d >= 0 else 'red'}]{avg_d * 100:+.1f}% pts[/] | "
                         f"Disprop: [cyan]{item.chunk_disproportion:.2f}[/cyan]"
                     )
                 else:
@@ -3654,13 +3654,19 @@ def verify_command(
 
         summary_table.add_row("Total Contiguous Blocks Audited", str(sm.total_samples), str(sm.total_samples), "-")
         summary_table.add_row(
-            "Mean Oracle Recall (%)",
+            "Mean QA Recall (%)",
             f"{sm.mean_old_recall * 100:.2f}%",
             f"{sm.mean_new_recall * 100:.2f}%",
             f"[{'green' if sm.mean_delta_recall >= -0.03 else 'red'}]{sm.mean_delta_recall * 100:+.2f}% pts[/]",
         )
         summary_table.add_row(
-            "Aggregate Fail Ratio [sum(Failed)/sum(Total Ideas)] (%)",
+            "Mean Seam Integrity Rate (Cross-Sentence) (%)",
+            f"{sm.mean_old_seam_integrity * 100:.2f}%",
+            f"[{'green' if sm.mean_new_seam_integrity >= 0.80 else 'red'}]{sm.mean_new_seam_integrity * 100:.2f}%[/]",
+            f"{(sm.mean_new_seam_integrity - sm.mean_old_seam_integrity) * 100:+.2f}% pts",
+        )
+        summary_table.add_row(
+            "Aggregate Fail Ratio [sum(Failed)/sum(Total Probes)] (%)",
             f"{sm.mean_old_fail_ratio * 100:.2f}%",
             f"{sm.mean_new_fail_ratio * 100:.2f}%",
             f"[{'green' if sm.mean_delta_fail_ratio <= 0 else 'red'}]{sm.mean_delta_fail_ratio * 100:+.2f}% pts[/]",
@@ -3679,7 +3685,7 @@ def verify_command(
         )
         summary_table.add_section()
         summary_table.add_row(
-            "Mean Chunk Disproportion [sum(A)/sum(A∪B)]",
+            "Mean Chunk Disproportion [intersect(A,B)/union(A,B)]",
             "-",
             f"[bold cyan]{sm.mean_chunk_disproportion:.4f}[/bold cyan]",
             "-",
@@ -3699,30 +3705,30 @@ def verify_command(
             sample_table.add_column("Book / Section", style="dim")
             sample_table.add_column("Passage Len", justify="right")
             sample_table.add_column("Disproportion", justify="right", style="cyan")
-            sample_table.add_column("Recall A", justify="right")
-            sample_table.add_column("Recall B", justify="right")
+            sample_table.add_column("QA Rec A", justify="right")
+            sample_table.add_column("QA Rec B", justify="right")
             sample_table.add_column("ΔRecall", justify="right")
+            sample_table.add_column("Seam Int B", justify="right")
             sample_table.add_column("Fail A", justify="right")
             sample_table.add_column("Fail B", justify="right")
             sample_table.add_column("ΔFail", justify="right")
-            sample_table.add_column("B Truncation", justify="right")
 
             for s in report.samples[:10]:
                 d_color = "green" if s.delta_recall >= 0 else ("yellow" if s.delta_recall >= -0.03 else "red")
                 f_color = "green" if s.delta_fail_ratio <= 0 else "red"
-                t_color = "green" if s.new_system.truncation_rate == 0 else "red"
+                seam_color = "green" if s.new_system.seam_integrity_rate >= 0.80 else "red"
                 sample_table.add_row(
                     str(s.sample_index),
                     f"{s.book_title[:16]} ({s.section_title[:14]})",
                     f"{s.passage_length_chars} chars",
                     f"{s.chunk_disproportion:.3f}",
-                    f"{s.old_system.oracle_recall * 100:.1f}%",
-                    f"{s.new_system.oracle_recall * 100:.1f}%",
+                    f"{s.old_system.qa_recall * 100:.1f}%",
+                    f"{s.new_system.qa_recall * 100:.1f}%",
                     f"[{d_color}]{s.delta_recall * 100:+.1f}%[/]",
+                    f"[{seam_color}]{s.new_system.seam_integrity_rate * 100:.1f}%[/]",
                     f"{s.old_system.fail_ratio * 100:.1f}%",
                     f"{s.new_system.fail_ratio * 100:.1f}%",
                     f"[{f_color}]{s.delta_fail_ratio * 100:+.1f}%[/]",
-                    f"[{t_color}]{s.new_system.truncation_rate * 100:.1f}%[/]",
                 )
             console.print(sample_table)
 

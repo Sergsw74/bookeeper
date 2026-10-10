@@ -1,0 +1,445 @@
+"""
+QA Probe Oracle for Knowledge Graph Cross-Check Verification.
+
+Evaluates retrieval utility and seam integrity by:
+1. Generating fact-based QA probes directly from unbroken passage W_raw,
+   with mandatory multi-sentence/cross-boundary probes.
+2. Executing constrained closed-book answering using ONLY candidate claims as context.
+3. Conducting objective arbitration with an Oracle judge against gold ground-truth answers.
+"""
+
+import json
+import logging
+import re
+from typing import Any, Dict, List, Literal, Optional, Tuple
+from pydantic import BaseModel, Field
+
+from bookeeper.processing.extractor import Concept
+from bookeeper.processing.ollama_pool import OllamaPool
+
+logger = logging.getLogger(__name__)
+
+
+# ==============================================================================
+# Data Models
+# ==============================================================================
+
+
+class QAProbeItem(BaseModel):
+    """A probe question-answer pair grounded in the raw passage."""
+
+    question_id: int
+    question: str
+    gold_answer: str
+    is_cross_sentence: bool = False
+
+
+class QAProbeEvaluation(BaseModel):
+    """Evaluation of a single system's response to a probe question."""
+
+    question_id: int
+    question: str
+    gold_answer: str
+    is_cross_sentence: bool
+    predicted_answer: str
+    verdict: Literal["PASS", "FAIL"]
+    reason: str = ""
+
+
+class QASystemBlockMetrics(BaseModel):
+    """QA evaluation results for a single system on an audited block."""
+
+    system: Literal["old", "new"]
+    total_probes: int = 0
+    passed_probes: int = 0
+    failed_probes: int = 0
+    qa_recall: float = 0.0  # passed_probes / total_probes
+    cross_sentence_total: int = 0
+    cross_sentence_passed: int = 0
+    seam_integrity_rate: float = 0.0  # cross_sentence_passed / cross_sentence_total
+    evaluations: List[QAProbeEvaluation] = Field(default_factory=list)
+
+
+# ==============================================================================
+# Claims Context Formatting
+# ==============================================================================
+
+
+def format_ideas_as_claims(ideas: List[Any]) -> str:
+    """
+    Format deduplicated Concept objects or string ideas into a structured list of claims.
+    Includes title, brief summary, and detailed explanation to supply complete context.
+    """
+    if not ideas:
+        return "(No knowledge claims extracted for this block)"
+
+    claims = []
+    for idx, item in enumerate(ideas, 1):
+        if isinstance(item, Concept):
+            title = item.name.strip()
+            summary = (item.summary or item.brief_description or "").strip()
+            details = (item.detailed_explanation or "").strip()
+
+            claim_text = f"Claim {idx}: {title}"
+            if summary:
+                claim_text += f"\nSummary: {summary}"
+            if details and details != summary:
+                claim_text += f"\nDetails: {details}"
+            claims.append(claim_text)
+        elif isinstance(item, dict):
+            title = str(item.get("name", "")).strip()
+            summary = str(item.get("summary") or item.get("brief_description", "")).strip()
+            claim_text = f"Claim {idx}: {title}"
+            if summary:
+                claim_text += f"\nSummary: {summary}"
+            claims.append(claim_text)
+        else:
+            claims.append(f"Claim {idx}: {str(item).strip()}")
+
+    return "\n\n".join(claims)
+
+
+# ==============================================================================
+# Helper for JSON extraction from LLM response
+# ==============================================================================
+
+
+def clean_llm_json_response(raw_text: str) -> str:
+    """Clean markdown code fences and thinking tags from LLM response."""
+    text = raw_text.strip()
+    if "<think>" in text and "</think>" in text:
+        text = text.split("</think>")[-1].strip()
+
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    return text
+
+
+def parse_json_array_safely(text: str) -> List[Dict[str, Any]]:
+    """Safely parse a JSON array from LLM response text with fallback heuristics."""
+    clean = clean_llm_json_response(text)
+    try:
+        data = json.loads(clean)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            # Check for keys like 'probes', 'questions', 'items'
+            for key in ("probes", "questions", "items", "qa_pairs"):
+                if key in data and isinstance(data[key], list):
+                    return data[key]
+            return [data]
+    except Exception:
+        pass
+
+    # Regex extraction of JSON array
+    match = re.search(r"\[\s*\{.*\}\s*\]", clean, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+
+    return []
+
+
+# ==============================================================================
+# 1. Targeted QA Probe Generation
+# ==============================================================================
+
+
+def generate_qa_probes(
+    w_raw: str,
+    pool: OllamaPool,
+    model_name: str,
+    num_questions: int = 5,
+) -> List[QAProbeItem]:
+    """
+    Generate fact-based QA probes directly from unbroken passage W_raw.
+    Requires at least 3 multi-sentence/cross-boundary probes.
+    """
+    prompt = (
+        "You are an adversarial test designer evaluating knowledge extraction systems.\n\n"
+        f"Given the passage below, generate exactly {num_questions} specific, fact-based Question-Answer pairs.\n\n"
+        "CRITICAL REQUIREMENTS:\n"
+        "1. At least 3 questions MUST require connecting information from two separate sentences or clauses "
+        '(e.g., causal relationships "Why did X happen?", conditions "Under what criteria does Y apply?", '
+        'or sequences "What happened after Z?"). Mark these with "is_cross_sentence": true.\n'
+        '2. The remaining questions can test localized facts ("is_cross_sentence": false).\n'
+        '3. "gold_answer" must be a concise, factual 1-2 sentence ground truth answer grounded strictly in the passage.\n\n'
+        f"Passage:\n\"\"\"\n{w_raw[:7000]}\n\"\"\"\n\n"
+        "Return strictly valid JSON with this schema:\n"
+        "[\n"
+        "  {\n"
+        '    "question": "string",\n'
+        '    "gold_answer": "string",\n'
+        '    "is_cross_sentence": true\n'
+        "  }\n"
+        "]\n"
+    )
+
+    try:
+        raw_text, _ = pool.generate(model_name, prompt, temperature=0.0)
+        items = parse_json_array_safely(raw_text)
+
+        probes: List[QAProbeItem] = []
+        for idx, item in enumerate(items, 1):
+            if not isinstance(item, dict):
+                continue
+            q = str(item.get("question", "")).strip()
+            a = str(item.get("gold_answer", item.get("answer", ""))).strip()
+            is_cross = bool(item.get("is_cross_sentence", False))
+            if q and a:
+                probes.append(
+                    QAProbeItem(
+                        question_id=idx,
+                        question=q,
+                        gold_answer=a,
+                        is_cross_sentence=is_cross,
+                    )
+                )
+
+        if probes:
+            # Enforce at least some cross-sentence probes if model didn't set flags
+            if not any(p.is_cross_sentence for p in probes) and len(probes) >= 2:
+                # Mark questions starting with Why / How / What happens if as cross-sentence
+                for p in probes:
+                    q_lower = p.question.lower()
+                    if any(q_lower.startswith(w) for w in ("why", "how", "what caused", "under what", "when")):
+                        p.is_cross_sentence = True
+                # If still none, mark the first 3
+                if not any(p.is_cross_sentence for p in probes):
+                    for p in probes[:3]:
+                        p.is_cross_sentence = True
+            return probes
+    except Exception as exc:
+        logger.warning(f"QA Probe generation failed: {exc}")
+
+    # Fallback minimal probe based on passage content
+    sentences = [s.strip() for s in re.split(r"[.!?]", w_raw) if len(s.strip()) > 15]
+    if len(sentences) >= 2:
+        return [
+            QAProbeItem(
+                question_id=1,
+                question=f"What is the main topic discussed in: '{sentences[0][:60]}...'?",
+                gold_answer=sentences[0],
+                is_cross_sentence=False,
+            ),
+            QAProbeItem(
+                question_id=2,
+                question=f"What relationship connects '{sentences[0][:40]}' and '{sentences[1][:40]}'?",
+                gold_answer=f"{sentences[0]} then {sentences[1]}",
+                is_cross_sentence=True,
+            ),
+        ]
+
+    return [
+        QAProbeItem(
+            question_id=1,
+            question="What fact is stated in the passage?",
+            gold_answer=w_raw[:150],
+            is_cross_sentence=False,
+        )
+    ]
+
+
+# ==============================================================================
+# 2. Constrained Closed-Book Answering
+# ==============================================================================
+
+
+def answer_probe(
+    claims_context: str,
+    question: str,
+    pool: OllamaPool,
+    model_name: str,
+) -> str:
+    """
+    Answer the question using ONLY the provided list of extracted claims.
+    If information is missing, respond with exactly 'INSUFFICIENT_INFORMATION'.
+    """
+    if not claims_context.strip() or "(No knowledge claims extracted" in claims_context:
+        return "INSUFFICIENT_INFORMATION"
+
+    prompt = (
+        "Answer the question using ONLY the provided list of extracted knowledge claims.\n"
+        "Do not assume, infer, or extrapolate anything outside these claims.\n"
+        'If the claims do not contain enough information to answer the question completely and accurately, respond with exactly: "INSUFFICIENT_INFORMATION".\n\n'
+        f"Extracted Knowledge Claims:\n\"\"\"\n{claims_context}\n\"\"\"\n\n"
+        f"Question: {question}\n\n"
+        "Concise Answer:"
+    )
+
+    try:
+        raw_text, _ = pool.generate(model_name, prompt, temperature=0.0)
+        clean = raw_text.strip()
+        if "<think>" in clean and "</think>" in clean:
+            clean = clean.split("</think>")[-1].strip()
+        return clean
+    except Exception as exc:
+        logger.warning(f"Answering probe '{question[:40]}' failed: {exc}")
+        return "INSUFFICIENT_INFORMATION"
+
+
+# ==============================================================================
+# 3. Objective Arbitration / Oracle Scoring LLM
+# ==============================================================================
+
+
+def judge_probe_answer(
+    gold_answer: str,
+    predicted_answer: str,
+    w_raw: str,
+    pool: OllamaPool,
+    model_name: str,
+) -> Tuple[Literal["PASS", "FAIL"], str]:
+    """
+    Compare Candidate Answer against Ground Truth Answer.
+    Returns (verdict, reason).
+    """
+    pred_clean = predicted_answer.strip()
+
+    # Fast short-circuits
+    if not pred_clean:
+        return "FAIL", "Candidate answer is empty."
+    if pred_clean.upper().startswith("INSUFFICIENT_INFORMATION"):
+        return "FAIL", "Candidate indicated insufficient information in extracted claims."
+
+    prompt = (
+        "You are an objective judge evaluating whether a candidate answer accurately conveys ground truth facts.\n\n"
+        f'Ground Truth Answer: "{gold_answer}"\n'
+        f'Candidate Answer: "{pred_clean}"\n\n'
+        f"Passage Context (for reference):\n\"\"\"\n{w_raw[:4000]}\n\"\"\"\n\n"
+        "Evaluation Criteria:\n"
+        '1. If Candidate Answer is "INSUFFICIENT_INFORMATION" or states that info is missing, mark as "FAIL".\n'
+        "2. If Candidate Answer contradicts the ground truth or hallucinates extra unsupported facts, mark as "
+        '"FAIL".\n'
+        "3. If Candidate Answer correctly conveys the essential ground truth facts (including necessary conditions or qualifiers), mark as "
+        '"PASS".\n\n'
+        "Return strictly valid JSON:\n"
+        "{\n"
+        '  "verdict": "PASS" | "FAIL",\n'
+        '  "reason": "concise rationale"\n'
+        "}\n"
+    )
+
+    try:
+        raw_text, _ = pool.generate(model_name, prompt, temperature=0.0)
+        clean = clean_llm_json_response(raw_text)
+        data = json.loads(clean)
+        verdict = str(data.get("verdict", "")).strip().upper()
+        if verdict not in ("PASS", "FAIL"):
+            verdict = "PASS" if "pass" in verdict.lower() else "FAIL"
+        reason = str(data.get("reason", "")).strip()
+        return verdict, reason  # type: ignore
+    except Exception as exc:
+        logger.warning(f"Judging probe answer failed: {exc}")
+        # Substring / token fallback
+        gold_words = set(re.findall(r"\w+", gold_answer.lower()))
+        pred_words = set(re.findall(r"\w+", pred_clean.lower()))
+        common = gold_words & pred_words
+        overlap = len(common) / max(1, len(gold_words))
+        if overlap >= 0.5:
+            return "PASS", f"Fallback token overlap ({overlap:.2f}) passed."
+        return "FAIL", f"Fallback token overlap ({overlap:.2f}) failed."
+
+
+# ==============================================================================
+# 4. End-to-End Block QA Evaluation Orchestration
+# ==============================================================================
+
+
+def evaluate_block_qa_probes(
+    w_raw: str,
+    ideas_old: List[Any],
+    ideas_new: List[Any],
+    pool: OllamaPool,
+    model_name: str,
+    probes: Optional[List[QAProbeItem]] = None,
+) -> Tuple[List[QAProbeItem], QASystemBlockMetrics, QASystemBlockMetrics]:
+    """
+    Generate probes for W_raw, query both systems (Old and New claims), and arbitrate verdicts.
+    Returns:
+      (probes, old_system_metrics, new_system_metrics)
+    """
+    if probes is None:
+        probes = generate_qa_probes(w_raw, pool, model_name)
+
+    claims_old = format_ideas_as_claims(ideas_old)
+    claims_new = format_ideas_as_claims(ideas_new)
+
+    evals_old: List[QAProbeEvaluation] = []
+    evals_new: List[QAProbeEvaluation] = []
+
+    for p in probes:
+        # 1. Old / Baseline evaluation
+        pred_old = answer_probe(claims_old, p.question, pool, model_name)
+        verdict_old, reason_old = judge_probe_answer(p.gold_answer, pred_old, w_raw, pool, model_name)
+        evals_old.append(
+            QAProbeEvaluation(
+                question_id=p.question_id,
+                question=p.question,
+                gold_answer=p.gold_answer,
+                is_cross_sentence=p.is_cross_sentence,
+                predicted_answer=pred_old,
+                verdict=verdict_old,
+                reason=reason_old,
+            )
+        )
+
+        # 2. New / Candidate evaluation
+        pred_new = answer_probe(claims_new, p.question, pool, model_name)
+        verdict_new, reason_new = judge_probe_answer(p.gold_answer, pred_new, w_raw, pool, model_name)
+        evals_new.append(
+            QAProbeEvaluation(
+                question_id=p.question_id,
+                question=p.question,
+                gold_answer=p.gold_answer,
+                is_cross_sentence=p.is_cross_sentence,
+                predicted_answer=pred_new,
+                verdict=verdict_new,
+                reason=reason_new,
+            )
+        )
+
+    tot = len(probes)
+    cross_tot = sum(1 for p in probes if p.is_cross_sentence)
+
+    # Metrics Baseline (Old)
+    passed_old = sum(1 for e in evals_old if e.verdict == "PASS")
+    cross_passed_old = sum(1 for e in evals_old if e.is_cross_sentence and e.verdict == "PASS")
+    metrics_old = QASystemBlockMetrics(
+        system="old",
+        total_probes=tot,
+        passed_probes=passed_old,
+        failed_probes=tot - passed_old,
+        qa_recall=round(passed_old / tot, 4) if tot > 0 else 0.0,
+        cross_sentence_total=cross_tot,
+        cross_sentence_passed=cross_passed_old,
+        seam_integrity_rate=round(cross_passed_old / cross_tot, 4) if cross_tot > 0 else 1.0,
+        evaluations=evals_old,
+    )
+
+    # Metrics Candidate (New)
+    passed_new = sum(1 for e in evals_new if e.verdict == "PASS")
+    cross_passed_new = sum(1 for e in evals_new if e.is_cross_sentence and e.verdict == "PASS")
+    metrics_new = QASystemBlockMetrics(
+        system="new",
+        total_probes=tot,
+        passed_probes=passed_new,
+        failed_probes=tot - passed_new,
+        qa_recall=round(passed_new / tot, 4) if tot > 0 else 0.0,
+        cross_sentence_total=cross_tot,
+        cross_sentence_passed=cross_passed_new,
+        seam_integrity_rate=round(cross_passed_new / cross_tot, 4) if cross_tot > 0 else 1.0,
+        evaluations=evals_new,
+    )
+
+    return probes, metrics_old, metrics_new

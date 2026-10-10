@@ -27,6 +27,7 @@ from bookeeper.processing.cross_checker import (
     stitch_chunks_dedup_text,
     tiered_deduplicate_ideas,
 )
+from bookeeper.processing.qa_probe import QAProbeEvaluation, QAProbeItem
 from bookeeper.processing.deduplicator import EntityDeduplicator
 from bookeeper.processing.extractor import Concept
 from bookeeper.processing.ollama_pool import OllamaPool, OllamaServerNode
@@ -435,25 +436,50 @@ def test_print_block_comparison(capsys):
     """Test print_block_comparison outputs structured block data without errors."""
     c_a = Concept(name="Concept Alpha", category="C", summary="A", brief_description="Desc A")
     c_b = Concept(name="Concept Beta", category="C", summary="B", brief_description="Desc B")
-    oracle = [Concept(name="Concept Alpha", category="C", summary="A", brief_description="Oracle A")]
+    probes = [
+        QAProbeItem(
+            question_id=1,
+            question="What is Alpha?",
+            gold_answer="Alpha is core.",
+            is_cross_sentence=True,
+        )
+    ]
 
     eval_a = SystemBlockMetrics(
         system="old",
+        qa_recall=1.0,
         oracle_recall=1.0,
-        grounded_precision=1.0,
-        truncation_rate=0.0,
-        fail_ratio=0.0,
-        retained_oracle_ideas=["Concept Alpha"],
-        dropped_oracle_ideas=[],
+        seam_integrity_rate=1.0,
+        passed_probes_count=1,
+        total_probes_count=1,
+        evaluations=[
+            QAProbeEvaluation(
+                question_id=1,
+                question="What is Alpha?",
+                gold_answer="Alpha is core.",
+                is_cross_sentence=True,
+                predicted_answer="Alpha is core.",
+                verdict="PASS",
+            )
+        ],
     )
     eval_b = SystemBlockMetrics(
         system="new",
+        qa_recall=0.0,
         oracle_recall=0.0,
-        grounded_precision=0.0,
-        truncation_rate=0.0,
-        fail_ratio=1.0,
-        retained_oracle_ideas=[],
-        dropped_oracle_ideas=["Concept Alpha"],
+        seam_integrity_rate=0.0,
+        passed_probes_count=0,
+        total_probes_count=1,
+        evaluations=[
+            QAProbeEvaluation(
+                question_id=1,
+                question="What is Alpha?",
+                gold_answer="Alpha is core.",
+                is_cross_sentence=True,
+                predicted_answer="INSUFFICIENT_INFORMATION",
+                verdict="FAIL",
+            )
+        ],
     )
 
     print_block_comparison(
@@ -468,7 +494,7 @@ def test_print_block_comparison(capsys):
         union_len=150,
         ideas_old=[c_a],
         ideas_new=[c_b],
-        oracle_ideas=oracle,
+        probes=probes,
         eval_old=eval_a,
         eval_new=eval_b,
     )
@@ -480,7 +506,8 @@ def test_print_block_comparison(capsys):
     assert "BLOCK B" in captured.out
     assert "Concept Alpha" in captured.out
     assert "Concept Beta" in captured.out
-    assert "RETAINED" in captured.out
+    assert "PASS" in captured.out
+    assert "FAIL" in captured.out
 
 
 def test_run_cross_check_with_print_chunks(sample_graphs, mock_pool, capsys):

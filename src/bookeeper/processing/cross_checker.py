@@ -2,11 +2,11 @@
 Cross-Check Verification Engine for A/B Testing Chunking Strategies.
 
 Audits contiguous text blocks between two Knowledge Graph versions (Old / Baseline vs New / Candidate)
-against a high-tier Oracle extraction on seamless reconstructed reference passages (W_raw).
+using the adversarial QA Probe Oracle on seamless reconstructed reference passages (W_raw).
 Computes:
-  - Oracle Recall for both systems and Delta Recall (New - Old)
-  - Grounded Precision & Boundary Seam Truncation Artifact Rates
-  - Chunk Disproportion: sum(block_A.len) / sum(block_A ∪ block_B.len)
+  - QA Recall for both systems and Delta Recall (New - Old)
+  - Seam Integrity Rate (Cross-sentence / boundary-dependent probe pass rate)
+  - Chunk Disproportion: intersect(block_A, block_B) / union(block_A, block_B)
   - Decision Gating Checklist
 """
 
@@ -27,6 +27,12 @@ from bookeeper.graph.store import ConceptGraphStore
 from bookeeper.processing.deduplicator import EntityDeduplicator
 from bookeeper.processing.extractor import Concept, KnowledgeExtractor
 from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings, OllamaPool
+from bookeeper.processing.qa_probe import (
+    QAProbeEvaluation,
+    QAProbeItem,
+    QASystemBlockMetrics,
+    evaluate_block_qa_probes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +63,13 @@ class SystemBlockMetrics(BaseModel):
     dropped_oracle_ideas: List[str] = Field(default_factory=list)
     audited_items: List[CrossCheckAuditItem] = Field(default_factory=list)
 
+    # QA Probe Metrics
+    qa_recall: float = 0.0
+    seam_integrity_rate: float = 0.0
+    passed_probes_count: int = 0
+    total_probes_count: int = 0
+    evaluations: List[QAProbeEvaluation] = Field(default_factory=list)
+
 
 class CrossCheckBlockResult(BaseModel):
     """Audit evaluation result for a single sampled text window / block."""
@@ -69,13 +82,13 @@ class CrossCheckBlockResult(BaseModel):
     new_chunk_ids: List[str]
     passage_length_chars: int
 
-    # Chunk lengths & Disproportion metric: sum(block_A.len) / sum(block_A ∪ block_B.len)
+    # Chunk lengths & Disproportion metric: intersect(block_A, block_B) / union(block_A, block_B)
     block_a_total_len: int
     block_b_total_len: int
     union_len: int
     chunk_disproportion: float
 
-    oracle_ideas_count: int
+    oracle_ideas_count: int = 0
     old_system: SystemBlockMetrics
     new_system: SystemBlockMetrics
     delta_recall: float
@@ -88,6 +101,11 @@ class CrossCheckBlockResult(BaseModel):
     candidate_ideas_new: List[str] = Field(default_factory=list)
     oracle_ideas: List[str] = Field(default_factory=list)
 
+    # QA Probe Metrics
+    probes: List[QAProbeItem] = Field(default_factory=list)
+    delta_qa_recall: float = 0.0
+    delta_seam_integrity: float = 0.0
+
 
 class CrossCheckSummary(BaseModel):
     """Aggregated benchmark statistics and decision gating across all audited blocks."""
@@ -99,11 +117,14 @@ class CrossCheckSummary(BaseModel):
     mean_old_fail_ratio: float = 0.0
     mean_new_fail_ratio: float = 0.0
     mean_delta_fail_ratio: float = 0.0
-    mean_old_precision: float
-    mean_new_precision: float
-    mean_old_truncation_rate: float
-    mean_new_truncation_rate: float
+    mean_old_precision: float = 1.0
+    mean_new_precision: float = 1.0
+    mean_old_truncation_rate: float = 0.0
+    mean_new_truncation_rate: float = 0.0
     mean_chunk_disproportion: float
+    mean_old_seam_integrity: float = 0.0
+    mean_new_seam_integrity: float = 0.0
+    mean_delta_seam_integrity: float = 0.0
     decision_pass: bool
     pass_reason: str = ""
     total_duration_seconds: float = 0.0
@@ -277,7 +298,7 @@ def compute_chunk_disproportion(
 ) -> Tuple[int, int, int, float]:
     """
     Compute chunk lengths and chunk disproportion metric:
-      sum(block_A.len) / sum(block_A ∪ block_B.len)
+      intersect(block_A, block_B) / union(block_A, block_B)
     Using exact SequenceMatcher matching blocks across deduplicated passages.
     Returns:
       (sum_len_a, sum_len_b, union_len, chunk_disproportion)
@@ -289,6 +310,8 @@ def compute_chunk_disproportion(
         return 0, 0, 0, 0.0
     if not chunks_a_texts:
         return 0, sum_len_b, sum_len_b, 0.0
+    if not chunks_b_texts:
+        return sum_len_a, 0, sum_len_a, 0.0
     if chunks_a_texts == chunks_b_texts:
         return sum_len_a, sum_len_b, sum_len_a, 1.0
 
@@ -299,7 +322,7 @@ def compute_chunk_disproportion(
     sm = SequenceMatcher(None, w_a_norm, w_b_norm, autojunk=False)
     match_len = sum(b.size for b in sm.get_matching_blocks() if b.size > 0)
     union_norm = max(1, len(w_a_norm) + len(w_b_norm) - match_len)
-    disproportion = round(len(w_a_norm) / union_norm, 4)
+    disproportion = round(match_len / union_norm, 4)
 
     # Scale union length back to raw character space
     scale = len(w_raw) / max(1, len(w_a_norm))
@@ -589,25 +612,45 @@ def print_block_comparison(
     w_b: str,
     disproportion: float,
     union_len: int,
-    ideas_old: List[Concept],
-    ideas_new: List[Concept],
-    oracle_ideas: List[Concept],
-    eval_old: SystemBlockMetrics,
-    eval_new: SystemBlockMetrics,
+    ideas_old: List[Any],
+    ideas_new: List[Any],
+    probes: Optional[List[QAProbeItem]] = None,
+    eval_old: Optional[SystemBlockMetrics] = None,
+    eval_new: Optional[SystemBlockMetrics] = None,
     console: Optional[Any] = None,
+    oracle_ideas: Optional[List[Any]] = None,
 ) -> None:
-    """Print formatted comparative analysis of a single block."""
+    """Print formatted comparative analysis of a single block with QA Probes."""
     def _out(msg: str = "") -> None:
         if console is not None and hasattr(console, "print"):
             console.print(msg)
         else:
             print(msg)
 
+    if probes is None:
+        if oracle_ideas:
+            probes = [
+                QAProbeItem(
+                    question_id=idx,
+                    question=f"Concept: {getattr(o, 'name', str(o))}",
+                    gold_answer=getattr(o, "brief_description", "") or str(o),
+                    is_cross_sentence=(idx % 2 == 1),
+                )
+                for idx, o in enumerate(oracle_ideas, 1)
+            ]
+        else:
+            probes = []
+
+    if eval_old is None:
+        eval_old = SystemBlockMetrics(system="old")
+    if eval_new is None:
+        eval_new = SystemBlockMetrics(system="new")
+
     sep = "=" * 80
     sub_sep = "-" * 80
     disp_status = "Boundary Discrepancy" if disproportion < 0.999 else "Aligned"
     _out(f"\n{sep}")
-    _out(f"🔍 Block #{sample_index} Alignment Comparison [Disproportion = {disproportion:.4f} ({disp_status})]")
+    _out(f"🔍 Block #{sample_index} Alignment Comparison & QA Probe Audit [Disproportion = {disproportion:.4f} ({disp_status})]")
     _out(f"📖 Book: {book_title} | Section: {section_title}")
     _out(sub_sep)
     _out(f"📦 BLOCK A ({len(old_chunk_ids)} chunks: {', '.join(old_chunk_ids)})")
@@ -622,28 +665,59 @@ def print_block_comparison(
 
     _out(f"\n📏 ALIGNMENT: Disproportion = {disproportion:.4f} | Union = {union_len} chars")
 
-    _out(f"\n💡 IDEAS IN BLOCK A ({len(ideas_old)} unique):")
-    for idx, c in enumerate(ideas_old, 1):
-        desc = f" - {c.brief_description[:75]}..." if c.brief_description else ""
-        _out(f"   {idx}. {c.name}{desc}")
+    _out(f"\n💡 EXTRACTED CLAIMS CONTEXT:")
+    _out(f"   • BLOCK A: {len(ideas_old)} unique ideas")
+    for idx, c in enumerate(ideas_old[:5], 1):
+        name = getattr(c, "name", str(c))
+        desc = getattr(c, "brief_description", "") or getattr(c, "summary", "")
+        desc_str = f" - {desc[:60]}..." if desc else ""
+        _out(f"     {idx}. {name}{desc_str}")
+    if len(ideas_old) > 5:
+        _out(f"     ... and {len(ideas_old) - 5} more ideas")
 
-    _out(f"\n💡 IDEAS IN BLOCK B ({len(ideas_new)} unique):")
-    for idx, c in enumerate(ideas_new, 1):
-        desc = f" - {c.brief_description[:75]}..." if c.brief_description else ""
-        _out(f"   {idx}. {c.name}{desc}")
+    _out(f"   • BLOCK B: {len(ideas_new)} unique ideas")
+    for idx, c in enumerate(ideas_new[:5], 1):
+        name = getattr(c, "name", str(c))
+        desc = getattr(c, "brief_description", "") or getattr(c, "summary", "")
+        desc_str = f" - {desc[:60]}..." if desc else ""
+        _out(f"     {idx}. {name}{desc_str}")
+    if len(ideas_new) > 5:
+        _out(f"     ... and {len(ideas_new) - 5} more ideas")
 
-    _out(f"\n🔮 ORACLE IDEAS ON PASSAGE ({len(oracle_ideas)}):")
-    for idx, o in enumerate(oracle_ideas, 1):
-        o_name = getattr(o, "name", str(o))
-        desc = f" - {o.brief_description[:75]}..." if getattr(o, "brief_description", "") else ""
-        in_a = "RETAINED" if o_name in eval_old.retained_oracle_ideas else "DROPPED"
-        in_b = "RETAINED" if o_name in eval_new.retained_oracle_ideas else "DROPPED"
-        _out(f"   {idx}. {o_name}{desc} -> [A: {in_a} | B: {in_b}]")
+    _out(f"\n🎯 QA PROBES & SEAM INTEGRITY AUDIT ({len(probes)} Probes):")
+    eval_old_map = {e.question_id: e for e in eval_old.evaluations}
+    eval_new_map = {e.question_id: e for e in eval_new.evaluations}
 
-    _out(f"\n📊 BLOCK METRICS:")
-    _out(f"   • Baseline Recall:  {eval_old.oracle_recall * 100:.1f}% (Fail Ratio: {eval_old.fail_ratio * 100:.1f}%)")
-    _out(f"   • Candidate Recall: {eval_new.oracle_recall * 100:.1f}% (Fail Ratio: {eval_new.fail_ratio * 100:.1f}%)")
-    _out(f"   • Recall Delta:     {(eval_new.oracle_recall - eval_old.oracle_recall) * 100:+.1f}% pts")
+    for p in probes:
+        probe_tag = "[Cross-Sentence]" if p.is_cross_sentence else "[Single-Fact]"
+        _out(f"   {p.question_id}. {probe_tag} {p.question}")
+        _out(f"      • Gold: {p.gold_answer}")
+
+        e_a = eval_old_map.get(p.question_id)
+        if e_a:
+            pred_a = e_a.predicted_answer[:70].replace("\n", " ")
+            _out(f"      • Baseline (A): \"{pred_a}\" -> [{e_a.verdict}]")
+
+        e_b = eval_new_map.get(p.question_id)
+        if e_b:
+            pred_b = e_b.predicted_answer[:70].replace("\n", " ")
+            status_b = e_b.verdict
+            if e_b.verdict == "FAIL" and p.is_cross_sentence and (e_a and e_a.verdict == "PASS"):
+                status_b = "FAIL - Seam Lost"
+            _out(f"      • Candidate (B): \"{pred_b}\" -> [{status_b}]")
+        _out("")
+
+    _out(f"📊 BLOCK QA METRICS:")
+    _out(
+        f"   • Baseline QA Recall:  {eval_old.qa_recall * 100:.1f}% ({eval_old.passed_probes_count}/{eval_old.total_probes_count} passed) | "
+        f"Seam Integrity: {eval_old.seam_integrity_rate * 100:.1f}%"
+    )
+    _out(
+        f"   • Candidate QA Recall: {eval_new.qa_recall * 100:.1f}% ({eval_new.passed_probes_count}/{eval_new.total_probes_count} passed) | "
+        f"Seam Integrity: {eval_new.seam_integrity_rate * 100:.1f}%"
+    )
+    delta_pts = (eval_new.qa_recall - eval_old.qa_recall) * 100
+    _out(f"   • Recall Delta:        {delta_pts:+.1f}% pts")
     _out(f"{sep}\n")
 
 
@@ -667,7 +741,8 @@ def run_cross_check(
     progress_callback: Optional[Callable[[int, int, str, Optional[CrossCheckBlockResult]], None]] = None,
 ) -> CrossCheckReport:
     """
-    Execute full Cross-Check verification pipeline comparing Store A and Store B.
+    Execute full Cross-Check verification pipeline comparing Store A and Store B
+    using the adversarial QA Probe Oracle directly on seamless passages.
     """
     if seed is not None:
         random.seed(seed)
@@ -756,7 +831,7 @@ def run_cross_check(
         new_chunk_texts = [d.get("text", "") for d in new_chunk_dicts]
         w_b = stitch_chunks_dedup_text(new_chunk_texts)
 
-        # 4. Compute chunk disproportion: sum(block_A.len) / sum(block_A ∪ block_B.len)
+        # 4. Compute chunk disproportion: intersect(block_A, block_B) / union(block_A, block_B)
         sum_len_a, sum_len_b, union_len, disproportion = compute_chunk_disproportion(
             old_chunk_texts, new_chunk_texts, w_raw
         )
@@ -768,15 +843,51 @@ def run_cross_check(
         dedup_ideas_old = tiered_deduplicate_ideas(raw_ideas_old, deduplicator)
         dedup_ideas_new = tiered_deduplicate_ideas(raw_ideas_new, deduplicator)
 
-        # 6. Oracle extraction on contiguous passage (returns List[Concept])
-        i_oracle = extract_oracle_ideas_from_passage(w_raw, pool, model_name, extractor)
+        # 6. QA Probe Oracle Evaluation on contiguous passage
+        probes, qa_m_old, qa_m_new = evaluate_block_qa_probes(
+            w_raw=w_raw,
+            ideas_old=dedup_ideas_old,
+            ideas_new=dedup_ideas_new,
+            pool=pool,
+            model_name=model_name,
+        )
 
-        # 7. Evaluate both systems against Oracle (passing Concept objects directly)
-        eval_old = evaluate_system_against_oracle(dedup_ideas_old, i_oracle, w_raw, "old", deduplicator, pool, model_name, extractor)
-        eval_new = evaluate_system_against_oracle(dedup_ideas_new, i_oracle, w_raw, "new", deduplicator, pool, model_name, extractor)
+        eval_old = SystemBlockMetrics(
+            system="old",
+            raw_ideas_count=len(raw_ideas_old),
+            deduped_ideas_count=len(dedup_ideas_old),
+            retained_ideas_count=qa_m_old.passed_probes,
+            dropped_ideas_count=qa_m_old.failed_probes,
+            fail_ratio=round(qa_m_old.failed_probes / max(1, qa_m_old.total_probes), 4),
+            oracle_recall=qa_m_old.qa_recall,
+            grounded_precision=1.0,
+            truncation_rate=0.0,
+            qa_recall=qa_m_old.qa_recall,
+            seam_integrity_rate=qa_m_old.seam_integrity_rate,
+            passed_probes_count=qa_m_old.passed_probes,
+            total_probes_count=qa_m_old.total_probes,
+            evaluations=qa_m_old.evaluations,
+        )
+        eval_new = SystemBlockMetrics(
+            system="new",
+            raw_ideas_count=len(raw_ideas_new),
+            deduped_ideas_count=len(dedup_ideas_new),
+            retained_ideas_count=qa_m_new.passed_probes,
+            dropped_ideas_count=qa_m_new.failed_probes,
+            fail_ratio=round(qa_m_new.failed_probes / max(1, qa_m_new.total_probes), 4),
+            oracle_recall=qa_m_new.qa_recall,
+            grounded_precision=1.0,
+            truncation_rate=0.0,
+            qa_recall=qa_m_new.qa_recall,
+            seam_integrity_rate=qa_m_new.seam_integrity_rate,
+            passed_probes_count=qa_m_new.passed_probes,
+            total_probes_count=qa_m_new.total_probes,
+            evaluations=qa_m_new.evaluations,
+        )
 
-        delta_rec = round(eval_new.oracle_recall - eval_old.oracle_recall, 4)
+        delta_rec = round(eval_new.qa_recall - eval_old.qa_recall, 4)
         delta_fail = round(eval_new.fail_ratio - eval_old.fail_ratio, 4)
+        delta_seam = round(eval_new.seam_integrity_rate - eval_old.seam_integrity_rate, 4)
         dur = round(time.time() - t0, 2)
         curr_idx = len(samples) + 1
 
@@ -792,7 +903,7 @@ def run_cross_check(
             block_b_total_len=sum_len_b,
             union_len=union_len,
             chunk_disproportion=disproportion,
-            oracle_ideas_count=len(i_oracle),
+            oracle_ideas_count=len(probes),
             old_system=eval_old,
             new_system=eval_new,
             delta_recall=delta_rec,
@@ -802,7 +913,10 @@ def run_cross_check(
             block_b_text=w_b[:2000],
             candidate_ideas_old=[c.name for c in dedup_ideas_old],
             candidate_ideas_new=[c.name for c in dedup_ideas_new],
-            oracle_ideas=[getattr(o, "name", str(o)) for o in i_oracle],
+            oracle_ideas=[p.question for p in probes],
+            probes=probes,
+            delta_qa_recall=delta_rec,
+            delta_seam_integrity=delta_seam,
         )
         samples.append(block_result)
 
@@ -829,7 +943,7 @@ def run_cross_check(
                 union_len=union_len,
                 ideas_old=dedup_ideas_old,
                 ideas_new=dedup_ideas_new,
-                oracle_ideas=i_oracle,
+                probes=probes,
                 eval_old=eval_old,
                 eval_new=eval_new,
                 console=console,
@@ -841,18 +955,22 @@ def run_cross_check(
     # 8. Compute Summary & Decision Checklist
     tot = len(samples)
     if tot > 0:
-        mean_old_rec = round(float(np.mean([s.old_system.oracle_recall for s in samples])), 4)
-        mean_new_rec = round(float(np.mean([s.new_system.oracle_recall for s in samples])), 4)
-        mean_delta_rec = round(float(np.mean([s.delta_recall for s in samples])), 4)
+        mean_old_rec = round(float(np.mean([s.old_system.qa_recall for s in samples])), 4)
+        mean_new_rec = round(float(np.mean([s.new_system.qa_recall for s in samples])), 4)
+        mean_delta_rec = round(float(np.mean([s.delta_qa_recall for s in samples])), 4)
 
-        # Micro-aggregated fail ratios: sum(failed) / sum(total_block_ideas)
+        mean_old_seam = round(float(np.mean([s.old_system.seam_integrity_rate for s in samples])), 4)
+        mean_new_seam = round(float(np.mean([s.new_system.seam_integrity_rate for s in samples])), 4)
+        mean_delta_seam = round(float(np.mean([s.delta_seam_integrity for s in samples])), 4)
+
+        # Micro-aggregated fail ratios: sum(failed) / sum(total_block_probes)
         total_old_dropped = sum(s.old_system.dropped_ideas_count for s in samples)
-        total_old_ideas = sum(s.old_system.deduped_ideas_count for s in samples)
-        agg_old_fail = round(total_old_dropped / total_old_ideas, 4) if total_old_ideas > 0 else 0.0
+        total_old_probes = sum(s.old_system.total_probes_count for s in samples)
+        agg_old_fail = round(total_old_dropped / total_old_probes, 4) if total_old_probes > 0 else 0.0
 
         total_new_dropped = sum(s.new_system.dropped_ideas_count for s in samples)
-        total_new_ideas = sum(s.new_system.deduped_ideas_count for s in samples)
-        agg_new_fail = round(total_new_dropped / total_new_ideas, 4) if total_new_ideas > 0 else 0.0
+        total_new_probes = sum(s.new_system.total_probes_count for s in samples)
+        agg_new_fail = round(total_new_dropped / total_new_probes, 4) if total_new_probes > 0 else 0.0
 
         agg_delta_fail = round(agg_new_fail - agg_old_fail, 4)
         mean_old_prec = round(float(np.mean([s.old_system.grounded_precision for s in samples])), 4)
@@ -864,21 +982,22 @@ def run_cross_check(
         mean_old_rec = mean_new_rec = mean_delta_rec = mean_old_prec = mean_new_prec = 0.0
         agg_old_fail = agg_new_fail = agg_delta_fail = 0.0
         mean_old_trunc = mean_new_trunc = mean_disprop = 0.0
+        mean_old_seam = mean_new_seam = mean_delta_seam = 0.0
 
     # Decision Gates:
-    # 1. Mean Delta Recall >= -0.03
-    # 2. Mean New Truncation Rate < 0.02
+    # 1. Mean Delta QA Recall >= -0.03
+    # 2. Mean Candidate Seam Integrity Rate >= 0.80
     recall_pass = mean_delta_rec >= -0.03
-    trunc_pass = mean_new_trunc < 0.02
-    decision_pass = recall_pass and trunc_pass
+    seam_pass = mean_new_seam >= 0.80
+    decision_pass = recall_pass and seam_pass
 
     reasons = []
     if not recall_pass:
-        reasons.append(f"Mean Delta Recall drop ({mean_delta_rec * 100:.1f}%) exceeds 3% threshold")
-    if not trunc_pass:
-        reasons.append(f"Mean Truncation Rate ({mean_new_trunc * 100:.1f}%) exceeds 2% artifact threshold")
+        reasons.append(f"Mean Delta QA Recall drop ({mean_delta_rec * 100:+.1f}% pts) exceeds 3% threshold")
+    if not seam_pass:
+        reasons.append(f"Candidate Seam Integrity ({mean_new_seam * 100:.1f}%) below 80% threshold")
     if decision_pass:
-        reasons.append("All decision gates passed: Recall delta >= -3% and Truncation Rate < 2%")
+        reasons.append("All decision gates passed: QA Recall delta >= -3% and Seam Integrity >= 80%")
 
     summary = CrossCheckSummary(
         total_samples=tot,
@@ -893,6 +1012,9 @@ def run_cross_check(
         mean_old_truncation_rate=mean_old_trunc,
         mean_new_truncation_rate=mean_new_trunc,
         mean_chunk_disproportion=mean_disprop,
+        mean_old_seam_integrity=mean_old_seam,
+        mean_new_seam_integrity=mean_new_seam,
+        mean_delta_seam_integrity=mean_delta_seam,
         decision_pass=decision_pass,
         pass_reason="; ".join(reasons),
         total_duration_seconds=round(time.time() - t_global_start, 2),

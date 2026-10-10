@@ -1050,14 +1050,16 @@ class ABTestRunner:
 
         print(f"{'Total Contiguous Blocks Audited':<{col_w_m}} {sm['total_samples']:<{col_w_v}} {sm['total_samples']:<{col_w_v}} {'-':<{col_w_v}}")
         delta_rec_color = Colors.GREEN if sm['mean_delta_recall'] >= -0.03 else Colors.RED
-        print(f"{'Mean Oracle Recall (%)':<{col_w_m}} {sm['mean_old_recall']*100:.2f}%{'':<{col_w_v-8}} {sm['mean_new_recall']*100:.2f}%{'':<{col_w_v-8}} {delta_rec_color}{sm['mean_delta_recall']*100:+.2f}% pts{Colors.RESET}")
+        print(f"{'Mean QA Recall (%)':<{col_w_m}} {sm['mean_old_recall']*100:.2f}%{'':<{col_w_v-8}} {sm['mean_new_recall']*100:.2f}%{'':<{col_w_v-8}} {delta_rec_color}{sm['mean_delta_recall']*100:+.2f}% pts{Colors.RESET}")
+        seam_color = Colors.GREEN if sm.get('mean_new_seam_integrity', 0.0) >= 0.80 else Colors.RED
+        print(f"{'Mean Seam Integrity (Cross-Sentence) (%)':<{col_w_m}} {sm.get('mean_old_seam_integrity', 0.0)*100:.2f}%{'':<{col_w_v-8}} {seam_color}{sm.get('mean_new_seam_integrity', 0.0)*100:.2f}%{Colors.RESET}{'':<{col_w_v-8}} {(sm.get('mean_new_seam_integrity', 0.0)-sm.get('mean_old_seam_integrity', 0.0))*100:+.2f}% pts")
         delta_fail_color = Colors.GREEN if sm.get('mean_delta_fail_ratio', 0.0) <= 0 else Colors.RED
         print(f"{'Aggregate Fail Ratio [sum(Failed)/sum(Total)] (%)':<{col_w_m}} {sm.get('mean_old_fail_ratio', 0.0)*100:.2f}%{'':<{col_w_v-8}} {sm.get('mean_new_fail_ratio', 0.0)*100:.2f}%{'':<{col_w_v-8}} {delta_fail_color}{sm.get('mean_delta_fail_ratio', 0.0)*100:+.2f}% pts{Colors.RESET}")
         print(f"{'Mean Grounded Precision (%)':<{col_w_m}} {sm['mean_old_precision']*100:.2f}%{'':<{col_w_v-8}} {sm['mean_new_precision']*100:.2f}%{'':<{col_w_v-8}} {(sm['mean_new_precision']-sm['mean_old_precision'])*100:+.2f}% pts")
         trunc_color = Colors.GREEN if sm['mean_new_truncation_rate'] < 0.02 else Colors.RED
         print(f"{'Boundary Truncation Artifact Rate (%)':<{col_w_m}} {sm['mean_old_truncation_rate']*100:.2f}%{'':<{col_w_v-8}} {trunc_color}{sm['mean_new_truncation_rate']*100:.2f}%{Colors.RESET}{'':<{col_w_v-8}} {(sm['mean_new_truncation_rate']-sm['mean_old_truncation_rate'])*100:+.2f}% pts")
         print("-" * len(sep))
-        print(f"{'Mean Chunk Disproportion [sum(A)/sum(A∪B)]':<{col_w_m}} {'-':<{col_w_v}} {Colors.BOLD}{Colors.CYAN}{sm['mean_chunk_disproportion']:.4f}{Colors.RESET}{'':<{col_w_v-8}} {'-':<{col_w_v}}")
+        print(f"{'Mean Chunk Disproportion [intersect(A,B)/union(A,B)]':<{col_w_m}} {'-':<{col_w_v}} {Colors.BOLD}{Colors.CYAN}{sm['mean_chunk_disproportion']:.4f}{Colors.RESET}{'':<{col_w_v-8}} {'-':<{col_w_v}}")
 
         gate_badge = f"{Colors.BOLD}{Colors.GREEN}PASS{Colors.RESET}" if sm['decision_pass'] else f"{Colors.BOLD}{Colors.RED}FAIL{Colors.RESET}"
         print(f"{'Decision Gating Checklist':<{col_w_m}} {'-':<{col_w_v}} {gate_badge:<{col_w_v}} {sm['pass_reason']}")
@@ -1083,16 +1085,17 @@ class ABTestRunner:
             "",
             "| Metric | Baseline (A) | Candidate (B) | Delta (B - A) | Passing Criteria |",
             "| :--- | :--- | :--- | :--- | :--- |",
-            f"| Mean Oracle Recall | {sm.get('mean_old_recall', 0.0)*100:.2f}% | {sm.get('mean_new_recall', 0.0)*100:.2f}% | {sm.get('mean_delta_recall', 0.0)*100:+.2f}% pts | Mean ΔRecall >= -3% |",
+            f"| Mean QA Recall | {sm.get('mean_old_recall', 0.0)*100:.2f}% | {sm.get('mean_new_recall', 0.0)*100:.2f}% | {sm.get('mean_delta_recall', 0.0)*100:+.2f}% pts | Mean ΔRecall >= -3% |",
+            f"| Mean Seam Integrity (Cross-Sentence) | {sm.get('mean_old_seam_integrity', 0.0)*100:.2f}% | {sm.get('mean_new_seam_integrity', 0.0)*100:.2f}% | {(sm.get('mean_new_seam_integrity', 0.0)-sm.get('mean_old_seam_integrity', 0.0))*100:+.2f}% pts | Seam Integrity >= 80% |",
             f"| Aggregate Fail Ratio [sum(Failed)/sum(Total)] | {sm.get('mean_old_fail_ratio', 0.0)*100:.2f}% | {sm.get('mean_new_fail_ratio', 0.0)*100:.2f}% | {sm.get('mean_delta_fail_ratio', 0.0)*100:+.2f}% pts | Lower is better |",
             f"| Mean Grounded Precision | {sm.get('mean_old_precision', 0.0)*100:.2f}% | {sm.get('mean_new_precision', 0.0)*100:.2f}% | {(sm.get('mean_new_precision', 0.0)-sm.get('mean_old_precision', 0.0))*100:+.2f}% pts | Contextually Supported |",
             f"| Boundary Truncation Artifact Rate | {sm.get('mean_old_truncation_rate', 0.0)*100:.2f}% | {sm.get('mean_new_truncation_rate', 0.0)*100:.2f}% | {(sm.get('mean_new_truncation_rate', 0.0)-sm.get('mean_old_truncation_rate', 0.0))*100:+.2f}% pts | Mean Artifact Rate < 2% |",
-            f"| Chunk Disproportion [sum(A)/sum(A∪B)] | - | **{sm.get('mean_chunk_disproportion', 0.0):.4f}** | - | Ratio sum(A.len)/sum(A∪B.len) |",
+            f"| Chunk Disproportion [intersect(A,B)/union(A,B)] | - | **{sm.get('mean_chunk_disproportion', 0.0):.4f}** | - | Ratio intersect(A,B)/union(A,B) |",
             "",
             "### 📊 Audited Block Samples Breakdown (Top 10)",
             "",
-            "| Block # | Book / Section | Passage Chars | Disproportion | Recall (A) | Recall (B) | ΔRecall | Fail (A) | Fail (B) | ΔFail | Truncation Rate (B) |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+            "| Block # | Book / Section | Passage Chars | Disproportion | QA Recall (A) | QA Recall (B) | ΔRecall | Seam Int (B) | Fail (A) | Fail (B) | ΔFail |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
         ]
         for s in data.get("samples", [])[:10]:
             lines.append(
@@ -1631,7 +1634,7 @@ Examples:
         "--print-chunks",
         type=int,
         default=0,
-        help="Print text & ideas comparison for up to X blocks when disproportion < 1.0 (default: 0).",
+        help="Print text & QA probes comparison for up to X blocks (default: 0).",
     )
     parser.add_argument(
         "--books",

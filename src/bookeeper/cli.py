@@ -68,6 +68,13 @@ from bookeeper.processing.verifier import (
     CrossCheckReport,
     CrossCheckBlockResult,
 )
+from bookeeper.backup import (
+    clean_knowledge_artifacts,
+    create_backup,
+    detect_archive_format,
+    inspect_backup,
+    restore_backup,
+)
 from bookeeper.rag.lightrag_engine import LightRAGEngine
 
 app = typer.Typer(
@@ -4470,6 +4477,315 @@ def rebuild_graph_command(
             border_style="green",
         )
     )
+
+
+@app.command("backup")
+def backup_command(
+    destination: Optional[Path] = typer.Argument(
+        None,
+        help="Optional destination archive file path (e.g. backup.zip, backup.7z) or target directory.",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        "--destination",
+        help="Alternative option for destination archive path or target directory.",
+    ),
+    format_type: Optional[str] = typer.Option(
+        None,
+        "--format",
+        "-f",
+        help="Archive compression format: 'zip' or '7z'. Default: auto-detected from filename or 'zip'.",
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None,
+        "--output-dir",
+        help="Source directory containing knowledge artifacts to backup (default: configured output_dir).",
+    ),
+    config_path: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to config.yaml.",
+    ),
+    calibre_path: Optional[Path] = typer.Option(
+        None,
+        "--calibre-path",
+        help="Path to Calibre library.",
+    ),
+    no_chunks: bool = typer.Option(
+        False,
+        "--no-chunks",
+        help="Exclude cached chunks directory from the backup archive.",
+    ),
+    no_obsidian: bool = typer.Option(
+        False,
+        "--no-obsidian",
+        help="Exclude Obsidian vault notes from the backup archive.",
+    ),
+    no_states: bool = typer.Option(
+        False,
+        "--no-states",
+        help="Exclude per-book state checkpoints (.book_states) from the backup archive.",
+    ),
+    no_lightrag: bool = typer.Option(
+        False,
+        "--no-lightrag",
+        help="Exclude LightRAG database directory from the backup archive.",
+    ),
+):
+    """
+    Create a compressed backup archive (.zip or .7z) of the current knowledge graph,
+    Obsidian vault, book states, chunks, and progress checkpoints.
+    """
+    destination = _resolve_opt(destination)
+    output = _resolve_opt(output)
+    format_type = _resolve_opt(format_type)
+    output_dir = _resolve_opt(output_dir)
+    config_path = _resolve_opt(config_path)
+    calibre_path = _resolve_opt(calibre_path)
+    no_chunks = _resolve_opt(no_chunks, False)
+    no_obsidian = _resolve_opt(no_obsidian, False)
+    no_states = _resolve_opt(no_states, False)
+    no_lightrag = _resolve_opt(no_lightrag, False)
+
+    target_dest = destination or output
+
+    cfg = _get_effective_settings(config_path, calibre_path)
+    source_dir = Path(output_dir).expanduser().resolve() if output_dir else cfg.resolved_output_dir
+
+    if not source_dir.is_dir():
+        console.print(f"[bold red]Source output directory not found:[/bold red] {source_dir}")
+        raise typer.Exit(1)
+
+    custom_dirs = {
+        "chunks_dir": cfg.resolved_chunks_dir,
+        "state_file": cfg.resolved_state_file,
+    }
+
+    t0 = time.perf_counter()
+    console.print(f"[bold cyan]Creating knowledge backup from [bold white]{source_dir}[/bold white]...[/bold cyan]")
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=30),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        backup_task = progress.add_task("Archiving knowledge files...", total=1)
+
+        def _on_progress(completed: int, total: int, fname: str):
+            short_name = (fname[:32] + "...") if len(fname) > 35 else fname
+            progress.update(
+                backup_task,
+                total=total,
+                completed=completed,
+                description=f"Archiving: [cyan]{short_name}[/cyan]",
+            )
+
+        try:
+            result = create_backup(
+                source_dir=source_dir,
+                destination=Path(target_dest) if target_dest else None,
+                format_type=format_type,
+                include_chunks=not no_chunks,
+                include_obsidian=not no_obsidian,
+                include_states=not no_states,
+                include_lightrag=not no_lightrag,
+                custom_dirs=custom_dirs,
+                progress_callback=_on_progress,
+            )
+        except Exception as e:
+            console.print(f"[bold red]Failed to create backup:[/bold red] {e}")
+            raise typer.Exit(1)
+
+    elapsed = time.perf_counter() - t0
+    dest_path = result["destination"]
+    comp_bytes = result["compressed_bytes"]
+    uncomp_bytes = result["uncompressed_bytes"]
+    comp_ratio = ((1.0 - (comp_bytes / uncomp_bytes)) * 100) if uncomp_bytes > 0 else 0.0
+
+    table = Table(title="Knowledge Backup Summary", border_style="green")
+    table.add_column("Property", style="bold")
+    table.add_column("Details", style="cyan")
+
+    table.add_row("Backup Archive", str(dest_path))
+    table.add_row("Format", result["format"].upper())
+    table.add_row("Total Files Archived", f"{result['total_files']:,}")
+    table.add_row("Uncompressed Data Size", f"{uncomp_bytes / (1024 * 1024):.2f} MB ({uncomp_bytes:,} bytes)")
+    table.add_row("Compressed Archive Size", f"{comp_bytes / (1024 * 1024):.2f} MB ({comp_bytes:,} bytes)")
+    table.add_row("Compression Space Saved", f"{comp_ratio:.1f}%")
+    table.add_row("Duration", f"{elapsed:.2f}s")
+    console.print("\n", table)
+    console.print(f"[bold green]✓ Successfully created knowledge backup at:[/bold green] [bold cyan]{dest_path}[/bold cyan]\n")
+
+
+@app.command("restore")
+def restore_command(
+    archive_path: Optional[Path] = typer.Argument(
+        None,
+        help="Path to the backup archive (.zip or .7z) to restore from.",
+    ),
+    from_archive: Optional[Path] = typer.Option(
+        None,
+        "--from",
+        "-i",
+        "--input",
+        "--archive",
+        help="Alternative option for backup archive path.",
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None,
+        "--output-dir",
+        "-o",
+        help="Target directory to restore knowledge artifacts into (default: configured output_dir).",
+    ),
+    config_path: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to config.yaml.",
+    ),
+    calibre_path: Optional[Path] = typer.Option(
+        None,
+        "--calibre-path",
+        help="Path to Calibre library.",
+    ),
+    clean: bool = typer.Option(
+        False,
+        "--clean",
+        help="Wipe existing knowledge graph, Obsidian vault, chunks, and book states in destination before restoring.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Inspect archive contents and display summary table without writing files.",
+    ),
+):
+    """
+    Restore knowledge graph, Obsidian vault, book states, chunks, and checkpoints
+    from a backup archive (.zip or .7z).
+    """
+    archive_path = _resolve_opt(archive_path)
+    from_archive = _resolve_opt(from_archive)
+    output_dir = _resolve_opt(output_dir)
+    config_path = _resolve_opt(config_path)
+    calibre_path = _resolve_opt(calibre_path)
+    clean = _resolve_opt(clean, False)
+    dry_run = _resolve_opt(dry_run, False)
+
+    target_archive = archive_path or from_archive
+    if not target_archive:
+        console.print("[bold red]Please specify the archive file path to restore from.[/bold red]")
+        console.print("[dim]Usage: bookeeper restore <path_to_backup.zip|.7z> [--output-dir <path>] [--clean][/dim]")
+        raise typer.Exit(1)
+
+    archive_file = Path(target_archive).expanduser().resolve()
+    if not archive_file.is_file():
+        console.print(f"[bold red]Backup archive not found:[/bold red] {archive_file}")
+        raise typer.Exit(1)
+
+    cfg = _get_effective_settings(config_path, calibre_path)
+    target_dir = Path(output_dir).expanduser().resolve() if output_dir else cfg.resolved_output_dir
+
+    if dry_run:
+        console.print(f"[bold cyan]Inspecting archive [bold white]{archive_file}[/bold white] (Dry Run)...[/bold cyan]")
+        try:
+            info = inspect_backup(archive_file)
+        except Exception as e:
+            console.print(f"[bold red]Failed to inspect archive:[/bold red] {e}")
+            raise typer.Exit(1)
+
+        table = Table(title=f"Archive Inspection: {archive_file.name}", border_style="cyan")
+        table.add_column("Category", style="bold")
+        table.add_column("Count", justify="right", style="cyan")
+        for cat, cnt in info["categories"].items():
+            table.add_row(cat.replace("_", " ").title(), str(cnt))
+        table.add_row("Total Files", f"{info['total_files']:,}", style="bold green")
+        table.add_row("Compressed Size", f"{info['compressed_bytes'] / (1024 * 1024):.2f} MB")
+        table.add_row("Uncompressed Size", f"{info['uncompressed_bytes'] / (1024 * 1024):.2f} MB")
+        console.print("\n", table)
+        return
+
+    t0 = time.perf_counter()
+    if clean:
+        console.print(f"[bold yellow]Wiping existing knowledge artifacts in {target_dir} before restore...[/bold yellow]")
+
+    console.print(f"[bold cyan]Restoring knowledge artifacts into [bold white]{target_dir}[/bold white]...[/bold cyan]")
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=30),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        restore_task = progress.add_task("Restoring knowledge files...", total=1)
+
+        def _on_progress(completed: int, total: int, fname: str):
+            short_name = (fname[:32] + "...") if len(fname) > 35 else fname
+            progress.update(
+                restore_task,
+                total=total,
+                completed=completed,
+                description=f"Restoring: [cyan]{short_name}[/cyan]",
+            )
+
+        try:
+            result = restore_backup(
+                archive_path=archive_file,
+                target_dir=target_dir,
+                clean=clean,
+                dry_run=False,
+                progress_callback=_on_progress,
+            )
+        except Exception as e:
+            console.print(f"[bold red]Failed to restore archive:[/bold red] {e}")
+            raise typer.Exit(1)
+
+    elapsed = time.perf_counter() - t0
+    res_bytes = result["bytes_restored"]
+    res_files = result["files_restored"]
+
+    table = Table(title="Knowledge Restoration Summary", border_style="green")
+    table.add_column("Property", style="bold")
+    table.add_column("Details", style="cyan")
+
+    table.add_row("Source Archive", str(archive_file))
+    table.add_row("Target Directory", str(target_dir))
+    table.add_row("Format", result["format"].upper())
+    if clean:
+        cl = result.get("cleaned", {})
+        table.add_row(
+            "Clean Mode",
+            f"✓ Purged {cl.get('files_removed', 0)} old file(s), {cl.get('dirs_removed', 0)} old folder(s)",
+        )
+    table.add_row("Files Restored", f"{res_files:,}")
+    table.add_row("Data Restored", f"{res_bytes / (1024 * 1024):.2f} MB ({res_bytes:,} bytes)")
+    table.add_row("Duration", f"{elapsed:.2f}s")
+
+    # If knowledge_graph.json is restored, verify integrity
+    kg_file = target_dir / "knowledge_graph.json"
+    if kg_file.is_file():
+        try:
+            temp_store = ConceptGraphStore()
+            temp_store.load(kg_file)
+            st = temp_store.stats()
+            table.add_row(
+                "Knowledge Graph Verification",
+                f"[bold green]Valid[/bold green] ({st['total_nodes']:,} nodes, {st['total_edges']:,} edges)",
+            )
+        except Exception as e:
+            table.add_row("Knowledge Graph Verification", f"[yellow]Could not parse graph ({e})[/yellow]")
+
+    console.print("\n", table)
+    console.print(f"[bold green]✓ Knowledge successfully restored to:[/bold green] [bold cyan]{target_dir}[/bold cyan]\n")
 
 
 if __name__ == "__main__":

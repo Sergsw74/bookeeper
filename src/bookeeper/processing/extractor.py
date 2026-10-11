@@ -126,6 +126,16 @@ class Concept(BaseModel):
     def summary(self, val: str) -> None:
         self.brief_description = val
 
+    @property
+    def idea_type(self) -> str:
+        """Backward-compatible alias for category / idea_type."""
+        return self.category
+
+    @property
+    def source_quote(self) -> Optional[str]:
+        """Backward-compatible alias for supporting_quote."""
+        return self.supporting_quote
+
 
 class ExtractedIdea(BaseModel):
     """

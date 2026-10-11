@@ -55,6 +55,7 @@ bookeeper/
 ├── src/
 │   └── bookeeper/
 │       ├── cli.py            # Typer / Rich CLI commands with live progress indicators
+│       ├── backup.py         # Knowledge backup & restoration engine (ZIP and 7-Zip)
 │       ├── config.py         # Pydantic v2 settings loader with server capabilities & aliases
 │       ├── calibre/          # SQLite reader & EPUB/PDF parser
 │       │   ├── client.py     # Calibre library client & local DB SSD staging
@@ -334,6 +335,59 @@ bookeeper rebuild-graph --limit 5
 - **Clean Slate**: Automatically wipes existing `knowledge_graph.json`, `knowledge_graph.graphml`, Obsidian notes, and Neo4j database before rebuilding.
 - **Zero Inferences**: Directly loads extracted concepts, quotes, and chunks from disk, reconstructing books, sections, chunks, grounding links, idea relations, and sequential links in seconds.
 - **Preserves Skipped Books**: Re-initializes checkpoint completions while preserving memorized skipped formats.
+
+---
+
+### 📦 Knowledge Backup & Restoration (`bookeeper backup` / `bookeeper restore`)
+
+Create portable, compressed archives (`.zip` or `.7z`) of your entire extracted knowledge base, or restore into a clean output directory without re-processing books:
+
+- **What is Preserved**:
+  - **Knowledge Graph**: `knowledge_graph.json` and `knowledge_graph.graphml`.
+  - **Obsidian Vault**: The complete Markdown notes structure (`00_Index.md`, `Books/`, `Sections/`, `Concepts/`).
+  - **Book States**: All per-book extraction states in `.book_states/` (enabling instant offline `rebuild-graph`).
+  - **Persistent Chunks**: Pre-computed semantic chunks in `chunks/` (for instant verification and RAG indexing).
+  - **Checkpoint State**: `.bookeeper_state.json` (tracking completed and skipped book IDs).
+  - **Verification Reports**: Factual grounding and cross-check reports (`verification_report.json`, `cross_check_report.json`).
+  - **Safety**: Automatically excludes raw downloaded EPUBs (`calibre_ingest`), temporary databases (`.staged_metadata.db`), and OS caches (`.DS_Store`).
+
+#### Creating Backups (`bookeeper backup`)
+
+```bash
+# 1. Create a default timestamped ZIP backup in the current directory:
+bookeeper backup
+# Output: ./knowledge_backup_YYYYMMDD_HHMMSS.zip
+
+# 2. Create a backup at a specific file path or target directory:
+bookeeper backup /path/to/my_backup.zip
+bookeeper backup -o ./backups/
+
+# 3. Create a high-compression 7-Zip backup (.7z):
+bookeeper backup my_backup.7z
+bookeeper backup --format 7z
+
+# 4. Backup with specific exclusions (e.g. omit chunks or obsidian notes):
+bookeeper backup --no-chunks
+bookeeper backup --no-obsidian
+```
+
+#### Restoring Backups (`bookeeper restore`)
+
+```bash
+# 1. Restore from a backup archive into the default output directory:
+bookeeper restore /path/to/knowledge_backup_20261010_120000.zip
+
+# 2. Clean restore (wipes existing knowledge graph, vault, chunks, and states before extracting):
+bookeeper restore my_backup.7z --clean
+
+# 3. Restore to a custom output directory:
+bookeeper restore my_backup.zip --output-dir ./different_output
+
+# 4. Dry-run inspection (view contents, categories, and compression metrics without extracting):
+bookeeper restore my_backup.7z --dry-run
+```
+
+---
 
 ### 📤 Standalone Exporters (No Book Re-processing)
 

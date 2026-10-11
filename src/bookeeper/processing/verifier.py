@@ -3,6 +3,7 @@ Knowledge graph factual verification and discrepancy audit engine.
 Audits extracted ideas and concepts against source text chunks using a dedicated LLM model.
 """
 
+import datetime
 import json
 import logging
 import math
@@ -12,7 +13,8 @@ import shutil
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from langchain_core.embeddings import Embeddings
@@ -63,6 +65,8 @@ class VerificationResult(BaseModel):
     explanation: str = Field(
         description="Clear, concise explanation (1-2 sentences) of why the chunk supports the idea or why it represents a discrepancy."
     )
+    raw_prompt: Optional[str] = None
+    raw_response: Optional[str] = None
 
 
 class VerificationItem(BaseModel):
@@ -78,6 +82,10 @@ class VerificationItem(BaseModel):
     section_title: str = "Unknown"
     quote: str = ""
     chunk_snippet: str = ""
+    chunk_text: Optional[str] = None
+    sentences: List[str] = Field(default_factory=list)
+    raw_prompt: Optional[str] = None
+    raw_response: Optional[str] = None
     is_supported: bool
     confidence: float
     explanation: str
@@ -128,6 +136,14 @@ class ChunkAuditItem(BaseModel):
     book_title: str = "Unknown"
     section_title: str = "Unknown"
     chunk_text_snippet: str = ""
+
+    # Full text context and sentence breakdown
+    chunk_text: Optional[str] = None
+    sentences: List[str] = Field(default_factory=list)
+    formatted_claims_context: Optional[str] = None
+    probe_generation_prompt: Optional[str] = None
+    probe_generation_response: Optional[str] = None
+    ideas_details: List[Dict[str, Any]] = Field(default_factory=list)
 
     # Concept ideas in graph
     original_ideas: List[str] = Field(default_factory=list)
@@ -658,14 +674,20 @@ class IdeaVerifier:
             HumanMessage(content=user_content),
         ]
 
+        raw_prompt = f"{system_prompt}\n\n{user_content}"
         try:
-            return self._execute_structured_invoke(messages)
+            res = self._execute_structured_invoke(messages)
+            if res.raw_prompt is None:
+                res.raw_prompt = raw_prompt
+            return res
         except Exception as e:
             logger.warning(f"Verification call failed for '{idea_name}' on chunk: {e}")
             return VerificationResult(
                 is_supported=False,
                 confidence=0.0,
                 explanation=f"LLM verification error across server pool: {e}",
+                raw_prompt=raw_prompt,
+                raw_response=f"Error: {e}",
             )
 
 
@@ -910,6 +932,8 @@ def verify_graph(
             subsequent_context=task_item.get("subsequent_context", ""),
         )
         server_lbl = getattr(_thread_local, "last_used_server", None)
+        c_text = task_item["chunk_text"]
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", c_text) if s.strip()]
         return VerificationItem(
             idea_name=task_item["idea_name"],
             idea_category=task_item["idea_category"],
@@ -920,7 +944,11 @@ def verify_graph(
             book_title=task_item["book_title"],
             section_title=task_item["section_title"],
             quote=task_item["quote"],
-            chunk_snippet=task_item["chunk_text"][:250].strip() + ("..." if len(task_item["chunk_text"]) > 250 else ""),
+            chunk_snippet=c_text[:250].strip() + ("..." if len(c_text) > 250 else ""),
+            chunk_text=c_text,
+            sentences=sentences,
+            raw_prompt=res.raw_prompt,
+            raw_response=res.raw_response,
             is_supported=res.is_supported,
             confidence=res.confidence,
             explanation=res.explanation,
@@ -1563,6 +1591,23 @@ def verify_chunks(
             metrics = None
 
         dur = round(time.time() - t_start, 2)
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        ideas_details = [
+            {
+                "name": c.name,
+                "category": getattr(c, "category", "Concept"),
+                "brief_description": (getattr(c, "brief_description", "") or getattr(c, "summary", "") or "").strip(),
+                "detailed_explanation": (getattr(c, "detailed_explanation", "") or "").strip(),
+                "quote": (getattr(c, "quote", "") or getattr(c, "supporting_quote", "") or "").strip(),
+            }
+            for c in orig_concepts
+        ]
+        probe_gen_prompt = None
+        probe_gen_response = None
+        if assertions:
+            probe_gen_prompt = getattr(assertions[0], "raw_prompt", None)
+            probe_gen_response = getattr(assertions[0], "raw_response", None)
+        formatted_claims = getattr(metrics, "formatted_claims_context", None) if metrics else None
 
         if metrics is not None:
             missed_assertions = [
@@ -1589,6 +1634,12 @@ def verify_chunks(
                 book_title=btitle,
                 section_title=stitle,
                 chunk_text_snippet=text[:150],
+                chunk_text=text,
+                sentences=sentences,
+                formatted_claims_context=formatted_claims,
+                probe_generation_prompt=probe_gen_prompt,
+                probe_generation_response=probe_gen_response,
+                ideas_details=ideas_details,
                 original_ideas=[c.name for c in orig_concepts],
                 oracle_ideas=[getattr(a, "question", None) or a.assertion for a in assertions],
                 probes=assertions,
@@ -1626,6 +1677,12 @@ def verify_chunks(
                 book_title=btitle,
                 section_title=stitle,
                 chunk_text_snippet=text[:150],
+                chunk_text=text,
+                sentences=sentences,
+                formatted_claims_context=None,
+                probe_generation_prompt=None,
+                probe_generation_response=None,
+                ideas_details=ideas_details,
                 original_ideas=[c.name for c in orig_concepts],
                 oracle_ideas=[],
                 probes=[],
@@ -1743,3 +1800,340 @@ def verify_chunks(
         discrepancy_examples=discrepancy_examples,
         omission_examples=discrepancy_examples,
     )
+
+
+def export_verification_stats(
+    report: Any,
+    path: Union[str, Path],
+    mode: Optional[str] = None,
+    model_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Export clean statistical summary file (e.g. verification_stats.json)
+    standardized across idea verification, chunk verification, and cross-check.
+    Used for A/B testing comparing Model A versus Model B.
+    """
+    eff_mode = mode or getattr(report, "mode", "ideas")
+    stats_obj = getattr(report, "stats", None)
+    if stats_obj is not None:
+        stats_dict = (
+            stats_obj.model_dump()
+            if hasattr(stats_obj, "model_dump")
+            else (stats_obj.__dict__ if hasattr(stats_obj, "__dict__") else dict(stats_obj))
+        )
+    elif isinstance(report, dict) and "stats" in report:
+        stats_dict = report["stats"]
+    else:
+        stats_dict = {}
+
+    eff_model = (
+        model_name
+        or (stats_obj and getattr(stats_obj, "model_name", None))
+        or stats_dict.get("model_name")
+        or "unknown"
+    )
+    duration = (
+        (stats_obj and getattr(stats_obj, "total_duration_seconds", 0.0))
+        or stats_dict.get("total_duration_seconds", 0.0)
+    )
+
+    stats_data = {
+        "mode": eff_mode,
+        "model_name": eff_model,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "duration_seconds": duration,
+        "stats": stats_dict,
+    }
+    p = Path(path).expanduser().resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(stats_data, f, indent=2, ensure_ascii=False)
+    return stats_data
+
+
+def export_verification_debug(
+    report: Any,
+    path: Union[str, Path],
+    mode: Optional[str] = None,
+    model_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Export comprehensive debug JSON (e.g. verification_debug.json) containing:
+    - Raw request prompts and raw responses for verification
+    - Every sentence and every question/assertion evaluated
+    - Full context provided within the requests (full chunk text, formatted ideas claims context)
+    - Detailed evaluations and outcomes
+    """
+    eff_mode = mode or getattr(report, "mode", "ideas")
+    stats_obj = getattr(report, "stats", None)
+    if stats_obj is not None:
+        stats_dict = (
+            stats_obj.model_dump()
+            if hasattr(stats_obj, "model_dump")
+            else (stats_obj.__dict__ if hasattr(stats_obj, "__dict__") else dict(stats_obj))
+        )
+    elif isinstance(report, dict) and "stats" in report:
+        stats_dict = report["stats"]
+    else:
+        stats_dict = {}
+
+    eff_model = (
+        model_name
+        or (stats_obj and getattr(stats_obj, "model_name", None))
+        or stats_dict.get("model_name")
+        or "unknown"
+    )
+
+    debug_items = []
+
+    if eff_mode == "chunk" or hasattr(report, "audited_chunks"):
+        chunks = getattr(report, "audited_chunks", [])
+        if not chunks and isinstance(report, dict):
+            chunks = report.get("audited_chunks", [])
+
+        for it in chunks:
+            if isinstance(it, dict):
+                cid = it.get("chunk_id", "")
+                bid = it.get("book_id")
+                btitle = it.get("book_title", "Unknown")
+                stitle = it.get("section_title", "Unknown")
+                ctext = it.get("chunk_text") or it.get("chunk_text_snippet", "")
+                sents = it.get("sentences", [])
+                ideas_details = it.get("ideas_details", [])
+                claims_ctx = it.get("formatted_claims_context")
+                probe_prompt = it.get("probe_generation_prompt")
+                probe_resp = it.get("probe_generation_response")
+                probes = it.get("probes") or it.get("assertions", [])
+                evals = it.get("evaluations", [])
+                qa_recall = it.get("qa_recall", 0.0)
+                net_integrity = it.get("net_integrity_score", 0.0)
+                calibrated_fid = it.get("calibrated_fidelity", 0.0)
+                seam_rate = it.get("seam_integrity_rate", 1.0)
+                sup_cnt = it.get("supported_count", 0)
+                not_cnt = it.get("not_mentioned_count", 0)
+                against_cnt = it.get("against_count", 0)
+                tot_probes = it.get("total_probes", 0)
+                dur = it.get("duration_seconds", 0.0)
+                server = it.get("server_node")
+            else:
+                cid = it.chunk_id
+                bid = it.book_id
+                btitle = it.book_title
+                stitle = it.section_title
+                ctext = getattr(it, "chunk_text", None) or it.chunk_text_snippet
+                sents = getattr(it, "sentences", [])
+                ideas_details = getattr(it, "ideas_details", [])
+                claims_ctx = getattr(it, "formatted_claims_context", None)
+                probe_prompt = getattr(it, "probe_generation_prompt", None)
+                probe_resp = getattr(it, "probe_generation_response", None)
+                probes = getattr(it, "probes", []) or getattr(it, "assertions", [])
+                evals = getattr(it, "evaluations", [])
+                qa_recall = it.qa_recall
+                net_integrity = it.net_integrity_score
+                calibrated_fid = it.calibrated_fidelity
+                seam_rate = it.seam_integrity_rate
+                sup_cnt = it.supported_count
+                not_cnt = it.not_mentioned_count
+                against_cnt = it.against_count
+                tot_probes = it.total_probes
+                dur = it.duration_seconds
+                server = it.server_node
+
+            if not sents and ctext:
+                sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", ctext) if s.strip()]
+
+            parsed_questions = []
+            for p in probes:
+                if isinstance(p, dict):
+                    parsed_questions.append({
+                        "question_id": p.get("claim_id", p.get("question_id", 1)),
+                        "question": p.get("question") or p.get("assertion", ""),
+                        "assertion": p.get("assertion", ""),
+                        "source_quote": p.get("source_quote", ""),
+                        "is_cross_boundary": p.get("is_cross_boundary", False),
+                        "raw_prompt": p.get("raw_prompt"),
+                        "raw_response": p.get("raw_response"),
+                    })
+                else:
+                    parsed_questions.append({
+                        "question_id": p.claim_id,
+                        "question": getattr(p, "question", None) or p.assertion,
+                        "assertion": p.assertion,
+                        "source_quote": getattr(p, "source_quote", ""),
+                        "is_cross_boundary": p.is_cross_boundary,
+                        "raw_prompt": getattr(p, "raw_prompt", None),
+                        "raw_response": getattr(p, "raw_response", None),
+                    })
+
+            probes_eval = []
+            for e in evals:
+                if isinstance(e, dict):
+                    probes_eval.append({
+                        "probe_id": e.get("claim_id", e.get("question_id", 1)),
+                        "question": e.get("question") or e.get("assertion", ""),
+                        "assertion": e.get("assertion", ""),
+                        "source_quote": e.get("gold_answer") or e.get("source_quote", ""),
+                        "is_cross_boundary": e.get("is_cross_boundary", False),
+                        "raw_verifier_prompt": e.get("raw_prompt") or e.get("verifier_prompt", ""),
+                        "raw_verifier_response": e.get("raw_response", ""),
+                        "result": {
+                            "classification": e.get("classification", "NOT_MENTIONED"),
+                            "score": e.get("score", -0.25),
+                            "verdict": e.get("verdict", "FAIL"),
+                            "rationale": e.get("rationale") or e.get("reason", ""),
+                        },
+                    })
+                else:
+                    probes_eval.append({
+                        "probe_id": e.claim_id,
+                        "question": getattr(e, "question", None) or e.assertion,
+                        "assertion": e.assertion,
+                        "source_quote": getattr(e, "gold_answer", "") or getattr(e, "source_quote", ""),
+                        "is_cross_boundary": e.is_cross_boundary,
+                        "raw_verifier_prompt": getattr(e, "raw_prompt", "") or e.verifier_prompt,
+                        "raw_verifier_response": getattr(e, "raw_response", ""),
+                        "result": {
+                            "classification": e.classification,
+                            "score": e.score,
+                            "verdict": e.verdict,
+                            "rationale": e.rationale or e.reason,
+                        },
+                    })
+
+            debug_items.append({
+                "chunk_id": cid,
+                "book_id": bid,
+                "book_title": btitle,
+                "section_title": stitle,
+                "chunk_text": ctext,
+                "sentences": sents,
+                "ideas_context": {
+                    "extracted_ideas": ideas_details,
+                    "formatted_prompt_context": claims_ctx,
+                },
+                "question_generation": {
+                    "raw_prompt": probe_prompt,
+                    "raw_response": probe_resp,
+                    "parsed_questions": parsed_questions,
+                },
+                "probes_evaluation": probes_eval,
+                "metrics": {
+                    "qa_recall": qa_recall,
+                    "net_integrity_score": net_integrity,
+                    "calibrated_fidelity": calibrated_fid,
+                    "seam_integrity_rate": seam_rate,
+                    "supported_count": sup_cnt,
+                    "not_mentioned_count": not_cnt,
+                    "against_count": against_cnt,
+                    "total_probes": tot_probes,
+                    "duration_seconds": dur,
+                    "server_node": server,
+                },
+            })
+
+    elif eff_mode in ("cross-check", "cross_check") or hasattr(report, "blocks"):
+        blocks = getattr(report, "blocks", [])
+        if not blocks and isinstance(report, dict):
+            blocks = report.get("blocks", [])
+
+        for blk in blocks:
+            bdata = blk.model_dump() if hasattr(blk, "model_dump") else (blk if isinstance(blk, dict) else blk.__dict__)
+            raw_t = bdata.get("raw_text", "")
+            debug_items.append({
+                "block_index": bdata.get("block_index"),
+                "book_id": bdata.get("book_id"),
+                "book_title": bdata.get("book_title"),
+                "section_title": bdata.get("section_title"),
+                "raw_text": raw_t,
+                "sentences": [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw_t) if s.strip()],
+                "ideas_old": bdata.get("ideas_old", []),
+                "ideas_new": bdata.get("ideas_new", []),
+                "probes": bdata.get("probes", []),
+                "metrics_old": bdata.get("metrics_old", {}),
+                "metrics_new": bdata.get("metrics_new", {}),
+                "delta_recall": bdata.get("delta_recall", 0.0),
+                "delta_net_integrity": bdata.get("delta_net_integrity", 0.0),
+            })
+
+    else:
+        # Ideas mode
+        items = list(getattr(report, "discrepancies", [])) + list(getattr(report, "verified_samples", []))
+        if not items and isinstance(report, dict):
+            items = list(report.get("discrepancies", [])) + list(report.get("verified_samples", []))
+
+        for it in items:
+            if isinstance(it, dict):
+                iname = it.get("idea_name", "")
+                icat = it.get("idea_category", "Concept")
+                isum = it.get("idea_summary", "")
+                iwt = it.get("idea_weight", 5)
+                cid = it.get("chunk_id", "")
+                bid = it.get("book_id")
+                btitle = it.get("book_title", "Unknown")
+                stitle = it.get("section_title", "Unknown")
+                q = it.get("quote", "")
+                ctext = it.get("chunk_text") or it.get("chunk_snippet", "")
+                sents = it.get("sentences", [])
+                prompt = it.get("raw_prompt")
+                resp = it.get("raw_response")
+                sup = it.get("is_supported", False)
+                conf = it.get("confidence", 0.0)
+                exp = it.get("explanation", "")
+                srv = it.get("server_node")
+            else:
+                iname = it.idea_name
+                icat = getattr(it, "idea_category", "Concept")
+                isum = getattr(it, "idea_summary", "")
+                iwt = getattr(it, "idea_weight", 5)
+                cid = it.chunk_id
+                bid = getattr(it, "book_id", None)
+                btitle = getattr(it, "book_title", "Unknown")
+                stitle = getattr(it, "section_title", "Unknown")
+                q = getattr(it, "quote", "")
+                ctext = getattr(it, "chunk_text", None) or it.chunk_snippet
+                sents = getattr(it, "sentences", [])
+                prompt = getattr(it, "raw_prompt", None)
+                resp = getattr(it, "raw_response", None)
+                sup = it.is_supported
+                conf = it.confidence
+                exp = it.explanation
+                srv = it.server_node
+
+            if not sents and ctext:
+                sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", ctext) if s.strip()]
+
+            debug_items.append({
+                "idea_name": iname,
+                "idea_category": icat,
+                "idea_summary": isum,
+                "idea_weight": iwt,
+                "chunk_id": cid,
+                "book_id": bid,
+                "book_title": btitle,
+                "section_title": stitle,
+                "quote": q,
+                "chunk_text": ctext,
+                "sentences": sents,
+                "raw_verifier_prompt": prompt,
+                "raw_verifier_response": resp,
+                "result": {
+                    "is_supported": sup,
+                    "confidence": conf,
+                    "explanation": exp,
+                },
+                "server_node": srv,
+            })
+
+    debug_data = {
+        "mode": eff_mode,
+        "model_name": eff_model,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "stats": stats_dict,
+        "debug_items": debug_items,
+    }
+
+    p = Path(path).expanduser().resolve()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(debug_data, f, indent=2, ensure_ascii=False)
+    return debug_data

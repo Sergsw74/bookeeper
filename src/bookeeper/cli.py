@@ -2,6 +2,7 @@
 Production-quality Typer CLI interface for bookeeper with rich progress bars and configurable Ollama / Calibre paths.
 """
 
+import datetime
 import json
 import logging
 import queue
@@ -72,6 +73,8 @@ from bookeeper.processing.verifier import (
     run_cross_check,
     CrossCheckReport,
     CrossCheckBlockResult,
+    export_verification_stats,
+    export_verification_debug,
 )
 from bookeeper.backup import (
     clean_knowledge_artifacts,
@@ -2960,6 +2963,70 @@ def build_rag(
     )
 
 
+def _save_verification_artifacts(
+    report: Any,
+    effective_mode: str,
+    effective_model: str,
+    output_report: Optional[str],
+    stats_output: Optional[str],
+    debug_output: Optional[str],
+    effective_debug: bool,
+    cfg: Settings,
+    pool: Optional[OllamaPool] = None,
+    mode_label: str = "verification",
+) -> Dict[str, Any]:
+    """
+    Save primary verification report, standalone statistics summary file, and debug trace JSON.
+    """
+    if output_report:
+        report_dest = Path(output_report).expanduser().resolve()
+        stats_dest = (
+            Path(stats_output).expanduser().resolve()
+            if stats_output
+            else report_dest.parent / f"{report_dest.stem}_stats{report_dest.suffix}"
+        )
+        debug_dest = (
+            Path(debug_output).expanduser().resolve()
+            if debug_output
+            else report_dest.parent / f"{report_dest.stem}_debug{report_dest.suffix}"
+        )
+    else:
+        report_dest = cfg.resolved_output_dir / "verification_report.json"
+        stats_dest = (
+            Path(stats_output).expanduser().resolve()
+            if stats_output
+            else cfg.resolved_output_dir / "verification_stats.json"
+        )
+        debug_dest = (
+            Path(debug_output).expanduser().resolve()
+            if debug_output
+            else cfg.resolved_output_dir / "verification_debug.json"
+        )
+
+    # 1. Primary verification report
+    report_dest.parent.mkdir(parents=True, exist_ok=True)
+    report_dict = report.model_dump() if hasattr(report, "model_dump") else report
+    with open(report_dest, "w", encoding="utf-8") as f:
+        json.dump(report_dict, f, indent=2, ensure_ascii=False)
+    console.print(f"[dim green]✓ Full {mode_label} report saved to: [bold]{report_dest}[/bold][/dim green]")
+
+    # 2. Standalone statistical summary file (for A/B testing and direct comparison)
+    export_verification_stats(report, stats_dest, mode=effective_mode, model_name=effective_model)
+    console.print(f"[dim green]✓ Standalone statistics file saved to: [bold]{stats_dest}[/bold][/dim green]")
+
+    # 3. Comprehensive debug trace JSON (raw prompts, responses, questions, sentences, context)
+    if effective_debug:
+        export_verification_debug(report, debug_dest, mode=effective_mode, model_name=effective_model)
+        console.print(f"[dim green]✓ Verification debug trace saved to: [bold]{debug_dest}[/bold][/dim green]\n")
+    else:
+        console.print()
+
+    if pool is not None:
+        _print_ollama_server_stats([pool], console=console, title=f"Ollama Server {mode_label.title()} Effort Statistics")
+
+    return report_dict
+
+
 def _execute_single_verification(
     config_path: Optional[str] = None,
     graph_file: Optional[str] = None,
@@ -2981,6 +3048,9 @@ def _execute_single_verification(
     print_chunks: Optional[int] = None,
     max_tasks: Optional[int] = None,
     cooldown: Optional[int] = None,
+    debug: Optional[bool] = None,
+    debug_output: Optional[str] = None,
+    stats_output: Optional[str] = None,
     cfg: Optional[Settings] = None,
 ) -> Optional[Dict[str, Any]]:
     """
@@ -3003,6 +3073,9 @@ def _execute_single_verification(
     print_chunks = _resolve_opt(print_chunks)
     max_tasks = _resolve_opt(max_tasks)
     cooldown = _resolve_opt(cooldown)
+    debug = _resolve_opt(debug)
+    debug_output = _resolve_opt(debug_output)
+    stats_output = _resolve_opt(stats_output)
 
     if cfg is None:
         cfg = _get_effective_settings(
@@ -3010,6 +3083,7 @@ def _execute_single_verification(
             embedding_model=embedding_model,
             embedding_url=embedding_url,
         )
+    effective_debug = debug if debug is not None else getattr(cfg.verification, "debug", True)
     effective_cooldown = cooldown if cooldown is not None else cfg.resolved_verification_cooldown_seconds
     effective_mode = (mode or cfg.verification.mode).strip().lower()
 
@@ -3219,14 +3293,19 @@ def _execute_single_verification(
         else:
             console.print("\n[bold green]✓ Zero chunking discrepancies found! All chunks are semantically coherent and aligned.[/bold green]\n")
 
-        # 4. Save JSON Report
-        report_dest = Path(output_report).expanduser().resolve() if output_report else cfg.resolved_output_dir / "verification_report.json"
-        report_dest.parent.mkdir(parents=True, exist_ok=True)
-        with open(report_dest, "w", encoding="utf-8") as f:
-            json.dump(report.model_dump(), f, indent=2, ensure_ascii=False)
-        console.print(f"[dim green]✓ Full chunking verification report saved to: [bold]{report_dest}[/bold][/dim green]\n")
-        _print_ollama_server_stats([pool], console=console, title="Ollama Server Chunking Verification Effort Statistics")
-        return report.model_dump() if hasattr(report, "model_dump") else report
+        # 4. Save JSON Report, Standalone Statistics, and Debug Trace
+        return _save_verification_artifacts(
+            report=report,
+            effective_mode=effective_mode,
+            effective_model=effective_emb_model,
+            output_report=output_report,
+            stats_output=stats_output,
+            debug_output=debug_output,
+            effective_debug=effective_debug,
+            cfg=cfg,
+            pool=pool,
+            mode_label="chunking verification",
+        )
 
     # Mode: 'chunk' (Oracle Idea Extraction & Alignment)
     if effective_mode in ("chunk", "oracle_chunk"):
@@ -3505,20 +3584,19 @@ def _execute_single_verification(
         )
         console.print(Panel(legend_content, title="[bold]📖 Metrics Legend[/bold]", border_style="dim", expand=False))
 
-        # 3. Save JSON Report
-        report_dest = (
-            Path(output_report).expanduser().resolve()
-            if output_report
-            else cfg.resolved_output_dir / "verification_report.json"
+        # 3. Save JSON Report, Standalone Statistics, and Debug Trace
+        return _save_verification_artifacts(
+            report=report,
+            effective_mode=effective_mode,
+            effective_model=effective_model,
+            output_report=output_report,
+            stats_output=stats_output,
+            debug_output=debug_output,
+            effective_debug=effective_debug,
+            cfg=cfg,
+            pool=pool,
+            mode_label="chunk verification",
         )
-        report_dest.parent.mkdir(parents=True, exist_ok=True)
-        with open(report_dest, "w", encoding="utf-8") as f:
-            json.dump(report.model_dump(), f, indent=2, ensure_ascii=False)
-        console.print(
-            f"[dim green]✓ Full chunk verification report saved to: [bold]{report_dest}[/bold][/dim green]\n"
-        )
-        _print_ollama_server_stats([pool], console=console, title="Ollama Server Chunk Verification Effort Statistics")
-        return report.model_dump() if hasattr(report, "model_dump") else report
 
     # Mode: 'cross-check' (Dual Knowledge Base Seam & Recall Comparative Audit)
     if effective_mode in ("cross-check", "cross_check"):
@@ -3892,20 +3970,19 @@ def _execute_single_verification(
         )
         console.print(Panel(legend_content, title="[bold]📖 Metrics Legend[/bold]", border_style="dim", expand=False))
 
-        # 4. Save JSON Report
-        report_dest = (
-            Path(output_report).expanduser().resolve()
-            if output_report
-            else cfg.resolved_output_dir / "cross_check_report.json"
+        # 4. Save JSON Report, Standalone Statistics, and Debug Trace
+        return _save_verification_artifacts(
+            report=report,
+            effective_mode=effective_mode,
+            effective_model=effective_model,
+            output_report=output_report or str(cfg.resolved_output_dir / "cross_check_report.json"),
+            stats_output=stats_output,
+            debug_output=debug_output,
+            effective_debug=effective_debug,
+            cfg=cfg,
+            pool=pool,
+            mode_label="cross-check verification",
         )
-        report_dest.parent.mkdir(parents=True, exist_ok=True)
-        with open(report_dest, "w", encoding="utf-8") as f:
-            json.dump(report.model_dump(), f, indent=2, ensure_ascii=False)
-        console.print(
-            f"[dim green]✓ Full cross-check verification report saved to: [bold]{report_dest}[/bold][/dim green]\n"
-        )
-        _print_ollama_server_stats([pool], console=console, title="Ollama Server Cross-Check Verification Effort Statistics")
-        return report.model_dump() if hasattr(report, "model_dump") else report
 
     # Mode: 'ideas'
     target_graph_file = Path(graph_file).expanduser().resolve() if graph_file else cfg.resolved_output_dir / "knowledge_graph.json"
@@ -4086,13 +4163,19 @@ def _execute_single_verification(
         console.print("\n[bold green]✓ Zero discrepancies found! All sampled idea-chunk pairs are factual and supported.[/bold green]\n")
 
     # 3. Save JSON report
-    report_dest = Path(output_report).expanduser().resolve() if output_report else cfg.resolved_output_dir / "verification_report.json"
-    report_dest.parent.mkdir(parents=True, exist_ok=True)
-    with open(report_dest, "w", encoding="utf-8") as f:
-        json.dump(report.model_dump(), f, indent=2, ensure_ascii=False)
-    console.print(f"[dim green]✓ Full verification report saved to: [bold]{report_dest}[/bold][/dim green]\n")
-    _print_ollama_server_stats([pool], console=console, title="Ollama Server Verification Effort Statistics")
-    return report.model_dump() if hasattr(report, "model_dump") else report
+    # 3. Save JSON Report, Standalone Statistics, and Debug Trace
+    return _save_verification_artifacts(
+        report=report,
+        effective_mode=effective_mode,
+        effective_model=effective_model,
+        output_report=output_report,
+        stats_output=stats_output,
+        debug_output=debug_output,
+        effective_debug=effective_debug,
+        cfg=cfg,
+        pool=pool,
+        mode_label="ideas verification",
+    )
 
 
 def _write_combined_multi_verification_report(
@@ -4118,7 +4201,31 @@ def _write_combined_multi_verification_report(
     with open(dest, "w", encoding="utf-8") as f:
         json.dump(combined, f, indent=2, ensure_ascii=False)
     console.print(
-        f"[dim green]✓ Combined multi-verification report saved to: [bold]{dest}[/bold][/dim green]\n"
+        f"[dim green]✓ Combined multi-verification report saved to: [bold]{dest}[/bold][/dim green]"
+    )
+
+    stats_dest = (
+        dest.parent / f"{dest.stem}_stats{dest.suffix}"
+        if dest.stem != "verification_report"
+        else dest.parent / "verification_stats.json"
+    )
+    stats_combined = {
+        "multi_verification": True,
+        "mode": first_mode,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "stats": first_data.get("stats") if isinstance(first_data, dict) else getattr(first_data, "stats", None),
+        "verifiers": [
+            {
+                "mode": m,
+                "stats": d.get("stats") if isinstance(d, dict) else getattr(d, "stats", None),
+            }
+            for m, p, d in reports
+        ],
+    }
+    with open(stats_dest, "w", encoding="utf-8") as f:
+        json.dump(stats_combined, f, indent=2, ensure_ascii=False)
+    console.print(
+        f"[dim green]✓ Combined multi-verification statistics saved to: [bold]{stats_dest}[/bold][/dim green]\n"
     )
 
 
@@ -4186,6 +4293,21 @@ def verify_command(
     cooldown: Optional[int] = typer.Option(
         None, "--cooldown", help="Failover cooldown in seconds for verification tasks (overrides config.yaml)."
     ),
+    debug: Optional[bool] = typer.Option(
+        None,
+        "--debug/--no-debug",
+        help="Generate detailed debug JSON with raw prompts, questions, sentences, and responses (default: True).",
+    ),
+    debug_output: Optional[str] = typer.Option(
+        None,
+        "--debug-output",
+        help="Optional path to save debug JSON report (default: output_dir/verification_debug.json).",
+    ),
+    stats_output: Optional[str] = typer.Option(
+        None,
+        "--stats-output",
+        help="Optional path to save standalone statistics JSON file (default: output_dir/verification_stats.json).",
+    ),
 ):
     """
     Verify Knowledge Graph factual integrity, chunking correctness, or chunk Oracle alignment.
@@ -4208,6 +4330,9 @@ def verify_command(
     print_chunks = _resolve_opt(print_chunks)
     max_tasks = _resolve_opt(max_tasks)
     cooldown = _resolve_opt(cooldown)
+    debug = _resolve_opt(debug)
+    debug_output = _resolve_opt(debug_output)
+    stats_output = _resolve_opt(stats_output)
 
     cfg = _get_effective_settings(
         config_path=config_path,
@@ -4251,14 +4376,23 @@ def verify_command(
             v_seed = seed if seed is not None else v.seed
             v_max_tasks = max_tasks if max_tasks is not None else v.max_tasks
             v_cooldown = cooldown if cooldown is not None else v.cooldown_seconds
+            v_debug = debug if debug is not None else v.debug
+            v_debug_out = debug_output if debug_output is not None else v.debug_output
+            v_stats_out = stats_output if stats_output is not None else v.stats_output
 
             if output_report:
                 p_out = Path(output_report)
                 v_report = str(p_out.parent / f"{p_out.stem}_{v_mode}{p_out.suffix}")
+                v_stats = str(p_out.parent / f"{p_out.stem}_{v_mode}_stats{p_out.suffix}") if not v_stats_out else v_stats_out
+                v_debug_file = str(p_out.parent / f"{p_out.stem}_{v_mode}_debug{p_out.suffix}") if not v_debug_out else v_debug_out
             elif v.output_report:
                 v_report = v.output_report
+                v_stats = v_stats_out or str(Path(v_report).parent / f"{Path(v_report).stem}_stats{Path(v_report).suffix}")
+                v_debug_file = v_debug_out or str(Path(v_report).parent / f"{Path(v_report).stem}_debug{Path(v_report).suffix}")
             else:
                 v_report = str(cfg.resolved_output_dir / f"verification_report_{v_mode}.json")
+                v_stats = v_stats_out or str(cfg.resolved_output_dir / f"verification_stats_{v_mode}.json")
+                v_debug_file = v_debug_out or str(cfg.resolved_output_dir / f"verification_debug_{v_mode}.json")
 
             rep = _execute_single_verification(
                 cfg=cfg,
@@ -4282,6 +4416,9 @@ def verify_command(
                 print_chunks=v_print_chunks,
                 max_tasks=v_max_tasks,
                 cooldown=v_cooldown,
+                debug=v_debug,
+                debug_output=v_debug_file,
+                stats_output=v_stats,
             )
             reports.append((v_mode, v_report, rep))
 
@@ -4313,6 +4450,12 @@ def verify_command(
             blocks = first_v.blocks
         if print_chunks is None:
             print_chunks = first_v.print_chunks
+        if debug is None:
+            debug = first_v.debug
+        if debug_output is None:
+            debug_output = first_v.debug_output
+        if stats_output is None:
+            stats_output = first_v.stats_output
 
     return _execute_single_verification(
         cfg=cfg,
@@ -4336,6 +4479,9 @@ def verify_command(
         print_chunks=print_chunks,
         max_tasks=max_tasks,
         cooldown=cooldown,
+        debug=debug,
+        debug_output=debug_output,
+        stats_output=stats_output,
     )
 
 

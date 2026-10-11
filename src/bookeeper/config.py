@@ -266,6 +266,18 @@ class SingleVerifierConfig(BaseModel):
         default=None,
         description="Max concurrent tasks across Ollama servers.",
     )
+    debug: Optional[bool] = Field(
+        default=None,
+        description="Whether to generate detailed debug JSON output with raw prompts and responses.",
+    )
+    debug_output: Optional[str] = Field(
+        default=None,
+        description="Optional path to save debug JSON output.",
+    )
+    stats_output: Optional[str] = Field(
+        default=None,
+        description="Optional path to save standalone statistics JSON file.",
+    )
 
     @property
     def resolved_distance_threshold(self) -> Optional[float]:
@@ -309,6 +321,18 @@ class VerificationConfig(BaseModel):
     cooldown_seconds: Optional[int] = Field(
         default=None,
         description="Failover cooldown duration in seconds for verification tasks (default: 60s).",
+    )
+    debug: bool = Field(
+        default=True,
+        description="Whether to generate detailed debug JSON output with raw prompts and responses.",
+    )
+    debug_output: Optional[str] = Field(
+        default=None,
+        description="Optional path to save debug JSON output.",
+    )
+    stats_output: Optional[str] = Field(
+        default=None,
+        description="Optional path to save standalone statistics JSON file.",
     )
     verifiers: List[SingleVerifierConfig] = Field(
         default_factory=list,

@@ -725,12 +725,24 @@ class ABTestRunner:
                     repo_output_dir = self.repo_dir / "output"
                     copied_artifacts = []
 
-                    for fname in ["verification_report.json", "knowledge_graph.json", ".bookeeper_state.json"]:
+                    for fname in [
+                        "verification_report.json",
+                        "verification_stats.json",
+                        "verification_debug.json",
+                        "knowledge_graph.json",
+                        ".bookeeper_state.json",
+                    ]:
                         src = repo_output_dir / fname
                         if src.is_file():
                             dest = branch_dir / fname
                             shutil.copy2(src, dest)
                             copied_artifacts.append(fname)
+
+                    # Also archive any mode-specific verification artifacts
+                    for extra_vf in repo_output_dir.glob("verification_*.json"):
+                        if extra_vf.name not in copied_artifacts and extra_vf.is_file():
+                            shutil.copy2(extra_vf, branch_dir / extra_vf.name)
+                            copied_artifacts.append(extra_vf.name)
 
                     chunks_src = repo_output_dir / "chunks"
                     if chunks_src.is_dir():
@@ -1496,8 +1508,16 @@ class ABTestRunner:
         """Compute side-by-side comparison between the two verification reports."""
         log_header("Verification A/B Comparison Analysis")
 
-        report_a_file = dir_a / "verification_report.json"
-        report_b_file = dir_b / "verification_report.json"
+        report_a_file = (
+            dir_a / "verification_stats.json"
+            if (dir_a / "verification_stats.json").is_file()
+            else dir_a / "verification_report.json"
+        )
+        report_b_file = (
+            dir_b / "verification_stats.json"
+            if (dir_b / "verification_stats.json").is_file()
+            else dir_b / "verification_report.json"
+        )
         meta_a_file = dir_a / "run_meta.json"
         meta_b_file = dir_b / "run_meta.json"
 

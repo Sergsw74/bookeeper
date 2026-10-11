@@ -116,6 +116,10 @@ class AtomicAssertionItem(BaseModel):
     is_cross_sentence: Optional[bool] = None
     source_sentence_references: List[str] = Field(default_factory=list)
 
+    # Debug prompt and raw response trace
+    raw_prompt: Optional[str] = None
+    raw_response: Optional[str] = None
+
     def __init__(self, **data: Any):
         # Sync legacy question fields if provided
         if "question_id" in data and "claim_id" not in data:
@@ -159,6 +163,10 @@ class NLIAssertionEvaluation(BaseModel):
     rationale: str = ""
     verifier_prompt: str = ""
 
+    # Debug prompt and raw response trace
+    raw_prompt: Optional[str] = None
+    raw_response: Optional[str] = None
+
     # Backwards compatibility fields for QA probe callers
     question_id: Optional[int] = None
     question: Optional[str] = None
@@ -170,6 +178,8 @@ class NLIAssertionEvaluation(BaseModel):
     judge_prompt: str = ""
 
     def __init__(self, **data: Any):
+        if "verifier_prompt" in data and not data.get("raw_prompt"):
+            data["raw_prompt"] = data["verifier_prompt"]
         if "question_id" in data and "claim_id" not in data:
             data["claim_id"] = data["question_id"]
         if "question" in data and "assertion" not in data:
@@ -250,6 +260,9 @@ class NLISystemBlockMetrics(BaseModel):
     calibrated_fidelity: float = 0.0
     seam_net_integrity: float = 0.0
     seam_calibrated_fidelity: float = 0.0
+
+    # Debug full claims context formatted from ideas
+    formatted_claims_context: Optional[str] = None
 
 
 QASystemBlockMetrics = NLISystemBlockMetrics
@@ -446,6 +459,8 @@ def generate_atomic_assertions(
                         assertion=assertion_text,
                         is_cross_boundary=is_cross,
                         source_quote=source_quote,
+                        raw_prompt=prompt,
+                        raw_response=raw_text,
                     )
                 )
 
@@ -554,16 +569,21 @@ def verify_assertion_entailment(
     pool: OllamaPool,
     model_name: str,
     question: Optional[str] = None,
-) -> Tuple[Literal["SUPPORTED", "CONTRADICTED", "NOT_MENTIONED"], str]:
+    return_raw: bool = False,
+) -> Any:
     """
     Classify whether Target Assertion/Question is SUPPORTED, CONTRADICTED, or NOT_MENTIONED
     by the extracted knowledge base context.
-    Returns (classification, rationale).
+    Returns (classification, rationale) or (classification, rationale, raw_response) if return_raw=True.
     """
     if not claims_context.strip() or "(No knowledge claims extracted" in claims_context:
+        if return_raw:
+            return "NOT_MENTIONED", "Knowledge base contains no claims for this block.", ""
         return "NOT_MENTIONED", "Knowledge base contains no claims for this block."
 
     if not assertion.strip() and not (question and question.strip()):
+        if return_raw:
+            return "NOT_MENTIONED", "Target assertion and question are empty.", ""
         return "NOT_MENTIONED", "Target assertion and question are empty."
 
     prompt = build_nli_verifier_prompt(claims_context, assertion, question=question)
@@ -585,23 +605,32 @@ def verify_assertion_entailment(
         raw_cls = str(data.get("classification", "")).strip().upper()
         rationale = str(data.get("rationale", "")).strip()
 
-        if "SUPPORTED" in raw_cls and "NOT_MENTIONED" not in raw_cls and "NOT SUPPORTED" not in raw_cls and "UNSUPPORTED" not in raw_cls:
-            return "SUPPORTED", rationale or "Entailed by claims."
-        elif "CONTRADICT" in raw_cls or "AGAINST" in raw_cls or "CONFRONT" in raw_cls:
-            return "CONTRADICTED", rationale or "Contradicts claims."
-        elif "NOT_MENTIONED" in raw_cls or "UNSUPPORTED" in raw_cls:
-            return "NOT_MENTIONED", rationale or "Not mentioned in claims."
+        cls_res = "NOT_MENTIONED"
+        rat_res = ""
 
-        # Heuristic fallback
-        clean_upper = clean.upper()
-        if "SUPPORTED" in clean_upper and "NOT_MENTIONED" not in clean_upper and "NOT SUPPORTED" not in clean_upper and "UNSUPPORTED" not in clean_upper:
-            return "SUPPORTED", rationale or clean[:120]
-        elif "CONTRADICT" in clean_upper or "AGAINST" in clean_upper or "CONFRONT" in clean_upper:
-            return "CONTRADICTED", rationale or clean[:120]
+        if "SUPPORTED" in raw_cls and "NOT_MENTIONED" not in raw_cls and "NOT SUPPORTED" not in raw_cls and "UNSUPPORTED" not in raw_cls:
+            cls_res, rat_res = "SUPPORTED", rationale or "Entailed by claims."
+        elif "CONTRADICT" in raw_cls or "AGAINST" in raw_cls or "CONFRONT" in raw_cls:
+            cls_res, rat_res = "CONTRADICTED", rationale or "Contradicts claims."
+        elif "NOT_MENTIONED" in raw_cls or "UNSUPPORTED" in raw_cls:
+            cls_res, rat_res = "NOT_MENTIONED", rationale or "Not mentioned in claims."
         else:
-            return "NOT_MENTIONED", rationale or clean[:120]
+            # Heuristic fallback
+            clean_upper = clean.upper()
+            if "SUPPORTED" in clean_upper and "NOT_MENTIONED" not in clean_upper and "NOT SUPPORTED" not in clean_upper and "UNSUPPORTED" not in clean_upper:
+                cls_res, rat_res = "SUPPORTED", rationale or clean[:120]
+            elif "CONTRADICT" in clean_upper or "AGAINST" in clean_upper or "CONFRONT" in clean_upper:
+                cls_res, rat_res = "CONTRADICTED", rationale or clean[:120]
+            else:
+                cls_res, rat_res = "NOT_MENTIONED", rationale or clean[:120]
+
+        if return_raw:
+            return cls_res, rat_res, raw_text
+        return cls_res, rat_res
     except Exception as exc:
         logger.warning(f"NLI classification failed for assertion '{assertion[:40]}': {exc}")
+        if return_raw:
+            return "NOT_MENTIONED", f"Evaluation error: {exc}", ""
         return "NOT_MENTIONED", f"Evaluation error: {exc}"
 
 
@@ -673,6 +702,8 @@ def generate_chunk_probes(
                         assertion=assertion_text or question_text,
                         source_quote=source_quote,
                         is_cross_boundary=False,
+                        raw_prompt=prompt,
+                        raw_response=raw_text,
                     )
                 )
 
@@ -695,6 +726,8 @@ def generate_chunk_probes(
                 assertion=s0,
                 source_quote=s0,
                 is_cross_boundary=False,
+                raw_prompt=prompt if "prompt" in locals() else "",
+                raw_response="(Deterministic fallback based on text sentences)",
             )
         ]
 
@@ -706,6 +739,8 @@ def generate_chunk_probes(
             assertion=chunk_text[:150],
             source_quote=chunk_text[:150],
             is_cross_boundary=False,
+            raw_prompt=prompt if "prompt" in locals() else "",
+            raw_response="(Deterministic fallback based on text snippet)",
         )
     ]
 
@@ -807,7 +842,12 @@ def evaluate_claims_atomic_assertions(
     for a in assertions:
         q_text = getattr(a, "question", None) or a.assertion
         prompt = build_nli_verifier_prompt(claims, a.assertion, question=q_text)
-        cls, rat = verify_assertion_entailment(claims, a.assertion, pool, model_name, question=q_text)
+        res_tuple = verify_assertion_entailment(claims, a.assertion, pool, model_name, question=q_text, return_raw=True)
+        if len(res_tuple) == 3:
+            cls, rat, raw_resp = res_tuple
+        else:
+            cls, rat = res_tuple
+            raw_resp = ""
         verdict: Literal["PASS", "FAIL"] = "PASS" if cls == "SUPPORTED" else "FAIL"
 
         evals.append(
@@ -819,6 +859,8 @@ def evaluate_claims_atomic_assertions(
                 verdict=verdict,
                 rationale=rat,
                 verifier_prompt=prompt,
+                raw_prompt=prompt,
+                raw_response=raw_resp,
                 # compatibility
                 question_id=a.claim_id,
                 question=q_text,
@@ -858,6 +900,7 @@ def evaluate_claims_atomic_assertions(
         calibrated_fidelity=t_scores["calibrated_fidelity"],
         seam_net_integrity=cross_t["net_integrity_score"],
         seam_calibrated_fidelity=cross_t["calibrated_fidelity"],
+        formatted_claims_context=claims,
     )
 
     return assertions, metrics

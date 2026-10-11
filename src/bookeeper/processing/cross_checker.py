@@ -168,6 +168,18 @@ class CrossCheckSummary(BaseModel):
     mean_new_hallucination_ratio: float = 0.0
     mean_delta_hallucination_ratio: float = 0.0
 
+    # Grouped status counters
+    total_assertions_count: int = 0
+    total_old_supported: int = 0
+    total_new_supported: int = 0
+    delta_supported: int = 0
+    total_old_not_mentioned: int = 0
+    total_new_not_mentioned: int = 0
+    delta_not_mentioned: int = 0
+    total_old_against: int = 0
+    total_new_against: int = 0
+    delta_against: int = 0
+
 
 class CrossCheckReport(BaseModel):
     """Complete serialization report for Cross-Check verification mode."""
@@ -884,18 +896,23 @@ def print_block_comparison(
     _out(f"📊 BLOCK NLI ENTAILMENT METRICS:")
     _out(
         f"   • Baseline:  Recall: {eval_old.qa_recall * 100:.1f}% ({eval_old.passed_probes_count}/{eval_old.total_probes_count} supported) | "
+        f"Status: [{eval_old.supported_count} Supported, {eval_old.not_mentioned_count} Omitted, {eval_old.against_count} Contradicted] | "
         f"Net Integrity (S_net): {eval_old.net_integrity_score:+.2f} | Fidelity (R_calib): {eval_old.calibrated_fidelity * 100:.1f}% | "
         f"Seam Integrity: {eval_old.seam_integrity_rate * 100:.1f}%"
     )
     _out(
         f"   • Candidate: Recall: {eval_new.qa_recall * 100:.1f}% ({eval_new.passed_probes_count}/{eval_new.total_probes_count} supported) | "
+        f"Status: [{eval_new.supported_count} Supported, {eval_new.not_mentioned_count} Omitted, {eval_new.against_count} Contradicted] | "
         f"Net Integrity (S_net): {eval_new.net_integrity_score:+.2f} | Fidelity (R_calib): {eval_new.calibrated_fidelity * 100:.1f}% | "
         f"Seam Integrity: {eval_new.seam_integrity_rate * 100:.1f}%"
     )
     delta_pts = (eval_new.qa_recall - eval_old.qa_recall) * 100
     delta_net = eval_new.net_integrity_score - eval_old.net_integrity_score
     delta_fid = (eval_new.calibrated_fidelity - eval_old.calibrated_fidelity) * 100
-    _out(f"   • Deltas (B - A): Recall: {delta_pts:+.1f}% pts | Net Integrity: {delta_net:+.2f} | Fidelity: {delta_fid:+.1f}% pts")
+    d_sup = eval_new.supported_count - eval_old.supported_count
+    d_not = eval_new.not_mentioned_count - eval_old.not_mentioned_count
+    d_opp = eval_new.against_count - eval_old.against_count
+    _out(f"   • Deltas (B - A): Recall: {delta_pts:+.1f}% pts | Status Δ: [{d_sup:+d} Supported, {d_not:+d} Omitted, {d_opp:+d} Contradicted] | Net Integrity: {delta_net:+.2f} | Fidelity: {delta_fid:+.1f}% pts")
     _out(
         f"   [Legend] Recall = Supported / Total | "
         f"Net Integrity (S_net) = (1.0*Sup - 0.25*Not - 1.0*Against)/Total | "
@@ -1225,11 +1242,11 @@ def run_cross_check(
     if tot > 0:
         mean_old_rec = round(float(np.mean([s.old_system.qa_recall for s in samples])), 4)
         mean_new_rec = round(float(np.mean([s.new_system.qa_recall for s in samples])), 4)
-        mean_delta_rec = round(float(np.mean([s.delta_qa_recall for s in samples])), 4)
+        mean_delta_rec = round(float(mean_new_rec - mean_old_rec), 4)
 
         mean_old_seam = round(float(np.mean([s.old_system.seam_integrity_rate for s in samples])), 4)
         mean_new_seam = round(float(np.mean([s.new_system.seam_integrity_rate for s in samples])), 4)
-        mean_delta_seam = round(float(np.mean([s.delta_seam_integrity for s in samples])), 4)
+        mean_delta_seam = round(float(mean_new_seam - mean_old_seam), 4)
 
         mean_old_net = round(float(np.mean([s.old_system.net_integrity_score for s in samples])), 4)
         mean_new_net = round(float(np.mean([s.new_system.net_integrity_score for s in samples])), 4)
@@ -1258,6 +1275,20 @@ def run_cross_check(
         mean_old_trunc = round(float(np.mean([s.old_system.truncation_rate for s in samples])), 4)
         mean_new_trunc = round(float(np.mean([s.new_system.truncation_rate for s in samples])), 4)
         mean_disprop = round(float(np.mean([s.chunk_disproportion for s in samples])), 4)
+
+        # Grouped Status Breakdown Counters across all audited blocks
+        tot_assertions = sum(s.new_system.total_probes_count for s in samples)
+        tot_old_sup = sum(s.old_system.supported_count for s in samples)
+        tot_new_sup = sum(s.new_system.supported_count for s in samples)
+        delta_sup = tot_new_sup - tot_old_sup
+
+        tot_old_not = sum(s.old_system.not_mentioned_count for s in samples)
+        tot_new_not = sum(s.new_system.not_mentioned_count for s in samples)
+        delta_not = tot_new_not - tot_old_not
+
+        tot_old_opp = sum(s.old_system.against_count for s in samples)
+        tot_new_opp = sum(s.new_system.against_count for s in samples)
+        delta_opp = tot_new_opp - tot_old_opp
     else:
         mean_old_rec = mean_new_rec = mean_delta_rec = mean_old_prec = mean_new_prec = 0.0
         agg_old_fail = agg_new_fail = agg_delta_fail = 0.0
@@ -1266,6 +1297,9 @@ def run_cross_check(
         mean_old_net = mean_new_net = mean_delta_net = 0.0
         mean_old_fid = mean_new_fid = mean_delta_fid = 0.0
         mean_old_halluc = mean_new_halluc = mean_delta_halluc = 0.0
+        tot_assertions = tot_old_sup = tot_new_sup = delta_sup = 0
+        tot_old_not = tot_new_not = delta_not = 0
+        tot_old_opp = tot_new_opp = delta_opp = 0
 
     # Decision Gates:
     # 1. Mean Delta QA Recall >= -0.03
@@ -1307,6 +1341,16 @@ def run_cross_check(
         mean_old_hallucination_ratio=mean_old_halluc,
         mean_new_hallucination_ratio=mean_new_halluc,
         mean_delta_hallucination_ratio=mean_delta_halluc,
+        total_assertions_count=tot_assertions,
+        total_old_supported=tot_old_sup,
+        total_new_supported=tot_new_sup,
+        delta_supported=delta_sup,
+        total_old_not_mentioned=tot_old_not,
+        total_new_not_mentioned=tot_new_not,
+        delta_not_mentioned=delta_not,
+        total_old_against=tot_old_opp,
+        total_new_against=tot_new_opp,
+        delta_against=delta_opp,
         decision_pass=decision_pass,
         pass_reason="; ".join(reasons),
         total_duration_seconds=round(time.time() - t_global_start, 2),

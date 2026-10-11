@@ -3742,6 +3742,28 @@ def verify_command(
         summary_table.add_column("Delta (B - A)", justify="right")
 
         summary_table.add_row("Total Contiguous Blocks Audited", str(sm.total_samples), str(sm.total_samples), "-")
+        summary_table.add_row("Total Assertions Evaluated", str(sm.total_assertions_count), str(sm.total_assertions_count), "-")
+        d_sup_color = "green" if sm.delta_supported >= 0 else "red"
+        summary_table.add_row(
+            "Supported Assertions Count (+1.0)",
+            str(sm.total_old_supported),
+            str(sm.total_new_supported),
+            f"[{d_sup_color}]{sm.delta_supported:+d}[/]",
+        )
+        d_not_color = "green" if sm.delta_not_mentioned <= 0 else "yellow"
+        summary_table.add_row(
+            "Not Mentioned / Omission Count (-0.25)",
+            str(sm.total_old_not_mentioned),
+            str(sm.total_new_not_mentioned),
+            f"[{d_not_color}]{sm.delta_not_mentioned:+d}[/]",
+        )
+        d_opp_color = "green" if sm.delta_against <= 0 else "red"
+        summary_table.add_row(
+            "Contradicted / Hallucination Count (-1.0)",
+            str(sm.total_old_against),
+            str(sm.total_new_against),
+            f"[{d_opp_color}]{sm.delta_against:+d}[/]",
+        )
         summary_table.add_row(
             "Mean QA Recall (%)",
             f"{sm.mean_old_recall * 100:.2f}%",
@@ -3815,6 +3837,8 @@ def verify_command(
             sample_table.add_column("QA Rec A", justify="right")
             sample_table.add_column("QA Rec B", justify="right")
             sample_table.add_column("ΔRecall", justify="right")
+            sample_table.add_column("Status A (S/N/C)", justify="right", style="cyan")
+            sample_table.add_column("Status B (S/N/C)", justify="right", style="magenta")
             sample_table.add_column("S_net A", justify="right")
             sample_table.add_column("S_net B", justify="right")
             sample_table.add_column("ΔS_net", justify="right")
@@ -3834,6 +3858,8 @@ def verify_command(
                     f"{s.old_system.qa_recall * 100:.1f}%",
                     f"{s.new_system.qa_recall * 100:.1f}%",
                     f"[{d_color}]{s.delta_recall * 100:+.1f}%[/]",
+                    f"{s.old_system.supported_count}/{s.old_system.not_mentioned_count}/{s.old_system.against_count}",
+                    f"{s.new_system.supported_count}/{s.new_system.not_mentioned_count}/{s.new_system.against_count}",
                     f"{s.old_system.net_integrity_score:+.2f}",
                     f"{s.new_system.net_integrity_score:+.2f}",
                     f"[{d_net_color}]{s.delta_net_integrity:+.2f}[/]",

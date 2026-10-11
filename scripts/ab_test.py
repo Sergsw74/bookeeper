@@ -1172,8 +1172,16 @@ class ABTestRunner:
                 union_len = max(len_a, len_b) + random.randint(50, 150)
                 disprop = round(len_a / union_len, 4)
 
-                old_rec = round(random.uniform(0.80, 0.90), 4)
-                new_rec = round(min(1.0, old_rec + random.uniform(0.01, 0.05)), 4)
+                old_sup = random.randint(3, 4)
+                old_not = random.randint(1, 2)
+                old_opp = 0
+                tot_p = old_sup + old_not + old_opp
+                old_rec = round(old_sup / tot_p, 4)
+
+                new_sup = min(tot_p, old_sup + random.randint(0, 1))
+                new_not = max(0, tot_p - new_sup)
+                new_opp = 0
+                new_rec = round(new_sup / tot_p, 4)
                 delta_rec = round(new_rec - old_rec, 4)
 
                 mock_samples.append({
@@ -1188,12 +1196,22 @@ class ABTestRunner:
                     "block_b_total_len": len_b,
                     "union_len": union_len,
                     "chunk_disproportion": disprop,
-                    "oracle_ideas_count": 5,
+                    "oracle_ideas_count": tot_p,
                     "old_system": {
                         "system": "old",
                         "raw_ideas_count": 5,
                         "deduped_ideas_count": 5,
                         "oracle_recall": old_rec,
+                        "qa_recall": old_rec,
+                        "total_probes_count": tot_p,
+                        "passed_probes_count": old_sup,
+                        "supported_count": old_sup,
+                        "not_mentioned_count": old_not,
+                        "against_count": old_opp,
+                        "net_integrity_score": round((old_sup * 1.0 - old_not * 0.25) / tot_p, 2),
+                        "calibrated_fidelity": round(max(0.0, (old_sup + 0.2 * old_not) / tot_p), 2),
+                        "seam_integrity_rate": 0.85,
+                        "fail_ratio": round(old_not / tot_p, 4),
                         "grounded_precision": 0.95,
                         "truncation_rate": 0.0,
                         "retained_oracle_ideas": ["Core Idea 1", "Core Idea 2"],
@@ -1205,6 +1223,16 @@ class ABTestRunner:
                         "raw_ideas_count": 6,
                         "deduped_ideas_count": 6,
                         "oracle_recall": new_rec,
+                        "qa_recall": new_rec,
+                        "total_probes_count": tot_p,
+                        "passed_probes_count": new_sup,
+                        "supported_count": new_sup,
+                        "not_mentioned_count": new_not,
+                        "against_count": new_opp,
+                        "net_integrity_score": round((new_sup * 1.0 - new_not * 0.25) / tot_p, 2),
+                        "calibrated_fidelity": round(max(0.0, (new_sup + 0.2 * new_not) / tot_p), 2),
+                        "seam_integrity_rate": 0.90,
+                        "fail_ratio": round(new_not / tot_p, 4),
                         "grounded_precision": 0.97,
                         "truncation_rate": 0.005,
                         "retained_oracle_ideas": ["Core Idea 1", "Core Idea 2", "Core Idea 3"],
@@ -1212,6 +1240,11 @@ class ABTestRunner:
                         "audited_items": [],
                     },
                     "delta_recall": delta_rec,
+                    "delta_qa_recall": delta_rec,
+                    "delta_fail_ratio": round((new_not / tot_p) - (old_not / tot_p), 4),
+                    "delta_seam_integrity": 0.05,
+                    "delta_net_integrity": round(((new_sup * 1.0 - new_not * 0.25) - (old_sup * 1.0 - old_not * 0.25)) / tot_p, 2),
+                    "delta_calibrated_fidelity": delta_rec,
                     "duration_seconds": 0.8,
                 })
                 if self.print_chunks > 0 and b_idx <= self.print_chunks:
@@ -1230,18 +1263,25 @@ class ABTestRunner:
                         ideas_old=[Concept(name="Core Idea 1", brief_description="Key concept present in Baseline", category="Sim", summary="s")],
                         ideas_new=[Concept(name="Core Idea 1", brief_description="Key concept present in Candidate", category="Sim", summary="s"), Concept(name="Core Idea 3", brief_description="Candidate exclusive concept", category="Sim", summary="s")],
                         oracle_ideas=[Concept(name="Core Idea 1", brief_description="Oracle truth 1", category="Sim", summary="s"), Concept(name="Core Idea 2", brief_description="Oracle truth 2", category="Sim", summary="s")],
-                        eval_old=SystemBlockMetrics(system="old", oracle_recall=old_rec, fail_ratio=0.0, retained_oracle_ideas=["Core Idea 1"], dropped_oracle_ideas=["Core Idea 2"]),
-                        eval_new=SystemBlockMetrics(system="new", oracle_recall=new_rec, fail_ratio=0.0, retained_oracle_ideas=["Core Idea 1", "Core Idea 2"], dropped_oracle_ideas=[]),
+                        eval_old=SystemBlockMetrics(system="old", oracle_recall=old_rec, qa_recall=old_rec, supported_count=old_sup, not_mentioned_count=old_not, against_count=old_opp, fail_ratio=0.0, retained_oracle_ideas=["Core Idea 1"], dropped_oracle_ideas=["Core Idea 2"]),
+                        eval_new=SystemBlockMetrics(system="new", oracle_recall=new_rec, qa_recall=new_rec, supported_count=new_sup, not_mentioned_count=new_not, against_count=new_opp, fail_ratio=0.0, retained_oracle_ideas=["Core Idea 1", "Core Idea 2"], dropped_oracle_ideas=[]),
                     )
 
-            mean_old_rec = round(float(sum(s["old_system"]["oracle_recall"] for s in mock_samples) / num_blocks), 4)
-            mean_new_rec = round(float(sum(s["new_system"]["oracle_recall"] for s in mock_samples) / num_blocks), 4)
-            mean_delta_rec = round(float(sum(s["delta_recall"] for s in mock_samples) / num_blocks), 4)
+            mean_old_rec = round(float(sum(s["old_system"]["qa_recall"] for s in mock_samples) / num_blocks), 4)
+            mean_new_rec = round(float(sum(s["new_system"]["qa_recall"] for s in mock_samples) / num_blocks), 4)
+            mean_delta_rec = round(float(mean_new_rec - mean_old_rec), 4)
             mean_old_prec = 0.95
             mean_new_prec = 0.97
             mean_old_trunc = 0.0
             mean_new_trunc = 0.005
             mean_disprop = round(float(sum(s["chunk_disproportion"] for s in mock_samples) / num_blocks), 4)
+            tot_probes = sum(s["old_system"]["total_probes_count"] for s in mock_samples)
+            tot_old_sup = sum(s["old_system"]["supported_count"] for s in mock_samples)
+            tot_new_sup = sum(s["new_system"]["supported_count"] for s in mock_samples)
+            tot_old_not = sum(s["old_system"]["not_mentioned_count"] for s in mock_samples)
+            tot_new_not = sum(s["new_system"]["not_mentioned_count"] for s in mock_samples)
+            tot_old_opp = sum(s["old_system"]["against_count"] for s in mock_samples)
+            tot_new_opp = sum(s["new_system"]["against_count"] for s in mock_samples)
             decision_pass = mean_delta_rec >= -0.03 and mean_new_trunc < 0.02
 
             report_data = {
@@ -1259,6 +1299,28 @@ class ABTestRunner:
                     "mean_old_truncation_rate": mean_old_trunc,
                     "mean_new_truncation_rate": mean_new_trunc,
                     "mean_chunk_disproportion": mean_disprop,
+                    "mean_old_seam_integrity": 0.85,
+                    "mean_new_seam_integrity": 0.90,
+                    "mean_delta_seam_integrity": 0.05,
+                    "mean_old_net_integrity": 0.65,
+                    "mean_new_net_integrity": 0.72,
+                    "mean_delta_net_integrity": 0.07,
+                    "mean_old_calibrated_fidelity": 0.82,
+                    "mean_new_calibrated_fidelity": 0.88,
+                    "mean_delta_calibrated_fidelity": 0.06,
+                    "mean_old_hallucination_ratio": 0.0,
+                    "mean_new_hallucination_ratio": 0.0,
+                    "mean_delta_hallucination_ratio": 0.0,
+                    "total_assertions_count": tot_probes,
+                    "total_old_supported": tot_old_sup,
+                    "total_new_supported": tot_new_sup,
+                    "delta_supported": tot_new_sup - tot_old_sup,
+                    "total_old_not_mentioned": tot_old_not,
+                    "total_new_not_mentioned": tot_new_not,
+                    "delta_not_mentioned": tot_new_not - tot_old_not,
+                    "total_old_against": tot_old_opp,
+                    "total_new_against": tot_new_opp,
+                    "delta_against": tot_new_opp - tot_old_opp,
                     "decision_pass": decision_pass,
                     "pass_reason": "All decision gates passed: Recall delta >= -3% and Truncation Rate < 2%",
                     "total_duration_seconds": round(time.time() - t0, 2),
@@ -1303,21 +1365,70 @@ class ABTestRunner:
         print(f"{Colors.BOLD}{header}{Colors.RESET}")
         print("-" * len(sep))
 
-        print(f"{'Total Contiguous Blocks Audited':<{col_w_m}} {sm['total_samples']:<{col_w_v}} {sm['total_samples']:<{col_w_v}} {'-':<{col_w_v}}")
+        def _cell(v: str) -> str:
+            return f"{v:<{col_w_v}}"
+
+        print(f"{'Total Contiguous Blocks Audited':<{col_w_m}} {_cell(str(sm['total_samples']))} {_cell(str(sm['total_samples']))} {_cell('-')}")
+        print(f"{'Total Assertions Evaluated':<{col_w_m}} {_cell(str(sm.get('total_assertions_count', 0)))} {_cell(str(sm.get('total_assertions_count', 0)))} {_cell('-')}")
+        d_sup = sm.get("delta_supported", 0)
+        d_sup_c = Colors.GREEN if d_sup >= 0 else Colors.RED
+        print(f"{'Supported Assertions Count (+1.0)':<{col_w_m}} {_cell(str(sm.get('total_old_supported', 0)))} {_cell(str(sm.get('total_new_supported', 0)))} {d_sup_c}{_cell(f'{d_sup:+d}')}{Colors.RESET}")
+        d_not = sm.get("delta_not_mentioned", 0)
+        d_not_c = Colors.GREEN if d_not <= 0 else Colors.YELLOW
+        print(f"{'Not Mentioned / Omission Count (-0.25)':<{col_w_m}} {_cell(str(sm.get('total_old_not_mentioned', 0)))} {_cell(str(sm.get('total_new_not_mentioned', 0)))} {d_not_c}{_cell(f'{d_not:+d}')}{Colors.RESET}")
+        d_opp = sm.get("delta_against", 0)
+        d_opp_c = Colors.GREEN if d_opp <= 0 else Colors.RED
+        print(f"{'Contradicted / Hallucination Count (-1.0)':<{col_w_m}} {_cell(str(sm.get('total_old_against', 0)))} {_cell(str(sm.get('total_new_against', 0)))} {d_opp_c}{_cell(f'{d_opp:+d}')}{Colors.RESET}")
+
         delta_rec_color = Colors.GREEN if sm['mean_delta_recall'] >= -0.03 else Colors.RED
-        print(f"{'Mean QA Recall (%)':<{col_w_m}} {sm['mean_old_recall']*100:.2f}%{'':<{col_w_v-8}} {sm['mean_new_recall']*100:.2f}%{'':<{col_w_v-8}} {delta_rec_color}{sm['mean_delta_recall']*100:+.2f}% pts{Colors.RESET}")
+        v_old_rec = f"{sm['mean_old_recall']*100:.2f}%"
+        v_new_rec = f"{sm['mean_new_recall']*100:.2f}%"
+        v_d_rec = f"{sm['mean_delta_recall']*100:+.2f}% pts"
+        print(f"{'Mean QA Recall (%)':<{col_w_m}} {_cell(v_old_rec)} {_cell(v_new_rec)} {delta_rec_color}{_cell(v_d_rec)}{Colors.RESET}")
+
         seam_color = Colors.GREEN if sm.get('mean_new_seam_integrity', 0.0) >= 0.80 else Colors.RED
-        print(f"{'Mean Seam Integrity (Cross-Sentence) (%)':<{col_w_m}} {sm.get('mean_old_seam_integrity', 0.0)*100:.2f}%{'':<{col_w_v-8}} {seam_color}{sm.get('mean_new_seam_integrity', 0.0)*100:.2f}%{Colors.RESET}{'':<{col_w_v-8}} {(sm.get('mean_new_seam_integrity', 0.0)-sm.get('mean_old_seam_integrity', 0.0))*100:+.2f}% pts")
+        d_seam = sm.get('mean_delta_seam_integrity', sm.get('mean_new_seam_integrity', 0.0) - sm.get('mean_old_seam_integrity', 0.0))
+        v_old_seam = f"{sm.get('mean_old_seam_integrity', 0.0)*100:.2f}%"
+        v_new_seam = f"{sm.get('mean_new_seam_integrity', 0.0)*100:.2f}%"
+        v_d_seam = f"{d_seam*100:+.2f}% pts"
+        print(f"{'Mean Seam Integrity (Cross-Sentence) (%)':<{col_w_m}} {_cell(v_old_seam)} {seam_color}{_cell(v_new_seam)}{Colors.RESET} {_cell(v_d_seam)}")
+
+        d_net = sm.get('mean_delta_net_integrity', 0.0)
+        d_net_c = Colors.GREEN if d_net >= 0 else Colors.RED
+        v_old_net = f"{sm.get('mean_old_net_integrity', 0.0):+.2f}"
+        v_new_net = f"{sm.get('mean_new_net_integrity', 0.0):+.2f}"
+        v_d_net = f"{d_net:+.2f}"
+        print(f"{'Mean Net Semantic Integrity (S_net [-1, +1])':<{col_w_m}} {_cell(v_old_net)} {_cell(v_new_net)} {d_net_c}{_cell(v_d_net)}{Colors.RESET}")
+
+        d_fid = sm.get('mean_delta_calibrated_fidelity', 0.0)
+        d_fid_c = Colors.GREEN if d_fid >= 0 else Colors.RED
+        v_old_fid = f"{sm.get('mean_old_calibrated_fidelity', 0.0)*100:.2f}%"
+        v_new_fid = f"{sm.get('mean_new_calibrated_fidelity', 0.0)*100:.2f}%"
+        v_d_fid = f"{d_fid*100:+.2f}% pts"
+        print(f"{'Mean Calibrated Fidelity (R_calib) (%)':<{col_w_m}} {_cell(v_old_fid)} {_cell(v_new_fid)} {d_fid_c}{_cell(v_d_fid)}{Colors.RESET}")
+
         delta_fail_color = Colors.GREEN if sm.get('mean_delta_fail_ratio', 0.0) <= 0 else Colors.RED
-        print(f"{'Aggregate Fail Ratio [sum(Failed)/sum(Total)] (%)':<{col_w_m}} {sm.get('mean_old_fail_ratio', 0.0)*100:.2f}%{'':<{col_w_v-8}} {sm.get('mean_new_fail_ratio', 0.0)*100:.2f}%{'':<{col_w_v-8}} {delta_fail_color}{sm.get('mean_delta_fail_ratio', 0.0)*100:+.2f}% pts{Colors.RESET}")
-        print(f"{'Mean Grounded Precision (%)':<{col_w_m}} {sm['mean_old_precision']*100:.2f}%{'':<{col_w_v-8}} {sm['mean_new_precision']*100:.2f}%{'':<{col_w_v-8}} {(sm['mean_new_precision']-sm['mean_old_precision'])*100:+.2f}% pts")
+        v_old_fail = f"{sm.get('mean_old_fail_ratio', 0.0)*100:.2f}%"
+        v_new_fail = f"{sm.get('mean_new_fail_ratio', 0.0)*100:.2f}%"
+        v_d_fail = f"{sm.get('mean_delta_fail_ratio', 0.0)*100:+.2f}% pts"
+        print(f"{'Aggregate Fail Ratio [sum(Fail)/sum(Tot)] (%)':<{col_w_m}} {_cell(v_old_fail)} {_cell(v_new_fail)} {delta_fail_color}{_cell(v_d_fail)}{Colors.RESET}")
+
+        v_old_prec = f"{sm['mean_old_precision']*100:.2f}%"
+        v_new_prec = f"{sm['mean_new_precision']*100:.2f}%"
+        v_d_prec = f"{(sm['mean_new_precision']-sm['mean_old_precision'])*100:+.2f}% pts"
+        print(f"{'Mean Grounded Precision (%)':<{col_w_m}} {_cell(v_old_prec)} {_cell(v_new_prec)} {_cell(v_d_prec)}")
+
         trunc_color = Colors.GREEN if sm['mean_new_truncation_rate'] < 0.02 else Colors.RED
-        print(f"{'Boundary Truncation Artifact Rate (%)':<{col_w_m}} {sm['mean_old_truncation_rate']*100:.2f}%{'':<{col_w_v-8}} {trunc_color}{sm['mean_new_truncation_rate']*100:.2f}%{Colors.RESET}{'':<{col_w_v-8}} {(sm['mean_new_truncation_rate']-sm['mean_old_truncation_rate'])*100:+.2f}% pts")
+        v_old_trunc = f"{sm['mean_old_truncation_rate']*100:.2f}%"
+        v_new_trunc = f"{sm['mean_new_truncation_rate']*100:.2f}%"
+        v_d_trunc = f"{(sm['mean_new_truncation_rate']-sm['mean_old_truncation_rate'])*100:+.2f}% pts"
+        print(f"{'Boundary Truncation Artifact Rate (%)':<{col_w_m}} {_cell(v_old_trunc)} {trunc_color}{_cell(v_new_trunc)}{Colors.RESET} {_cell(v_d_trunc)}")
         print("-" * len(sep))
-        print(f"{'Mean Chunk Disproportion [intersect(A,B)/union(A,B)]':<{col_w_m}} {'-':<{col_w_v}} {Colors.BOLD}{Colors.CYAN}{sm['mean_chunk_disproportion']:.4f}{Colors.RESET}{'':<{col_w_v-8}} {'-':<{col_w_v}}")
+        v_disprop = f"{sm['mean_chunk_disproportion']:.4f}"
+        print(f"{'Mean Chunk Disproportion':<{col_w_m}} {_cell('-')} {Colors.BOLD}{Colors.CYAN}{_cell(v_disprop)}{Colors.RESET} {_cell('-')}")
 
         gate_badge = f"{Colors.BOLD}{Colors.GREEN}PASS{Colors.RESET}" if sm['decision_pass'] else f"{Colors.BOLD}{Colors.RED}FAIL{Colors.RESET}"
-        print(f"{'Decision Gating Checklist':<{col_w_m}} {'-':<{col_w_v}} {gate_badge:<{col_w_v}} {sm['pass_reason']}")
+        print(f"{'Decision Gating Checklist':<{col_w_m}} {_cell('-')} {_cell(gate_badge)} {sm['pass_reason']}")
         print(sep + "\n")
 
         log_success(f"Full cross-check JSON saved to: {Colors.BOLD}{json_out}{Colors.RESET}")
@@ -1340,6 +1451,10 @@ class ABTestRunner:
             "",
             "| Metric | Baseline (A) | Candidate (B) | Delta (B - A) | Passing Criteria |",
             "| :--- | :--- | :--- | :--- | :--- |",
+            f"| Total Assertions Evaluated | {sm.get('total_assertions_count', 0)} | {sm.get('total_assertions_count', 0)} | - | Probed Assertions |",
+            f"| Supported Assertions Count (+1.0) | {sm.get('total_old_supported', 0)} | {sm.get('total_new_supported', 0)} | {sm.get('delta_supported', 0):+d} | Higher is better |",
+            f"| Not Mentioned (Omission) Count (-0.25) | {sm.get('total_old_not_mentioned', 0)} | {sm.get('total_new_not_mentioned', 0)} | {sm.get('delta_not_mentioned', 0):+d} | Lower is better |",
+            f"| Contradicted (Hallucination) Count (-1.0) | {sm.get('total_old_against', 0)} | {sm.get('total_new_against', 0)} | {sm.get('delta_against', 0):+d} | Lower is better |",
             f"| Mean QA Recall | {sm.get('mean_old_recall', 0.0)*100:.2f}% | {sm.get('mean_new_recall', 0.0)*100:.2f}% | {sm.get('mean_delta_recall', 0.0)*100:+.2f}% pts | Mean ΔRecall >= -3% |",
             f"| Mean Seam Integrity (Cross-Sentence) | {sm.get('mean_old_seam_integrity', 0.0)*100:.2f}% | {sm.get('mean_new_seam_integrity', 0.0)*100:.2f}% | {(sm.get('mean_new_seam_integrity', 0.0)-sm.get('mean_old_seam_integrity', 0.0))*100:+.2f}% pts | Seam Integrity >= 80% |",
             f"| Mean Net Semantic Integrity (S_net [-1, +1]) | {sm.get('mean_old_net_integrity', 0.0):+.2f} | {sm.get('mean_new_net_integrity', 0.0):+.2f} | {sm.get('mean_delta_net_integrity', 0.0):+.2f} | Continuous Ternary Score |",
@@ -1352,12 +1467,26 @@ class ABTestRunner:
             "",
             "### 📊 Audited Block Samples Breakdown (Top 10)",
             "",
-            "| Block # | Book / Section | Passage Chars | Disproportion | QA Recall (A) | QA Recall (B) | ΔRecall | Seam Int (B) | Fail (A) | Fail (B) | ΔFail |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+            "| Block # | Book / Section | Passage Chars | Disproportion | QA Rec (A) | QA Rec (B) | ΔRecall | Status A (Sup/Not/Opp) | Status B (Sup/Not/Opp) | S_net (A) | S_net (B) | ΔS_net | Seam Int (B) | Fail (A) | Fail (B) | ΔFail |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
         ]
         for s in data.get("samples", [])[:10]:
+            old_s = s.get("old_system", {})
+            new_s = s.get("new_system", {})
+            rec_a = old_s.get("qa_recall", old_s.get("oracle_recall", 0.0))
+            rec_b = new_s.get("qa_recall", new_s.get("oracle_recall", 0.0))
+            d_rec = s.get("delta_qa_recall", s.get("delta_recall", round(rec_b - rec_a, 4)))
+            status_a = f"{old_s.get('supported_count', 0)}/{old_s.get('not_mentioned_count', 0)}/{old_s.get('against_count', 0)}"
+            status_b = f"{new_s.get('supported_count', 0)}/{new_s.get('not_mentioned_count', 0)}/{new_s.get('against_count', 0)}"
+            snet_a = old_s.get("net_integrity_score", 0.0)
+            snet_b = new_s.get("net_integrity_score", 0.0)
+            d_snet = s.get("delta_net_integrity", round(snet_b - snet_a, 4))
+            seam_b = new_s.get("seam_integrity_rate", 0.0)
+            fail_a = old_s.get("fail_ratio", 0.0)
+            fail_b = new_s.get("fail_ratio", 0.0)
+            d_fail = s.get("delta_fail_ratio", round(fail_b - fail_a, 4))
             lines.append(
-                f"| {s['sample_index']} | {s['book_title'][:18]} ({s['section_title'][:16]}) | {s['passage_length_chars']} | {s['chunk_disproportion']:.3f} | {s['old_system']['oracle_recall']*100:.1f}% | {s['new_system']['oracle_recall']*100:.1f}% | {s['delta_recall']*100:+.1f}% | {s['old_system'].get('fail_ratio', 0.0)*100:.1f}% | {s['new_system'].get('fail_ratio', 0.0)*100:.1f}% | {s.get('delta_fail_ratio', 0.0)*100:+.1f}% | {s['new_system']['truncation_rate']*100:.1f}% |"
+                f"| {s.get('sample_index', 0)} | {s.get('book_title', '')[:16]} ({s.get('section_title', '')[:14]}) | {s.get('passage_length_chars', 0)} | {s.get('chunk_disproportion', 0.0):.3f} | {rec_a*100:.1f}% | {rec_b*100:.1f}% | {d_rec*100:+.1f}% | {status_a} | {status_b} | {snet_a:+.2f} | {snet_b:+.2f} | {d_snet:+.2f} | {seam_b*100:.1f}% | {fail_a*100:.1f}% | {fail_b*100:.1f}% | {d_fail*100:+.1f}% |"
             )
 
         with open(dest, "w", encoding="utf-8") as f:

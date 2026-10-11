@@ -865,5 +865,230 @@ def test_cross_check_continuous_ternary_scoring_pipeline(sample_graphs, mock_poo
     assert "delta_net_integrity" in dumped["samples"][0]
 
 
+def test_cross_check_status_breakdown_counters(sample_graphs):
+    """Test that grouped status counters (Supported, Not Mentioned, Contradicted) are correctly aggregated."""
+    from bookeeper.processing.qa_probe import NLISystemBlockMetrics
+    store_a, store_b = sample_graphs
+
+    with patch("bookeeper.processing.cross_checker.evaluate_block_qa_probes") as mock_eval:
+        p1 = QAProbeItem(question_id=1, question="P1", gold_answer="G1")
+        p2 = QAProbeItem(question_id=2, question="P2", gold_answer="G2")
+        p3 = QAProbeItem(question_id=3, question="P3", gold_answer="G3")
+
+        m_old = NLISystemBlockMetrics(
+            system="old",
+            total_probes=3,
+            passed_probes=1,
+            failed_probes=2,
+            qa_recall=0.3333,
+            supported_count=1,
+            not_mentioned_count=1,
+            against_count=1,
+            support_ratio=0.3333,
+            hallucination_ratio=0.3333,
+            net_integrity_score=0.0,
+            calibrated_fidelity=0.3333,
+        )
+        m_new = NLISystemBlockMetrics(
+            system="new",
+            total_probes=3,
+            passed_probes=3,
+            failed_probes=0,
+            qa_recall=1.0,
+            supported_count=3,
+            not_mentioned_count=0,
+            against_count=0,
+            support_ratio=1.0,
+            hallucination_ratio=0.0,
+            net_integrity_score=1.0,
+            calibrated_fidelity=1.0,
+        )
+        mock_eval.return_value = ([p1, p2, p3], m_old, m_new)
+
+        report = run_cross_check(
+            store_a=store_a,
+            store_b=store_b,
+            num_blocks=1,
+            pool=MagicMock(),
+        )
+
+        sm = report.summary
+        assert sm.total_assertions_count == 3
+        assert sm.total_old_supported == 1
+        assert sm.total_new_supported == 3
+        assert sm.delta_supported == +2
+        assert sm.total_old_not_mentioned == 1
+        assert sm.total_new_not_mentioned == 0
+        assert sm.delta_not_mentioned == -1
+        assert sm.total_old_against == 1
+        assert sm.total_new_against == 0
+        assert sm.delta_against == -1
+
+        # Assert delta recall calculation strictly equals candidate - baseline
+        assert sm.mean_old_recall == 0.3333
+        assert sm.mean_new_recall == 1.0
+        assert sm.mean_delta_recall == round(1.0 - 0.3333, 4)
+        assert sm.mean_delta_recall > 0.0
+
+
+def test_delta_qa_recall_candidate_outperforms_baseline():
+    """Verify that when candidate outperforms baseline across multiple blocks, delta QA recall is positive."""
+    import numpy as np
+    from bookeeper.processing.cross_checker import SystemBlockMetrics, CrossCheckBlockResult
+    from bookeeper.processing.cross_checker import CrossCheckSummary
+
+    eval_a1 = SystemBlockMetrics(system="old", qa_recall=0.60, total_probes_count=5, supported_count=3, not_mentioned_count=2, against_count=0)
+    eval_b1 = SystemBlockMetrics(system="new", qa_recall=0.80, total_probes_count=5, supported_count=4, not_mentioned_count=1, against_count=0)
+    s1 = CrossCheckBlockResult(
+        sample_index=1,
+        book_id=1,
+        book_title="Book 1",
+        section_title="Sec 1",
+        old_chunk_ids=["c1"],
+        new_chunk_ids=["c1"],
+        passage_length_chars=1000,
+        block_a_total_len=1000,
+        block_b_total_len=1000,
+        union_len=1000,
+        chunk_disproportion=1.0,
+        old_system=eval_a1,
+        new_system=eval_b1,
+        delta_recall=0.20,
+        delta_qa_recall=0.20,
+    )
+
+    eval_a2 = SystemBlockMetrics(system="old", qa_recall=0.50, total_probes_count=4, supported_count=2, not_mentioned_count=2, against_count=0)
+    eval_b2 = SystemBlockMetrics(system="new", qa_recall=0.75, total_probes_count=4, supported_count=3, not_mentioned_count=1, against_count=0)
+    s2 = CrossCheckBlockResult(
+        sample_index=2,
+        book_id=1,
+        book_title="Book 1",
+        section_title="Sec 2",
+        old_chunk_ids=["c2"],
+        new_chunk_ids=["c2"],
+        passage_length_chars=1000,
+        block_a_total_len=1000,
+        block_b_total_len=1000,
+        union_len=1000,
+        chunk_disproportion=1.0,
+        old_system=eval_a2,
+        new_system=eval_b2,
+        delta_recall=0.25,
+        delta_qa_recall=0.25,
+    )
+
+    samples = [s1, s2]
+    mean_old = round(float(np.mean([s.old_system.qa_recall for s in samples])), 4)
+    mean_new = round(float(np.mean([s.new_system.qa_recall for s in samples])), 4)
+    mean_delta = round(float(mean_new - mean_old), 4)
+
+    assert mean_old == 0.55
+    assert mean_new == 0.775
+    assert mean_delta == +0.225
+    assert mean_delta > 0.0
+    assert mean_delta > 0.0
+
+
+def test_ab_test_cross_check_markdown_alignment(tmp_path):
+    """Test that scripts/ab_test.py generates markdown report with strictly aligned columns and status breakdown."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import ab_test
+
+    runner = ab_test.ABTestRunner(
+        branch1="main",
+        branch2="feat",
+        dry_run=True,
+        output_dir=str(tmp_path),
+    )
+
+    report_file = tmp_path / "test_report.md"
+    sample_data = {
+        "summary": {
+            "total_samples": 1,
+            "total_assertions_count": 5,
+            "total_old_supported": 3,
+            "total_new_supported": 5,
+            "delta_supported": 2,
+            "total_old_not_mentioned": 2,
+            "total_new_not_mentioned": 0,
+            "delta_not_mentioned": -2,
+            "total_old_against": 0,
+            "total_new_against": 0,
+            "delta_against": 0,
+            "mean_old_recall": 0.60,
+            "mean_new_recall": 1.00,
+            "mean_delta_recall": 0.40,
+            "mean_chunk_disproportion": 0.95,
+            "decision_pass": True,
+            "pass_reason": "PASS",
+        },
+        "samples": [
+            {
+                "sample_index": 1,
+                "book_title": "AI Primer",
+                "section_title": "Intro",
+                "passage_length_chars": 2500,
+                "chunk_disproportion": 0.95,
+                "old_system": {
+                    "qa_recall": 0.60,
+                    "supported_count": 3,
+                    "not_mentioned_count": 2,
+                    "against_count": 0,
+                    "net_integrity_score": 0.50,
+                    "fail_ratio": 0.40,
+                },
+                "new_system": {
+                    "qa_recall": 1.00,
+                    "supported_count": 5,
+                    "not_mentioned_count": 0,
+                    "against_count": 0,
+                    "net_integrity_score": 1.00,
+                    "seam_integrity_rate": 0.90,
+                    "fail_ratio": 0.0,
+                },
+                "delta_qa_recall": 0.40,
+                "delta_net_integrity": 0.50,
+                "delta_fail_ratio": -0.40,
+            }
+        ],
+    }
+
+    runner._write_cross_check_markdown(report_file, sample_data)
+    content = report_file.read_text(encoding="utf-8")
+
+    # Verify summary rows
+    assert "| Supported Assertions Count (+1.0) | 3 | 5 | +2 | Higher is better |" in content
+    assert "| Not Mentioned (Omission) Count (-0.25) | 2 | 0 | -2 | Lower is better |" in content
+
+    # Verify sample table headers and row cell count match exactly
+    header_line = [line for line in content.splitlines() if line.startswith("| Block #")][0]
+    headers = [c.strip() for c in header_line.split("|")[1:-1]]
+    data_line = [line for line in content.splitlines() if line.startswith("| 1 |")][0]
+    cells = [c.strip() for c in data_line.split("|")[1:-1]]
+
+    assert len(headers) == len(cells), f"Header count {len(headers)} != Cell count {len(cells)}"
+    assert "QA Rec (A)" in headers
+    assert "QA Rec (B)" in headers
+    assert "ΔRecall" in headers
+    assert "Status A (Sup/Not/Opp)" in headers
+    assert "Status B (Sup/Not/Opp)" in headers
+
+    # Verify cells match their headers
+    rec_a_idx = headers.index("QA Rec (A)")
+    rec_b_idx = headers.index("QA Rec (B)")
+    delta_idx = headers.index("ΔRecall")
+    status_a_idx = headers.index("Status A (Sup/Not/Opp)")
+    status_b_idx = headers.index("Status B (Sup/Not/Opp)")
+
+    assert cells[rec_a_idx] == "60.0%"
+    assert cells[rec_b_idx] == "100.0%"
+    assert cells[delta_idx] == "+40.0%"
+    assert cells[status_a_idx] == "3/2/0"
+    assert cells[status_b_idx] == "5/0/0"
+
+
+
 
 

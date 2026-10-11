@@ -6,6 +6,7 @@ import json
 import logging
 import queue
 import random
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -3121,6 +3122,13 @@ def verify_command(
 
                 chunk_progress.update(tot_chunk_task, completed=completed, total=total, stats_line=stats_str)
                 live.update(Group(Text.from_markup(cur_text), chunk_progress))
+                if completed > 0 and (completed % 10 == 0 or completed == total):
+                    pct = (completed / total * 100) if total > 0 else 0.0
+                    console.print(
+                        f"[bold cyan][Chunking Coherence][/bold cyan] {completed}/{total} chunks ({pct:.1f}%)"
+                        f" | {rate_str} | ETA: {eta_str} | [bold green]✓ {coherent_cnt} coherent[/bold green] | [bold red]✗ {divergent_cnt} divergent[/bold red]"
+                    )
+                    sys.stdout.flush()
 
             report = verify_chunking(
                 chunk_store=chunk_store,
@@ -3360,6 +3368,13 @@ def verify_command(
                 )
                 chunk_progress.update(tot_chunk_task, completed=completed, total=total, stats_line=stats_str)
                 live.update(Group(Text.from_markup(cur_text), chunk_progress))
+                if item is not None and (completed % 10 == 0 or completed == total):
+                    pct = (completed / total * 100) if total > 0 else 0.0
+                    console.print(
+                        f"[bold cyan][Chunk Verification][/bold cyan] {completed}/{total} chunks ({pct:.1f}%)"
+                        f" | {speed_str} | ETA: {eta_str} | [bold green]✓ {tot_matched} matched[/bold green] | [bold red]✗ {tot_missed} missed[/bold red]"
+                    )
+                    sys.stdout.flush()
 
             report = verify_chunks(
                 store=store,
@@ -3653,6 +3668,13 @@ def verify_command(
                 stats_str = f"[cyan]{speed_str}[/cyan] | [yellow]ETA: {eta_str}[/yellow]"
                 cc_progress.update(tot_cc_task, completed=completed, total=total, stats_line=stats_str)
                 live.update(Group(Text.from_markup(cur_text), cc_progress))
+                if item is not None and (completed % 5 == 0 or completed == total):
+                    pct = (completed / total * 100) if total > 0 else 0.0
+                    console.print(
+                        f"[bold cyan][Cross-Check][/bold cyan] {completed}/{total} blocks ({pct:.1f}%)"
+                        f" | {speed_str} | ETA: {eta_str}"
+                    )
+                    sys.stdout.flush()
 
             report = run_cross_check(
                 store_a=store_a,
@@ -3887,6 +3909,13 @@ def verify_command(
 
             progress.update(tot_task, completed=completed, total=total, stats_line=stats_str)
             live.update(Group(Text.from_markup(cur_text), progress))
+            if item is not None and (completed % 10 == 0 or completed == total):
+                pct = (completed / total * 100) if total > 0 else 0.0
+                console.print(
+                    f"[bold cyan][Ideas Verification][/bold cyan] {completed}/{total} items ({pct:.1f}%)"
+                    f" | {rate_str} | ETA: {eta_str} | [bold green]✓ {verified_cnt} passed[/bold green] | [bold red]✗ {discrepancy_cnt} failed[/bold red]"
+                )
+                sys.stdout.flush()
 
         raw_cdir = chunks_dir or getattr(cfg, "chunks_dir", None) or (cfg.resolved_output_dir / "chunks" if hasattr(cfg, "resolved_output_dir") else None)
         chunks_storage_dir = Path(raw_cdir).expanduser().resolve() if raw_cdir else None

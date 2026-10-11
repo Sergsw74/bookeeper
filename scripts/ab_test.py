@@ -670,6 +670,7 @@ class ABTestRunner:
                         stderr=subprocess.STDOUT,
                         text=True,
                         bufsize=1,
+                        env={**os.environ, "PYTHONUNBUFFERED": "1"},
                     )
                     for line in proc.stdout:  # type: ignore
                         sys.stdout.write(line)
@@ -953,6 +954,7 @@ class ABTestRunner:
                         stderr=subprocess.STDOUT,
                         text=True,
                         bufsize=1,
+                        env={**os.environ, "PYTHONUNBUFFERED": "1"},
                     )
                     for line in proc.stdout:  # type: ignore
                         sys.stdout.write(line)

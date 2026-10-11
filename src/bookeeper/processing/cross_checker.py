@@ -29,6 +29,7 @@ from bookeeper.processing.extractor import Concept, KnowledgeExtractor
 from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings, OllamaPool
 from bookeeper.processing.qa_probe import (
     AtomicAssertionItem,
+    EvaluationWeights,
     NLIAssertionEvaluation,
     NLISystemBlockMetrics,
     QAProbeEvaluation,
@@ -37,6 +38,7 @@ from bookeeper.processing.qa_probe import (
     build_assertion_generator_prompt,
     build_generator_prompt,
     build_nli_verifier_prompt,
+    calculate_ternary_scores,
     evaluate_block_atomic_assertions,
     evaluate_block_qa_probes,
     format_ideas_for_context,
@@ -78,6 +80,17 @@ class SystemBlockMetrics(BaseModel):
     total_probes_count: int = 0
     evaluations: List[QAProbeEvaluation] = Field(default_factory=list)
 
+    # Continuous ternary verification metrics
+    supported_count: int = 0
+    not_mentioned_count: int = 0
+    against_count: int = 0
+    support_ratio: float = 0.0
+    hallucination_ratio: float = 0.0
+    net_integrity_score: float = 0.0
+    calibrated_fidelity: float = 0.0
+    seam_net_integrity: float = 0.0
+    seam_calibrated_fidelity: float = 0.0
+
 
 class CrossCheckBlockResult(BaseModel):
     """Audit evaluation result for a single sampled text window / block."""
@@ -113,6 +126,8 @@ class CrossCheckBlockResult(BaseModel):
     probes: List[QAProbeItem] = Field(default_factory=list)
     delta_qa_recall: float = 0.0
     delta_seam_integrity: float = 0.0
+    delta_net_integrity: float = 0.0
+    delta_calibrated_fidelity: float = 0.0
 
     # Verification Prompts & Formatted Claims Context
     generator_prompt: str = ""
@@ -141,6 +156,17 @@ class CrossCheckSummary(BaseModel):
     decision_pass: bool
     pass_reason: str = ""
     total_duration_seconds: float = 0.0
+
+    # Continuous ternary verification metrics
+    mean_old_net_integrity: float = 0.0
+    mean_new_net_integrity: float = 0.0
+    mean_delta_net_integrity: float = 0.0
+    mean_old_calibrated_fidelity: float = 0.0
+    mean_new_calibrated_fidelity: float = 0.0
+    mean_delta_calibrated_fidelity: float = 0.0
+    mean_old_hallucination_ratio: float = 0.0
+    mean_new_hallucination_ratio: float = 0.0
+    mean_delta_hallucination_ratio: float = 0.0
 
 
 class CrossCheckReport(BaseModel):
@@ -836,7 +862,10 @@ def print_block_comparison(
             cls_a = getattr(e_a, "classification", e_a.verdict)
             rat_a = getattr(e_a, "rationale", getattr(e_a, "reason", ""))
             rat_a_str = f" ({rat_a[:60]})" if rat_a else ""
-            _out(f"      • Baseline (A):  [{cls_a} | {e_a.verdict}]{rat_a_str}")
+            sc_a = getattr(e_a, "score", None)
+            if sc_a is None:
+                sc_a = 1.0 if cls_a == "SUPPORTED" else (-1.0 if cls_a in ("CONTRADICTED", "AGAINST") else -0.25)
+            _out(f"      • Baseline (A):  [{cls_a} ({sc_a:+.2f}) | {e_a.verdict}]{rat_a_str}")
 
         e_b = eval_new_map.get(p.question_id)
         if e_b:
@@ -846,23 +875,32 @@ def print_block_comparison(
             if cls_b != "SUPPORTED" and p.is_cross_sentence and (e_a and getattr(e_a, "classification", e_a.verdict) == "SUPPORTED"):
                 status_b = f"{cls_b} - Seam Lost"
             rat_b_str = f" ({rat_b[:60]})" if rat_b else ""
-            _out(f"      • Candidate (B): [{status_b} | {e_b.verdict}]{rat_b_str}")
+            sc_b = getattr(e_b, "score", None)
+            if sc_b is None:
+                sc_b = 1.0 if cls_b == "SUPPORTED" else (-1.0 if cls_b in ("CONTRADICTED", "AGAINST") else -0.25)
+            _out(f"      • Candidate (B): [{status_b} ({sc_b:+.2f}) | {e_b.verdict}]{rat_b_str}")
         _out("")
 
     _out(f"📊 BLOCK NLI ENTAILMENT METRICS:")
     _out(
-        f"   • Baseline NLI Recall:  {eval_old.qa_recall * 100:.1f}% ({eval_old.passed_probes_count}/{eval_old.total_probes_count} supported) | "
+        f"   • Baseline:  Recall: {eval_old.qa_recall * 100:.1f}% ({eval_old.passed_probes_count}/{eval_old.total_probes_count} supported) | "
+        f"Net Integrity (S_net): {eval_old.net_integrity_score:+.2f} | Fidelity (R_calib): {eval_old.calibrated_fidelity * 100:.1f}% | "
         f"Seam Integrity: {eval_old.seam_integrity_rate * 100:.1f}%"
     )
     _out(
-        f"   • Candidate NLI Recall: {eval_new.qa_recall * 100:.1f}% ({eval_new.passed_probes_count}/{eval_new.total_probes_count} supported) | "
+        f"   • Candidate: Recall: {eval_new.qa_recall * 100:.1f}% ({eval_new.passed_probes_count}/{eval_new.total_probes_count} supported) | "
+        f"Net Integrity (S_net): {eval_new.net_integrity_score:+.2f} | Fidelity (R_calib): {eval_new.calibrated_fidelity * 100:.1f}% | "
         f"Seam Integrity: {eval_new.seam_integrity_rate * 100:.1f}%"
     )
     delta_pts = (eval_new.qa_recall - eval_old.qa_recall) * 100
-    _out(f"   • Recall Delta:         {delta_pts:+.1f}% pts")
+    delta_net = eval_new.net_integrity_score - eval_old.net_integrity_score
+    delta_fid = (eval_new.calibrated_fidelity - eval_old.calibrated_fidelity) * 100
+    _out(f"   • Deltas (B - A): Recall: {delta_pts:+.1f}% pts | Net Integrity: {delta_net:+.2f} | Fidelity: {delta_fid:+.1f}% pts")
     _out(
         f"   [Legend] Recall = Supported / Total | "
-        f"Seam Int (SIMINT) = Supported Cross-Boundary / Total Cross-Boundary"
+        f"Net Integrity (S_net) = (1.0*Sup - 0.25*Not - 1.0*Against)/Total | "
+        f"Fidelity = max(0, Sup + 0.2*Not - 1.0*Against)/Total | "
+        f"Seam Int = Supported Cross-Boundary / Total Cross-Boundary"
     )
     _out(f"{sep}\n")
 
@@ -1068,6 +1106,15 @@ def run_cross_check(
             passed_probes_count=qa_m_old.passed_probes,
             total_probes_count=qa_m_old.total_probes,
             evaluations=qa_m_old.evaluations,
+            supported_count=qa_m_old.supported_count,
+            not_mentioned_count=qa_m_old.not_mentioned_count,
+            against_count=qa_m_old.against_count,
+            support_ratio=qa_m_old.support_ratio,
+            hallucination_ratio=qa_m_old.hallucination_ratio,
+            net_integrity_score=qa_m_old.net_integrity_score,
+            calibrated_fidelity=qa_m_old.calibrated_fidelity,
+            seam_net_integrity=qa_m_old.seam_net_integrity,
+            seam_calibrated_fidelity=qa_m_old.seam_calibrated_fidelity,
         )
         eval_new = SystemBlockMetrics(
             system="new",
@@ -1084,11 +1131,22 @@ def run_cross_check(
             passed_probes_count=qa_m_new.passed_probes,
             total_probes_count=qa_m_new.total_probes,
             evaluations=qa_m_new.evaluations,
+            supported_count=qa_m_new.supported_count,
+            not_mentioned_count=qa_m_new.not_mentioned_count,
+            against_count=qa_m_new.against_count,
+            support_ratio=qa_m_new.support_ratio,
+            hallucination_ratio=qa_m_new.hallucination_ratio,
+            net_integrity_score=qa_m_new.net_integrity_score,
+            calibrated_fidelity=qa_m_new.calibrated_fidelity,
+            seam_net_integrity=qa_m_new.seam_net_integrity,
+            seam_calibrated_fidelity=qa_m_new.seam_calibrated_fidelity,
         )
 
         delta_rec = round(eval_new.qa_recall - eval_old.qa_recall, 4)
         delta_fail = round(eval_new.fail_ratio - eval_old.fail_ratio, 4)
         delta_seam = round(eval_new.seam_integrity_rate - eval_old.seam_integrity_rate, 4)
+        delta_net = round(eval_new.net_integrity_score - eval_old.net_integrity_score, 4)
+        delta_fid = round(eval_new.calibrated_fidelity - eval_old.calibrated_fidelity, 4)
         dur = round(time.time() - t0, 2)
         curr_idx = len(samples) + 1
 
@@ -1122,6 +1180,8 @@ def run_cross_check(
             probes=probes,
             delta_qa_recall=delta_rec,
             delta_seam_integrity=delta_seam,
+            delta_net_integrity=delta_net,
+            delta_calibrated_fidelity=delta_fid,
             generator_prompt=gen_prompt,
             claims_context_old=claims_ctx_old,
             claims_context_new=claims_ctx_new,
@@ -1171,6 +1231,18 @@ def run_cross_check(
         mean_new_seam = round(float(np.mean([s.new_system.seam_integrity_rate for s in samples])), 4)
         mean_delta_seam = round(float(np.mean([s.delta_seam_integrity for s in samples])), 4)
 
+        mean_old_net = round(float(np.mean([s.old_system.net_integrity_score for s in samples])), 4)
+        mean_new_net = round(float(np.mean([s.new_system.net_integrity_score for s in samples])), 4)
+        mean_delta_net = round(float(mean_new_net - mean_old_net), 4)
+
+        mean_old_fid = round(float(np.mean([s.old_system.calibrated_fidelity for s in samples])), 4)
+        mean_new_fid = round(float(np.mean([s.new_system.calibrated_fidelity for s in samples])), 4)
+        mean_delta_fid = round(float(mean_new_fid - mean_old_fid), 4)
+
+        mean_old_halluc = round(float(np.mean([s.old_system.hallucination_ratio for s in samples])), 4)
+        mean_new_halluc = round(float(np.mean([s.new_system.hallucination_ratio for s in samples])), 4)
+        mean_delta_halluc = round(float(mean_new_halluc - mean_old_halluc), 4)
+
         # Micro-aggregated fail ratios: sum(failed) / sum(total_block_probes)
         total_old_dropped = sum(s.old_system.dropped_ideas_count for s in samples)
         total_old_probes = sum(s.old_system.total_probes_count for s in samples)
@@ -1191,6 +1263,9 @@ def run_cross_check(
         agg_old_fail = agg_new_fail = agg_delta_fail = 0.0
         mean_old_trunc = mean_new_trunc = mean_disprop = 0.0
         mean_old_seam = mean_new_seam = mean_delta_seam = 0.0
+        mean_old_net = mean_new_net = mean_delta_net = 0.0
+        mean_old_fid = mean_new_fid = mean_delta_fid = 0.0
+        mean_old_halluc = mean_new_halluc = mean_delta_halluc = 0.0
 
     # Decision Gates:
     # 1. Mean Delta QA Recall >= -0.03
@@ -1223,6 +1298,15 @@ def run_cross_check(
         mean_old_seam_integrity=mean_old_seam,
         mean_new_seam_integrity=mean_new_seam,
         mean_delta_seam_integrity=mean_delta_seam,
+        mean_old_net_integrity=mean_old_net,
+        mean_new_net_integrity=mean_new_net,
+        mean_delta_net_integrity=mean_delta_net,
+        mean_old_calibrated_fidelity=mean_old_fid,
+        mean_new_calibrated_fidelity=mean_new_fid,
+        mean_delta_calibrated_fidelity=mean_delta_fid,
+        mean_old_hallucination_ratio=mean_old_halluc,
+        mean_new_hallucination_ratio=mean_new_halluc,
+        mean_delta_hallucination_ratio=mean_delta_halluc,
         decision_pass=decision_pass,
         pass_reason="; ".join(reasons),
         total_duration_seconds=round(time.time() - t_global_start, 2),

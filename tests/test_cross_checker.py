@@ -791,4 +791,79 @@ def test_midpoint_bounded_candidate_selection():
     assert aligned_ids == ["c_overlap_start", "c_inside", "c_overlap_end"]
 
 
+def test_cross_check_continuous_ternary_scoring_pipeline(sample_graphs, mock_pool):
+    """Verify run_cross_check populates and serializes continuous ternary metrics."""
+    store_a, store_b = sample_graphs
+
+    def fake_generate(model, prompt, **kwargs):
+        if "extract all core standalone ideas" in prompt.lower() or "knowledge extractor" in prompt.lower():
+            return (
+                json.dumps({
+                    "ideas": [
+                        {"name": "Fox Agility", "brief_description": "Fox jumping over dog"},
+                    ]
+                }),
+                {},
+            )
+        elif "natural language inference" in prompt.lower() or "target assertion" in prompt.lower():
+            # Entailment classification
+            return (
+                json.dumps({
+                    "classification": "SUPPORTED",
+                    "rationale": "Directly grounded",
+                }),
+                {},
+            )
+        else:
+            return (
+                json.dumps({
+                    "verdict": "VALID_DETAIL",
+                    "rationale": "Accurate detail",
+                }),
+                {},
+            )
+
+    mock_pool.generate = MagicMock(side_effect=fake_generate)
+
+    report = run_cross_check(
+        store_a=store_a,
+        store_b=store_b,
+        num_blocks=1,
+        branch_a_name="Baseline",
+        branch_b_name="Candidate",
+        model_name="test-model",
+        pool=mock_pool,
+        print_chunks=0,
+    )
+
+    assert isinstance(report, CrossCheckReport)
+    assert len(report.samples) == 1
+    sample = report.samples[0]
+
+    # Verify block sample ternary fields
+    assert hasattr(sample.old_system, "net_integrity_score")
+    assert hasattr(sample.new_system, "net_integrity_score")
+    assert hasattr(sample.old_system, "calibrated_fidelity")
+    assert hasattr(sample.new_system, "calibrated_fidelity")
+    assert hasattr(sample, "delta_net_integrity")
+    assert hasattr(sample, "delta_calibrated_fidelity")
+
+    # Verify summary ternary fields
+    assert hasattr(report.summary, "mean_old_net_integrity")
+    assert hasattr(report.summary, "mean_new_net_integrity")
+    assert hasattr(report.summary, "mean_delta_net_integrity")
+    assert hasattr(report.summary, "mean_old_calibrated_fidelity")
+    assert hasattr(report.summary, "mean_new_calibrated_fidelity")
+    assert hasattr(report.summary, "mean_delta_calibrated_fidelity")
+    assert hasattr(report.summary, "mean_old_hallucination_ratio")
+    assert hasattr(report.summary, "mean_new_hallucination_ratio")
+
+    # Verify JSON serialization includes continuous ternary scores
+    dumped = report.model_dump()
+    assert "mean_new_net_integrity" in dumped["summary"]
+    assert "mean_new_calibrated_fidelity" in dumped["summary"]
+    assert "delta_net_integrity" in dumped["samples"][0]
+
+
+
 

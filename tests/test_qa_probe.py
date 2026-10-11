@@ -265,9 +265,28 @@ def test_evaluate_block_atomic_assertions():
     assert len(m_old.evaluations[0].verifier_prompt) > 20
     assert "Target Assertion:" in m_old.evaluations[0].verifier_prompt
     assert m_old.evaluations[0].classification == "SUPPORTED"
+    assert m_old.evaluations[0].score == 1.0
     assert m_old.evaluations[0].verdict == "PASS"
     assert m_old.evaluations[1].classification == "NOT_MENTIONED"
+    assert m_old.evaluations[1].score == -0.25
     assert m_old.evaluations[1].verdict == "FAIL"
+
+    # Verify ternary continuous scoring
+    assert m_old.supported_count == 1
+    assert m_old.not_mentioned_count == 1
+    assert m_old.against_count == 0
+    assert m_old.net_integrity_score == 0.375
+    assert m_old.calibrated_fidelity == 0.60
+    assert m_old.seam_net_integrity == 1.0
+    assert m_old.seam_calibrated_fidelity == 1.0
+
+    assert m_new.supported_count == 1
+    assert m_new.not_mentioned_count == 1
+    assert m_new.against_count == 0
+    assert m_new.net_integrity_score == 0.375
+    assert m_new.calibrated_fidelity == 0.60
+    assert m_new.seam_net_integrity == -0.25
+    assert m_new.seam_calibrated_fidelity == 0.20
 
 
 def test_prompt_builders_and_constraints():
@@ -297,3 +316,90 @@ def test_prompt_builders_and_constraints():
     assert "NOT_MENTIONED" in ver_p
     assert "classification" in ver_p
     assert "rationale" in ver_p
+
+
+def test_evaluation_weights_and_ternary_scores():
+    from bookeeper.processing.qa_probe import EvaluationWeights, calculate_ternary_scores
+
+    # 1. Empty results
+    res_empty = calculate_ternary_scores([])
+    assert res_empty["total_probes"] == 0
+    assert res_empty["net_integrity_score"] == 0.0
+    assert res_empty["calibrated_fidelity"] == 0.0
+    assert res_empty["net_score"] == 0.0
+
+    # 2. All SUPPORTED
+    res_sup = calculate_ternary_scores(["SUPPORTED", "SUPPORTED"])
+    assert res_sup["total_probes"] == 2
+    assert res_sup["supported_count"] == 2
+    assert res_sup["not_mentioned_count"] == 0
+    assert res_sup["against_count"] == 0
+    assert res_sup["support_ratio"] == 1.0
+    assert res_sup["hallucination_ratio"] == 0.0
+    assert res_sup["net_integrity_score"] == 1.0
+    assert res_sup["calibrated_fidelity"] == 1.0
+
+    # 3. All AGAINST / CONTRADICTED
+    res_opp = calculate_ternary_scores(["AGAINST", "CONTRADICTED"])
+    assert res_opp["total_probes"] == 2
+    assert res_opp["against_count"] == 2
+    assert res_opp["hallucination_ratio"] == 1.0
+    assert res_opp["net_integrity_score"] == -1.0
+    assert res_opp["calibrated_fidelity"] == 0.0
+
+    # 4. All NOT_MENTIONED
+    res_not = calculate_ternary_scores(["NOT_MENTIONED", "NOT_MENTIONED"])
+    assert res_not["total_probes"] == 2
+    assert res_not["not_mentioned_count"] == 2
+    assert res_not["net_integrity_score"] == -0.25
+    assert res_not["calibrated_fidelity"] == 0.20
+
+    # 5. Mixed: 1 SUPPORTED, 1 NOT_MENTIONED, 1 AGAINST
+    res_mix = calculate_ternary_scores(["SUPPORTED", "NOT_MENTIONED", "AGAINST"])
+    assert res_mix["total_probes"] == 3
+    assert res_mix["supported_count"] == 1
+    assert res_mix["not_mentioned_count"] == 1
+    assert res_mix["against_count"] == 1
+    # raw_score = 1.0*1 - 0.25*1 - 1.0*1 = -0.25 -> net_score = -0.25 / 3 = -0.0833
+    assert res_mix["net_integrity_score"] == -0.0833
+    # calibrated_fidelity = max(0.0, (1 + 0.2*1 - 1.0*1) / 3) = 0.2 / 3 = 0.0667
+    assert res_mix["calibrated_fidelity"] == 0.0667
+
+    # 6. Custom weights
+    custom_w = EvaluationWeights(supported=1.0, not_mentioned=-0.20, against=-1.0)
+    res_custom = calculate_ternary_scores(["SUPPORTED", "NOT_MENTIONED"], weights=custom_w)
+    # raw_score = 1.0 - 0.20 = 0.80 -> net_score = 0.40
+    assert res_custom["net_integrity_score"] == 0.40
+
+
+def test_nli_assertion_evaluation_numeric_encoding():
+    # 1. Default numeric score assignments
+    e_sup = NLIAssertionEvaluation(claim_id=1, assertion="Claim", classification="SUPPORTED")
+    assert e_sup.score == 1.0
+    assert e_sup.verdict == "PASS"
+
+    e_opp = NLIAssertionEvaluation(claim_id=2, assertion="Claim", classification="CONTRADICTED")
+    assert e_opp.score == -1.0
+    assert e_opp.verdict == "FAIL"
+
+    e_against = NLIAssertionEvaluation(claim_id=3, assertion="Claim", classification="AGAINST")
+    assert e_against.score == -1.0
+    assert e_against.verdict == "FAIL"
+
+    e_not = NLIAssertionEvaluation(claim_id=4, assertion="Claim", classification="NOT_MENTIONED")
+    assert e_not.score == -0.25
+    assert e_not.verdict == "FAIL"
+
+    # 2. Score inferred to classification when classification is missing
+    e_from_score_sup = NLIAssertionEvaluation(claim_id=5, assertion="Claim", score=1.0)
+    assert e_from_score_sup.classification == "SUPPORTED"
+    assert e_from_score_sup.verdict == "PASS"
+
+    e_from_score_opp = NLIAssertionEvaluation(claim_id=6, assertion="Claim", score=-1.0)
+    assert e_from_score_opp.classification == "CONTRADICTED"
+    assert e_from_score_opp.verdict == "FAIL"
+
+    e_from_score_not = NLIAssertionEvaluation(claim_id=7, assertion="Claim", score=-0.25)
+    assert e_from_score_not.classification == "NOT_MENTIONED"
+    assert e_from_score_not.verdict == "FAIL"
+

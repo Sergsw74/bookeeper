@@ -12,6 +12,7 @@ Evaluates retrieval utility and seam integrity by:
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from pydantic import BaseModel, Field
 
@@ -19,6 +20,80 @@ from bookeeper.processing.extractor import Concept
 from bookeeper.processing.ollama_pool import OllamaPool
 
 logger = logging.getLogger(__name__)
+
+
+# ==============================================================================
+# Ternary Continuous Verification Scoring Model
+# ==============================================================================
+
+
+@dataclass
+class EvaluationWeights:
+    supported: float = 1.0
+    not_mentioned: float = -0.25
+    against: float = -1.0
+
+
+def calculate_ternary_scores(
+    results: List[str],
+    weights: EvaluationWeights = EvaluationWeights(),
+) -> dict:
+    """
+    Calculates weighted semantic integrity and calibrated fidelity scores.
+    results: list of strings, each in ['SUPPORTED', 'NOT_MENTIONED', 'AGAINST', 'CONTRADICTED']
+    """
+    n_total = len(results)
+    if n_total == 0:
+        return {
+            "total_probes": 0,
+            "supported_count": 0,
+            "not_mentioned_count": 0,
+            "against_count": 0,
+            "support_ratio": 0.0,
+            "hallucination_ratio": 0.0,
+            "net_integrity_score": 0.0,
+            "calibrated_fidelity": 0.0,
+            "net_score": 0.0,
+        }
+
+    # Normalize classifications to canonical forms: SUPPORTED, NOT_MENTIONED, AGAINST
+    normalized: List[str] = []
+    for r in results:
+        r_str = str(r).strip().upper()
+        if r_str in ("SUPPORTED", "PASS"):
+            normalized.append("SUPPORTED")
+        elif r_str in ("AGAINST", "CONTRADICTED", "CONFRONTED"):
+            normalized.append("AGAINST")
+        else:
+            normalized.append("NOT_MENTIONED")
+
+    n_sup = normalized.count("SUPPORTED")
+    n_not = normalized.count("NOT_MENTIONED")
+    n_opp = normalized.count("AGAINST")
+
+    # 1. Bounded [-1.0, 1.0] Net Score
+    raw_score = (
+        (n_sup * weights.supported) +
+        (n_not * weights.not_mentioned) +
+        (n_opp * weights.against)
+    )
+    net_score = raw_score / n_total
+
+    # 2. Normalized [0.0, 1.0] Benchmark Fidelity
+    # Supported gives 1.0, Not Mentioned gives 0.2 partial credit, Against cancels out 1 supported
+    calibrated_fidelity = max(0.0, (n_sup + (0.2 * n_not) - (1.0 * n_opp)) / n_total)
+
+    return {
+        "total_probes": n_total,
+        "supported_count": n_sup,
+        "not_mentioned_count": n_not,
+        "against_count": n_opp,
+        "support_ratio": round(n_sup / n_total, 4),
+        "hallucination_ratio": round(n_opp / n_total, 4),
+        "net_integrity_score": round(net_score, 4),
+        "calibrated_fidelity": round(calibrated_fidelity, 4),
+        "net_score": round(net_score, 4),
+    }
 
 
 # ==============================================================================
@@ -78,7 +153,8 @@ class NLIAssertionEvaluation(BaseModel):
     claim_id: int = 1
     assertion: str = ""
     is_cross_boundary: bool = False
-    classification: Literal["SUPPORTED", "CONTRADICTED", "NOT_MENTIONED"] = "NOT_MENTIONED"
+    classification: Literal["SUPPORTED", "CONTRADICTED", "NOT_MENTIONED", "AGAINST"] = "NOT_MENTIONED"
+    score: float = -0.25
     verdict: Literal["PASS", "FAIL"] = "FAIL"
     rationale: str = ""
     verifier_prompt: str = ""
@@ -106,6 +182,27 @@ class NLIAssertionEvaluation(BaseModel):
             data["verdict"] = "PASS" if data["classification"] == "SUPPORTED" else "FAIL"
         elif "verdict" in data and "classification" not in data:
             data["classification"] = "SUPPORTED" if data["verdict"] == "PASS" else "NOT_MENTIONED"
+
+        # Sync numeric encoding: SUPPORTED=+1.0, CONTRADICTED/AGAINST=-1.0, NOT_MENTIONED=-0.25
+        if "score" not in data or data["score"] is None:
+            cls_upper = str(data.get("classification", "")).strip().upper()
+            if cls_upper in ("SUPPORTED", "PASS"):
+                data["score"] = 1.0
+            elif cls_upper in ("CONTRADICTED", "AGAINST", "CONFRONTED"):
+                data["score"] = -1.0
+            else:
+                data["score"] = -0.25
+        elif "classification" not in data:
+            sc = float(data["score"])
+            if sc > 0:
+                data["classification"] = "SUPPORTED"
+                data["verdict"] = "PASS"
+            elif sc <= -0.5:
+                data["classification"] = "CONTRADICTED"
+                data["verdict"] = "FAIL"
+            else:
+                data["classification"] = "NOT_MENTIONED"
+                data["verdict"] = "FAIL"
 
         # Sync forward
         if "claim_id" in data and "question_id" not in data:
@@ -142,6 +239,17 @@ class NLISystemBlockMetrics(BaseModel):
     cross_sentence_passed: int = 0
     seam_integrity_rate: float = 0.0  # cross_sentence_passed / cross_sentence_total
     evaluations: List[NLIAssertionEvaluation] = Field(default_factory=list)
+
+    # Continuous ternary verification metrics
+    supported_count: int = 0
+    not_mentioned_count: int = 0
+    against_count: int = 0
+    support_ratio: float = 0.0
+    hallucination_ratio: float = 0.0
+    net_integrity_score: float = 0.0
+    calibrated_fidelity: float = 0.0
+    seam_net_integrity: float = 0.0
+    seam_calibrated_fidelity: float = 0.0
 
 
 QASystemBlockMetrics = NLISystemBlockMetrics
@@ -462,7 +570,7 @@ def verify_assertion_entailment(
 
         if "SUPPORTED" in raw_cls and "NOT_MENTIONED" not in raw_cls and "NOT SUPPORTED" not in raw_cls and "UNSUPPORTED" not in raw_cls:
             return "SUPPORTED", rationale or "Entailed by claims."
-        elif "CONTRADICT" in raw_cls:
+        elif "CONTRADICT" in raw_cls or "AGAINST" in raw_cls or "CONFRONT" in raw_cls:
             return "CONTRADICTED", rationale or "Contradicts claims."
         elif "NOT_MENTIONED" in raw_cls or "UNSUPPORTED" in raw_cls:
             return "NOT_MENTIONED", rationale or "Not mentioned in claims."
@@ -471,7 +579,7 @@ def verify_assertion_entailment(
         clean_upper = clean.upper()
         if "SUPPORTED" in clean_upper and "NOT_MENTIONED" not in clean_upper and "NOT SUPPORTED" not in clean_upper and "UNSUPPORTED" not in clean_upper:
             return "SUPPORTED", rationale or clean[:120]
-        elif "CONTRADICT" in clean_upper:
+        elif "CONTRADICT" in clean_upper or "AGAINST" in clean_upper or "CONFRONT" in clean_upper:
             return "CONTRADICTED", rationale or clean[:120]
         else:
             return "NOT_MENTIONED", rationale or clean[:120]
@@ -632,6 +740,10 @@ def evaluate_block_atomic_assertions(
     # Metrics Baseline (Old)
     passed_old = sum(1 for e in evals_old if e.verdict == "PASS")
     cross_passed_old = sum(1 for e in evals_old if e.is_cross_boundary and e.verdict == "PASS")
+    t_old = calculate_ternary_scores([e.classification for e in evals_old])
+    cross_evals_old = [e for e in evals_old if e.is_cross_boundary]
+    cross_t_old = calculate_ternary_scores([e.classification for e in cross_evals_old])
+
     metrics_old = NLISystemBlockMetrics(
         system="old",
         total_probes=tot,
@@ -642,11 +754,24 @@ def evaluate_block_atomic_assertions(
         cross_sentence_passed=cross_passed_old,
         seam_integrity_rate=round(cross_passed_old / cross_tot, 4) if cross_tot > 0 else 1.0,
         evaluations=evals_old,
+        supported_count=t_old["supported_count"],
+        not_mentioned_count=t_old["not_mentioned_count"],
+        against_count=t_old["against_count"],
+        support_ratio=t_old["support_ratio"],
+        hallucination_ratio=t_old["hallucination_ratio"],
+        net_integrity_score=t_old["net_integrity_score"],
+        calibrated_fidelity=t_old["calibrated_fidelity"],
+        seam_net_integrity=cross_t_old["net_integrity_score"],
+        seam_calibrated_fidelity=cross_t_old["calibrated_fidelity"],
     )
 
     # Metrics Candidate (New)
     passed_new = sum(1 for e in evals_new if e.verdict == "PASS")
     cross_passed_new = sum(1 for e in evals_new if e.is_cross_boundary and e.verdict == "PASS")
+    t_new = calculate_ternary_scores([e.classification for e in evals_new])
+    cross_evals_new = [e for e in evals_new if e.is_cross_boundary]
+    cross_t_new = calculate_ternary_scores([e.classification for e in cross_evals_new])
+
     metrics_new = NLISystemBlockMetrics(
         system="new",
         total_probes=tot,
@@ -657,6 +782,15 @@ def evaluate_block_atomic_assertions(
         cross_sentence_passed=cross_passed_new,
         seam_integrity_rate=round(cross_passed_new / cross_tot, 4) if cross_tot > 0 else 1.0,
         evaluations=evals_new,
+        supported_count=t_new["supported_count"],
+        not_mentioned_count=t_new["not_mentioned_count"],
+        against_count=t_new["against_count"],
+        support_ratio=t_new["support_ratio"],
+        hallucination_ratio=t_new["hallucination_ratio"],
+        net_integrity_score=t_new["net_integrity_score"],
+        calibrated_fidelity=t_new["calibrated_fidelity"],
+        seam_net_integrity=cross_t_new["net_integrity_score"],
+        seam_calibrated_fidelity=cross_t_new["calibrated_fidelity"],
     )
 
     return assertions, metrics_old, metrics_new

@@ -3683,6 +3683,7 @@ def verify_command(
                     cur_text = (
                         f"[bold blue]Current Block:[/bold blue] {block_info} | "
                         f"ΔQA Recall: [{'green' if avg_d >= 0 else 'red'}]{avg_d * 100:+.1f}% pts[/] | "
+                        f"Net Int B: [magenta]{item.new_system.net_integrity_score:+.2f}[/magenta] | "
                         f"Disprop: [cyan]{item.chunk_disproportion:.2f}[/cyan]"
                     )
                 else:
@@ -3754,6 +3755,24 @@ def verify_command(
             f"{(sm.mean_new_seam_integrity - sm.mean_old_seam_integrity) * 100:+.2f}% pts",
         )
         summary_table.add_row(
+            "Mean Net Semantic Integrity (S_net [-1 to +1])",
+            f"{sm.mean_old_net_integrity:+.2f}",
+            f"{sm.mean_new_net_integrity:+.2f}",
+            f"[{'green' if sm.mean_delta_net_integrity >= 0 else 'red'}]{sm.mean_delta_net_integrity:+.2f}[/]",
+        )
+        summary_table.add_row(
+            "Mean Calibrated Fidelity (R_calibrated) (%)",
+            f"{sm.mean_old_calibrated_fidelity * 100:.2f}%",
+            f"{sm.mean_new_calibrated_fidelity * 100:.2f}%",
+            f"[{'green' if sm.mean_delta_calibrated_fidelity >= 0 else 'red'}]{sm.mean_delta_calibrated_fidelity * 100:+.2f}% pts[/]",
+        )
+        summary_table.add_row(
+            "Mean Hallucination / Contradiction Rate (%)",
+            f"{sm.mean_old_hallucination_ratio * 100:.2f}%",
+            f"[{'green' if sm.mean_new_hallucination_ratio == 0 else 'red'}]{sm.mean_new_hallucination_ratio * 100:.2f}%[/]",
+            f"[{'green' if sm.mean_delta_hallucination_ratio <= 0 else 'red'}]{sm.mean_delta_hallucination_ratio * 100:+.2f}% pts[/]",
+        )
+        summary_table.add_row(
             "Aggregate Fail Ratio [sum(Failed)/sum(Total Probes)] (%)",
             f"{sm.mean_old_fail_ratio * 100:.2f}%",
             f"{sm.mean_new_fail_ratio * 100:.2f}%",
@@ -3796,14 +3815,16 @@ def verify_command(
             sample_table.add_column("QA Rec A", justify="right")
             sample_table.add_column("QA Rec B", justify="right")
             sample_table.add_column("ΔRecall", justify="right")
+            sample_table.add_column("S_net A", justify="right")
+            sample_table.add_column("S_net B", justify="right")
+            sample_table.add_column("ΔS_net", justify="right")
             sample_table.add_column("Seam Int B", justify="right")
             sample_table.add_column("Fail A", justify="right")
             sample_table.add_column("Fail B", justify="right")
-            sample_table.add_column("ΔFail", justify="right")
 
             for s in report.samples[:10]:
                 d_color = "green" if s.delta_recall >= 0 else ("yellow" if s.delta_recall >= -0.03 else "red")
-                f_color = "green" if s.delta_fail_ratio <= 0 else "red"
+                d_net_color = "green" if s.delta_net_integrity >= 0 else "red"
                 seam_color = "green" if s.new_system.seam_integrity_rate >= 0.80 else "red"
                 sample_table.add_row(
                     str(s.sample_index),
@@ -3813,10 +3834,12 @@ def verify_command(
                     f"{s.old_system.qa_recall * 100:.1f}%",
                     f"{s.new_system.qa_recall * 100:.1f}%",
                     f"[{d_color}]{s.delta_recall * 100:+.1f}%[/]",
+                    f"{s.old_system.net_integrity_score:+.2f}",
+                    f"{s.new_system.net_integrity_score:+.2f}",
+                    f"[{d_net_color}]{s.delta_net_integrity:+.2f}[/]",
                     f"[{seam_color}]{s.new_system.seam_integrity_rate * 100:.1f}%[/]",
                     f"{s.old_system.fail_ratio * 100:.1f}%",
                     f"{s.new_system.fail_ratio * 100:.1f}%",
-                    f"[{f_color}]{s.delta_fail_ratio * 100:+.1f}%[/]",
                 )
             console.print(sample_table)
 
@@ -3824,6 +3847,11 @@ def verify_command(
         legend_content = (
             "[bold cyan]• Recall (QA / NLI Recall):[/bold cyan] Proportion of raw-passage factual assertions verified as SUPPORTED by the knowledge base.\n"
             "  [dim]Formula: Recall = (Supported Assertions) / (Total Assertions)[/dim]\n\n"
+            "[bold cyan]• Net Semantic Integrity (S_net):[/bold cyan] Continuous ternary score bounded in [-1.0, +1.0].\n"
+            "  [dim]Weights: Supported (+1.0), Omission / Not Mentioned (-0.25), Contradiction / Against (-1.0).[/dim]\n"
+            "  [dim]Formula: S_net = (1.0 * N_sup - 0.25 * N_not - 1.0 * N_opp) / N[/dim]\n\n"
+            "[bold cyan]• Calibrated Fidelity (R_calibrated):[/bold cyan] Normalized [0.0, 1.0] score awarding 0.2 partial credit for omission while deducting 1.0 for contradiction.\n"
+            "  [dim]Formula: R_calibrated = max(0.0, (N_sup + 0.20 * N_not - 1.0 * N_opp) / N)[/dim]\n\n"
             "[bold cyan]• Seam Integrity (Seam Int / SIMINT):[/bold cyan] Retention rate of cross-boundary assertions spanning multiple sentences.\n"
             "  [dim]Formula: Seam Int = (Supported Cross-Boundary Assertions) / (Total Cross-Boundary Assertions)[/dim]\n"
             "  [dim]Detects seam failure: when Sentence A (cause) and Sentence B (effect) land on separate sides of a chunk boundary and the relationship is severed.[/dim]"

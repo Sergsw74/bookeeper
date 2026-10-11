@@ -587,29 +587,31 @@ bookeeper list-books --search "Redwall"
 
 ### 📥 Archive Downloader (arXiv Crawler)
 
-A standalone subproject located in `archive_downloader/` to crawl, index, and download papers and books from arXiv feeds (*e.g.* `https://arxiv.org/list/cs.AI/recent?skip=0&show=500`) with pagination, deduplication, and Calibre `.opf` metadata:
+A standalone subproject located in `archive_downloader/` to crawl, index, and download papers and books from arXiv feeds (*e.g.* `https://arxiv.org/list/cs.AI/recent?skip=0&show=500`) with pagination, deduplication, and Calibre `.opf` metadata. Fully supported via `uv run`:
 
 ```bash
 # 1. Download up to 100 most recent articles into ./downloads (uses fast show=500 batching):
-python archive_downloader/run.py download --limit 100
+uv run archive-downloader download --limit 100
 
 # 2. Download from explicit show=500 URL:
-python archive_downloader/run.py download \
+uv run archive-downloader download \
   --url "https://arxiv.org/list/cs.AI/recent?skip=0&show=500" \
   --limit 500
 
 # 3. Download into a custom directory:
-python archive_downloader/run.py download --limit 50 --output-dir ./arxiv_papers
+uv run archive-downloader download --limit 50 --output-dir ./arxiv_papers
 
 # 4. Only count and download new articles:
-python archive_downloader/run.py download --limit 20 --new-only
+uv run archive-downloader download --limit 20 --new-only
 
-# 4. View index status, categories, and disk usage:
-python archive_downloader/run.py status
+# 5. View index status, categories, and disk usage:
+uv run archive-downloader status
 
-# 5. Inspect an arXiv URL and preview articles without downloading:
-python archive_downloader/run.py inspect --limit 10
+# 6. Inspect an arXiv URL and preview articles without downloading:
+uv run archive-downloader inspect --limit 10
 ```
+
+*(Note: Can also be executed with `uv run --project archive_downloader archive-downloader ...`, from inside `archive_downloader/`, or with `python archive_downloader/run.py`)*
 
 See [`archive_downloader/README.md`](archive_downloader/README.md) for full documentation.
 

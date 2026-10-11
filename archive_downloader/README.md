@@ -25,18 +25,36 @@
 
 ## 🚀 Quick Start
 
-### 1. Basic Invocation
+### 1. Using `uv run` (Recommended)
 
-Using the convenience launcher:
+From anywhere in the repository:
 
 ```bash
-# Download up to 100 most recent articles from cs.AI into ./downloads:
-python archive_downloader/run.py download --limit 100
+# Standard run from repository root:
+uv run archive-downloader download --limit 100
+
+# Or from inside archive_downloader/ directory:
+cd archive_downloader
+uv run archive-downloader download --limit 100
+
+# Or explicitly targeting the project from anywhere:
+uv run --project archive_downloader archive-downloader download --limit 100
 ```
 
-Or via module invocation:
+Both `archive-downloader` and `archive_downloader` command aliases are supported:
+```bash
+uv run archive_downloader download --limit 100
+```
+
+### 2. Alternative Invocations
+
+Using the standalone launcher or direct module invocation:
 
 ```bash
+# Convenience launcher:
+python archive_downloader/run.py download --limit 100
+
+# Direct module execution:
 PYTHONPATH=archive_downloader/src python -m archive_downloader download --limit 100
 ```
 

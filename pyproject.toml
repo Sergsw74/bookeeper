@@ -73,3 +73,8 @@ ignore = ["E501"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-ra -q"
+
+[tool.uv.workspace]
+members = ["archive_downloader"]
+
+

@@ -27,6 +27,7 @@ dev = [
 
 [project.scripts]
 archive-downloader = "archive_downloader.cli:app"
+archive_downloader = "archive_downloader.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/archive_downloader"]

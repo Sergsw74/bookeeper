@@ -133,11 +133,24 @@ neo4j:
   clean_export: false                 # Set to true to perform a clean start (delete all content before export)
 
 # ==============================================================================
-# Knowledge Graph Factual Verification Configuration
+# Multi-Verification Configuration
 # ==============================================================================
-# Audits concept groundings against source chunks using a dedicated LLM model.
-# Randomly samples a percentage of ideas (default 1%), pulls their related chunks,
-# and verifies whether each chunk contains or supports the idea.
+# Array of verifiers with mode and specific parameters for each verifier.
+# Automatically executed in sequence during 'test-run' or 'verify' without parameters.
+# The first verifier in this list also serves as the default verifier settings.
+verifiers:
+  - mode: "ideas"
+    model: "llama3.1:8b"              # Dedicated model for verification
+    percent: 1.0                      # Sampling percentage of ideas (1.0 = 1%)
+    temperature: 0.0                  # Low temperature for strict factual evaluation
+    max_examples: 20                  # Maximum discrepancy examples to report
+    cooldown_seconds: 60
+  - mode: "chunking"
+    distance_threshold: 0.20          # Cosine distance threshold for semantic chunk expansion
+    max_examples: 20
+
+# Legacy single-verifier configuration (retained for backward compatibility;
+# synchronized with the default verifier in verifiers list above).
 verification:
   enabled: true
   model: "llama3.1:8b"              # Dedicated model for verification (e.g. llama3.1:8b, qwen2.5:7b-instruct)

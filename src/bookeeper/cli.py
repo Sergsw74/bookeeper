@@ -2960,83 +2960,31 @@ def build_rag(
     )
 
 
-@app.command("verify")
-def verify_command(
-    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
-    graph_file: Optional[str] = typer.Option(
-        None, "--graph-file", help="Path to knowledge_graph.json (default: output_dir/knowledge_graph.json)."
-    ),
-    percent: Optional[float] = typer.Option(
-        None, "--percent", "-p", help="Percentage of ideas to randomly verify (default: 1.0 for 1%)."
-    ),
-    mode: Optional[str] = typer.Option(
-        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', 'chunk', or 'cross-check' (default: 'ideas')."
-    ),
-    compare_graph: Optional[str] = typer.Option(
-        None,
-        "--compare-graph",
-        help="Path to A/B test result directory OR candidate knowledge_graph.json to compare against in cross-check mode.",
-    ),
-    blocks: Optional[int] = typer.Option(
-        None, "--blocks", help="Number of contiguous chunk blocks to audit in cross-check mode (default: 20)."
-    ),
-    book_id: Optional[int] = typer.Option(
-        None, "--book-id", "-b", help="Specific book ID to verify (in chunking mode)."
-    ),
-    all_books: bool = typer.Option(
-        False, "--all", help="Verify chunking across all stored books."
-    ),
-    threshold: Optional[float] = typer.Option(
-        None, "--threshold", help="Cosine distance threshold for semantic chunk expansion (default: 0.20)."
-    ),
-    embedding_model: Optional[str] = typer.Option(
-        None, "--embedding-model", help="Embedding model name for chunking verification (default: nomic-embed-text)."
-    ),
-    embedding_url: Optional[str] = typer.Option(
-        None, "--embedding-url", help="Ollama server URL dedicated for embeddings (e.g. http://localhost:11434)."
-    ),
-    chunks_dir: Optional[str] = typer.Option(
-        None, "--chunks-dir", help="Directory containing stored book chunks (default: output_dir/chunks)."
-    ),
-    model: Optional[str] = typer.Option(
-        None, "--model", help="Dedicated LLM model for ideas verification (default: config.yaml verification.model or llm_model)."
-    ),
-    temperature: Optional[float] = typer.Option(
-        None, "--temperature", help="Sampling temperature for verifier model (default: 0.0)."
-    ),
-    max_examples: Optional[int] = typer.Option(
-        None, "--max-examples", help="Maximum discrepancy examples to display (default: 20)."
-    ),
-    output_report: Optional[str] = typer.Option(
-        None, "--output", "-o", help="Optional path to save JSON verification report (default: output_dir/verification_report.json)."
-    ),
-    seed: Optional[int] = typer.Option(
-        None, "--seed", help="Random seed for reproducible idea/book sampling."
-    ),
-    print_chunks: Optional[int] = typer.Option(
-        None,
-        "--print-chunks",
-        help="Print text & QA probes comparison for up to X blocks (cross-check mode).",
-    ),
-    max_tasks: Optional[int] = typer.Option(
-        None, "--max-tasks", "-t", help="Max concurrent verification worker tasks across Ollama servers."
-    ),
-    cooldown: Optional[int] = typer.Option(
-        None, "--cooldown", help="Failover cooldown in seconds for verification tasks (overrides config.yaml)."
-    ),
-):
+def _execute_single_verification(
+    config_path: Optional[str] = None,
+    graph_file: Optional[str] = None,
+    percent: Optional[float] = None,
+    mode: Optional[str] = None,
+    compare_graph: Optional[str] = None,
+    blocks: Optional[int] = None,
+    book_id: Optional[int] = None,
+    all_books: bool = False,
+    threshold: Optional[float] = None,
+    embedding_model: Optional[str] = None,
+    embedding_url: Optional[str] = None,
+    chunks_dir: Optional[str] = None,
+    model: Optional[str] = None,
+    temperature: Optional[float] = None,
+    max_examples: Optional[int] = None,
+    output_report: Optional[str] = None,
+    seed: Optional[int] = None,
+    print_chunks: Optional[int] = None,
+    max_tasks: Optional[int] = None,
+    cooldown: Optional[int] = None,
+    cfg: Optional[Settings] = None,
+) -> Optional[Dict[str, Any]]:
     """
-    Verify Knowledge Graph factual integrity, chunking correctness, or chunk Oracle alignment.
-    - 'ideas' mode: randomly samples X% (default: 1%) of ideas from knowledge_graph.json,
-      retrieves their assigned chunks, audits whether each chunk contains or supports the idea,
-      and reports stats and discrepancy examples.
-    - 'chunking' mode: verifies semantic chunk coherence using incremental sentence expansion
-      distances (smart chunking). Tests whether adding each subsequent sentence maintains distance
-      within accepted thresholds, shows distance distribution across chunks within the book,
-      and verifies that actual stored chunks match smart semantic boundaries.
-    - 'chunk' mode: randomly samples X% of chunks from knowledge_graph.json, re-extracts ideas
-      using the Oracle verifier model, aligns ideas against the original run extractions via
-      the EntityDeduplicator, and computes Success Rate (matched / Oracle) and Fail Rate (missed / original).
+    Execute a single verification run for a specific mode and parameters.
     """
     graph_file = _resolve_opt(graph_file)
     compare_graph = _resolve_opt(compare_graph)
@@ -3056,11 +3004,12 @@ def verify_command(
     max_tasks = _resolve_opt(max_tasks)
     cooldown = _resolve_opt(cooldown)
 
-    cfg = _get_effective_settings(
-        config_path=config_path,
-        embedding_model=embedding_model,
-        embedding_url=embedding_url,
-    )
+    if cfg is None:
+        cfg = _get_effective_settings(
+            config_path=config_path,
+            embedding_model=embedding_model,
+            embedding_url=embedding_url,
+        )
     effective_cooldown = cooldown if cooldown is not None else cfg.resolved_verification_cooldown_seconds
     effective_mode = (mode or cfg.verification.mode).strip().lower()
 
@@ -3277,7 +3226,7 @@ def verify_command(
             json.dump(report.model_dump(), f, indent=2, ensure_ascii=False)
         console.print(f"[dim green]✓ Full chunking verification report saved to: [bold]{report_dest}[/bold][/dim green]\n")
         _print_ollama_server_stats([pool], console=console, title="Ollama Server Chunking Verification Effort Statistics")
-        return
+        return report.model_dump() if hasattr(report, "model_dump") else report
 
     # Mode: 'chunk' (Oracle Idea Extraction & Alignment)
     if effective_mode in ("chunk", "oracle_chunk"):
@@ -3510,7 +3459,7 @@ def verify_command(
             f"[dim green]✓ Full chunk verification report saved to: [bold]{report_dest}[/bold][/dim green]\n"
         )
         _print_ollama_server_stats([pool], console=console, title="Ollama Server Chunk Verification Effort Statistics")
-        return
+        return report.model_dump() if hasattr(report, "model_dump") else report
 
     # Mode: 'cross-check' (Dual Knowledge Base Seam & Recall Comparative Audit)
     if effective_mode in ("cross-check", "cross_check"):
@@ -3897,7 +3846,7 @@ def verify_command(
             f"[dim green]✓ Full cross-check verification report saved to: [bold]{report_dest}[/bold][/dim green]\n"
         )
         _print_ollama_server_stats([pool], console=console, title="Ollama Server Cross-Check Verification Effort Statistics")
-        return
+        return report.model_dump() if hasattr(report, "model_dump") else report
 
     # Mode: 'ideas'
     target_graph_file = Path(graph_file).expanduser().resolve() if graph_file else cfg.resolved_output_dir / "knowledge_graph.json"
@@ -4084,6 +4033,341 @@ def verify_command(
         json.dump(report.model_dump(), f, indent=2, ensure_ascii=False)
     console.print(f"[dim green]✓ Full verification report saved to: [bold]{report_dest}[/bold][/dim green]\n")
     _print_ollama_server_stats([pool], console=console, title="Ollama Server Verification Effort Statistics")
+    return report.model_dump() if hasattr(report, "model_dump") else report
+
+
+def _write_combined_multi_verification_report(
+    dest: Path, reports: List[Tuple[str, str, Any]]
+) -> None:
+    """
+    Write a combined JSON report summarizing multi-verification while preserving
+    backward compatibility with single-verifier consumers (e.g. A/B test scripts).
+    """
+    if not reports:
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    first_mode, first_path, first_data = reports[0]
+    combined = dict(first_data) if isinstance(first_data, dict) else {"primary": first_data}
+    combined["multi_verification"] = [
+        {
+            "mode": m,
+            "report_path": str(p),
+            "stats": d.get("stats") if isinstance(d, dict) else None,
+        }
+        for m, p, d in reports
+    ]
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump(combined, f, indent=2, ensure_ascii=False)
+    console.print(
+        f"[dim green]✓ Combined multi-verification report saved to: [bold]{dest}[/bold][/dim green]\n"
+    )
+
+
+@app.command("verify")
+def verify_command(
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    graph_file: Optional[str] = typer.Option(
+        None, "--graph-file", help="Path to knowledge_graph.json (default: output_dir/knowledge_graph.json)."
+    ),
+    percent: Optional[float] = typer.Option(
+        None, "--percent", "-p", help="Percentage of ideas to randomly verify (default: 1.0 for 1%)."
+    ),
+    mode: Optional[str] = typer.Option(
+        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', 'chunk', or 'cross-check' (default: from config.yaml or 'ideas')."
+    ),
+    compare_graph: Optional[str] = typer.Option(
+        None,
+        "--compare-graph",
+        help="Path to A/B test result directory OR candidate knowledge_graph.json to compare against in cross-check mode.",
+    ),
+    blocks: Optional[int] = typer.Option(
+        None, "--blocks", help="Number of contiguous chunk blocks to audit in cross-check mode (default: 20)."
+    ),
+    book_id: Optional[int] = typer.Option(
+        None, "--book-id", "-b", help="Specific book ID to verify (in chunking mode)."
+    ),
+    all_books: bool = typer.Option(
+        False, "--all", help="Verify chunking across all stored books."
+    ),
+    threshold: Optional[float] = typer.Option(
+        None, "--threshold", help="Cosine distance threshold for semantic chunk expansion (default: 0.20)."
+    ),
+    embedding_model: Optional[str] = typer.Option(
+        None, "--embedding-model", help="Embedding model name for chunking verification (default: nomic-embed-text)."
+    ),
+    embedding_url: Optional[str] = typer.Option(
+        None, "--embedding-url", help="Ollama server URL dedicated for embeddings (e.g. http://localhost:11434)."
+    ),
+    chunks_dir: Optional[str] = typer.Option(
+        None, "--chunks-dir", help="Directory containing stored book chunks (default: output_dir/chunks)."
+    ),
+    model: Optional[str] = typer.Option(
+        None, "--model", help="Dedicated LLM model for ideas verification (default: config.yaml verification.model or llm_model)."
+    ),
+    temperature: Optional[float] = typer.Option(
+        None, "--temperature", help="Sampling temperature for verifier model (default: 0.0)."
+    ),
+    max_examples: Optional[int] = typer.Option(
+        None, "--max-examples", help="Maximum discrepancy examples to display (default: 20)."
+    ),
+    output_report: Optional[str] = typer.Option(
+        None, "--output", "-o", help="Optional path to save JSON verification report (default: output_dir/verification_report.json)."
+    ),
+    seed: Optional[int] = typer.Option(
+        None, "--seed", help="Random seed for reproducible idea/book sampling."
+    ),
+    print_chunks: Optional[int] = typer.Option(
+        None,
+        "--print-chunks",
+        help="Print text & QA probes comparison for up to X blocks (cross-check mode).",
+    ),
+    max_tasks: Optional[int] = typer.Option(
+        None, "--max-tasks", "-t", help="Max concurrent verification worker tasks across Ollama servers."
+    ),
+    cooldown: Optional[int] = typer.Option(
+        None, "--cooldown", help="Failover cooldown in seconds for verification tasks (overrides config.yaml)."
+    ),
+):
+    """
+    Verify Knowledge Graph factual integrity, chunking correctness, or chunk Oracle alignment.
+    Supports multi-verification when configured in config.yaml or called without parameters.
+    """
+    graph_file = _resolve_opt(graph_file)
+    compare_graph = _resolve_opt(compare_graph)
+    blocks = _resolve_opt(blocks)
+    percent = _resolve_opt(percent)
+    mode = _resolve_opt(mode)
+    book_id = _resolve_opt(book_id)
+    all_books = _resolve_opt(all_books, False)
+    threshold = _resolve_opt(threshold)
+    chunks_dir = _resolve_opt(chunks_dir)
+    model = _resolve_opt(model)
+    temperature = _resolve_opt(temperature)
+    max_examples = _resolve_opt(max_examples)
+    output_report = _resolve_opt(output_report)
+    seed = _resolve_opt(seed)
+    print_chunks = _resolve_opt(print_chunks)
+    max_tasks = _resolve_opt(max_tasks)
+    cooldown = _resolve_opt(cooldown)
+
+    cfg = _get_effective_settings(
+        config_path=config_path,
+        embedding_model=embedding_model,
+        embedding_url=embedding_url,
+    )
+
+    enabled_verifiers = [v for v in cfg.verifiers if v.enabled]
+
+    # If no explicit mode requested and multiple verifiers are configured: execute multi-verification
+    if mode is None and len(enabled_verifiers) > 1:
+        console.print(
+            Panel.fit(
+                f"[bold cyan]🔍 Multi-Verification Pipeline[/bold cyan]\n"
+                f"• Configured Verifiers: [bold green]{len(enabled_verifiers)}[/bold green]\n"
+                f"• Modes: [dim]{', '.join(v.mode for v in enabled_verifiers)}[/dim]",
+                title="bookeeper multi-verification",
+                border_style="cyan",
+            )
+        )
+        reports = []
+        for idx, v in enumerate(enabled_verifiers, 1):
+            console.print(
+                f"\n[bold yellow]═══ Running Verifier {idx}/{len(enabled_verifiers)}: {v.mode.upper()} ({v.name or v.mode}) ═══[/bold yellow]\n"
+            )
+            v_mode = v.mode
+            v_percent = percent if percent is not None else v.percent
+            v_model = model if model is not None else v.model
+            v_temp = temperature if temperature is not None else v.temperature
+            v_max_ex = max_examples if max_examples is not None else v.max_examples
+            v_thresh = threshold if threshold is not None else v.resolved_distance_threshold
+            v_book_id = book_id if book_id is not None else v.book_id
+            v_all_books = all_books or (v.all_books if v.all_books is not None else False)
+            v_emb_model = embedding_model or v.embedding_model
+            v_emb_url = embedding_url or v.embedding_url
+            v_chunks_dir = chunks_dir or v.chunks_dir
+            v_graph_file = graph_file or v.graph_file
+            v_compare_graph = compare_graph or v.compare_graph
+            v_blocks = blocks if blocks is not None else v.blocks
+            v_print_chunks = print_chunks if print_chunks is not None else v.print_chunks
+            v_seed = seed if seed is not None else v.seed
+            v_max_tasks = max_tasks if max_tasks is not None else v.max_tasks
+            v_cooldown = cooldown if cooldown is not None else v.cooldown_seconds
+
+            if output_report:
+                p_out = Path(output_report)
+                v_report = str(p_out.parent / f"{p_out.stem}_{v_mode}{p_out.suffix}")
+            elif v.output_report:
+                v_report = v.output_report
+            else:
+                v_report = str(cfg.resolved_output_dir / f"verification_report_{v_mode}.json")
+
+            rep = _execute_single_verification(
+                cfg=cfg,
+                config_path=config_path,
+                graph_file=v_graph_file,
+                percent=v_percent,
+                mode=v_mode,
+                compare_graph=v_compare_graph,
+                blocks=v_blocks,
+                book_id=v_book_id,
+                all_books=v_all_books,
+                threshold=v_thresh,
+                embedding_model=v_emb_model,
+                embedding_url=v_emb_url,
+                chunks_dir=v_chunks_dir,
+                model=v_model,
+                temperature=v_temp,
+                max_examples=v_max_ex,
+                output_report=v_report,
+                seed=v_seed,
+                print_chunks=v_print_chunks,
+                max_tasks=v_max_tasks,
+                cooldown=v_cooldown,
+            )
+            reports.append((v_mode, v_report, rep))
+
+        primary_rep_path = Path(output_report).expanduser().resolve() if output_report else cfg.resolved_output_dir / "verification_report.json"
+        _write_combined_multi_verification_report(primary_rep_path, reports)
+        return
+
+    # Single verifier execution
+    if mode is None and enabled_verifiers:
+        first_v = enabled_verifiers[0]
+        mode = first_v.mode
+        if percent is None:
+            percent = first_v.percent
+        if model is None:
+            model = first_v.model
+        if temperature is None:
+            temperature = first_v.temperature
+        if max_examples is None:
+            max_examples = first_v.max_examples
+        if threshold is None:
+            threshold = first_v.resolved_distance_threshold
+        if cooldown is None:
+            cooldown = first_v.cooldown_seconds
+        if book_id is None:
+            book_id = first_v.book_id
+        if all_books is False and first_v.all_books:
+            all_books = first_v.all_books
+        if blocks is None:
+            blocks = first_v.blocks
+        if print_chunks is None:
+            print_chunks = first_v.print_chunks
+
+    return _execute_single_verification(
+        cfg=cfg,
+        config_path=config_path,
+        graph_file=graph_file,
+        percent=percent,
+        mode=mode,
+        compare_graph=compare_graph,
+        blocks=blocks,
+        book_id=book_id,
+        all_books=all_books,
+        threshold=threshold,
+        embedding_model=embedding_model,
+        embedding_url=embedding_url,
+        chunks_dir=chunks_dir,
+        model=model,
+        temperature=temperature,
+        max_examples=max_examples,
+        output_report=output_report,
+        seed=seed,
+        print_chunks=print_chunks,
+        max_tasks=max_tasks,
+        cooldown=cooldown,
+    )
+
+
+@app.command("verifiers")
+def verifiers_command(
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    graph_file: Optional[str] = typer.Option(
+        None, "--graph-file", help="Path to knowledge_graph.json (default: output_dir/knowledge_graph.json)."
+    ),
+    percent: Optional[float] = typer.Option(
+        None, "--percent", "-p", help="Percentage of ideas to randomly verify (default: 1.0 for 1%)."
+    ),
+    mode: Optional[str] = typer.Option(
+        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', 'chunk', or 'cross-check' (default: from config.yaml or 'ideas')."
+    ),
+    compare_graph: Optional[str] = typer.Option(
+        None,
+        "--compare-graph",
+        help="Path to A/B test result directory OR candidate knowledge_graph.json to compare against in cross-check mode.",
+    ),
+    blocks: Optional[int] = typer.Option(
+        None, "--blocks", help="Number of contiguous chunk blocks to audit in cross-check mode (default: 20)."
+    ),
+    book_id: Optional[int] = typer.Option(
+        None, "--book-id", "-b", help="Specific book ID to verify (in chunking mode)."
+    ),
+    all_books: bool = typer.Option(
+        False, "--all", help="Verify chunking across all stored books."
+    ),
+    threshold: Optional[float] = typer.Option(
+        None, "--threshold", help="Cosine distance threshold for semantic chunk expansion (default: 0.20)."
+    ),
+    embedding_model: Optional[str] = typer.Option(
+        None, "--embedding-model", help="Embedding model name for chunking verification (default: nomic-embed-text)."
+    ),
+    embedding_url: Optional[str] = typer.Option(
+        None, "--embedding-url", help="Ollama server URL dedicated for embeddings (e.g. http://localhost:11434)."
+    ),
+    chunks_dir: Optional[str] = typer.Option(
+        None, "--chunks-dir", help="Directory containing stored book chunks (default: output_dir/chunks)."
+    ),
+    model: Optional[str] = typer.Option(
+        None, "--model", help="Dedicated LLM model for ideas verification (default: config.yaml verification.model or llm_model)."
+    ),
+    temperature: Optional[float] = typer.Option(
+        None, "--temperature", help="Sampling temperature for verifier model (default: 0.0)."
+    ),
+    max_examples: Optional[int] = typer.Option(
+        None, "--max-examples", help="Maximum discrepancy examples to display (default: 20)."
+    ),
+    output_report: Optional[str] = typer.Option(
+        None, "--output", "-o", help="Optional path to save JSON verification report (default: output_dir/verification_report.json)."
+    ),
+    seed: Optional[int] = typer.Option(
+        None, "--seed", help="Random seed for reproducible idea/book sampling."
+    ),
+    print_chunks: Optional[int] = typer.Option(
+        None,
+        "--print-chunks",
+        help="Print text & QA probes comparison for up to X blocks (cross-check mode).",
+    ),
+    max_tasks: Optional[int] = typer.Option(
+        None, "--max-tasks", "-t", help="Max concurrent verification worker tasks across Ollama servers."
+    ),
+    cooldown: Optional[int] = typer.Option(
+        None, "--cooldown", help="Failover cooldown in seconds for verification tasks (overrides config.yaml)."
+    ),
+):
+    """Execute configured verifiers (multi-verification by default when multiple verifiers configured)."""
+    return verify_command(
+        config_path=config_path,
+        graph_file=graph_file,
+        percent=percent,
+        mode=mode,
+        compare_graph=compare_graph,
+        blocks=blocks,
+        book_id=book_id,
+        all_books=all_books,
+        threshold=threshold,
+        embedding_model=embedding_model,
+        embedding_url=embedding_url,
+        chunks_dir=chunks_dir,
+        model=model,
+        temperature=temperature,
+        max_examples=max_examples,
+        output_report=output_report,
+        seed=seed,
+        print_chunks=print_chunks,
+        max_tasks=max_tasks,
+        cooldown=cooldown,
+    )
 
 
 @app.command("remove-book")
@@ -4189,15 +4473,24 @@ def test_run_command(
         raise typer.Exit(1)
 
     eff_cfg = _get_effective_settings(config_path, calibre_path, model=model, books_dir=books_dir)
+    enabled_verifiers = [v for v in eff_cfg.verifiers if v.enabled]
+    is_multi_verif = (mode is None and len(enabled_verifiers) > 1)
+
     effective_percent = percent if percent is not None else (eff_cfg.verification.percent if eff_cfg.verification.percent is not None else 1.0)
     effective_mode = mode or eff_cfg.verification.mode or "ideas"
+
+    verif_desc = (
+        f"[bold green]Multi-Verification[/bold green] ({len(enabled_verifiers)} verifiers: {', '.join(v.mode for v in enabled_verifiers)})"
+        if is_multi_verif
+        else f"[bold green]{effective_percent}%[/bold green] (mode: [cyan]{effective_mode}[/cyan])"
+    )
 
     console.print(
         Panel.fit(
             f"[bold cyan]🧪 Test Run Pipeline Initiated[/bold cyan]\n"
             f"• Target Books: [bold green]{book_cnt}[/bold green] (from scratch)\n"
             f"• Build Parameters: [dim]--from-scratch --no-lightrag --clean-export --timeout {timeout}[/dim]\n"
-            f"• Verification: [bold green]{effective_percent}%[/bold green] (mode: [cyan]{effective_mode}[/cyan])",
+            f"• Verification: {verif_desc}",
             title="bookeeper test-run",
             border_style="cyan",
         )
@@ -4240,14 +4533,19 @@ def test_run_command(
             raise typer.Exit(1)
 
     # 2. Automatically Run Verification
+    stage2_title = (
+        f"Multi-Verification: {len(enabled_verifiers)} verifiers ({', '.join(v.mode for v in enabled_verifiers)})"
+        if is_multi_verif
+        else f"{effective_percent}%, mode: {effective_mode}"
+    )
     console.print(
-        f"\n[bold yellow]═══ Stage 2/2: Verifying Knowledge Graph Integrity ({effective_percent}%, mode: {effective_mode}) ═══[/bold yellow]\n"
+        f"\n[bold yellow]═══ Stage 2/2: Verifying Knowledge Graph Integrity ({stage2_title}) ═══[/bold yellow]\n"
     )
     try:
         verify_command(
             config_path=config_path,
-            percent=effective_percent,
-            mode=effective_mode,
+            percent=percent,
+            mode=mode,
             model=verifier_model,
         )
     except typer.Exit as e:

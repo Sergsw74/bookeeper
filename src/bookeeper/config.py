@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -173,6 +173,108 @@ class Neo4jConfig(BaseModel):
     )
 
 
+class SingleVerifierConfig(BaseModel):
+    """Configuration for an individual verifier in multi-verification."""
+
+    model_config = ConfigDict(extra="allow")
+
+    mode: str = Field(
+        default="ideas",
+        description="Verification mode (e.g. 'ideas', 'chunking', 'chunk', 'cross-check').",
+    )
+    enabled: bool = Field(
+        default=True,
+        description="Whether this verifier is enabled in multi-verification.",
+    )
+    name: Optional[str] = Field(
+        default=None,
+        description="Optional descriptive label/name for the verifier.",
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description="Dedicated LLM model for this verifier (defaults to verification.model or llm_model).",
+    )
+    percent: Optional[float] = Field(
+        default=None,
+        description="Sampling percentage of ideas or chunks to verify.",
+    )
+    temperature: Optional[float] = Field(
+        default=None,
+        description="Sampling temperature for verifier model.",
+    )
+    max_examples: Optional[int] = Field(
+        default=None,
+        description="Maximum discrepancy examples to display.",
+    )
+    distance_threshold: Optional[float] = Field(
+        default=None,
+        description="Cosine distance threshold for semantic chunk expansion.",
+    )
+    threshold: Optional[float] = Field(
+        default=None,
+        description="Alias for distance_threshold.",
+    )
+    cooldown_seconds: Optional[int] = Field(
+        default=None,
+        description="Failover cooldown in seconds for verification tasks.",
+    )
+    embedding_model: Optional[str] = Field(
+        default=None,
+        description="Embedding model for chunking verification.",
+    )
+    embedding_url: Optional[str] = Field(
+        default=None,
+        description="Ollama server URL dedicated for embeddings.",
+    )
+    book_id: Optional[int] = Field(
+        default=None,
+        description="Specific book ID to verify (in chunking mode).",
+    )
+    all_books: Optional[bool] = Field(
+        default=None,
+        description="Verify chunking across all stored books.",
+    )
+    chunks_dir: Optional[str] = Field(
+        default=None,
+        description="Directory containing stored book chunks.",
+    )
+    graph_file: Optional[str] = Field(
+        default=None,
+        description="Path to knowledge_graph.json.",
+    )
+    compare_graph: Optional[str] = Field(
+        default=None,
+        description="Path to comparison knowledge_graph.json or A/B run directory.",
+    )
+    blocks: Optional[int] = Field(
+        default=None,
+        description="Number of contiguous chunk blocks in cross-check mode.",
+    )
+    print_chunks: Optional[int] = Field(
+        default=None,
+        description="Print text & QA probes comparison for up to X blocks in cross-check mode.",
+    )
+    output_report: Optional[str] = Field(
+        default=None,
+        description="Path to save verification report.",
+    )
+    seed: Optional[int] = Field(
+        default=None,
+        description="Random seed for reproducible sampling.",
+    )
+    max_tasks: Optional[int] = Field(
+        default=None,
+        description="Max concurrent tasks across Ollama servers.",
+    )
+
+    @property
+    def resolved_distance_threshold(self) -> Optional[float]:
+        """Return threshold if set, otherwise distance_threshold."""
+        if self.threshold is not None:
+            return self.threshold
+        return self.distance_threshold
+
+
 class VerificationConfig(BaseModel):
     """Configuration for Knowledge Graph factual verification."""
 
@@ -208,6 +310,25 @@ class VerificationConfig(BaseModel):
         default=None,
         description="Failover cooldown duration in seconds for verification tasks (default: 60s).",
     )
+    verifiers: List[SingleVerifierConfig] = Field(
+        default_factory=list,
+        description="Optional list of verifier configurations for multi-verification.",
+    )
+
+    @field_validator("verifiers", mode="before")
+    @classmethod
+    def parse_verifiers(cls, v: Any) -> Any:
+        if v is None:
+            return []
+        if isinstance(v, list):
+            parsed = []
+            for item in v:
+                if isinstance(item, dict):
+                    parsed.append(SingleVerifierConfig(**item))
+                elif isinstance(item, SingleVerifierConfig):
+                    parsed.append(item)
+            return parsed
+        return v
 
     def __init__(self, **data: Any):
         if "failover_cooldown_seconds" in data and "cooldown_seconds" not in data:
@@ -577,6 +698,66 @@ class Settings(BaseSettings):
             return VerificationConfig(**v)
         return v
 
+    # Multi-Verification Configurations
+    verifiers: List[SingleVerifierConfig] = Field(
+        default_factory=list,
+        description="List of verifier configurations for multi-verification.",
+    )
+
+    @field_validator("verifiers", mode="before")
+    @classmethod
+    def parse_settings_verifiers(cls, v: Any) -> Any:
+        if v is None:
+            return []
+        if isinstance(v, list):
+            parsed = []
+            for item in v:
+                if isinstance(item, dict):
+                    parsed.append(SingleVerifierConfig(**item))
+                elif isinstance(item, SingleVerifierConfig):
+                    parsed.append(item)
+            return parsed
+        return v
+
+    @model_validator(mode="after")
+    def sync_verifiers_and_verification(self) -> "Settings":
+        # 1. If verification has verifiers, sync to self.verifiers
+        if self.verification.verifiers and not self.verifiers:
+            self.verifiers = list(self.verification.verifiers)
+
+        # 2. If self.verifiers has items, sync to verification and apply defaults
+        if self.verifiers:
+            self.verification.verifiers = list(self.verifiers)
+            first_v = self.verifiers[0]
+            if first_v.mode:
+                self.verification.mode = first_v.mode
+            if first_v.model is not None:
+                self.verification.model = first_v.model
+            if first_v.percent is not None:
+                self.verification.percent = first_v.percent
+            if first_v.temperature is not None:
+                self.verification.temperature = first_v.temperature
+            if first_v.max_examples is not None:
+                self.verification.max_examples = first_v.max_examples
+            if first_v.resolved_distance_threshold is not None:
+                self.verification.distance_threshold = first_v.resolved_distance_threshold
+            if first_v.cooldown_seconds is not None:
+                self.verification.cooldown_seconds = first_v.cooldown_seconds
+        else:
+            default_v = SingleVerifierConfig(
+                mode=self.verification.mode,
+                model=self.verification.model,
+                percent=self.verification.percent,
+                temperature=self.verification.temperature,
+                max_examples=self.verification.max_examples,
+                distance_threshold=self.verification.distance_threshold,
+                cooldown_seconds=self.verification.cooldown_seconds,
+            )
+            self.verifiers = [default_v]
+            self.verification.verifiers = [default_v]
+
+        return self
+
     @property
     def resolved_verifier_model(self) -> str:
         """Return dedicated verification model or fallback to llm_model."""
@@ -643,6 +824,8 @@ class Settings(BaseSettings):
                 flat_data["neo4j"] = val
             elif key == "verification" and isinstance(val, dict):
                 flat_data["verification"] = val
+            elif key == "verifiers" and isinstance(val, list):
+                flat_data["verifiers"] = val
             elif key == "lightrag" and isinstance(val, dict):
                 for sub_key, sub_val in val.items():
                     if sub_key == "enabled":
@@ -655,6 +838,11 @@ class Settings(BaseSettings):
                     flat_data[sub_key] = sub_val
             else:
                 flat_data[key] = val
+
+        # Handle nested verifiers inside verification block if verifiers not at root
+        if "verification" in flat_data and isinstance(flat_data["verification"], dict):
+            if "verifiers" in flat_data["verification"] and "verifiers" not in flat_data:
+                flat_data["verifiers"] = flat_data["verification"]["verifiers"]
 
         # Handle cooldown aliases at root
         if "cooldown_seconds" in flat_data:

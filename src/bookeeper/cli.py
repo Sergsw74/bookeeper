@@ -53,6 +53,12 @@ from bookeeper.processing.extractor import (
     SectionExtraction,
     validate_concept_chunk_grounding,
 )
+from bookeeper.processing.idea_postprocessor import (
+    ConsolidatedIdeaOutput,
+    IdeaCluster,
+    IdeaPostProcessor,
+    IdeaPostProcessorReport,
+)
 from bookeeper.processing.ollama_pool import (
     FailoverOllamaEmbeddings,
     OllamaPool,
@@ -1207,6 +1213,12 @@ def build_graph(
     limit: Optional[int] = typer.Option(
         None, "--limit", "-n", help="Stop build-graph after successfully processing N books."
     ),
+    dual_pass: Optional[bool] = typer.Option(
+        None,
+        "--dual-pass/--no-dual-pass",
+        "--postprocess-ideas/--no-postprocess-ideas",
+        help="Perform second-pass idea consolidation and synthesis for multi-occurrence ideas (default: config.yaml dual_pass.enabled).",
+    ),
 ):
     """
     Ingest sections, perform semantic chunking, extract concepts via Ollama,
@@ -1237,6 +1249,7 @@ def build_graph(
     clean_export = _resolve_opt(clean_export)
     continue_run = _resolve_opt(continue_run, False)
     limit = _resolve_opt(limit)
+    dual_pass = _resolve_opt(dual_pass)
     books_dir = _resolve_opt(books_dir)
 
     cfg = _get_effective_settings(
@@ -2423,6 +2436,21 @@ def build_graph(
         graphml_dest = output_dir / "knowledge_graph.graphml"
 
         if store.graph.number_of_nodes() > 0:
+            should_dual_pass = cfg.dual_pass.enabled if dual_pass is None else dual_pass
+            if should_dual_pass and not interrupted:
+                console.print("\n[bold cyan]═══ Running Dual-Pass Idea Postprocessor & Synthesis ═══[/bold cyan]")
+                try:
+                    postprocessor = IdeaPostProcessor.from_settings(cfg)
+                    pp_report = postprocessor.process_graph(store)
+                    console.print(
+                        f"[bold green]✓ Idea Postprocessing Complete ({pp_report.duration_seconds:.2f}s):[/bold green] "
+                        f"{pp_report.total_clusters} clusters ({pp_report.multi_occurrence_clusters_count} synthesized, "
+                        f"{pp_report.single_occurrence_clusters_count} bypassed, {pp_report.merged_clusters_count} merged). "
+                        f"Added {pp_report.edges_added_count} provenance/relational edges."
+                    )
+                except Exception as e:
+                    console.print(f"[bold red]✗ Idea Postprocessor failed:[/bold red] {e}")
+
             store.save(graph_file)
             final_clean = should_clean and not has_cleaned
             obs = ObsidianExporter(vault_dest)
@@ -4624,6 +4652,96 @@ def remove_book_cmd(
         console.print(f"[bold yellow]Book #{book_id} was not found in the Knowledge Graph (checkpoint cleared).[/bold yellow]")
 
 
+@app.command("postprocess-ideas")
+def postprocess_ideas_command(
+    graph_file: Optional[str] = typer.Option(
+        None, "--graph-file", "-g", help="Path to knowledge_graph.json (default: output_dir/knowledge_graph.json)."
+    ),
+    config_path: Optional[str] = typer.Option(
+        None, "--config", "-c", help="Path to config.yaml file."
+    ),
+    model: Optional[str] = typer.Option(
+        None, "--model", "-m", help="Dedicated LLM model for idea consolidation (default: from config.yaml dual_pass.model or llm_model)."
+    ),
+    similarity_threshold: Optional[float] = typer.Option(
+        None, "--similarity-threshold", help="Cosine similarity threshold for merging idea clusters (default: 0.92)."
+    ),
+    min_occurrences: Optional[int] = typer.Option(
+        None, "--min-occurrences", help="Minimum occurrences (N >= 2) to trigger LLM synthesis (default: 2)."
+    ),
+    output_graph: Optional[str] = typer.Option(
+        None, "--output-graph", "-o", help="Optional output path for consolidated graph (defaults to overwriting input graph)."
+    ),
+    export_obsidian: Optional[str] = typer.Option(
+        None, "--export-obsidian", help="Custom destination directory for Obsidian Markdown vault to refresh after consolidation."
+    ),
+):
+    """
+    Execute Two-Pass Idea Aggregation and Synthesis on a Knowledge Graph:
+    1. Deterministic normalization and grouping + semantic cosine clustering (>= 0.92).
+    2. Chronological observation linearization and top 3-5 quote selection.
+    3. Branching: N=1 passes through; N>=2 synthesized via LLM consolidation.
+    4. Graph overwrite with unified brief_description, detailed_explanation, :MENTIONED_IN, and :RELATES_TO edges.
+    """
+    cfg = get_settings(config_path)
+    output_dir = cfg.resolved_output_dir
+    target_graph = Path(graph_file).expanduser().resolve() if graph_file else output_dir / "knowledge_graph.json"
+
+    if not target_graph.is_file():
+        console.print(f"[bold red]Knowledge graph file not found at {target_graph}.[/bold red]")
+        raise typer.Exit(1)
+
+    eff_model = model or cfg.resolved_dual_pass_model
+    eff_thresh = similarity_threshold if similarity_threshold is not None else cfg.dual_pass.similarity_threshold
+    eff_min_occ = min_occurrences if min_occurrences is not None else cfg.dual_pass.min_occurrences
+
+    console.print(
+        Panel.fit(
+            f"[bold cyan]🧠 Two-Pass Idea Aggregation & Synthesis Initialized[/bold cyan]\n"
+            f"• Knowledge Graph: [bold]{target_graph}[/bold]\n"
+            f"• Consolidation Model: [bold green]{eff_model}[/bold green]\n"
+            f"• Cosine Similarity Threshold: [bold yellow]{eff_thresh}[/bold yellow]\n"
+            f"• Multi-Occurrence Threshold: [bold]{eff_min_occ}+ mentions[/bold]",
+            title="bookeeper postprocess-ideas",
+            border_style="cyan",
+        )
+    )
+
+    store = ConceptGraphStore()
+    store.load(target_graph)
+
+    postprocessor = IdeaPostProcessor.from_settings(
+        cfg,
+        model_name=eff_model,
+        similarity_threshold=eff_thresh,
+    )
+    if min_occurrences is not None:
+        postprocessor.min_occurrences = eff_min_occ
+
+    report = postprocessor.process_graph(store)
+
+    dest_graph = Path(output_graph).expanduser().resolve() if output_graph else target_graph
+    store.save(dest_graph)
+
+    # Refresh Obsidian vault & GraphML
+    vault_dest = Path(export_obsidian) if export_obsidian else output_dir / "obsidian_vault"
+    graphml_dest = output_dir / "knowledge_graph.graphml"
+    obs = ObsidianExporter(vault_dest)
+    obs.export(store, clean=False)
+    gml = GraphMLExporter(graphml_dest)
+    gml.export(store)
+
+    console.print(
+        f"\n[bold green]✓ Dual-Pass Idea Aggregation & Synthesis Complete ({report.duration_seconds:.2f}s):[/bold green]\n"
+        f"• Total Initial Concepts: [bold]{report.total_input_concepts}[/bold]\n"
+        f"• Resolved Clusters: [bold]{report.total_clusters}[/bold] (Merged: [yellow]{report.merged_clusters_count}[/yellow])\n"
+        f"• Synthesized Multi-Occurrence Ideas: [bold green]{report.synthesized_count}[/bold green]\n"
+        f"• Bypassed Single-Occurrence Ideas: [dim]{report.single_occurrence_clusters_count}[/dim]\n"
+        f"• Provenance & Relational Edges Added: [bold cyan]{report.edges_added_count}[/bold cyan]\n"
+        f"• Updated Knowledge Graph saved to: [bold]{dest_graph}[/bold]\n"
+    )
+
+
 @app.command("test-run")
 def test_run_command(
     book_cnt: int = typer.Argument(
@@ -4664,6 +4782,12 @@ def test_run_command(
     ),
     skip_warmup: bool = typer.Option(
         False, "--skip-warmup", help="Skip Ollama warmup and GPU acceleration check."
+    ),
+    dual_pass: Optional[bool] = typer.Option(
+        None,
+        "--dual-pass/--no-dual-pass",
+        "--postprocess-ideas/--no-postprocess-ideas",
+        help="Perform second-pass idea consolidation across multi-occurrence ideas (default: config.yaml dual_pass.enabled).",
     ),
 ):
     """
@@ -4718,6 +4842,7 @@ def test_run_command(
             model=model,
             export_neo4j=export_neo4j,
             skip_warmup=skip_warmup,
+            dual_pass=dual_pass,
         )
     except typer.Exit as e:
         if e.exit_code != 0:

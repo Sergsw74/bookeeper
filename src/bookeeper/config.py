@@ -360,6 +360,35 @@ class VerificationConfig(BaseModel):
         super().__init__(**data)
 
 
+class DualPassConfig(BaseModel):
+    """Configuration for two-pass idea postprocessing, aggregation, and synthesis."""
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether to perform second-pass idea consolidation across multi-occurrence ideas.",
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description="Dedicated LLM model for idea consolidation (defaults to llm_model).",
+    )
+    similarity_threshold: float = Field(
+        default=0.92,
+        description="Cosine similarity threshold for merging semantic idea clusters (default: 0.92).",
+    )
+    max_quotes: int = Field(
+        default=5,
+        description="Maximum representative supporting quotes to retain per idea cluster (default: 5).",
+    )
+    min_occurrences: int = Field(
+        default=2,
+        description="Minimum occurrences (N >= 2) required to trigger LLM consolidation synthesis.",
+    )
+    temperature: float = Field(
+        default=0.1,
+        description="Sampling temperature for consolidation LLM (default: 0.1).",
+    )
+
+
 class Settings(BaseSettings):
     """Application settings for bookeeper."""
 
@@ -722,6 +751,21 @@ class Settings(BaseSettings):
             return VerificationConfig(**v)
         return v
 
+    # Dual-Pass Idea Postprocessor Configuration
+    dual_pass: DualPassConfig = Field(
+        default_factory=DualPassConfig,
+        description="Configuration for two-pass idea postprocessing, aggregation, and synthesis.",
+    )
+
+    @field_validator("dual_pass", mode="before")
+    @classmethod
+    def parse_dual_pass_config(cls, v: Any) -> Any:
+        if v is None:
+            return DualPassConfig()
+        if isinstance(v, dict):
+            return DualPassConfig(**v)
+        return v
+
     # Multi-Verification Configurations
     verifiers: List[SingleVerifierConfig] = Field(
         default_factory=list,
@@ -788,6 +832,11 @@ class Settings(BaseSettings):
         return self.verification.model or self.llm_model
 
     @property
+    def resolved_dual_pass_model(self) -> str:
+        """Return dedicated model for dual pass idea postprocessing or fallback to llm_model."""
+        return self.dual_pass.model or self.llm_model
+
+    @property
     def resolved_analysis_cooldown_seconds(self) -> int:
         """
         Return cooldown duration in seconds for book analysis / extraction.
@@ -848,6 +897,8 @@ class Settings(BaseSettings):
                 flat_data["neo4j"] = val
             elif key == "verification" and isinstance(val, dict):
                 flat_data["verification"] = val
+            elif key in ("dual_pass", "idea_postprocessor") and isinstance(val, dict):
+                flat_data["dual_pass"] = val
             elif key == "verifiers" and isinstance(val, list):
                 flat_data["verifiers"] = val
             elif key == "lightrag" and isinstance(val, dict):

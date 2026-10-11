@@ -170,6 +170,7 @@ class ABTestRunner:
         base_config: Optional[str] = None,
         config_a: Optional[str] = None,
         config_b: Optional[str] = None,
+        skip_cross_check: bool = False,
     ):
         self.num_books = num_books
         self._raw_percent = percent
@@ -179,6 +180,8 @@ class ABTestRunner:
         self.extra_args = extra_args or ""
         self.dry_run = dry_run
         self.print_chunks = print_chunks
+        self.skip_cross_check = skip_cross_check
+        self.cross_check_report: Optional[Dict[str, Any]] = None
         self.base_config_path = Path(base_config).expanduser().resolve() if base_config else None
         self.config_a_path = Path(config_a).expanduser().resolve() if config_a else None
         self.config_b_path = Path(config_b).expanduser().resolve() if config_b else None
@@ -582,13 +585,13 @@ class ABTestRunner:
             self.bookeeper_cmd,
             "test-run",
             str(self.num_books),
-            "--percent",
-            str(self.percent),
-            "--mode",
-            str(self.mode),
             "--timeout",
             str(self.timeout),
         ]
+        if self._raw_percent is not None:
+            cmd.extend(["--percent", str(self._raw_percent)])
+        if self._raw_mode is not None:
+            cmd.extend(["--mode", str(self._raw_mode)])
         if config_file and config_file.is_file():
             cmd.extend(["--config", str(config_file)])
         if self.extra_args:
@@ -602,11 +605,30 @@ class ABTestRunner:
         if self.dry_run:
             log_warning("Dry-run mode enabled: generating mock verification report.")
             time.sleep(0.5)
-            if self.mode == "chunk":
-                mock_report = {
-                    "mode": "chunk",
+
+            # Determine configured verifiers from config file if available
+            cfg_data = {}
+            target_cfg = config_file or self.base_config_path or (self.repo_dir / "config.yaml")
+            if target_cfg and Path(target_cfg).is_file() and yaml is not None:
+                try:
+                    with open(target_cfg, "r", encoding="utf-8") as f:
+                        cfg_data = yaml.safe_load(f) or {}
+                except Exception:
+                    pass
+            verifiers_cfg = cfg_data.get("verifiers", [])
+            enabled_v = (
+                [v for v in verifiers_cfg if isinstance(v, dict) and v.get("enabled", True)]
+                if isinstance(verifiers_cfg, list)
+                else []
+            )
+
+            is_multi = (self._raw_mode is None and len(enabled_v) > 1)
+
+            def _mock_chunk_report(m_name: str = "chunk") -> Dict[str, Any]:
+                return {
+                    "mode": m_name,
                     "stats": {
-                        "mode": "chunk",
+                        "mode": m_name,
                         "model_name": f"oracle-{branch}",
                         "embedding_model": "nomic-embed-text",
                         "total_chunks_in_graph": 150,
@@ -621,6 +643,12 @@ class ABTestRunner:
                         "overall_fail_rate": 16.67,
                         "chunks_with_perfect_match": 10,
                         "chunks_with_omissions": 5,
+                        "total_supported_count": 38,
+                        "total_not_mentioned_count": 7,
+                        "total_against_count": 0,
+                        "mean_qa_recall": 0.8444,
+                        "mean_net_integrity_score": 0.81,
+                        "mean_calibrated_fidelity": 0.88,
                         "total_duration_seconds": 12.0,
                     },
                     "audited_chunks": [],
@@ -644,20 +672,27 @@ class ABTestRunner:
                         }
                     ],
                 }
-            else:
-                mock_report = {
+
+            def _mock_ideas_report(m_name: str = "ideas") -> Dict[str, Any]:
+                return {
+                    "mode": m_name,
                     "stats": {
                         "total_ideas_in_graph": 155,
                         "candidate_ideas_with_chunks": 150,
                         "sampled_ideas": 15,
                         "sample_percentage": self.percent,
-                        "mode": self.mode,
-                        "model_name": "candidate-model",
+                        "mode": m_name,
+                        "model_name": f"verifier-{branch}",
                         "total_evaluations": 15,
                         "verified_count": 14,
                         "discrepancy_count": 1,
                         "verified_percentage": 93.33,
                         "discrepancy_percentage": 6.67,
+                        "total_supported_count": 14,
+                        "total_not_mentioned_count": 0,
+                        "total_against_count": 1,
+                        "net_integrity_score": 0.87,
+                        "calibrated_fidelity": 0.93,
                         "total_duration_seconds": 12.0,
                     },
                     "discrepancies": [
@@ -674,12 +709,68 @@ class ABTestRunner:
                     ],
                     "verified_samples": [],
                 }
-            with open(branch_dir / "verification_report.json", "w", encoding="utf-8") as f:
-                json.dump(mock_report, f, indent=2)
+
+            copied_artifacts = []
+            if is_multi:
+                mock_reports_list = []
+                for v_it in enabled_v:
+                    v_mode = v_it.get("mode", "ideas")
+                    rep = _mock_chunk_report(v_mode) if v_mode in ("chunk", "chunks") else _mock_ideas_report(v_mode)
+                    mock_reports_list.append((v_mode, rep))
+                    r_file = branch_dir / f"verification_report_{v_mode}.json"
+                    s_file = branch_dir / f"verification_stats_{v_mode}.json"
+                    with open(r_file, "w", encoding="utf-8") as rf:
+                        json.dump(rep, rf, indent=2)
+                    with open(s_file, "w", encoding="utf-8") as sf:
+                        json.dump({"mode": v_mode, "stats": rep["stats"]}, sf, indent=2)
+                    copied_artifacts.extend([r_file.name, s_file.name])
+
+                first_m, first_rep = mock_reports_list[0]
+                combined_rep = dict(first_rep)
+                combined_rep["multi_verification"] = [
+                    {"mode": m, "report_path": str(branch_dir / f"verification_report_{m}.json"), "stats": r.get("stats")}
+                    for m, r in mock_reports_list
+                ]
+                combined_stats = {
+                    "multi_verification": True,
+                    "mode": first_m,
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "stats": first_rep.get("stats"),
+                    "verifiers": [{"mode": m, "stats": r.get("stats")} for m, r in mock_reports_list],
+                }
+                with open(branch_dir / "verification_report.json", "w", encoding="utf-8") as f:
+                    json.dump(combined_rep, f, indent=2)
+                with open(branch_dir / "verification_stats.json", "w", encoding="utf-8") as f:
+                    json.dump(combined_stats, f, indent=2)
+                copied_artifacts.extend(["verification_report.json", "verification_stats.json"])
+            else:
+                eff_m = self._raw_mode or (enabled_v[0].get("mode") if enabled_v else self.mode)
+                mock_rep = _mock_chunk_report(eff_m) if eff_m in ("chunk", "chunks") else _mock_ideas_report(eff_m)
+                with open(branch_dir / "verification_report.json", "w", encoding="utf-8") as f:
+                    json.dump(mock_rep, f, indent=2)
+                with open(branch_dir / "verification_stats.json", "w", encoding="utf-8") as f:
+                    json.dump({"mode": eff_m, "stats": mock_rep["stats"]}, f, indent=2)
+                copied_artifacts.extend(["verification_report.json", "verification_stats.json"])
+
+            dummy_kg = {
+                "nodes": [
+                    {"id": f"book:{branch}", "type": "Book", "title": f"Book on {branch}"},
+                    {"id": f"chunk:{branch}_1", "type": "Chunk", "book_id": 1, "text": "Sample text for chunk"},
+                ],
+                "edges": [],
+            }
+            with open(branch_dir / "knowledge_graph.json", "w", encoding="utf-8") as f:
+                json.dump(dummy_kg, f, indent=2)
+            copied_artifacts.append("knowledge_graph.json")
+
             with open(log_file, "w", encoding="utf-8") as f:
                 f.write(f"Dry-run executed successfully for {branch}\n")
-            copied_artifacts = ["verification_report.json"]
-            duration = time.time() - t0
+            verif_sum = (
+                sum(r[1]["stats"]["total_duration_seconds"] for r in mock_reports_list)
+                if is_multi
+                else mock_rep["stats"]["total_duration_seconds"]
+            )
+            duration = max(35.0, verif_sum + 15.0)
             run_meta = {
                 "branch": branch,
                 "exit_code": exit_code,
@@ -854,7 +945,18 @@ class ABTestRunner:
                 except Exception as e:
                     log_warning(f"Could not restore initial branch: {e}")
 
-        # 5. Compare verification results
+        # 5. Run Cross-Check Comparative Audit between generated A/B result folders
+        if not getattr(self, "skip_cross_check", False) and not self.is_vs_mode:
+            has_kg_a = (branch1_dir / "knowledge_graph.json").is_file()
+            has_kg_b = (branch2_dir / "knowledge_graph.json").is_file()
+            if self.dry_run or (has_kg_a and has_kg_b):
+                try:
+                    log_header(f"Running Cross-Check Comparative Audit ({self.blocks} blocks)")
+                    self.cross_check_flow(branch1_dir, branch2_dir, num_blocks=self.blocks)
+                except Exception as e:
+                    log_warning(f"Could not complete cross-check verification: {e}")
+
+        # 6. Compare verification results & generate overall summary report
         self.compare_results(branch1_dir, branch2_dir)
         return self.session_dir
 
@@ -1165,10 +1267,11 @@ class ABTestRunner:
         kg_a = src_dir_a / "knowledge_graph.json"
         kg_b = src_dir_b / "knowledge_graph.json"
 
-        if not kg_a.is_file():
-            raise FileNotFoundError(f"Missing knowledge_graph.json in {src_dir_a}")
-        if not kg_b.is_file():
-            raise FileNotFoundError(f"Missing knowledge_graph.json in {src_dir_b}")
+        if not self.dry_run:
+            if not kg_a.is_file():
+                raise FileNotFoundError(f"Missing knowledge_graph.json in {src_dir_a}")
+            if not kg_b.is_file():
+                raise FileNotFoundError(f"Missing knowledge_graph.json in {src_dir_b}")
 
         t0 = time.time()
         if self.dry_run:
@@ -1443,10 +1546,11 @@ class ABTestRunner:
         print(f"{'Decision Gating Checklist':<{col_w_m}} {_cell('-')} {_cell(gate_badge)} {sm['pass_reason']}")
         print(sep + "\n")
 
+        self.cross_check_report = report_data
         log_success(f"Full cross-check JSON saved to: {Colors.BOLD}{json_out}{Colors.RESET}")
         log_success(f"Full cross-check Markdown report saved to: {Colors.BOLD}{md_out}{Colors.RESET}\n")
 
-        return self.session_dir
+        return report_data
 
     def _write_cross_check_markdown(self, dest: Path, data: Dict[str, Any]) -> None:
         sm = data.get("summary", {})
@@ -1550,6 +1654,52 @@ class ABTestRunner:
         nodes_a, edges_a = _count_graph(graph_a)
         nodes_b, edges_b = _count_graph(graph_b)
 
+        # Collect all verifiers
+        def _get_verifiers_dict(d_root: Path, d_json: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+            res: Dict[str, Dict[str, Any]] = {}
+            if d_json:
+                if d_json.get("multi_verification") and "verifiers" in d_json:
+                    for item in d_json["verifiers"]:
+                        m = item.get("mode")
+                        st = item.get("stats")
+                        if m and st:
+                            res[m] = st
+                elif "stats" in d_json:
+                    m = d_json.get("mode") or d_json.get("stats", {}).get("mode") or "ideas"
+                    res[m] = d_json.get("stats", {})
+            for p in d_root.glob("verification_stats_*.json"):
+                m_name = p.stem.replace("verification_stats_", "")
+                if m_name not in res:
+                    loaded = ABTestRunner._load_json(p)
+                    if loaded and "stats" in loaded:
+                        res[m_name] = loaded["stats"]
+            return res
+
+        verifiers_dict_a = _get_verifiers_dict(dir_a, data_a)
+        verifiers_dict_b = _get_verifiers_dict(dir_b, data_b)
+        all_modes = sorted(set(list(verifiers_dict_a.keys()) + list(verifiers_dict_b.keys())))
+
+        # Cross-check report if present
+        cross_check_file = self.session_dir / "cross_check_report.json"
+        cross_data = getattr(self, "cross_check_report", None) or self._load_json(cross_check_file)
+        cross_dur = float(cross_data.get("summary", {}).get("total_duration_seconds", 0.0)) if cross_data else 0.0
+
+        # Timing calculations
+        total_dur_a = float(meta_a.get("duration_seconds", 0.0))
+        total_dur_b = float(meta_b.get("duration_seconds", 0.0))
+
+        verif_dur_a = sum(float(st.get("total_duration_seconds", 0.0)) for st in verifiers_dict_a.values())
+        if verif_dur_a == 0.0 and stats_a:
+            verif_dur_a = float(stats_a.get("total_duration_seconds", 0.0))
+
+        verif_dur_b = sum(float(st.get("total_duration_seconds", 0.0)) for st in verifiers_dict_b.values())
+        if verif_dur_b == 0.0 and stats_b:
+            verif_dur_b = float(stats_b.get("total_duration_seconds", 0.0))
+
+        build_dur_a = max(0.0, total_dur_a - verif_dur_a)
+        build_dur_b = max(0.0, total_dur_b - verif_dur_b)
+        overall_duration = total_dur_a + total_dur_b + cross_dur
+
         # Determine mode
         mode_a = (data_a.get("mode") or stats_a.get("mode") or self.mode) if data_a else self.mode
         mode_b = (data_b.get("mode") or stats_b.get("mode") or self.mode) if data_b else self.mode
@@ -1595,6 +1745,24 @@ class ABTestRunner:
                     "percent",
                 ),
                 (
+                    "Supported Assertions Count (+1.0)",
+                    stats_a.get("total_supported_count", stats_a.get("total_matched_ideas", 0)),
+                    stats_b.get("total_supported_count", stats_b.get("total_matched_ideas", 0)),
+                    "count",
+                ),
+                (
+                    "Not Mentioned / Omission Count (-0.25)",
+                    stats_a.get("total_not_mentioned_count", stats_a.get("total_missed_ideas", 0)),
+                    stats_b.get("total_not_mentioned_count", stats_b.get("total_missed_ideas", 0)),
+                    "count_lower_is_better",
+                ),
+                (
+                    "Contradicted / Against Count (-1.0)",
+                    stats_a.get("total_against_count", 0),
+                    stats_b.get("total_against_count", 0),
+                    "count_lower_is_better",
+                ),
+                (
                     "Missed Ideas (Omissions)",
                     stats_a.get("total_missed_ideas", 0),
                     stats_b.get("total_missed_ideas", 0),
@@ -1625,15 +1793,21 @@ class ABTestRunner:
                     "raw",
                 ),
                 (
-                    "End-to-End Pipeline Duration (s)",
-                    meta_a.get("duration_seconds", 0.0),
-                    meta_b.get("duration_seconds", 0.0),
+                    "Knowledge Graph Build Duration (s)",
+                    round(build_dur_a, 2),
+                    round(build_dur_b, 2),
                     "duration",
                 ),
                 (
                     "Verification Phase Duration (s)",
-                    stats_a.get("total_duration_seconds", 0.0),
-                    stats_b.get("total_duration_seconds", 0.0),
+                    round(verif_dur_a, 2),
+                    round(verif_dur_b, 2),
+                    "duration",
+                ),
+                (
+                    "End-to-End Pipeline Duration (s)",
+                    round(total_dur_a, 2),
+                    round(total_dur_b, 2),
                     "duration",
                 ),
             ]
@@ -1682,21 +1856,45 @@ class ABTestRunner:
                     "percent_lower_is_better",
                 ),
                 (
+                    "Supported Assertions Count (+1.0)",
+                    stats_a.get("total_supported_count", stats_a.get("verified_count", 0)),
+                    stats_b.get("total_supported_count", stats_b.get("verified_count", 0)),
+                    "count",
+                ),
+                (
+                    "Not Mentioned / Omission Count (-0.25)",
+                    stats_a.get("total_not_mentioned_count", 0),
+                    stats_b.get("total_not_mentioned_count", 0),
+                    "count_lower_is_better",
+                ),
+                (
+                    "Contradicted / Against Count (-1.0)",
+                    stats_a.get("total_against_count", stats_a.get("discrepancy_count", 0)),
+                    stats_b.get("total_against_count", stats_b.get("discrepancy_count", 0)),
+                    "count_lower_is_better",
+                ),
+                (
                     "Graph Nodes / Edges",
                     f"{nodes_a} / {edges_a}",
                     f"{nodes_b} / {edges_b}",
                     "raw",
                 ),
                 (
-                    "End-to-End Pipeline Duration (s)",
-                    meta_a.get("duration_seconds", 0.0),
-                    meta_b.get("duration_seconds", 0.0),
+                    "Knowledge Graph Build Duration (s)",
+                    round(build_dur_a, 2),
+                    round(build_dur_b, 2),
                     "duration",
                 ),
                 (
                     "Verification Phase Duration (s)",
-                    stats_a.get("total_duration_seconds", 0.0),
-                    stats_b.get("total_duration_seconds", 0.0),
+                    round(verif_dur_a, 2),
+                    round(verif_dur_b, 2),
+                    "duration",
+                ),
+                (
+                    "End-to-End Pipeline Duration (s)",
+                    round(total_dur_a, 2),
+                    round(total_dur_b, 2),
                     "duration",
                 ),
             ]
@@ -1918,12 +2116,36 @@ class ABTestRunner:
             "mode": self.mode,
             "verdict": verdict,
             "timestamp": datetime.datetime.now().isoformat(),
+            "timing": {
+                "baseline": {
+                    "build_duration_seconds": round(build_dur_a, 2),
+                    "verification_duration_seconds": round(verif_dur_a, 2),
+                    "pipeline_duration_seconds": round(total_dur_a, 2),
+                },
+                "candidate": {
+                    "build_duration_seconds": round(build_dur_b, 2),
+                    "verification_duration_seconds": round(verif_dur_b, 2),
+                    "pipeline_duration_seconds": round(total_dur_b, 2),
+                },
+                "cross_check_duration_seconds": round(cross_dur, 2),
+                "total_overall_duration_seconds": round(overall_duration, 2),
+            },
             "metrics": summary_data,
             "discrepancies_count": {
                 "baseline": len(disc_a),
                 "candidate": len(disc_b),
             },
         }
+        if cross_data:
+            comparison_record["cross_check"] = cross_data.get("summary", {})
+        if len(all_modes) > 1:
+            comparison_record["verifiers_breakdown"] = {
+                m: {
+                    "baseline": verifiers_dict_a.get(m, {}),
+                    "candidate": verifiers_dict_b.get(m, {}),
+                }
+                for m in all_modes
+            }
         if is_chunk_mode:
             omiss_a = data_a.get("omission_examples", []) if data_a else []
             omiss_b = data_b.get("omission_examples", []) if data_b else []
@@ -1939,8 +2161,13 @@ class ABTestRunner:
         md_out = self.session_dir / "comparison_summary.md"
         self._write_markdown_report(md_out, comparison_record)
 
+        # Also write ab_test_summary.md as requested
+        ab_summary_md = self.session_dir / "ab_test_summary.md"
+        shutil.copy2(md_out, ab_summary_md)
+
         log_success(f"Full comparison JSON saved to: {Colors.BOLD}{json_out}{Colors.RESET}")
         log_success(f"Full comparison Markdown report saved to: {Colors.BOLD}{md_out}{Colors.RESET}")
+        log_success(f"Overall A/B test summary saved to: {Colors.BOLD}{ab_summary_md}{Colors.RESET}")
 
         return comparison_record
 
@@ -1972,9 +2199,40 @@ class ABTestRunner:
             f"- **Sample Rate:** `{data['sample_percent']}%` (Mode: `{data['mode']}`)",
             f"- **Generated:** `{data['timestamp']}`",
             "",
-            f"### 🎯 Verdict",
+            f"### 🎯 Overall Verdict",
             f"> **{data['verdict']}**",
             "",
+        ])
+
+        # 1. Execution Timing & Graph Performance
+        timing = data.get("timing")
+        if timing:
+            t_base = timing.get("baseline", {})
+            t_cand = timing.get("candidate", {})
+            d_build = t_cand.get("build_duration_seconds", 0.0) - t_base.get("build_duration_seconds", 0.0)
+            d_verif = t_cand.get("verification_duration_seconds", 0.0) - t_base.get("verification_duration_seconds", 0.0)
+            d_pipe = t_cand.get("pipeline_duration_seconds", 0.0) - t_base.get("pipeline_duration_seconds", 0.0)
+
+            lines.extend([
+                "### ⏱️ Execution Timing & Performance",
+                "",
+                f"| Phase / Metric | {col_hdr_a} | {col_hdr_b} | {col_hdr_d} |",
+                "| :--- | :--- | :--- | :--- |",
+                f"| Knowledge Graph Build Duration | {t_base.get('build_duration_seconds', 0.0):.2f}s | {t_cand.get('build_duration_seconds', 0.0):.2f}s | {d_build:+.2f}s |",
+                f"| Verification Phase Duration | {t_base.get('verification_duration_seconds', 0.0):.2f}s | {t_cand.get('verification_duration_seconds', 0.0):.2f}s | {d_verif:+.2f}s |",
+                f"| End-to-End Pipeline Duration | {t_base.get('pipeline_duration_seconds', 0.0):.2f}s | {t_cand.get('pipeline_duration_seconds', 0.0):.2f}s | {d_pipe:+.2f}s |",
+                "",
+            ])
+            cross_dur = timing.get("cross_check_duration_seconds", 0.0)
+            total_dur = timing.get("total_overall_duration_seconds", 0.0)
+            if cross_dur > 0:
+                lines.extend([
+                    f"*Cross-check Comparative Audit Duration: {cross_dur:.1f}s | Overall A/B Pipeline Duration: {total_dur:.1f}s*",
+                    "",
+                ])
+
+        # 2. Comparative Verification Metrics
+        lines.extend([
             "### 📊 Comparative Metrics",
             "",
             f"| Metric | {col_hdr_a} | {col_hdr_b} | {col_hdr_d} |",
@@ -1982,6 +2240,35 @@ class ABTestRunner:
         ])
         for m in data.get("metrics", []):
             lines.append(f"| {m['metric']} | {m['branch_a']} | {m['branch_b']} | {m['delta']} |")
+
+        # 3. Cross-Check Comparative Audit
+        cross_check = data.get("cross_check")
+        if cross_check:
+            sm = cross_check
+            d_sup = sm.get("delta_supported", 0)
+            d_not = sm.get("delta_not_mentioned", 0)
+            d_opp = sm.get("delta_against", 0)
+            gate_badge = "**PASS**" if sm.get("decision_pass") else "**FAIL**"
+
+            lines.extend([
+                "",
+                "### 🔄 Cross-Check Comparative Audit",
+                "",
+                f"| Cross-Check Metric | {col_hdr_a} | {col_hdr_b} | {col_hdr_d} | Notes |",
+                "| :--- | :--- | :--- | :--- | :--- |",
+                f"| Contiguous Chunk Blocks Audited | {sm.get('total_samples', 0)} | {sm.get('total_samples', 0)} | - | - |",
+                f"| Total Assertions Evaluated | {sm.get('total_assertions_count', 0)} | {sm.get('total_assertions_count', 0)} | - | - |",
+                f"| Supported Assertions Count (+1.0) | {sm.get('total_old_supported', 0)} | {sm.get('total_new_supported', 0)} | {d_sup:+d} | Higher is better |",
+                f"| Not Mentioned / Omission Count (-0.25) | {sm.get('total_old_not_mentioned', 0)} | {sm.get('total_new_not_mentioned', 0)} | {d_not:+d} | Lower is better |",
+                f"| Contradicted / Hallucination Count (-1.0) | {sm.get('total_old_against', 0)} | {sm.get('total_new_against', 0)} | {d_opp:+d} | Lower is better |",
+                f"| Mean QA Recall (%) | {sm.get('mean_old_recall', 0.0)*100:.2f}% | {sm.get('mean_new_recall', 0.0)*100:.2f}% | {sm.get('mean_delta_recall', 0.0)*100:+.2f}% pts | Higher is better |",
+                f"| Mean Net Semantic Integrity (S_net [-1, +1]) | {sm.get('mean_old_net_integrity', 0.0):+.2f} | {sm.get('mean_new_net_integrity', 0.0):+.2f} | {sm.get('mean_delta_net_integrity', 0.0):+.2f} | Higher is better |",
+                f"| Mean Calibrated Fidelity (R_calib) (%) | {sm.get('mean_old_calibrated_fidelity', 0.0)*100:.2f}% | {sm.get('mean_new_calibrated_fidelity', 0.0)*100:.2f}% | {sm.get('mean_delta_calibrated_fidelity', 0.0)*100:+.2f}% pts | Higher is better |",
+                f"| Mean Seam Integrity (%) | {sm.get('mean_old_seam_integrity', 0.0)*100:.2f}% | {sm.get('mean_new_seam_integrity', 0.0)*100:.2f}% | {sm.get('mean_delta_seam_integrity', 0.0)*100:+.2f}% pts | Higher is better |",
+                f"| Boundary Truncation Artifact Rate (%) | {sm.get('mean_old_truncation_rate', 0.0)*100:.2f}% | {sm.get('mean_new_truncation_rate', 0.0)*100:.2f}% | {(sm.get('mean_new_truncation_rate', 0.0)-sm.get('mean_old_truncation_rate', 0.0))*100:+.2f}% pts | Lower is better |",
+                f"| Mean Chunk Disproportion | - | {sm.get('mean_chunk_disproportion', 0.0):.4f} | - | Target ~1.0 |",
+                f"| Decision Gating Checklist | - | {gate_badge} | {sm.get('pass_reason', '')} | - |",
+            ])
 
         tag_a = "Case A (Config A)" if data.get("is_same_branch") else f"Baseline (`{data['baseline']}`)"
         tag_b = "Case B (Config B)" if data.get("is_same_branch") else f"Candidate (`{data['candidate']}`)"
@@ -2186,6 +2473,14 @@ Examples:
         "--dry-run",
         action="store_true",
         help="Simulate the workflow and produce comparison reports without running Ollama LLM queries.",
+    )
+    parser.add_argument(
+        "--skip-cross-check",
+        "--no-cross-check",
+        dest="skip_cross_check",
+        action="store_true",
+        default=False,
+        help="Skip the cross-check comparative audit step at the end of verification.",
     )
 
     args = parser.parse_args()
@@ -2464,15 +2759,18 @@ Examples:
             same_branch=args.same_branch,
             num_books=args.books,
             percent=args.percent,
+            blocks=args.blocks,
             mode=args.mode,
             timeout=args.timeout,
             repo_dir=args.repo_dir,
             output_dir=args.output_dir,
             extra_args=args.extra_args,
             dry_run=args.dry_run,
+            print_chunks=args.print_chunks,
             base_config=args.base_config,
             config_a=args.config_a,
             config_b=args.config_b,
+            skip_cross_check=args.skip_cross_check,
         )
         runner.execute_flow()
     except KeyboardInterrupt:

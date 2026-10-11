@@ -343,3 +343,113 @@ def test_ab_test_cli_same_branch_invocations(tmp_path: Path):
     assert "Same-Branch Configuration Comparison" in res.stdout
 
 
+def test_ab_test_runs_verifiers_from_config_yaml_and_cross_check(tmp_path: Path):
+    """Test that A/B test runs all verifiers from config.yaml, auto-executes cross-check, and generates ab_test_summary.md with timing stats."""
+    import json
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+
+    cfg = {
+        "llm_model": "test-model",
+        "verifiers": [
+            {"mode": "ideas", "percent": 1.0},
+            {"mode": "chunk", "percent": 10.0},
+        ],
+    }
+    with open(repo_dir / "config.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f)
+
+    out_dir = tmp_path / "ab_test_runs"
+    runner = ABTestRunner(
+        branch1="main",
+        repo_dir=str(repo_dir),
+        output_dir=str(out_dir),
+        dry_run=True,
+        blocks=5,
+    )
+    session_dir = runner.execute_flow()
+    assert session_dir.is_dir()
+
+    # 1. Cross-check report generated at end of verification
+    cc_json = session_dir / "cross_check_report.json"
+    cc_md = session_dir / "cross_check_report.md"
+    assert cc_json.is_file()
+    assert cc_md.is_file()
+
+    # 2. Both summary markdown files generated
+    sum_json = session_dir / "comparison_summary.json"
+    sum_md = session_dir / "comparison_summary.md"
+    ab_md = session_dir / "ab_test_summary.md"
+    assert sum_json.is_file()
+    assert sum_md.is_file()
+    assert ab_md.is_file()
+
+    # 3. Verify comparison_summary.json structure
+    with open(sum_json, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # Timing metrics
+    assert "timing" in data
+    timing = data["timing"]
+    assert "baseline" in timing and "candidate" in timing
+    assert timing["baseline"]["build_duration_seconds"] > 0
+    assert timing["baseline"]["verification_duration_seconds"] > 0
+    assert timing["baseline"]["pipeline_duration_seconds"] > 0
+    assert timing["cross_check_duration_seconds"] >= 0
+    assert timing["total_overall_duration_seconds"] > 0
+
+    # Cross-check summary included
+    assert "cross_check" in data
+    assert data["cross_check"]["total_samples"] == 5
+    assert "mean_delta_recall" in data["cross_check"]
+    assert "total_old_supported" in data["cross_check"]
+
+    # Verifiers breakdown included for multi-verifier config
+    assert "verifiers_breakdown" in data
+    assert "ideas" in data["verifiers_breakdown"]
+    assert "chunk" in data["verifiers_breakdown"]
+
+    # 4. Verify markdown summary contents
+    md_content = ab_md.read_text(encoding="utf-8")
+    assert "Overall Verdict" in md_content
+    assert "Execution Timing & Performance" in md_content
+    assert "Knowledge Graph Build Duration" in md_content
+    assert "Verification Phase Duration" in md_content
+    assert "End-to-End Pipeline Duration" in md_content
+    assert "Cross-Check Comparative Audit" in md_content
+    assert "Supported Assertions Count (+1.0)" in md_content
+    assert "Not Mentioned / Omission Count (-0.25)" in md_content
+    assert "Contradicted / Hallucination Count (-1.0)" in md_content
+    assert "Mean Net Semantic Integrity" in md_content
+    assert "Mean Calibrated Fidelity" in md_content
+
+
+def test_ab_test_skip_cross_check_flag(tmp_path: Path):
+    """Test that --skip-cross-check skips cross check audit generation."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+
+    cfg = {"llm_model": "test-model", "verification": {"percent": 1.0}}
+    with open(repo_dir / "config.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f)
+
+    out_dir = tmp_path / "ab_test_runs"
+    runner = ABTestRunner(
+        branch1="main",
+        repo_dir=str(repo_dir),
+        output_dir=str(out_dir),
+        dry_run=True,
+        skip_cross_check=True,
+    )
+    session_dir = runner.execute_flow()
+    assert session_dir.is_dir()
+
+    # Cross-check should NOT be generated
+    assert not (session_dir / "cross_check_report.json").is_file()
+    # Summary should still be generated
+    assert (session_dir / "ab_test_summary.md").is_file()
+
+
+

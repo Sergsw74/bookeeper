@@ -2,7 +2,15 @@
 # bookeeper - Configuration File
 # ==============================================================================
 
-# Calibre Library Integration
+# Book Source Options
+# ==============================================================================
+# Option A: Folder of downloaded books/articles (e.g. from Archive Downloader)
+# Point directly to a directory of PDFs/EPUBs (supports index.json and .opf metadata).
+# If set, Bookkeeper uses this folder as its book source instead of Calibre database.
+# books_dir: "archive_downloader/downloads"
+books_dir: null
+
+# Option B: Calibre Library Integration
 # Supports:
 # 1. Mounted SMB share: e.g. "/Volumes/Calibre Library" or "/Volumes/share/books"
 # 2. Local folder path: e.g. "~/Calibre Library"

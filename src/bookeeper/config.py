@@ -231,6 +231,10 @@ class Settings(BaseSettings):
         default="~/Calibre Library",
         description="Path to local library directory (with metadata.db) or remote URL (http://host:port/#library).",
     )
+    books_dir: Optional[str] = Field(
+        default=None,
+        description="Path to folder containing downloaded books/papers (e.g. archive_downloader/downloads or ./downloads) to use as source instead of Calibre database.",
+    )
     calibre_user: Optional[str] = Field(
         default=None,
         description="Optional username for remote Calibre content server.",
@@ -251,6 +255,22 @@ class Settings(BaseSettings):
         default=None,
         description="Optional custom local path for staged metadata.db (default: output_dir/.staged_metadata.db).",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def handle_books_dir_aliases(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            for alias in ("download_dir", "downloads_dir", "source_dir"):
+                if alias in data and "books_dir" not in data:
+                    data["books_dir"] = data.pop(alias)
+        return data
+
+    @property
+    def resolved_books_dir(self) -> Optional[Path]:
+        """Return expanded Path for books_dir if configured."""
+        if self.books_dir:
+            return Path(self.books_dir).expanduser().resolve()
+        return None
 
     # Local / Remote Ollama LLM & Embeddings
     ollama_base_url: str = Field(

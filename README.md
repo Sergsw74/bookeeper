@@ -1,8 +1,8 @@
 # 📚 bookeeper
 
-> **Calibre library ingester, LLM metadata normalizer, and Concept Knowledge Graph extractor using local Ollama.**
+> **Calibre library & download folder ingester, LLM metadata normalizer, and Concept Knowledge Graph extractor using local Ollama.**
 
-`bookeeper` bridges your digital book library (EPUB / PDF / FB2 via Calibre) with local Large Language Models (Ollama) to extract structured ideas, architectural patterns, technical themes, and concept graphs mapped down to individual chapters and sections.
+`bookeeper` bridges your digital book library (EPUB / PDF / FB2 via Calibre or direct download directories such as `archive_downloader/downloads`) with local Large Language Models (Ollama) to extract structured ideas, architectural patterns, technical themes, and concept graphs mapped down to individual chapters and sections.
 
 ---
 
@@ -121,8 +121,11 @@ cp config.yaml.example config.yaml
 ```
 
 Edit `config.yaml` to point to your library and Ollama server(s):
-```yaml
-# Calibre Library Integration (Local folder or mounted SMB share)
+# Book Source Options: Calibre Library OR Download Folder
+# 1. Direct download directory / arXiv papers (no Calibre database required):
+books_dir: "archive_downloader/downloads"  # Aliases: download_dir, downloads_dir, source_dir
+
+# 2. Calibre Library Integration (Local folder or mounted SMB share):
 calibre_library_path: "/Volumes/Calibre Library"
 stage_metadata_db: true        # Stage SQLite DB on local SSD for microsecond queries
 backup_metadata_db: true       # Create remote metadata.db.bak backup before syncing
@@ -258,6 +261,9 @@ bookeeper build-graph --from-scratch
 
 # Ingest up to N books and stop (e.g. process 5 books):
 bookeeper build-graph --limit 5
+
+# Ingest books directly from a download folder / arXiv collection instead of Calibre:
+bookeeper build-graph --books-dir archive_downloader/downloads --limit 10
 ```
 
 ---
@@ -269,6 +275,9 @@ Runs an end-to-end integration pipeline from scratch for a specified number of b
 ```bash
 # Ingest 5 books from scratch and automatically verify 1% of ideas:
 bookeeper test-run 5
+
+# Test run using an arXiv download folder as the book source:
+bookeeper test-run 5 --books-dir archive_downloader/downloads
 
 # Customize timeout, sample percentage, or verification mode:
 bookeeper test-run 10 --timeout 60 --percent 2.0 --mode ideas
@@ -578,9 +587,10 @@ bookeeper status
 # Inspect active configuration and server pool capabilities:
 bookeeper config
 
-# List or search books in the library:
+# List or search books in the library or download directory:
 bookeeper list-books --limit 20
-bookeeper list-books --search "Redwall"
+bookeeper list-books --search "Neural"
+bookeeper list-books --books-dir archive_downloader/downloads --limit 10
 ```
 
 ---
@@ -612,6 +622,16 @@ uv run archive-downloader inspect --limit 10
 ```
 
 *(Note: Can also be executed with `uv run --project archive_downloader archive-downloader ...`, from inside `archive_downloader/`, or with `python archive_downloader/run.py`)*
+
+#### 🔗 Seamless Ingestion into Bookkeeper
+Downloaded papers are ready to be ingested directly by `bookeeper` without Calibre:
+```bash
+# Ingest arXiv papers directly into your Knowledge Graph:
+uv run bookeeper build-graph --books-dir archive_downloader/downloads --limit 10
+
+# Or run an end-to-end test run with verification on downloaded papers:
+uv run bookeeper test-run 5 --books-dir archive_downloader/downloads
+```
 
 See [`archive_downloader/README.md`](archive_downloader/README.md) for full documentation.
 

@@ -34,8 +34,13 @@ from rich.text import Text
 
 logger = logging.getLogger(__name__)
 
-from bookeeper.calibre.client import CalibreClient
-from bookeeper.calibre.parser import BookParser
+from bookeeper.calibre import (
+    BookParser,
+    CalibreClient,
+    FolderBookClient,
+    Section,
+    get_book_client,
+)
 from bookeeper.config import Settings, get_settings
 from bookeeper.graph.exporters import GraphMLExporter, Neo4jExporter, ObsidianExporter
 from bookeeper.graph.store import ConceptGraphStore
@@ -192,6 +197,7 @@ def _get_effective_settings(
     request_timeout: Optional[int] = None,
     max_retries: Optional[int] = None,
     max_chunk_attempts: Optional[int] = None,
+    books_dir: Optional[str] = None,
 ) -> Settings:
     """Retrieve settings and merge explicit CLI arguments with highest precedence."""
     config_path = _resolve_opt(config_path)
@@ -204,11 +210,14 @@ def _get_effective_settings(
     request_timeout = _resolve_opt(request_timeout)
     max_retries = _resolve_opt(max_retries)
     max_chunk_attempts = _resolve_opt(max_chunk_attempts)
+    books_dir = _resolve_opt(books_dir)
 
     cfg = get_settings(config_path)
     overrides = {}
     if calibre_path:
         overrides["calibre_library_path"] = calibre_path
+    if books_dir:
+        overrides["books_dir"] = books_dir
     if ollama_url:
         overrides["ollama_base_url"] = ollama_url
     if model:
@@ -426,33 +435,38 @@ def list_books(
     calibre_path: Optional[str] = typer.Option(
         None, "--calibre-path", help="Calibre library path or SMB mount (e.g. /Volumes/share/calibre)."
     ),
+    books_dir: Optional[str] = typer.Option(
+        None,
+        "--books-dir",
+        "--download-dir",
+        "--source-dir",
+        help="Path to folder containing downloaded books/papers (e.g. archive_downloader/downloads) to use as source instead of Calibre database.",
+    ),
     config_path: Optional[str] = typer.Option(
         None, "--config", "-c", help="Path to config.yaml file."
     ),
 ):
     """
-    List and search books in the configured Calibre library or mounted SMB share.
+    List and search books in the configured Calibre library, download folder, or mounted SMB share.
     Useful for testing database connectivity and discovering book IDs.
     """
-    cfg = _get_effective_settings(config_path, calibre_path=calibre_path)
-    client = CalibreClient(
-        library_path=cfg.calibre_library_path,
-        user=cfg.calibre_user,
-        password=cfg.calibre_password,
-    )
+    cfg = _get_effective_settings(config_path, calibre_path=calibre_path, books_dir=books_dir)
+    client = get_book_client(cfg, calibre_path=calibre_path, books_dir=books_dir)
+    source_display = getattr(client, "display_name", f"Calibre Library: {cfg.calibre_library_path}")
 
     if not client.is_available():
         console.print(
-            f"[bold red]Error:[/bold red] Cannot access Calibre library at '[bold cyan]{cfg.calibre_library_path}[/bold cyan]'.\n"
-            f"If this is on a remote SMB share, ensure the share is mounted (e.g. /Volumes/...) or that calibredb is installed."
+            f"[bold red]Error:[/bold red] Cannot access book source at '[bold cyan]{source_display}[/bold cyan]'.\n"
+            f"If using Calibre, ensure the share is mounted or that calibredb is installed.\n"
+            f"If using a download folder, ensure --books-dir points to a valid folder containing downloaded books."
         )
         raise typer.Exit(1)
 
-    with console.status(f"[bold blue]Connecting to Calibre library at {cfg.calibre_library_path}...[/bold blue]"):
+    with console.status(f"[bold blue]Connecting to book source ({source_display})...[/bold blue]"):
         try:
             books = client.list_books(fields=["id", "title", "authors", "formats"])
         except Exception as e:
-            console.print(f"[bold red]Failed to read Calibre library:[/bold red] {e}")
+            console.print(f"[bold red]Failed to read book source:[/bold red] {e}")
             raise typer.Exit(1)
 
     if search:
@@ -462,17 +476,21 @@ def list_books(
             for b in books
             if q in b.get("title", "").lower()
             or any(q in a.lower() for a in b.get("authors", []))
+            or q in b.get("arxiv_id", "").lower()
         ]
 
     total_count = len(books)
     if limit and limit > 0:
         books = books[:limit]
 
+    has_arxiv = any(b.get("arxiv_id") for b in books)
     table = Table(
-        title=f"Calibre Library: {cfg.calibre_library_path} (Showing {len(books)} of {total_count})",
+        title=f"{source_display} (Showing {len(books)} of {total_count})",
         show_lines=False,
     )
     table.add_column("ID", justify="right", style="cyan", width=6)
+    if has_arxiv:
+        table.add_column("arXiv ID", style="yellow", width=12)
     table.add_column("Title", style="bold white", min_width=30)
     table.add_column("Authors", style="green", width=24)
     table.add_column("Formats", style="magenta", width=16)
@@ -487,12 +505,11 @@ def list_books(
         if len(title) > 50:
             title = title[:47] + "..."
 
-        table.add_row(
-            str(b.get("id", "")),
-            title,
-            authors_str[:24],
-            formats_str or "[dim]None[/dim]",
-        )
+        row_vals = [str(b.get("id", ""))]
+        if has_arxiv:
+            row_vals.append(str(b.get("arxiv_id", "")))
+        row_vals.extend([title, authors_str[:24], formats_str or "[dim]None[/dim]"])
+        table.add_row(*row_vals)
 
     console.print(table)
     if limit and total_count > limit:
@@ -526,6 +543,13 @@ def clean_metadata(
     ),
     calibre_path: Optional[str] = typer.Option(
         None, "--calibre-path", help="Calibre library path or SMB mount (e.g. /Volumes/share/calibre)."
+    ),
+    books_dir: Optional[str] = typer.Option(
+        None,
+        "--books-dir",
+        "--download-dir",
+        "--source-dir",
+        help="Path to folder containing downloaded books/papers (e.g. archive_downloader/downloads) to use as source instead of Calibre database.",
     ),
     ollama_url: Optional[str] = typer.Option(
         None, "--ollama-url", "-u", help="Ollama server URL (e.g. http://192.168.50.15:11434)."
@@ -574,20 +598,18 @@ def clean_metadata(
         model_fallback=model_fallback,
         request_timeout=request_timeout,
         max_retries=retries,
+        books_dir=books_dir,
     )
     effective_stage_db = cfg.stage_metadata_db if stage_db is None else stage_db
     effective_backup_db = cfg.backup_metadata_db if backup_db is None else backup_db
 
-    client = CalibreClient(
-        library_path=cfg.calibre_library_path,
-        user=cfg.calibre_user,
-        password=cfg.calibre_password,
-    )
+    client = get_book_client(cfg, calibre_path=calibre_path, books_dir=books_dir)
 
     if not client.is_available():
+        source_display = getattr(client, "display_name", cfg.calibre_library_path)
         console.print(
-            f"[bold red]Error:[/bold red] Cannot access Calibre library at '{cfg.calibre_library_path}'.\n"
-            f"Ensure the SMB share is mounted or calibredb is in PATH."
+            f"[bold red]Error:[/bold red] Cannot access book source at '{source_display}'.\n"
+            f"Ensure the SMB share is mounted, calibredb is in PATH, or --books-dir contains downloaded books."
         )
         raise typer.Exit(1)
 
@@ -674,14 +696,19 @@ def clean_metadata(
     if not skip_warmup:
         _perform_ollama_warmup(extractor, console)
 
-    query_msg = "Reading book catalog from staged local SQLite..." if client.is_staged else "Querying Calibre library over network/calibredb..."
+    if client.is_staged:
+        query_msg = "Reading book catalog from staged local SQLite..."
+    elif getattr(client, "source_type", None) == "folder":
+        query_msg = f"Reading book catalog from {getattr(client, 'display_name', 'download folder')}..."
+    else:
+        query_msg = "Querying Calibre library over network/calibredb..."
     with console.status(f"[bold blue]{query_msg}[/bold blue]"):
         try:
             books = client.list_books(fields=["id", "title", "authors", "comments", "formats"])
         except Exception as e:
             if should_stage and client.is_staged:
                 client.cleanup_staged(delete_file=True)
-            console.print(f"[bold red]Failed to query Calibre library:[/bold red] {e}")
+            console.print(f"[bold red]Failed to query book source:[/bold red] {e}")
             raise typer.Exit(1)
 
     if book_id is not None:
@@ -1076,6 +1103,13 @@ def build_graph(
     calibre_path: Optional[str] = typer.Option(
         None, "--calibre-path", help="Calibre library path or SMB mount (e.g. /Volumes/share/calibre)."
     ),
+    books_dir: Optional[str] = typer.Option(
+        None,
+        "--books-dir",
+        "--download-dir",
+        "--source-dir",
+        help="Path to folder containing downloaded books/papers (e.g. archive_downloader/downloads) to use as source instead of Calibre database.",
+    ),
     ollama_url: Optional[str] = typer.Option(
         None, "--ollama-url", "-u", help="Ollama server URL (e.g. http://192.168.50.15:11434)."
     ),
@@ -1200,6 +1234,7 @@ def build_graph(
     clean_export = _resolve_opt(clean_export)
     continue_run = _resolve_opt(continue_run, False)
     limit = _resolve_opt(limit)
+    books_dir = _resolve_opt(books_dir)
 
     cfg = _get_effective_settings(
         config_path,
@@ -1212,6 +1247,7 @@ def build_graph(
         request_timeout=request_timeout,
         max_retries=retries,
         max_chunk_attempts=max_chunk_attempts,
+        books_dir=books_dir,
     )
     output_dir = cfg.resolved_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1279,11 +1315,7 @@ def build_graph(
         except Exception:
             pass
 
-    client = CalibreClient(
-        library_path=cfg.calibre_library_path,
-        user=cfg.calibre_user,
-        password=cfg.calibre_password,
-    )
+    client = get_book_client(cfg, calibre_path=calibre_path, books_dir=books_dir)
 
     # Local DB Staging: Copy metadata.db locally to bypass SMB network roundtrips and latency
     effective_stage_db = cfg.stage_metadata_db if stage_db is None else stage_db
@@ -1417,13 +1449,14 @@ def build_graph(
             raise typer.Exit(0)
         books_to_process.append({"id": 1, "title": p.stem, "author": "Unknown", "path": p})
 
-    # Case 2: From Calibre / SMB share
+    # Case 2: From Calibre / Download Folder / SMB share
     elif client.is_available():
-        query_msg = (
-            "Reading book catalog from staged local SQLite..."
-            if client.is_staged
-            else "Querying Calibre library over network/calibredb..."
-        )
+        if client.is_staged:
+            query_msg = "Reading book catalog from staged local SQLite..."
+        elif getattr(client, "source_type", None) == "folder":
+            query_msg = f"Reading book catalog from {getattr(client, 'display_name', 'download folder')}..."
+        else:
+            query_msg = "Querying Calibre library over network/calibredb..."
         console.print(f"[dim]{query_msg}[/dim]")
         with console.status(f"[bold blue]{query_msg}[/bold blue]"):
             try:
@@ -1431,13 +1464,13 @@ def build_graph(
             except Exception as e:
                 if should_stage and client.is_staged:
                     client.cleanup_staged(delete_file=True)
-                console.print(f"[bold red]Failed to query Calibre library:[/bold red] {e}")
+                console.print(f"[bold red]Failed to query book source:[/bold red] {e}")
                 raise typer.Exit(1)
 
         if book_id is not None:
             matches = [b for b in all_calibre_books if b["id"] == book_id]
             if not matches:
-                console.print(f"[bold red]Book ID {book_id} not found in Calibre library.[/bold red]")
+                console.print(f"[bold red]Book ID {book_id} not found in book catalog.[/bold red]")
                 raise typer.Exit(1)
             target_list = matches
         elif retry_failed:
@@ -1609,9 +1642,10 @@ def build_graph(
                     console.print(f"[yellow]Skipping book #{bid}: No supported text format available (EPUB, FB2, PDF, RTF, TXT, ZIP).[/yellow]")
                     tracker.mark_skipped("build_graph", bid, title=b.get("title", f"Book {bid}"), reason="No supported text format available")
     else:
+        source_display = getattr(client, "display_name", "Calibre library")
         console.print(
-            "[bold red]Calibre not available. Pass an explicit book file via --file <path.epub> "
-            "or mount the SMB share and pass --calibre-path <path>.[/bold red]"
+            f"[bold red]Book source not available ({source_display}). Pass an explicit book file via --file <path.epub>, "
+            "a download folder via --books-dir <dir>, or mount the Calibre library SMB share via --calibre-path <path>.[/bold red]"
         )
         raise typer.Exit(1)
 
@@ -4060,6 +4094,13 @@ def test_run_command(
     calibre_path: Optional[str] = typer.Option(
         None, "--calibre-path", help="Calibre library path or SMB mount."
     ),
+    books_dir: Optional[str] = typer.Option(
+        None,
+        "--books-dir",
+        "--download-dir",
+        "--source-dir",
+        help="Path to folder containing downloaded books/papers (e.g. archive_downloader/downloads) to use as source instead of Calibre database.",
+    ),
     timeout: int = typer.Option(
         60, "--request-timeout", "--timeout", help="HTTP timeout in seconds for Ollama LLM requests (default: 60s)."
     ),
@@ -4093,7 +4134,7 @@ def test_run_command(
         console.print("[bold red]book-cnt must be at least 1[/bold red]")
         raise typer.Exit(1)
 
-    eff_cfg = _get_effective_settings(config_path, calibre_path, model=model)
+    eff_cfg = _get_effective_settings(config_path, calibre_path, model=model, books_dir=books_dir)
     effective_percent = percent if percent is not None else (eff_cfg.verification.percent if eff_cfg.verification.percent is not None else 1.0)
     effective_mode = mode or eff_cfg.verification.mode or "ideas"
 
@@ -4115,6 +4156,7 @@ def test_run_command(
     try:
         build_graph(
             calibre_path=calibre_path,
+            books_dir=books_dir,
             config_path=config_path,
             from_scratch=True,
             enable_lightrag=False,
@@ -4172,6 +4214,13 @@ def rebuild_graph_command(
     calibre_path: Optional[str] = typer.Option(
         None, "--calibre-path", help="Calibre library root path or SMB mount."
     ),
+    books_dir: Optional[str] = typer.Option(
+        None,
+        "--books-dir",
+        "--download-dir",
+        "--source-dir",
+        help="Path to folder containing downloaded books/papers (e.g. archive_downloader/downloads) to use as source instead of Calibre database.",
+    ),
     states_dir: Optional[str] = typer.Option(
         None, "--states-dir", help="Directory containing .book_states JSON files (default: output_dir/.book_states)."
     ),
@@ -4217,8 +4266,9 @@ def rebuild_graph_command(
     export_neo4j = _resolve_opt(export_neo4j)
     clean_export = _resolve_opt(clean_export, True)
     dedup = _resolve_opt(dedup, True)
+    books_dir = _resolve_opt(books_dir)
 
-    cfg = _get_effective_settings(config_path, calibre_path)
+    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir)
     output_dir = cfg.resolved_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     graph_file = output_dir / "knowledge_graph.json"
@@ -4305,9 +4355,9 @@ def rebuild_graph_command(
     chunk_store = ChunkStore(resolved_chunks_dir)
     deduplicator = EntityDeduplicator.from_settings(cfg) if dedup else None
 
-    # Fetch Calibre authors if available
+    # Fetch authors if available
     authors_by_id = {}
-    client = CalibreClient(cfg.calibre_library_path)
+    client = get_book_client(cfg, calibre_path=calibre_path, books_dir=books_dir)
     if client.is_available():
         try:
             b_meta = client.list_books(fields=["id", "authors"])

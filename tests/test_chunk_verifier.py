@@ -176,20 +176,64 @@ def test_entity_deduplicator_is_same_concept_with_embeddings():
 
 
 def test_verify_chunks_execution(populated_chunk_store, mock_pool):
-    """Test verify_chunks pipeline on graph store with mock oracle extraction and deduplication."""
-    def mock_extract_ideas(text, book_title="Unknown", section_title="Unknown", **kwargs):
-        if "Deliberate practice" in text:
-            return [
-                Concept(name="Deliberate Practice", category="Learning", summary="Focus"),
-                Concept(name="Feedback Loops", category="Learning", summary="Signals"),
-                Concept(name="Continuous Improvement", category="Learning", summary="Nuance"),
-            ]
-        else:
-            return [
-                Concept(name="Spaced Repetition", category="Memory", summary="Retention"),
-            ]
+    """Test verify_chunks pipeline on graph store with mock NLI atomic assertions per-chunk evaluation."""
+    from bookeeper.processing.qa_probe import AtomicAssertionItem, NLIAssertionEvaluation, NLISystemBlockMetrics
 
-    with patch("bookeeper.processing.extractor.KnowledgeExtractor.extract_ideas", side_effect=mock_extract_ideas):
+    def mock_evaluate_claims(w_raw, ideas, pool, model_name, assertions=None, system_label="old"):
+        if "Deliberate practice" in w_raw:
+            a1 = AtomicAssertionItem(claim_id=1, assertion="Deliberate practice requires focused attention.", is_cross_boundary=False)
+            a2 = AtomicAssertionItem(claim_id=2, assertion="Feedback loops provide constant iterative signals.", is_cross_boundary=True)
+            e1 = NLIAssertionEvaluation(claim_id=1, assertion=a1.assertion, classification="SUPPORTED", score=1.0, verdict="PASS")
+            e2 = NLIAssertionEvaluation(claim_id=2, assertion=a2.assertion, classification="SUPPORTED", score=1.0, verdict="PASS")
+            m = NLISystemBlockMetrics(
+                system="old",
+                total_probes=2,
+                passed_probes=2,
+                failed_probes=0,
+                qa_recall=1.0,
+                cross_sentence_total=1,
+                cross_sentence_passed=1,
+                seam_integrity_rate=1.0,
+                evaluations=[e1, e2],
+                supported_count=2,
+                not_mentioned_count=0,
+                against_count=0,
+                support_ratio=1.0,
+                hallucination_ratio=0.0,
+                net_integrity_score=1.0,
+                calibrated_fidelity=1.0,
+                seam_net_integrity=1.0,
+                seam_calibrated_fidelity=1.0,
+            )
+            return [a1, a2], m
+        else:
+            a3 = AtomicAssertionItem(claim_id=3, assertion="Spaced repetition leverages the spacing effect.", is_cross_boundary=False)
+            a4 = AtomicAssertionItem(claim_id=4, assertion="Spacing effect causes memory interference.", is_cross_boundary=True)
+            e3 = NLIAssertionEvaluation(claim_id=3, assertion=a3.assertion, classification="SUPPORTED", score=1.0, verdict="PASS")
+            e4 = NLIAssertionEvaluation(claim_id=4, assertion=a4.assertion, classification="NOT_MENTIONED", score=-0.25, verdict="FAIL")
+            m = NLISystemBlockMetrics(
+                system="old",
+                total_probes=2,
+                passed_probes=1,
+                failed_probes=1,
+                qa_recall=0.5,
+                cross_sentence_total=1,
+                cross_sentence_passed=0,
+                seam_integrity_rate=0.0,
+                evaluations=[e3, e4],
+                supported_count=1,
+                not_mentioned_count=1,
+                against_count=0,
+                support_ratio=0.5,
+                hallucination_ratio=0.0,
+                net_integrity_score=0.375,
+                calibrated_fidelity=0.375,
+                seam_net_integrity=-0.25,
+                seam_calibrated_fidelity=0.0,
+            )
+            return [a3, a4], m
+
+    with patch("bookeeper.processing.verifier.evaluate_claims_atomic_assertions", side_effect=mock_evaluate_claims):
         report = verify_chunks(
             store=populated_chunk_store,
             pool=mock_pool,
@@ -204,31 +248,63 @@ def test_verify_chunks_execution(populated_chunk_store, mock_pool):
     assert report.stats.sampled_chunks_count == 2
     assert report.stats.total_chunks_in_graph == 2
 
-    # Check that ideas were extracted and matched
-    assert report.stats.total_oracle_ideas >= 3
-    assert report.stats.total_matched_ideas >= 3
-    assert report.stats.overall_success_rate > 0.0
+    # Continuous ternary metrics assertions
+    assert report.stats.total_assertions_count == 4
+    assert report.stats.total_supported_count == 3
+    assert report.stats.total_not_mentioned_count == 1
+    assert report.stats.total_against_count == 0
+    assert report.stats.mean_qa_recall == 0.75  # mean(1.0, 0.5)
+    assert report.stats.chunks_with_perfect_recall == 1
+    assert report.stats.chunks_with_omissions == 1
+
+    # Backwards compatibility assertions
+    assert report.stats.total_oracle_ideas == 4
+    assert report.stats.total_matched_ideas == 3
+    assert report.stats.overall_success_rate == 75.0
 
     # Ensure audited chunks are present
     assert len(report.audited_chunks) == 2
+    assert report.audited_chunks[0].qa_recall in (1.0, 0.5)
+    assert len(report.discrepancy_examples) == 1
 
 
 def test_cli_verify_chunk_mode(populated_chunk_store, tmp_path, mock_pool):
     """Test CLI `bookeeper verify --mode chunk` command."""
+    from bookeeper.processing.qa_probe import AtomicAssertionItem, NLIAssertionEvaluation, NLISystemBlockMetrics
+
     kg_file = tmp_path / "knowledge_graph.json"
     populated_chunk_store.save(str(kg_file))
 
     out_file = tmp_path / "verification_report.json"
 
-    def mock_extract_ideas(text, book_title="Unknown", section_title="Unknown", **kwargs):
-        return [
-            Concept(name="Deliberate Practice", category="Learning", summary="Focus"),
-            Concept(name="Feedback Loops", category="Learning", summary="Signals"),
-        ]
+    def mock_evaluate_claims(w_raw, ideas, pool, model_name, assertions=None, system_label="old"):
+        a1 = AtomicAssertionItem(claim_id=1, assertion="Deliberate practice requires focused attention.", is_cross_boundary=False)
+        e1 = NLIAssertionEvaluation(claim_id=1, assertion=a1.assertion, classification="SUPPORTED", score=1.0, verdict="PASS")
+        m = NLISystemBlockMetrics(
+            system="old",
+            total_probes=1,
+            passed_probes=1,
+            failed_probes=0,
+            qa_recall=1.0,
+            cross_sentence_total=0,
+            cross_sentence_passed=0,
+            seam_integrity_rate=1.0,
+            evaluations=[e1],
+            supported_count=1,
+            not_mentioned_count=0,
+            against_count=0,
+            support_ratio=1.0,
+            hallucination_ratio=0.0,
+            net_integrity_score=1.0,
+            calibrated_fidelity=1.0,
+            seam_net_integrity=0.0,
+            seam_calibrated_fidelity=0.0,
+        )
+        return [a1], m
 
     runner = CliRunner()
     with patch("bookeeper.cli.IdeaVerifier.warmup", return_value=True), \
-         patch("bookeeper.processing.extractor.KnowledgeExtractor.extract_ideas", side_effect=mock_extract_ideas):
+         patch("bookeeper.processing.verifier.evaluate_claims_atomic_assertions", side_effect=mock_evaluate_claims):
         result = runner.invoke(
             app,
             [
@@ -248,6 +324,8 @@ def test_cli_verify_chunk_mode(populated_chunk_store, tmp_path, mock_pool):
     assert out_file.is_file()
     data = json.loads(out_file.read_text())
     assert data["mode"] == "chunk"
+    assert "mean_qa_recall" in data["stats"]
+    assert "total_supported_count" in data["stats"]
     assert "overall_success_rate" in data["stats"]
     assert "overall_fail_rate" in data["stats"]
 

@@ -658,6 +658,83 @@ def judge_probe_answer(
 # ==============================================================================
 
 
+def evaluate_claims_atomic_assertions(
+    w_raw: str,
+    ideas: List[Any],
+    pool: OllamaPool,
+    model_name: str,
+    assertions: Optional[List[AtomicAssertionItem]] = None,
+    system_label: Literal["old", "new"] = "old",
+) -> Tuple[List[AtomicAssertionItem], NLISystemBlockMetrics]:
+    """
+    Evaluate NLI entailment of atomic assertions for W_raw against a single claims knowledge base.
+    Returns:
+      (assertions, system_metrics)
+    """
+    if assertions is None:
+        assertions = generate_atomic_assertions(w_raw, pool, model_name)
+
+    claims = format_ideas_as_claims(ideas)
+    evals: List[NLIAssertionEvaluation] = []
+
+    for a in assertions:
+        prompt = build_nli_verifier_prompt(claims, a.assertion)
+        cls, rat = verify_assertion_entailment(claims, a.assertion, pool, model_name)
+        verdict: Literal["PASS", "FAIL"] = "PASS" if cls == "SUPPORTED" else "FAIL"
+
+        evals.append(
+            NLIAssertionEvaluation(
+                claim_id=a.claim_id,
+                assertion=a.assertion,
+                is_cross_boundary=a.is_cross_boundary,
+                classification=cls,
+                verdict=verdict,
+                rationale=rat,
+                verifier_prompt=prompt,
+                # compatibility
+                question_id=a.claim_id,
+                question=a.assertion,
+                gold_answer=a.source_quote or a.assertion,
+                is_cross_sentence=a.is_cross_boundary,
+                predicted_answer=cls,
+                reason=rat,
+                answering_prompt=prompt,
+                judge_prompt=prompt,
+            )
+        )
+
+    tot = len(assertions)
+    cross_tot = sum(1 for a in assertions if a.is_cross_boundary)
+    passed = sum(1 for e in evals if e.verdict == "PASS")
+    cross_passed = sum(1 for e in evals if e.is_cross_boundary and e.verdict == "PASS")
+    t_scores = calculate_ternary_scores([e.classification for e in evals])
+    cross_evals = [e for e in evals if e.is_cross_boundary]
+    cross_t = calculate_ternary_scores([e.classification for e in cross_evals])
+
+    metrics = NLISystemBlockMetrics(
+        system=system_label,
+        total_probes=tot,
+        passed_probes=passed,
+        failed_probes=tot - passed,
+        qa_recall=round(passed / tot, 4) if tot > 0 else 0.0,
+        cross_sentence_total=cross_tot,
+        cross_sentence_passed=cross_passed,
+        seam_integrity_rate=round(cross_passed / cross_tot, 4) if cross_tot > 0 else 1.0,
+        evaluations=evals,
+        supported_count=t_scores["supported_count"],
+        not_mentioned_count=t_scores["not_mentioned_count"],
+        against_count=t_scores["against_count"],
+        support_ratio=t_scores["support_ratio"],
+        hallucination_ratio=t_scores["hallucination_ratio"],
+        net_integrity_score=t_scores["net_integrity_score"],
+        calibrated_fidelity=t_scores["calibrated_fidelity"],
+        seam_net_integrity=cross_t["net_integrity_score"],
+        seam_calibrated_fidelity=cross_t["calibrated_fidelity"],
+    )
+
+    return assertions, metrics
+
+
 def evaluate_block_atomic_assertions(
     w_raw: str,
     ideas_old: List[Any],
@@ -675,122 +752,21 @@ def evaluate_block_atomic_assertions(
     if assertions is None:
         assertions = generate_atomic_assertions(w_raw, pool, model_name)
 
-    claims_old = format_ideas_as_claims(ideas_old)
-    claims_new = format_ideas_as_claims(ideas_new)
-
-    evals_old: List[NLIAssertionEvaluation] = []
-    evals_new: List[NLIAssertionEvaluation] = []
-
-    for a in assertions:
-        # 1. Baseline (Old) entailment
-        prompt_old = build_nli_verifier_prompt(claims_old, a.assertion)
-        cls_old, rat_old = verify_assertion_entailment(claims_old, a.assertion, pool, model_name)
-        verdict_old: Literal["PASS", "FAIL"] = "PASS" if cls_old == "SUPPORTED" else "FAIL"
-
-        evals_old.append(
-            NLIAssertionEvaluation(
-                claim_id=a.claim_id,
-                assertion=a.assertion,
-                is_cross_boundary=a.is_cross_boundary,
-                classification=cls_old,
-                verdict=verdict_old,
-                rationale=rat_old,
-                verifier_prompt=prompt_old,
-                # compatibility
-                question_id=a.claim_id,
-                question=a.assertion,
-                gold_answer=a.source_quote or a.assertion,
-                is_cross_sentence=a.is_cross_boundary,
-                predicted_answer=cls_old,
-                reason=rat_old,
-                answering_prompt=prompt_old,
-                judge_prompt=prompt_old,
-            )
-        )
-
-        # 2. Candidate (New) entailment
-        prompt_new = build_nli_verifier_prompt(claims_new, a.assertion)
-        cls_new, rat_new = verify_assertion_entailment(claims_new, a.assertion, pool, model_name)
-        verdict_new: Literal["PASS", "FAIL"] = "PASS" if cls_new == "SUPPORTED" else "FAIL"
-
-        evals_new.append(
-            NLIAssertionEvaluation(
-                claim_id=a.claim_id,
-                assertion=a.assertion,
-                is_cross_boundary=a.is_cross_boundary,
-                classification=cls_new,
-                verdict=verdict_new,
-                rationale=rat_new,
-                verifier_prompt=prompt_new,
-                # compatibility
-                question_id=a.claim_id,
-                question=a.assertion,
-                gold_answer=a.source_quote or a.assertion,
-                is_cross_sentence=a.is_cross_boundary,
-                predicted_answer=cls_new,
-                reason=rat_new,
-                answering_prompt=prompt_new,
-                judge_prompt=prompt_new,
-            )
-        )
-
-    tot = len(assertions)
-    cross_tot = sum(1 for a in assertions if a.is_cross_boundary)
-
-    # Metrics Baseline (Old)
-    passed_old = sum(1 for e in evals_old if e.verdict == "PASS")
-    cross_passed_old = sum(1 for e in evals_old if e.is_cross_boundary and e.verdict == "PASS")
-    t_old = calculate_ternary_scores([e.classification for e in evals_old])
-    cross_evals_old = [e for e in evals_old if e.is_cross_boundary]
-    cross_t_old = calculate_ternary_scores([e.classification for e in cross_evals_old])
-
-    metrics_old = NLISystemBlockMetrics(
-        system="old",
-        total_probes=tot,
-        passed_probes=passed_old,
-        failed_probes=tot - passed_old,
-        qa_recall=round(passed_old / tot, 4) if tot > 0 else 0.0,
-        cross_sentence_total=cross_tot,
-        cross_sentence_passed=cross_passed_old,
-        seam_integrity_rate=round(cross_passed_old / cross_tot, 4) if cross_tot > 0 else 1.0,
-        evaluations=evals_old,
-        supported_count=t_old["supported_count"],
-        not_mentioned_count=t_old["not_mentioned_count"],
-        against_count=t_old["against_count"],
-        support_ratio=t_old["support_ratio"],
-        hallucination_ratio=t_old["hallucination_ratio"],
-        net_integrity_score=t_old["net_integrity_score"],
-        calibrated_fidelity=t_old["calibrated_fidelity"],
-        seam_net_integrity=cross_t_old["net_integrity_score"],
-        seam_calibrated_fidelity=cross_t_old["calibrated_fidelity"],
+    _, metrics_old = evaluate_claims_atomic_assertions(
+        w_raw=w_raw,
+        ideas=ideas_old,
+        pool=pool,
+        model_name=model_name,
+        assertions=assertions,
+        system_label="old",
     )
-
-    # Metrics Candidate (New)
-    passed_new = sum(1 for e in evals_new if e.verdict == "PASS")
-    cross_passed_new = sum(1 for e in evals_new if e.is_cross_boundary and e.verdict == "PASS")
-    t_new = calculate_ternary_scores([e.classification for e in evals_new])
-    cross_evals_new = [e for e in evals_new if e.is_cross_boundary]
-    cross_t_new = calculate_ternary_scores([e.classification for e in cross_evals_new])
-
-    metrics_new = NLISystemBlockMetrics(
-        system="new",
-        total_probes=tot,
-        passed_probes=passed_new,
-        failed_probes=tot - passed_new,
-        qa_recall=round(passed_new / tot, 4) if tot > 0 else 0.0,
-        cross_sentence_total=cross_tot,
-        cross_sentence_passed=cross_passed_new,
-        seam_integrity_rate=round(cross_passed_new / cross_tot, 4) if cross_tot > 0 else 1.0,
-        evaluations=evals_new,
-        supported_count=t_new["supported_count"],
-        not_mentioned_count=t_new["not_mentioned_count"],
-        against_count=t_new["against_count"],
-        support_ratio=t_new["support_ratio"],
-        hallucination_ratio=t_new["hallucination_ratio"],
-        net_integrity_score=t_new["net_integrity_score"],
-        calibrated_fidelity=t_new["calibrated_fidelity"],
-        seam_net_integrity=cross_t_new["net_integrity_score"],
-        seam_calibrated_fidelity=cross_t_new["calibrated_fidelity"],
+    _, metrics_new = evaluate_claims_atomic_assertions(
+        w_raw=w_raw,
+        ideas=ideas_new,
+        pool=pool,
+        model_name=model_name,
+        assertions=assertions,
+        system_label="new",
     )
 
     return assertions, metrics_old, metrics_new

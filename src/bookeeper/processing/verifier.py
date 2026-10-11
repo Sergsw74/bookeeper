@@ -14,6 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 from langchain_core.embeddings import Embeddings
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
@@ -29,7 +30,18 @@ from bookeeper.processing.cross_checker import (
     SystemBlockMetrics,
     run_cross_check,
 )
+from bookeeper.processing.extractor import Concept
 from bookeeper.processing.ollama_pool import OllamaPool, _thread_local
+from bookeeper.processing.qa_probe import (
+    AtomicAssertionItem,
+    NLIAssertionEvaluation,
+    build_nli_verifier_prompt,
+    calculate_ternary_scores,
+    evaluate_claims_atomic_assertions,
+    format_ideas_for_context,
+    generate_atomic_assertions,
+    verify_assertion_entailment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -115,27 +127,80 @@ class ChunkAuditItem(BaseModel):
     section_title: str = "Unknown"
     chunk_text_snippet: str = ""
 
-    # Idea names lists
+    # Concept ideas in graph
     original_ideas: List[str] = Field(default_factory=list)
     oracle_ideas: List[str] = Field(default_factory=list)
 
-    # Alignment results
-    matched_pairs: List[ChunkMatchedPair] = Field(default_factory=list)
-    missed_oracle_ideas: List[str] = Field(default_factory=list)  # In Oracle, missing in Original
-    extra_original_ideas: List[str] = Field(default_factory=list)  # In Original, missing in Oracle
+    # NLI Atomic Assertion & Evaluation Probes
+    probes: List[AtomicAssertionItem] = Field(default_factory=list)
+    assertions: List[AtomicAssertionItem] = Field(default_factory=list)
+    evaluations: List[NLIAssertionEvaluation] = Field(default_factory=list)
 
-    # Counts
+    # Assertion Counts
+    total_probes: int = 0
+    passed_probes: int = 0
+    failed_probes: int = 0
+    supported_count: int = 0
+    not_mentioned_count: int = 0
+    against_count: int = 0
+
+    # Rates & Continuous Scores
+    qa_recall: float = 0.0
+    support_ratio: float = 0.0
+    hallucination_ratio: float = 0.0
+    net_integrity_score: float = 0.0
+    calibrated_fidelity: float = 0.0
+    seam_integrity_rate: float = 1.0
+    seam_net_integrity: float = 0.0
+    seam_calibrated_fidelity: float = 0.0
+
+    # Legacy alignment / count fields for backwards compatibility
+    matched_pairs: List[ChunkMatchedPair] = Field(default_factory=list)
+    missed_oracle_ideas: List[str] = Field(default_factory=list)  # In Oracle/Probes, missing/unsubstantiated in claims
+    extra_original_ideas: List[str] = Field(default_factory=list)
     original_count: int = 0
     oracle_count: int = 0
     matched_count: int = 0
     missed_count: int = 0
-
-    # Rates
-    success_rate: float = 0.0  # Matched / Oracle %
-    fail_rate: float = 0.0  # Missed / Original %
+    success_rate: float = 0.0  # Matched / Oracle % or QA Recall %
+    fail_rate: float = 0.0  # Missed % or 100 - QA Recall %
 
     duration_seconds: float = 0.0
     server_node: Optional[str] = None
+
+    def __init__(self, **data: Any):
+        if "assertions" in data and "probes" not in data:
+            data["probes"] = data["assertions"]
+        elif "probes" in data and "assertions" not in data:
+            data["assertions"] = data["probes"]
+
+        # Sync legacy fields if new ones are passed
+        if "qa_recall" in data and "success_rate" not in data:
+            data["success_rate"] = round(float(data["qa_recall"]) * 100.0, 2)
+        if "qa_recall" in data and "fail_rate" not in data:
+            data["fail_rate"] = round((1.0 - float(data["qa_recall"])) * 100.0, 2)
+        if "supported_count" in data and "matched_count" not in data:
+            data["matched_count"] = int(data["supported_count"])
+        if "failed_probes" in data and "missed_count" not in data:
+            data["missed_count"] = int(data["failed_probes"])
+        if "total_probes" in data and "oracle_count" not in data:
+            data["oracle_count"] = int(data["total_probes"])
+
+        # Sync forward if legacy fields are passed
+        if "matched_count" in data and "supported_count" not in data:
+            data["supported_count"] = int(data["matched_count"])
+            if "passed_probes" not in data:
+                data["passed_probes"] = int(data["matched_count"])
+        if "missed_count" in data and "failed_probes" not in data:
+            data["failed_probes"] = int(data["missed_count"])
+            if "not_mentioned_count" not in data:
+                data["not_mentioned_count"] = int(data["missed_count"])
+        if "oracle_count" in data and "total_probes" not in data:
+            data["total_probes"] = int(data["oracle_count"])
+        if "success_rate" in data and "qa_recall" not in data:
+            data["qa_recall"] = round(float(data["success_rate"]) / 100.0, 4)
+
+        super().__init__(**data)
 
 
 class ChunkVerificationStats(BaseModel):
@@ -144,22 +209,65 @@ class ChunkVerificationStats(BaseModel):
     mode: str = "chunk"
     model_name: str
     embedding_model: str = "embeddings"
-    total_chunks_in_graph: int
-    sampled_chunks_count: int
-    sample_percentage: float
+    total_chunks_in_graph: int = 0
+    sampled_chunks_count: int = 0
+    sample_percentage: float = 0.0
 
-    total_original_ideas: int
-    total_oracle_ideas: int
-    total_matched_ideas: int
-    total_missed_ideas: int
-    total_extra_original_ideas: int
+    # Continuous ternary verification metrics across all chunks
+    total_assertions_count: int = 0
+    total_supported_count: int = 0
+    total_not_mentioned_count: int = 0
+    total_against_count: int = 0
 
-    overall_success_rate: float
-    overall_fail_rate: float
+    mean_qa_recall: float = 0.0
+    mean_support_ratio: float = 0.0
+    mean_hallucination_ratio: float = 0.0
+    mean_net_integrity_score: float = 0.0
+    mean_calibrated_fidelity: float = 0.0
+    mean_seam_integrity_rate: float = 1.0
 
-    chunks_with_perfect_match: int
-    chunks_with_omissions: int
-    total_duration_seconds: float
+    chunks_with_perfect_recall: int = 0
+    chunks_with_omissions: int = 0
+    chunks_with_hallucinations: int = 0
+
+    # Legacy fields for backward compatibility
+    total_original_ideas: int = 0
+    total_oracle_ideas: int = 0
+    total_matched_ideas: int = 0
+    total_missed_ideas: int = 0
+    total_extra_original_ideas: int = 0
+
+    overall_success_rate: float = 0.0
+    overall_fail_rate: float = 0.0
+    chunks_with_perfect_match: int = 0
+
+    total_duration_seconds: float = 0.0
+
+    def __init__(self, **data: Any):
+        # Sync forward or backward
+        if "mean_qa_recall" in data and "overall_success_rate" not in data:
+            data["overall_success_rate"] = round(float(data["mean_qa_recall"]) * 100.0, 2)
+            if "overall_fail_rate" not in data:
+                data["overall_fail_rate"] = round((1.0 - float(data["mean_qa_recall"])) * 100.0, 2)
+        elif "overall_success_rate" in data and "mean_qa_recall" not in data:
+            data["mean_qa_recall"] = round(float(data["overall_success_rate"]) / 100.0, 4)
+
+        if "chunks_with_perfect_recall" in data and "chunks_with_perfect_match" not in data:
+            data["chunks_with_perfect_match"] = int(data["chunks_with_perfect_recall"])
+        elif "chunks_with_perfect_match" in data and "chunks_with_perfect_recall" not in data:
+            data["chunks_with_perfect_recall"] = int(data["chunks_with_perfect_match"])
+
+        if "total_assertions_count" in data and "total_oracle_ideas" not in data:
+            data["total_oracle_ideas"] = int(data["total_assertions_count"])
+        elif "total_oracle_ideas" in data and "total_assertions_count" not in data:
+            data["total_assertions_count"] = int(data["total_oracle_ideas"])
+
+        if "total_supported_count" in data and "total_matched_ideas" not in data:
+            data["total_matched_ideas"] = int(data["total_supported_count"])
+        elif "total_matched_ideas" in data and "total_supported_count" not in data:
+            data["total_supported_count"] = int(data["total_matched_ideas"])
+
+        super().__init__(**data)
 
 
 class ChunkVerificationReport(BaseModel):
@@ -168,7 +276,15 @@ class ChunkVerificationReport(BaseModel):
     mode: str = "chunk"
     stats: ChunkVerificationStats
     audited_chunks: List[ChunkAuditItem]
-    omission_examples: List[ChunkAuditItem]
+    discrepancy_examples: List[ChunkAuditItem] = Field(default_factory=list)
+    omission_examples: List[ChunkAuditItem] = Field(default_factory=list)
+
+    def __init__(self, **data: Any):
+        if "omission_examples" in data and "discrepancy_examples" not in data:
+            data["discrepancy_examples"] = data["omission_examples"]
+        elif "discrepancy_examples" in data and "omission_examples" not in data:
+            data["omission_examples"] = data["discrepancy_examples"]
+        super().__init__(**data)
 
 
 def _clean_json_str(text: str) -> str:
@@ -1386,6 +1502,19 @@ def verify_chunks(
             total_chunks_in_graph=len(all_chunk_nodes),
             sampled_chunks_count=0,
             sample_percentage=percent,
+            total_assertions_count=0,
+            total_supported_count=0,
+            total_not_mentioned_count=0,
+            total_against_count=0,
+            mean_qa_recall=1.0,
+            mean_support_ratio=1.0,
+            mean_hallucination_ratio=0.0,
+            mean_net_integrity_score=1.0,
+            mean_calibrated_fidelity=1.0,
+            mean_seam_integrity_rate=1.0,
+            chunks_with_perfect_recall=0,
+            chunks_with_omissions=0,
+            chunks_with_hallucinations=0,
             total_original_ideas=0,
             total_oracle_ideas=0,
             total_matched_ideas=0,
@@ -1394,13 +1523,13 @@ def verify_chunks(
             overall_success_rate=100.0,
             overall_fail_rate=0.0,
             chunks_with_perfect_match=0,
-            chunks_with_omissions=0,
             total_duration_seconds=0.0,
         )
         return ChunkVerificationReport(
             mode="chunk",
             stats=empty_stats,
             audited_chunks=[],
+            discrepancy_examples=[],
             omission_examples=[],
         )
 
@@ -1410,18 +1539,6 @@ def verify_chunks(
 
     rng = random.Random(seed) if seed is not None else random.Random()
     sampled_chunks = rng.sample(valid_chunks, sample_size)
-
-    extractor = KnowledgeExtractor(
-        model=model_name,
-        pool=pool,
-        request_timeout=timeout,
-    )
-    deduplicator = EntityDeduplicator(
-        embeddings=embeddings,
-        extractor=extractor,
-        similarity_threshold=0.80,
-        high_similarity_threshold=0.95,
-    )
 
     def _audit_single_chunk(chunk_item: Tuple[str, str, Optional[int], str, str]) -> ChunkAuditItem:
         cid, text, bid, btitle, stitle = chunk_item
@@ -1463,97 +1580,91 @@ def verify_chunks(
                         )
                     )
 
-        # 2. Extract Oracle Ideas
+        # 2. Extract Atomic Assertions & Evaluate NLI Entailment against Chunk's Knowledge Base Claims
         try:
-            oracle_extracted = extractor.extract_ideas(
-                text=text,
-                book_title=btitle,
-                section_title=stitle,
-                model=model_name,
+            assertions, metrics = evaluate_claims_atomic_assertions(
+                w_raw=text,
+                ideas=orig_concepts,
+                pool=pool,
+                model_name=model_name,
             )
-            oracle_concepts = [item if isinstance(item, Concept) else item.to_concept() for item in oracle_extracted]
         except Exception as exc:
-            logger.warning(f"Oracle idea extraction failed for chunk '{cid}': {exc}")
-            oracle_concepts = []
-
-        # 3. Match Oracle Ideas vs Original Ideas using EntityDeduplicator
-        matched_pairs: List[ChunkMatchedPair] = []
-        matched_oracle_indices = set()
-        matched_orig_indices = set()
-
-        for o_idx, o_c in enumerate(oracle_concepts):
-            best_match = None
-            best_orig_idx = None
-            best_score = -1.0
-            for r_idx, r_c in enumerate(orig_concepts):
-                if r_idx in matched_orig_indices:
-                    continue
-                is_same, score, method, canon, reason = deduplicator.is_same_concept(r_c, o_c)
-                if is_same and score > best_score:
-                    best_score = score
-                    best_orig_idx = r_idx
-                    best_match = (method, canon, reason)
-
-            if best_match is not None and best_orig_idx is not None:
-                matched_oracle_indices.add(o_idx)
-                matched_orig_indices.add(best_orig_idx)
-                r_c = orig_concepts[best_orig_idx]
-                matched_pairs.append(
-                    ChunkMatchedPair(
-                        oracle_idea_name=o_c.name,
-                        original_idea_name=r_c.name,
-                        similarity_score=round(best_score, 3),
-                        match_method=best_match[0],
-                        canonical_name=best_match[1],
-                        reasoning=best_match[2],
-                    )
-                )
-
-        missed_oracle = [
-            o_c.name for idx, o_c in enumerate(oracle_concepts) if idx not in matched_oracle_indices
-        ]
-        extra_original = [
-            r_c.name for idx, r_c in enumerate(orig_concepts) if idx not in matched_orig_indices
-        ]
-
-        orig_cnt = len(orig_concepts)
-        oracle_cnt = len(oracle_concepts)
-        matched_cnt = len(matched_pairs)
-        missed_cnt = max(0, oracle_cnt - matched_cnt)
-
-        # Success rate = matched / oracle %
-        if oracle_cnt > 0:
-            succ_rate = round((matched_cnt / oracle_cnt) * 100.0, 2)
-        else:
-            succ_rate = 100.0
-
-        # Fail rate = missed / original %
-        if orig_cnt > 0:
-            fail_rate = round((missed_cnt / orig_cnt) * 100.0, 2)
-        else:
-            fail_rate = 0.0 if missed_cnt == 0 else round(missed_cnt * 100.0, 2)
+            logger.warning(f"Atomic assertion NLI audit failed for chunk '{cid}': {exc}")
+            assertions = []
+            metrics = None
 
         dur = round(time.time() - t_start, 2)
 
-        return ChunkAuditItem(
-            chunk_id=cid,
-            book_id=bid,
-            book_title=btitle,
-            section_title=stitle,
-            chunk_text_snippet=text[:150],
-            original_ideas=[c.name for c in orig_concepts],
-            oracle_ideas=[c.name for c in oracle_concepts],
-            matched_pairs=matched_pairs,
-            missed_oracle_ideas=missed_oracle,
-            extra_original_ideas=extra_original,
-            original_count=orig_cnt,
-            oracle_count=oracle_cnt,
-            matched_count=matched_cnt,
-            missed_count=missed_cnt,
-            success_rate=succ_rate,
-            fail_rate=fail_rate,
-            duration_seconds=dur,
-        )
+        if metrics is not None:
+            missed_assertions = [
+                e.assertion
+                for e in metrics.evaluations
+                if e.classification in ("NOT_MENTIONED", "AGAINST", "CONTRADICTED")
+            ]
+            matched_assertions = [
+                ChunkMatchedPair(
+                    oracle_idea_name=e.assertion,
+                    original_idea_name="Claims Context",
+                    similarity_score=1.0 if e.classification == "SUPPORTED" else 0.0,
+                    match_method="nli_entailment",
+                    canonical_name=e.assertion,
+                    reasoning=e.rationale,
+                )
+                for e in metrics.evaluations
+                if e.classification == "SUPPORTED"
+            ]
+
+            return ChunkAuditItem(
+                chunk_id=cid,
+                book_id=bid,
+                book_title=btitle,
+                section_title=stitle,
+                chunk_text_snippet=text[:150],
+                original_ideas=[c.name for c in orig_concepts],
+                oracle_ideas=[a.assertion for a in assertions],
+                probes=assertions,
+                assertions=assertions,
+                evaluations=metrics.evaluations,
+                total_probes=metrics.total_probes,
+                passed_probes=metrics.passed_probes,
+                failed_probes=metrics.failed_probes,
+                supported_count=metrics.supported_count,
+                not_mentioned_count=metrics.not_mentioned_count,
+                against_count=metrics.against_count,
+                qa_recall=metrics.qa_recall,
+                support_ratio=metrics.support_ratio,
+                hallucination_ratio=metrics.hallucination_ratio,
+                net_integrity_score=metrics.net_integrity_score,
+                calibrated_fidelity=metrics.calibrated_fidelity,
+                seam_integrity_rate=metrics.seam_integrity_rate,
+                seam_net_integrity=metrics.seam_net_integrity,
+                seam_calibrated_fidelity=metrics.seam_calibrated_fidelity,
+                matched_pairs=matched_assertions,
+                missed_oracle_ideas=missed_assertions,
+                extra_original_ideas=[],
+                original_count=len(orig_concepts),
+                oracle_count=metrics.total_probes,
+                matched_count=metrics.supported_count,
+                missed_count=metrics.failed_probes,
+                success_rate=round(metrics.qa_recall * 100.0, 2),
+                fail_rate=round((1.0 - metrics.qa_recall) * 100.0, 2),
+                duration_seconds=dur,
+            )
+        else:
+            return ChunkAuditItem(
+                chunk_id=cid,
+                book_id=bid,
+                book_title=btitle,
+                section_title=stitle,
+                chunk_text_snippet=text[:150],
+                original_ideas=[c.name for c in orig_concepts],
+                oracle_ideas=[],
+                probes=[],
+                assertions=[],
+                evaluations=[],
+                original_count=len(orig_concepts),
+                duration_seconds=dur,
+            )
 
     audited_items: List[ChunkAuditItem] = []
     completed_count = 0
@@ -1600,21 +1711,22 @@ def verify_chunks(
     # Sort audited items by chunk_id
     audited_items.sort(key=lambda x: x.chunk_id)
 
+    tot_assertions = sum(it.total_probes for it in audited_items)
+    tot_sup = sum(it.supported_count for it in audited_items)
+    tot_not = sum(it.not_mentioned_count for it in audited_items)
+    tot_opp = sum(it.against_count for it in audited_items)
     tot_orig = sum(it.original_count for it in audited_items)
-    tot_oracle = sum(it.oracle_count for it in audited_items)
-    tot_matched = sum(it.matched_count for it in audited_items)
-    tot_missed = sum(it.missed_count for it in audited_items)
-    tot_extra = sum(len(it.extra_original_ideas) for it in audited_items)
 
-    overall_succ = round((tot_matched / tot_oracle * 100.0), 2) if tot_oracle > 0 else 100.0
-    overall_fail = (
-        round((tot_missed / tot_orig * 100.0), 2)
-        if tot_orig > 0
-        else (0.0 if tot_missed == 0 else round(tot_missed * 100.0, 2))
-    )
+    mean_rec = round(float(np.mean([it.qa_recall for it in audited_items])), 4) if audited_items else 0.0
+    mean_sup_ratio = round(float(np.mean([it.support_ratio for it in audited_items])), 4) if audited_items else 0.0
+    mean_opp_ratio = round(float(np.mean([it.hallucination_ratio for it in audited_items])), 4) if audited_items else 0.0
+    mean_net = round(float(np.mean([it.net_integrity_score for it in audited_items])), 4) if audited_items else 0.0
+    mean_fid = round(float(np.mean([it.calibrated_fidelity for it in audited_items])), 4) if audited_items else 0.0
+    mean_seam = round(float(np.mean([it.seam_integrity_rate for it in audited_items])), 4) if audited_items else 1.0
 
-    perfect_cnt = sum(1 for it in audited_items if it.missed_count == 0 and it.oracle_count > 0)
-    omission_cnt = sum(1 for it in audited_items if it.missed_count > 0)
+    perfect_cnt = sum(1 for it in audited_items if it.qa_recall >= 1.0 and it.total_probes > 0)
+    omission_cnt = sum(1 for it in audited_items if it.not_mentioned_count > 0)
+    hallucination_cnt = sum(1 for it in audited_items if it.against_count > 0)
 
     tot_dur = round(time.time() - start_time, 2)
 
@@ -1625,21 +1737,33 @@ def verify_chunks(
         total_chunks_in_graph=len(all_chunk_nodes),
         sampled_chunks_count=len(audited_items),
         sample_percentage=clamped_percent,
-        total_original_ideas=tot_orig,
-        total_oracle_ideas=tot_oracle,
-        total_matched_ideas=tot_matched,
-        total_missed_ideas=tot_missed,
-        total_extra_original_ideas=tot_extra,
-        overall_success_rate=overall_succ,
-        overall_fail_rate=overall_fail,
-        chunks_with_perfect_match=perfect_cnt,
+        total_assertions_count=tot_assertions,
+        total_supported_count=tot_sup,
+        total_not_mentioned_count=tot_not,
+        total_against_count=tot_opp,
+        mean_qa_recall=mean_rec,
+        mean_support_ratio=mean_sup_ratio,
+        mean_hallucination_ratio=mean_opp_ratio,
+        mean_net_integrity_score=mean_net,
+        mean_calibrated_fidelity=mean_fid,
+        mean_seam_integrity_rate=mean_seam,
+        chunks_with_perfect_recall=perfect_cnt,
         chunks_with_omissions=omission_cnt,
+        chunks_with_hallucinations=hallucination_cnt,
+        total_original_ideas=tot_orig,
+        total_oracle_ideas=tot_assertions,
+        total_matched_ideas=tot_sup,
+        total_missed_ideas=tot_not + tot_opp,
+        total_extra_original_ideas=0,
+        overall_success_rate=round(mean_rec * 100.0, 2),
+        overall_fail_rate=round((1.0 - mean_rec) * 100.0, 2),
+        chunks_with_perfect_match=perfect_cnt,
         total_duration_seconds=tot_dur,
     )
 
-    omission_examples = sorted(
-        [it for it in audited_items if it.missed_count > 0],
-        key=lambda x: (x.missed_count, x.fail_rate),
+    discrepancy_examples = sorted(
+        [it for it in audited_items if it.failed_probes > 0 or it.missed_count > 0],
+        key=lambda x: (x.against_count, x.not_mentioned_count, 1.0 - x.qa_recall),
         reverse=True,
     )[:max_examples]
 
@@ -1647,5 +1771,6 @@ def verify_chunks(
         mode="chunk",
         stats=stats,
         audited_chunks=audited_items,
-        omission_examples=omission_examples,
+        discrepancy_examples=discrepancy_examples,
+        omission_examples=discrepancy_examples,
     )

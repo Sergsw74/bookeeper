@@ -3296,8 +3296,10 @@ def _execute_single_verification(
             warmup_verifier.warmup(timeout=90)
 
         t_start = time.perf_counter()
-        tot_matched = 0
-        tot_missed = 0
+        tot_sup = 0
+        tot_not = 0
+        tot_opp = 0
+        tot_recall = 0.0
 
         chunk_progress = Progress(
             SpinnerColumn(),
@@ -3314,16 +3316,20 @@ def _execute_single_verification(
         with Live(Group(cur_chunk_line, chunk_progress), console=console, refresh_per_second=10) as live:
 
             def _on_chunk_progress(completed: int, total: int, chunk_id: str, item: Optional[ChunkAuditItem] = None):
-                nonlocal tot_matched, tot_missed
+                nonlocal tot_sup, tot_not, tot_opp, tot_recall
                 if item is not None:
-                    tot_matched += item.matched_count
-                    tot_missed += item.missed_count
-                    if item.missed_count == 0:
-                        badge = "[bold green]✓ Full Match[/bold green]"
-                    elif item.matched_count > 0:
-                        badge = f"[bold yellow]⚠ Partial ({item.matched_count}/{item.oracle_count})[/bold yellow]"
+                    tot_sup += item.supported_count
+                    tot_not += item.not_mentioned_count
+                    tot_opp += item.against_count
+                    tot_recall += item.qa_recall
+                    avg_rec = tot_recall / completed if completed > 0 else 0.0
+
+                    if item.qa_recall >= 1.0:
+                        badge = f"[bold green]✓ 100% Recall ({item.supported_count}/{item.total_probes})[/bold green]"
+                    elif item.supported_count > 0:
+                        badge = f"[bold yellow]⚠ {item.qa_recall * 100:.1f}% ({item.supported_count}/{item.total_probes})[/bold yellow]"
                     else:
-                        badge = "[bold red]✗ Omission[/bold red]"
+                        badge = f"[bold red]✗ 0% Recall ({item.failed_probes} failed)[/bold red]"
 
                     book_str = f" | '{item.book_title[:18]}'" if item.book_title else ""
                     sec_str = f" ({item.section_title[:16]})" if item.section_title else ""
@@ -3351,10 +3357,11 @@ def _execute_single_verification(
                 else:
                     speed_str = "-- chk/s"
 
+                avg_rec_str = f"{tot_recall / completed * 100:.1f}%" if completed > 0 else "0.0%"
                 stats_str = (
                     f"[cyan]{speed_str}[/cyan] | [yellow]ETA: {eta_str}[/yellow] | "
-                    f"[bold green]✓ {tot_matched} matched[/bold green] | "
-                    f"[bold red]✗ {tot_missed} missed[/bold red]"
+                    f"[bold green]✓ {tot_sup} Sup[/bold green] | [bold yellow]◯ {tot_not} Omit[/bold yellow] | [bold red]✗ {tot_opp} Opp[/bold red] | "
+                    f"Avg Rec: [bold]{avg_rec_str}[/bold]"
                 )
                 chunk_progress.update(tot_chunk_task, completed=completed, total=total, stats_line=stats_str)
                 live.update(Group(Text.from_markup(cur_text), chunk_progress))
@@ -3362,7 +3369,7 @@ def _execute_single_verification(
                     pct = (completed / total * 100) if total > 0 else 0.0
                     console.print(
                         f"[bold cyan][Chunk Verification][/bold cyan] {completed}/{total} chunks ({pct:.1f}%)"
-                        f" | {speed_str} | ETA: {eta_str} | [bold green]✓ {tot_matched} matched[/bold green] | [bold red]✗ {tot_missed} missed[/bold red]"
+                        f" | {speed_str} | ETA: {eta_str} | [bold green]✓ {tot_sup} Sup[/bold green] | [bold yellow]◯ {tot_not} Omit[/bold yellow] | [bold red]✗ {tot_opp} Opp[/bold red]"
                     )
                     sys.stdout.flush()
 
@@ -3382,7 +3389,7 @@ def _execute_single_verification(
         # 1. Summary Metrics Table
         st = report.stats
         summary_table = Table(
-            title="Chunk Verification Results Summary (Oracle Alignment)",
+            title="Chunk Verification Results Summary (NLI Continuous Entailment)",
             border_style="cyan",
         )
         summary_table.add_column("Metric", style="bold")
@@ -3390,61 +3397,113 @@ def _execute_single_verification(
 
         summary_table.add_row("Total Chunks in Graph", str(st.total_chunks_in_graph))
         summary_table.add_row("Audited Chunks Sampled", f"{st.sampled_chunks_count} ({st.sample_percentage:.1f}%)")
-        summary_table.add_row("Original Model Extracted Ideas", str(st.total_original_ideas))
-        summary_table.add_row("Oracle Model Discovered Ideas", str(st.total_oracle_ideas))
+        summary_table.add_row("Total Assertions Evaluated", str(st.total_assertions_count))
         summary_table.add_section()
 
-        succ_color = "green" if st.overall_success_rate >= 80.0 else "yellow"
         summary_table.add_row(
-            "Matched Ideas (Verified in Both)",
-            f"[bold {succ_color}]{st.total_matched_ideas} ({st.overall_success_rate}%)[/bold {succ_color}]",
+            "Supported Assertions Count (+1.0)",
+            f"[bold green]{st.total_supported_count}[/bold green]",
         )
-        fail_color = "red" if st.overall_fail_rate > 15.0 else "green"
         summary_table.add_row(
-            "Missed Ideas (Omitted by Candidate)",
-            f"[bold {fail_color}]{st.total_missed_ideas} ({st.overall_fail_rate}%)[/bold {fail_color}]",
+            "Not Mentioned / Omission Count (-0.25)",
+            f"[bold yellow]{st.total_not_mentioned_count}[/bold yellow]",
         )
-        summary_table.add_row("Extra Original Ideas (Candidate Exclusive)", str(st.total_extra_original_ideas))
+        summary_table.add_row(
+            "Contradicted / Hallucination Count (-1.0)",
+            f"[bold red]{st.total_against_count}[/bold red]",
+        )
         summary_table.add_section()
 
-        summary_table.add_row("Chunks with 100% Idea Match", f"{st.chunks_with_perfect_match} / {st.sampled_chunks_count}")
+        rec_color = "green" if st.mean_qa_recall >= 0.80 else ("yellow" if st.mean_qa_recall >= 0.60 else "red")
+        summary_table.add_row(
+            "Mean QA Recall (%)",
+            f"[bold {rec_color}]{st.mean_qa_recall * 100:.2f}%[/bold {rec_color}]",
+        )
+        seam_color = "green" if st.mean_seam_integrity_rate >= 0.80 else "yellow"
+        summary_table.add_row(
+            "Mean Seam Integrity Rate (Cross-Boundary) (%)",
+            f"[bold {seam_color}]{st.mean_seam_integrity_rate * 100:.2f}%[/bold {seam_color}]",
+        )
+        net_color = "green" if st.mean_net_integrity_score >= 0.50 else ("yellow" if st.mean_net_integrity_score >= 0.0 else "red")
+        summary_table.add_row(
+            "Mean Net Semantic Integrity (S_net [-1 to +1])",
+            f"[bold {net_color}]{st.mean_net_integrity_score:+.2f}[/bold {net_color}]",
+        )
+        fid_color = "green" if st.mean_calibrated_fidelity >= 0.70 else "yellow"
+        summary_table.add_row(
+            "Mean Calibrated Fidelity (R_calibrated) (%)",
+            f"[bold {fid_color}]{st.mean_calibrated_fidelity * 100:.2f}%[/bold {fid_color}]",
+        )
+        summary_table.add_row(
+            "Mean Hallucination / Contradiction Rate (%)",
+            f"[bold {'green' if st.mean_hallucination_ratio == 0 else 'red'}]{st.mean_hallucination_ratio * 100:.2f}%[/bold {'green' if st.mean_hallucination_ratio == 0 else 'red'}]",
+        )
+        summary_table.add_section()
+
+        summary_table.add_row("Chunks with 100% Recall", f"{st.chunks_with_perfect_recall} / {st.sampled_chunks_count}")
         summary_table.add_row("Chunks with Omissions", f"{st.chunks_with_omissions} / {st.sampled_chunks_count}")
+        summary_table.add_row("Chunks with Contradictions", f"{st.chunks_with_hallucinations} / {st.sampled_chunks_count}")
         summary_table.add_row("Total Audit Duration", f"{st.total_duration_seconds:.2f}s")
         console.print(summary_table)
 
-        # 2. Omissions Discrepancy Table
-        if report.omission_examples:
+        # 2. Discrepancy Table
+        if report.discrepancy_examples:
             disc_table = Table(
-                title=f"Top Idea Omission Discrepancies (Missed by Candidate, Found by Oracle '{st.model_name}')",
+                title=f"Top Chunk Discrepancies (Unsubstantiated or Contradicted Assertions)",
                 border_style="red",
             )
             disc_table.add_column("#", justify="center", style="dim")
             disc_table.add_column("Chunk ID / Section", style="cyan")
-            disc_table.add_column("Missed Oracle Ideas", style="bold red")
-            disc_table.add_column("Original Ideas", style="dim")
-            disc_table.add_column("Fail Rate", justify="right", style="yellow")
+            disc_table.add_column("Unsubstantiated / Failed Assertions", style="bold red")
+            disc_table.add_column("QA Recall", justify="right", style="yellow")
+            disc_table.add_column("Status (S/N/C)", justify="center", style="dim")
+            disc_table.add_column("S_net", justify="right", style="magenta")
 
-            for idx, item in enumerate(report.omission_examples, 1):
-                missed_str = "\n".join(f"• {name}" for name in item.missed_oracle_ideas[:3])
-                if len(item.missed_oracle_ideas) > 3:
-                    missed_str += f"\n... +{len(item.missed_oracle_ideas) - 3} more"
+            for idx, item in enumerate(report.discrepancy_examples, 1):
+                failed_evals = [e for e in item.evaluations if e.classification in ("NOT_MENTIONED", "AGAINST", "CONTRADICTED")]
+                if failed_evals:
+                    disc_lines = []
+                    for e in failed_evals[:3]:
+                        tag = "[red]CONTRADICTED[/red]" if e.classification in ("AGAINST", "CONTRADICTED") else "[yellow]OMISSION[/yellow]"
+                        disc_lines.append(f"• [{tag}] {e.assertion}")
+                    if len(failed_evals) > 3:
+                        disc_lines.append(f"... +{len(failed_evals) - 3} more")
+                    disc_str = "\n".join(disc_lines)
+                elif item.missed_oracle_ideas:
+                    disc_str = "\n".join(f"• {name}" for name in item.missed_oracle_ideas[:3])
+                    if len(item.missed_oracle_ideas) > 3:
+                        disc_str += f"\n... +{len(item.missed_oracle_ideas) - 3} more"
+                else:
+                    disc_str = "(No failed assertions)"
 
-                orig_str = "\n".join(f"• {name}" for name in item.original_ideas[:3]) if item.original_ideas else "(None)"
-                if len(item.original_ideas) > 3:
-                    orig_str += f"\n... +{len(item.original_ideas) - 3} more"
-
+                status_str = f"{item.supported_count}/{item.not_mentioned_count}/{item.against_count}"
                 disc_table.add_row(
                     str(idx),
                     f"{item.chunk_id}\n[dim]{item.book_title} ({item.section_title})[/dim]",
-                    missed_str,
-                    orig_str,
-                    f"{item.fail_rate:.1f}%",
+                    disc_str,
+                    f"{item.qa_recall * 100:.1f}%",
+                    status_str,
+                    f"{item.net_integrity_score:+.2f}",
                 )
             console.print(disc_table)
         else:
             console.print(
-                "\n[bold green]✓ Zero chunk omissions found! All Oracle ideas were successfully matched in the candidate run.[/bold green]\n"
+                "\n[bold green]✓ Zero chunk discrepancies found! All evaluated atomic assertions were supported by the knowledge base.[/bold green]\n"
             )
+
+        # 3. Metrics Legend Panel
+        legend_content = (
+            "[bold cyan]• Recall (QA / NLI Recall):[/bold cyan] Proportion of chunk factual assertions verified as SUPPORTED by the knowledge base claims.\n"
+            "  [dim]Formula: Recall = (Supported Assertions) / (Total Assertions)[/dim]\n\n"
+            "[bold cyan]• Net Semantic Integrity (S_net):[/bold cyan] Continuous ternary score bounded in [-1.0, +1.0].\n"
+            "  [dim]Weights: Supported (+1.0), Omission / Not Mentioned (-0.25), Contradiction / Against (-1.0).[/dim]\n"
+            "  [dim]Formula: S_net = (1.0 * N_sup - 0.25 * N_not - 1.0 * N_opp) / N[/dim]\n\n"
+            "[bold cyan]• Calibrated Fidelity (R_calibrated):[/bold cyan] Normalized [0.0, 1.0] score penalizing omission (-0.25) and contradiction (-1.0), bounded at 0.\n"
+            "  [dim]Formula: R_calibrated = max(0.0, (N_sup - 0.25 * N_not - 1.0 * N_opp) / N)[/dim]\n\n"
+            "[bold cyan]• Seam Integrity (Seam Int):[/bold cyan] Retention rate of cross-boundary assertions spanning multiple sentences within the chunk.\n"
+            "  [dim]Formula: Seam Int = (Supported Cross-Boundary Assertions) / (Total Cross-Boundary Assertions)[/dim]"
+        )
+        console.print(Panel(legend_content, title="[bold]📖 Metrics Legend[/bold]", border_style="dim", expand=False))
 
         # 3. Save JSON Report
         report_dest = (

@@ -40,17 +40,31 @@ Or via module invocation:
 PYTHONPATH=archive_downloader/src python -m archive_downloader download --limit 100
 ```
 
-### 2. Custom Output Directory & URL
+### 2. High-Throughput Batch URLs (`show=500`)
+
+arXiv supports fetching up to 500 (or up to 2000) articles per listing page using `?skip=0&show=500`, drastically minimizing HTML scraping round-trips:
+
+```bash
+# Pass the full show=500 URL directly:
+python archive_downloader/run.py download \
+  --url "https://arxiv.org/list/cs.AI/recent?skip=0&show=500" \
+  --limit 500
+
+# Or configure page size with --show / --page-size (default: 500):
+python archive_downloader/run.py download --limit 500 --page-size 500
+```
+
+### 3. Custom Output Directory & Category URL
 
 ```bash
 # Download 50 articles from a specific arXiv category to a custom folder:
 python archive_downloader/run.py download \
-  --url "https://arxiv.org/list/cs.LG/recent" \
+  --url "https://arxiv.org/list/cs.LG/recent?skip=0&show=100" \
   --limit 50 \
   --output-dir "./my_ai_library"
 ```
 
-### 3. Downloading Strictly New Articles (`--new-only`)
+### 4. Downloading Strictly New Articles (`--new-only`)
 
 ```bash
 # Keep paginating until 20 brand-new articles are downloaded:

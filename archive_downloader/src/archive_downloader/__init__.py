@@ -6,7 +6,7 @@ __version__ = "0.1.0"
 
 from archive_downloader.models import ArticleMetadata, DownloadStats, IndexEntry
 from archive_downloader.indexer import DownloadIndex
-from archive_downloader.parser import parse_arxiv_list_page, sanitize_filename
+from archive_downloader.parser import normalize_arxiv_url, parse_arxiv_list_page, sanitize_filename
 from archive_downloader.downloader import ArxivDownloader
 
 __all__ = [
@@ -14,6 +14,7 @@ __all__ = [
     "DownloadStats",
     "IndexEntry",
     "DownloadIndex",
+    "normalize_arxiv_url",
     "parse_arxiv_list_page",
     "sanitize_filename",
     "ArxivDownloader",

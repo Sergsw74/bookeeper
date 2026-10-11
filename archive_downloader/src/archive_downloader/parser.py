@@ -4,11 +4,33 @@ HTML parser for arXiv recent / list pages and pagination extraction.
 
 import re
 from typing import List, Optional, Tuple
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup
 
 from archive_downloader.models import ArticleMetadata
+
+
+def normalize_arxiv_url(url: str, default_show: int = 500, default_skip: int = 0) -> str:
+    """
+    Ensure arXiv list URL has appropriate skip and show parameters.
+    If already present in URL, preserves user-specified values.
+    Otherwise sets skip=default_skip and show=default_show.
+    """
+    parsed = urlparse(url)
+    if "/list/" not in parsed.path:
+        return url
+
+    qs = parse_qs(parsed.query)
+    if "skip" not in qs:
+        qs["skip"] = [str(default_skip)]
+    if "show" not in qs:
+        valid_sizes = [25, 50, 100, 250, 500, 1000, 2000]
+        chosen_show = default_show if default_show in valid_sizes else 500
+        qs["show"] = [str(chosen_show)]
+
+    new_query = urlencode([(k, v[0]) for k, v in qs.items()])
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
 
 
 def sanitize_filename(text: str, max_length: int = 120) -> str:

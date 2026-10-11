@@ -22,7 +22,7 @@ from rich.table import Table
 from archive_downloader.downloader import DEFAULT_URL, ArxivDownloader
 from archive_downloader.indexer import DownloadIndex
 from archive_downloader.models import ArticleMetadata
-from archive_downloader.parser import parse_arxiv_list_page
+from archive_downloader.parser import normalize_arxiv_url, parse_arxiv_list_page
 
 app = typer.Typer(
     name="archive-downloader",
@@ -58,6 +58,12 @@ def download_command(
         "--count-existing/--new-only",
         help="Count already downloaded articles towards the limit target (default: True). Use --new-only to download N new articles.",
     ),
+    page_size: int = typer.Option(
+        500,
+        "--page-size",
+        "--show",
+        help="Number of entries to fetch per page on arXiv (e.g. 50, 100, 250, 500, 1000, 2000).",
+    ),
     delay: float = typer.Option(
         0.5,
         "--delay",
@@ -73,11 +79,13 @@ def download_command(
     Download articles from arXiv up to the specified limit with automatic pagination and deduplication.
     """
     dest_dir = output_dir.expanduser().resolve()
+    effective_url = normalize_arxiv_url(url, default_show=page_size)
     console.print(
         Panel.fit(
-            f"[bold]Source URL:[/bold] [cyan]{url}[/cyan]\n"
+            f"[bold]Source URL:[/bold] [cyan]{effective_url}[/cyan]\n"
             f"[bold]Destination:[/bold] [green]{dest_dir}[/green]\n"
             f"[bold]Target Limit:[/bold] [yellow]{limit}[/yellow] articles\n"
+            f"[bold]Page Size (show):[/bold] [cyan]{page_size}[/cyan] entries/page\n"
             f"[bold]Accounting Mode:[/bold] [dim]{'Count existing & new' if count_existing else 'New downloads only'}[/dim]\n"
             f"[bold]Calibre Metadata (.opf):[/bold] [dim]{'Disabled' if no_opf else 'Enabled'}[/dim]",
             title="Archive Downloader Starting",
@@ -86,9 +94,10 @@ def download_command(
     )
 
     downloader = ArxivDownloader(
-        base_url=url,
+        base_url=effective_url,
         output_dir=dest_dir,
         limit=limit,
+        page_size=page_size,
         count_existing=count_existing,
         request_delay=delay,
         write_opf=not no_opf,
@@ -220,16 +229,23 @@ def inspect_command(
         "-n",
         help="Number of articles to preview.",
     ),
+    page_size: int = typer.Option(
+        500,
+        "--page-size",
+        "--show",
+        help="Number of entries to fetch per page on arXiv (e.g. 50, 100, 250, 500).",
+    ),
 ):
     """
     Inspect an arXiv list page and preview article metadata without downloading.
     """
     import httpx
 
-    console.print(f"[bold cyan]Fetching page for inspection:[/bold cyan] {url}")
+    effective_url = normalize_arxiv_url(url, default_show=page_size)
+    console.print(f"[bold cyan]Fetching page for inspection:[/bold cyan] {effective_url}")
     try:
         resp = httpx.get(
-            url,
+            effective_url,
             headers={"User-Agent": "ArchiveDownloader/1.0"},
             follow_redirects=True,
             timeout=20,

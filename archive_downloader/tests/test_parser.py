@@ -2,7 +2,35 @@
 Tests for arXiv HTML parser and pagination discovery.
 """
 
-from archive_downloader.parser import parse_arxiv_list_page, sanitize_filename
+from archive_downloader.parser import (
+    normalize_arxiv_url,
+    parse_arxiv_list_page,
+    sanitize_filename,
+)
+
+
+def test_normalize_arxiv_url():
+    # 1. Plain URL -> appends skip=0 and show=500
+    assert (
+        normalize_arxiv_url("https://arxiv.org/list/cs.AI/recent")
+        == "https://arxiv.org/list/cs.AI/recent?skip=0&show=500"
+    )
+
+    # 2. URL already containing skip and show -> preserved
+    assert (
+        normalize_arxiv_url("https://arxiv.org/list/cs.AI/recent?skip=0&show=500")
+        == "https://arxiv.org/list/cs.AI/recent?skip=0&show=500"
+    )
+    assert (
+        normalize_arxiv_url("https://arxiv.org/list/cs.AI/recent?skip=500&show=500")
+        == "https://arxiv.org/list/cs.AI/recent?skip=500&show=500"
+    )
+
+    # 3. Custom default show
+    assert (
+        normalize_arxiv_url("https://arxiv.org/list/cs.AI/recent", default_show=100)
+        == "https://arxiv.org/list/cs.AI/recent?skip=0&show=100"
+    )
 
 
 SAMPLE_HTML = """

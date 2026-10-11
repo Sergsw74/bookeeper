@@ -14,11 +14,15 @@ import httpx
 from archive_downloader.calibre_metadata import generate_calibre_opf
 from archive_downloader.indexer import DownloadIndex
 from archive_downloader.models import ArticleMetadata, DownloadStats, IndexEntry
-from archive_downloader.parser import parse_arxiv_list_page, sanitize_filename
+from archive_downloader.parser import (
+    normalize_arxiv_url,
+    parse_arxiv_list_page,
+    sanitize_filename,
+)
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_URL = "https://arxiv.org/list/cs.AI/recent"
+DEFAULT_URL = "https://arxiv.org/list/cs.AI/recent?skip=0&show=500"
 DEFAULT_USER_AGENT = "ArchiveDownloader/1.0 (academic research & library indexing; mailto:serg@example.com)"
 
 
@@ -32,13 +36,15 @@ class ArxivDownloader:
         base_url: str = DEFAULT_URL,
         output_dir: Optional[Path] = None,
         limit: int = 100,
+        page_size: int = 500,
         count_existing: bool = True,
         request_delay: float = 0.5,
         user_agent: str = DEFAULT_USER_AGENT,
         timeout: float = 30.0,
         write_opf: bool = True,
     ):
-        self.base_url = base_url
+        self.page_size = page_size
+        self.base_url = normalize_arxiv_url(base_url, default_show=page_size)
         self.output_dir = Path(output_dir or "./downloads").expanduser().resolve()
         self.limit = max(1, limit)
         self.count_existing = count_existing

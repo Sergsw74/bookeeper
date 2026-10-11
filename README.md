@@ -587,16 +587,21 @@ bookeeper list-books --search "Redwall"
 
 ### 📥 Archive Downloader (arXiv Crawler)
 
-A standalone subproject located in `archive_downloader/` to crawl, index, and download papers and books from arXiv feeds (*e.g.* `https://arxiv.org/list/cs.AI/recent`) with pagination, deduplication, and Calibre `.opf` metadata:
+A standalone subproject located in `archive_downloader/` to crawl, index, and download papers and books from arXiv feeds (*e.g.* `https://arxiv.org/list/cs.AI/recent?skip=0&show=500`) with pagination, deduplication, and Calibre `.opf` metadata:
 
 ```bash
-# 1. Download up to 100 most recent articles into ./downloads:
+# 1. Download up to 100 most recent articles into ./downloads (uses fast show=500 batching):
 python archive_downloader/run.py download --limit 100
 
-# 2. Download into a custom directory:
+# 2. Download from explicit show=500 URL:
+python archive_downloader/run.py download \
+  --url "https://arxiv.org/list/cs.AI/recent?skip=0&show=500" \
+  --limit 500
+
+# 3. Download into a custom directory:
 python archive_downloader/run.py download --limit 50 --output-dir ./arxiv_papers
 
-# 3. Only count and download new articles:
+# 4. Only count and download new articles:
 python archive_downloader/run.py download --limit 20 --new-only
 
 # 4. View index status, categories, and disk usage:

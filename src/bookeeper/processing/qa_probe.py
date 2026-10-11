@@ -80,8 +80,8 @@ def calculate_ternary_scores(
     net_score = raw_score / n_total
 
     # 2. Normalized [0.0, 1.0] Benchmark Fidelity
-    # Supported gives 1.0, Not Mentioned gives 0.2 partial credit, Against cancels out 1 supported
-    calibrated_fidelity = max(0.0, (n_sup + (0.2 * n_not) - (1.0 * n_opp)) / n_total)
+    # Formula: max(0.0, (Sup - 0.25*Not - 1.0*Against) / Total)
+    calibrated_fidelity = max(0.0, (n_sup - (0.25 * n_not) - (1.0 * n_opp)) / n_total)
 
     return {
         "total_probes": n_total,

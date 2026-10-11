@@ -276,7 +276,7 @@ def test_evaluate_block_atomic_assertions():
     assert m_old.not_mentioned_count == 1
     assert m_old.against_count == 0
     assert m_old.net_integrity_score == 0.375
-    assert m_old.calibrated_fidelity == 0.60
+    assert m_old.calibrated_fidelity == 0.375
     assert m_old.seam_net_integrity == 1.0
     assert m_old.seam_calibrated_fidelity == 1.0
 
@@ -284,9 +284,9 @@ def test_evaluate_block_atomic_assertions():
     assert m_new.not_mentioned_count == 1
     assert m_new.against_count == 0
     assert m_new.net_integrity_score == 0.375
-    assert m_new.calibrated_fidelity == 0.60
+    assert m_new.calibrated_fidelity == 0.375
     assert m_new.seam_net_integrity == -0.25
-    assert m_new.seam_calibrated_fidelity == 0.20
+    assert m_new.seam_calibrated_fidelity == 0.0
 
 
 def test_prompt_builders_and_constraints():
@@ -352,7 +352,7 @@ def test_evaluation_weights_and_ternary_scores():
     assert res_not["total_probes"] == 2
     assert res_not["not_mentioned_count"] == 2
     assert res_not["net_integrity_score"] == -0.25
-    assert res_not["calibrated_fidelity"] == 0.20
+    assert res_not["calibrated_fidelity"] == 0.0
 
     # 5. Mixed: 1 SUPPORTED, 1 NOT_MENTIONED, 1 AGAINST
     res_mix = calculate_ternary_scores(["SUPPORTED", "NOT_MENTIONED", "AGAINST"])
@@ -362,8 +362,8 @@ def test_evaluation_weights_and_ternary_scores():
     assert res_mix["against_count"] == 1
     # raw_score = 1.0*1 - 0.25*1 - 1.0*1 = -0.25 -> net_score = -0.25 / 3 = -0.0833
     assert res_mix["net_integrity_score"] == -0.0833
-    # calibrated_fidelity = max(0.0, (1 + 0.2*1 - 1.0*1) / 3) = 0.2 / 3 = 0.0667
-    assert res_mix["calibrated_fidelity"] == 0.0667
+    # calibrated_fidelity = max(0.0, (1 - 0.25*1 - 1.0*1) / 3) = max(0.0, -0.25 / 3) = 0.0
+    assert res_mix["calibrated_fidelity"] == 0.0
 
     # 6. Custom weights
     custom_w = EvaluationWeights(supported=1.0, not_mentioned=-0.20, against=-1.0)

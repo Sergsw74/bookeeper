@@ -916,7 +916,7 @@ def print_block_comparison(
     _out(
         f"   [Legend] Recall = Supported / Total | "
         f"Net Integrity (S_net) = (1.0*Sup - 0.25*Not - 1.0*Against)/Total | "
-        f"Fidelity = max(0, Sup + 0.2*Not - 1.0*Against)/Total | "
+        f"Fidelity = max(0, Sup - 0.25*Not - 1.0*Against)/Total | "
         f"Seam Int = Supported Cross-Boundary / Total Cross-Boundary"
     )
     _out(f"{sep}\n")

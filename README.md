@@ -292,33 +292,49 @@ bookeeper test-run 3 --model "qwen2.5:3b" --calibre-path "/path/to/calibre"
 
 ---
 
-### 🔬 Automated A/B Testing & Branch Benchmarking (`scripts/ab_test.sh` / `scripts/ab_test.py`)
+### 🔬 Automated A/B Testing & Benchmarking (`scripts/ab_test.sh` / `scripts/ab_test.py`)
 
-`bookeeper` provides an automated harness to benchmark and compare two Git branches or an existing baseline against a candidate branch across extraction speed, idea counts, and factual grounding:
+`bookeeper` provides an automated harness to benchmark and compare either **two different configurations on the same branch** or **two Git branches** (or an existing baseline report against a candidate) across extraction speed, idea counts, and factual grounding:
 
 ```bash
-# 1. Standard Branch vs Branch comparison (ingests 5 books per branch from scratch):
+# 1. Same-Branch Mode (Config A vs Config B on active branch, no branch switching needed):
+./scripts/ab_test.sh 5 1.0
+python3 scripts/ab_test.py --books 5 --percent 1.0
+
+# 2. Single-Branch Mode (Explicit branch with Config A vs Config B):
+./scripts/ab_test.sh master 5 1.0
+python3 scripts/ab_test.py master --books 5
+
+# 3. Standard Branch vs Branch comparison (ingests 5 books per branch from scratch):
 ./scripts/ab_test.sh main feature-rolling-window 5
 
-# 2. Compare against an existing baseline verification report (skips re-indexing Branch A):
+# 4. Compare against an existing baseline verification report (skips re-indexing Branch A):
 ./scripts/ab_test.sh vs ./ab_test_runs/run_20261010_120000/branch_A/verification_report.json feature-rolling-window 5
 
-# 3. Direct Python invocation with custom arguments:
+# 5. Direct Python invocation with custom arguments:
 python3 scripts/ab_test.py main feature-rolling-window --books 5 --percent 2.0 --timeout 60
 ```
 
 #### ⚙️ Configuration Customization Overlays (`config-a.yaml` & `config-b.yaml`)
 
-When running A/B tests to evaluate architectural, chunking, or prompt changes, you can customize configurations per branch without modifying `config.yaml` or dirtying your Git working tree:
+When running A/B tests to evaluate architectural, chunking, prompt, or model changes—either on the same branch or across branches—you can customize configurations per test case without modifying `config.yaml` or dirtying your Git working tree:
 
 - **Base Configuration**: The runner reads `config.yaml` (or `--config <path>`).
-- **Branch A Overlay**: If `config-a.yaml` (or `--config-a <path>`) exists, it is automatically deep-merged on top of `config.yaml` for Branch A.
-- **Branch B Overlay**: If `config-b.yaml` (or `--config-b <path>`) exists, it is automatically deep-merged on top of `config.yaml` for Branch B.
+- **Case A Overlay**: If `config-a.yaml` (or `--config-a <path>`) exists, it is automatically deep-merged on top of `config.yaml` for Case A / Branch A.
+- **Case B Overlay**: If `config-b.yaml` (or `--config-b <path>`) exists, it is automatically deep-merged on top of `config.yaml` for Case B / Branch B.
+- **Same-Branch Execution**: When invoked without any branch arguments or with only one branch, the runner tests Case A (Config A) vs Case B (Config B) on your current branch without checking out different branches or requiring a stashed git state.
 - **Deep Merge Semantics**: Overlays recursively overwrite specific keys (e.g. `llm_model`, `chunk_size`, `verification_cooldown_seconds`, or nested blocks under `verification:`) while preserving all unmentioned base settings.
 - **Reproducibility**: Merged configurations are written directly into the run session directory (`ab_test_runs/run_<timestamp>/branch_<X>/config.yaml`), ensuring clean git checkouts and deterministic reproducibility.
 
 ```bash
-# Example with explicit overlay configs:
+# Same-branch A/B test with custom config overlays:
+python3 scripts/ab_test.py \
+  --books 5 \
+  --config config.yaml \
+  --config-a config-a.yaml \
+  --config-b config-b.yaml
+
+# Branch vs Branch with custom config overlays:
 python3 scripts/ab_test.py main feature-rolling-window \
   --books 5 \
   --config config.yaml \

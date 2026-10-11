@@ -3,25 +3,36 @@
 A/B Testing Automation Runner for Bookeeper.
 
 Performs automated end-to-end A/B testing:
-1. Standard Mode: Checks out Branch A, runs `bookeeper test-run`, then checks out
+1. Same-Branch Mode: Compares two configurations (Config A vs Config B) on the same branch
+   (or current working branch when no branches are specified) without switching branches.
+2. Standard Mode: Checks out Branch A, runs `bookeeper test-run`, then checks out
    Branch B, runs `bookeeper test-run`, and compares results.
-2. VS Mode: Ingests an existing baseline `verification_report.json` path as Branch A,
+3. VS Mode: Ingests an existing baseline `verification_report.json` path as Branch A,
    checks out only Branch B to run `bookeeper test-run`, and compares results.
-3. Re-verify Mode: Reuses existing knowledge graphs from a prior A/B test run folder,
+4. Re-verify Mode: Reuses existing knowledge graphs from a prior A/B test run folder,
    re-runs `bookeeper verify` on both branches with a specified sample percentage,
    and compares results.
+5. Cross-Check Mode: Audits contiguous chunk blocks across two runs using NLI assertions.
 
 Usage:
-    # 1. Standard Branch vs Branch Mode
+    # 1. Same-Branch Mode (No branches specified -> active branch, or single branch)
+    ./ab_test.py [--books 5] [--percent 1.0]
+    ./ab_test.py <branch> [--books 5] [--percent 1.0]
+    ./ab_test.py --same-branch [<branch>] [--books 5] [--percent 1.0]
+
+    # 2. Standard Branch vs Branch Mode
     ./ab_test.py <branch1> <branch2> [--books 5] [--percent 1.0]
 
-    # 2. VS Mode (Existing Baseline Report vs Candidate Branch)
+    # 3. VS Mode (Existing Baseline Report vs Candidate Branch)
     ./ab_test.py vs <baseline_report_path> <branch2> [--books 5] [--percent 1.0]
     ./ab_test.py --vs <baseline_report_path> <branch2> [--books 5] [--percent 1.0]
 
-    # 3. Re-verify Mode (Reuse Existing Graphs with New Verification Sample %)
+    # 4. Re-verify Mode (Reuse Existing Graphs with New Verification Sample %)
     ./ab_test.py reverify <path_to_abtest_result> [percent]
     ./ab_test.py --reverify <path_to_abtest_result> [--percent 5.0]
+
+    # 5. Cross-Check Mode (Contiguous Chunk Seam & Recall Comparative Audit)
+    ./ab_test.py cross-check <path_to_abtest_result> [blocks]
 """
 
 import argparse
@@ -140,11 +151,12 @@ class ABTestRunner:
 
     def __init__(
         self,
-        branch1: str,
-        branch2: str,
+        branch1: Optional[str] = None,
+        branch2: Optional[str] = None,
         baseline_report: Optional[str] = None,
         reverify_src_dir: Optional[str] = None,
         cross_check_src_dir: Optional[str] = None,
+        same_branch: bool = False,
         num_books: int = 5,
         percent: Optional[float] = None,
         blocks: int = 20,
@@ -159,7 +171,6 @@ class ABTestRunner:
         config_a: Optional[str] = None,
         config_b: Optional[str] = None,
     ):
-        self.branch2 = branch2
         self.num_books = num_books
         self._raw_percent = percent
         self._raw_mode = mode
@@ -173,47 +184,7 @@ class ABTestRunner:
         self.config_b_path = Path(config_b).expanduser().resolve() if config_b else None
         self.is_cross_check_mode = bool(cross_check_src_dir)
 
-        # Handle Cross-check / Reverify mode with pre-existing A/B test run directory
-        if cross_check_src_dir:
-            self.cross_check_src_dir: Optional[Path] = Path(cross_check_src_dir).expanduser().resolve()
-            if not self.dry_run and not self.cross_check_src_dir.is_dir():
-                raise FileNotFoundError(f"Run directory not found at {self.cross_check_src_dir}")
-            self.reverify_src_dir = self.cross_check_src_dir
-            self.is_reverify_mode = False
-            self.is_vs_mode = False
-            self.baseline_report_path = None
-            self.branch1 = branch1
-        elif reverify_src_dir:
-            self.reverify_src_dir: Optional[Path] = Path(reverify_src_dir).expanduser().resolve()
-            if not self.dry_run and not self.reverify_src_dir.is_dir():
-                raise FileNotFoundError(f"Run directory not found at {self.reverify_src_dir}")
-            self.cross_check_src_dir = None
-            self.is_reverify_mode = True
-            self.is_vs_mode = False
-            self.baseline_report_path = None
-            self.branch1 = branch1
-        elif baseline_report:
-            self.reverify_src_dir = None
-            self.cross_check_src_dir = None
-            self.is_reverify_mode = False
-            self.baseline_report_path: Optional[Path] = Path(baseline_report).expanduser().resolve()
-            if not self.dry_run and not self.baseline_report_path.is_file():
-                raise FileNotFoundError(f"Baseline report not found at {self.baseline_report_path}")
-            self.is_vs_mode = True
-            # Clean descriptive title for baseline
-            stem = self.baseline_report_path.stem
-            parent_name = self.baseline_report_path.parent.name
-            desc_tag = parent_name if parent_name not in ("output", ".") else stem
-            self.branch1 = branch1 or f"Report ({desc_tag})"
-        else:
-            self.reverify_src_dir = None
-            self.cross_check_src_dir = None
-            self.is_reverify_mode = False
-            self.baseline_report_path = None
-            self.is_vs_mode = False
-            self.branch1 = branch1
-
-        # Resolve repository directory
+        # Resolve repository directory first to allow git branch resolution
         if repo_dir:
             self.repo_dir = Path(repo_dir).expanduser().resolve()
         else:
@@ -233,6 +204,59 @@ class ABTestRunner:
 
         if not (self.repo_dir / ".git").is_dir():
             raise FileNotFoundError(f"Directory {self.repo_dir} is not a valid git repository.")
+
+        # Determine active branch fallback if not provided
+        active_branch = self.get_current_branch()
+        resolved_b1 = (branch1.strip() if branch1 else "") or active_branch
+        resolved_b2 = resolved_b1 if same_branch else ((branch2.strip() if branch2 else "") or resolved_b1)
+
+        # Handle Cross-check / Reverify mode with pre-existing A/B test run directory
+        if cross_check_src_dir:
+            self.cross_check_src_dir: Optional[Path] = Path(cross_check_src_dir).expanduser().resolve()
+            if not self.dry_run and not self.cross_check_src_dir.is_dir():
+                raise FileNotFoundError(f"Run directory not found at {self.cross_check_src_dir}")
+            self.reverify_src_dir = self.cross_check_src_dir
+            self.is_reverify_mode = False
+            self.is_vs_mode = False
+            self.baseline_report_path = None
+            self.branch1 = branch1 or resolved_b1
+            self.branch2 = branch2 or self.branch1
+            self.is_same_branch = False
+        elif reverify_src_dir:
+            self.reverify_src_dir: Optional[Path] = Path(reverify_src_dir).expanduser().resolve()
+            if not self.dry_run and not self.reverify_src_dir.is_dir():
+                raise FileNotFoundError(f"Run directory not found at {self.reverify_src_dir}")
+            self.cross_check_src_dir = None
+            self.is_reverify_mode = True
+            self.is_vs_mode = False
+            self.baseline_report_path = None
+            self.branch1 = branch1 or resolved_b1
+            self.branch2 = branch2 or self.branch1
+            self.is_same_branch = False
+        elif baseline_report:
+            self.reverify_src_dir = None
+            self.cross_check_src_dir = None
+            self.is_reverify_mode = False
+            self.baseline_report_path: Optional[Path] = Path(baseline_report).expanduser().resolve()
+            if not self.dry_run and not self.baseline_report_path.is_file():
+                raise FileNotFoundError(f"Baseline report not found at {self.baseline_report_path}")
+            self.is_vs_mode = True
+            # Clean descriptive title for baseline
+            stem = self.baseline_report_path.stem
+            parent_name = self.baseline_report_path.parent.name
+            desc_tag = parent_name if parent_name not in ("output", ".") else stem
+            self.branch1 = branch1 or f"Report ({desc_tag})"
+            self.branch2 = branch2 or resolved_b1
+            self.is_same_branch = False
+        else:
+            self.reverify_src_dir = None
+            self.cross_check_src_dir = None
+            self.is_reverify_mode = False
+            self.baseline_report_path = None
+            self.is_vs_mode = False
+            self.branch1 = resolved_b1
+            self.branch2 = resolved_b2
+            self.is_same_branch = (self.branch1 == self.branch2)
 
         # Resolve bookeeper executable
         venv_bin = self.repo_dir / ".venv" / "bin" / "bookeeper"
@@ -257,6 +281,8 @@ class ABTestRunner:
         elif self.is_reverify_mode:
             pct_tag = f"p{str(self.percent).replace('.', '_')}"
             self.session_dir = base_archive / f"reverify_{timestamp}_{self._sanitize(self.branch1)}_vs_{self._sanitize(self.branch2)}_{pct_tag}"
+        elif self.is_same_branch:
+            self.session_dir = base_archive / f"run_{timestamp}_{self._sanitize(self.branch1)}_cfgA_vs_cfgB"
         else:
             mode_prefix = "vs" if self.is_vs_mode else "run"
             self.session_dir = base_archive / f"{mode_prefix}_{timestamp}_{self._sanitize(self.branch1)}_vs_{self._sanitize(self.branch2)}"
@@ -285,8 +311,13 @@ class ABTestRunner:
 
     def get_current_branch(self) -> str:
         """Retrieve current active git branch name."""
-        res = self._run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-        return res.stdout.strip()
+        try:
+            res = self._run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], check=False)
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+        except Exception:
+            pass
+        return "master"
 
     def checkout_branch(self, branch: str) -> None:
         """Check out requested git branch."""
@@ -735,10 +766,14 @@ class ABTestRunner:
         if self.is_vs_mode:
             print(f"• Mode:             {Colors.BOLD}{Colors.YELLOW}VS MODE (Report vs Branch){Colors.RESET}")
             print(f"• Baseline Report:  {Colors.BOLD}{self.baseline_report_path}{Colors.RESET}")
+            print(f"• Branch B:         {Colors.BOLD}{self.branch2}{Colors.RESET}")
+        elif self.is_same_branch:
+            print(f"• Mode:             {Colors.BOLD}{Colors.YELLOW}Same-Branch Configuration Comparison (Config A vs Config B){Colors.RESET}")
+            print(f"• Target Branch:    {Colors.BOLD}{self.branch1}{Colors.RESET}")
         else:
             print(f"• Mode:             {Colors.BOLD}Standard Branch vs Branch{Colors.RESET}")
             print(f"• Branch A:         {Colors.BOLD}{self.branch1}{Colors.RESET}")
-        print(f"• Branch B:         {Colors.BOLD}{self.branch2}{Colors.RESET}")
+            print(f"• Branch B:         {Colors.BOLD}{self.branch2}{Colors.RESET}")
         print(f"• Target Books:     {Colors.BOLD}{self.num_books}{Colors.RESET}")
         print(f"• Verification %:   {Colors.BOLD}{self.percent}%{Colors.RESET} (mode: {self.mode})")
         print(f"• Request Timeout:  {self.timeout}s")
@@ -764,11 +799,17 @@ class ABTestRunner:
         print("")
 
         # 1. Guard git clean state
-        if not self.dry_run and not self.check_repo_clean():
-            raise RuntimeError(
-                f"Repository at {self.repo_dir} has unstaged or uncommitted changes. "
-                "Please commit or stash changes before running A/B testing."
-            )
+        if not self.dry_run:
+            if not self.check_repo_clean():
+                if self.is_same_branch and self.get_current_branch() == self.branch1:
+                    log_warning(
+                        "Working tree has uncommitted changes. Proceeding on active branch without git checkout."
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Repository at {self.repo_dir} has unstaged or uncommitted changes. "
+                        "Please commit or stash changes before running multi-branch A/B testing."
+                    )
 
         self.initial_branch = self.get_current_branch()
         log_info(f"Original active branch: {Colors.BOLD}{self.initial_branch}{Colors.RESET}")
@@ -777,24 +818,24 @@ class ABTestRunner:
         branch2_dir = self.session_dir / f"branch_B_{self._sanitize(self.branch2)}"
 
         try:
-            # 2. Process Baseline (Branch A or imported report)
+            # 2. Process Baseline / Case A (Branch A or imported report)
             if self.is_vs_mode:
                 self.import_baseline_report(branch1_dir)
             else:
                 config_a = self.prepare_branch_config("A", branch1_dir)
-                if not self.dry_run:
+                if not self.dry_run and self.get_current_branch() != self.branch1:
                     self.checkout_branch(self.branch1)
                 self.run_test_run(self.branch1, branch1_dir, config_file=config_a)
 
-            # 3. Process Candidate (Branch B)
+            # 3. Process Candidate / Case B (Branch B)
             config_b = self.prepare_branch_config("B", branch2_dir)
-            if not self.dry_run:
+            if not self.dry_run and self.get_current_branch() != self.branch2:
                 self.checkout_branch(self.branch2)
             self.run_test_run(self.branch2, branch2_dir, config_file=config_b)
 
         finally:
-            # 4. Always restore initial branch
-            if not self.dry_run and self.initial_branch:
+            # 4. Always restore initial branch if switched
+            if not self.dry_run and self.initial_branch and self.get_current_branch() != self.initial_branch:
                 log_info(f"Restoring initial branch: {Colors.BOLD}{self.initial_branch}{Colors.RESET}...")
                 try:
                     self.checkout_branch(self.initial_branch)
@@ -1513,8 +1554,12 @@ class ABTestRunner:
         col_w_val = 24
         col_w_delta = 22
 
-        lbl_a = f"BASELINE ({self.branch1})"
-        lbl_b = f"CANDIDATE ({self.branch2})"
+        if self.is_same_branch:
+            lbl_a = f"CASE A ({self.branch1})"
+            lbl_b = f"CASE B ({self.branch2})"
+        else:
+            lbl_a = f"BASELINE ({self.branch1})"
+            lbl_b = f"CANDIDATE ({self.branch2})"
         header_line = (
             f"{'METRIC':<{col_w_metric}} "
             f"{lbl_a:<{col_w_val}} "
@@ -1635,47 +1680,82 @@ class ABTestRunner:
             rate_b = float(stats_b.get("overall_success_rate", 0.0))
             rate_diff = rate_b - rate_a
 
-            if rate_diff > 0.01:
-                verdict = (
-                    f"Candidate branch '{self.branch2}' outperformed baseline '{self.branch1}' with a "
-                    f"+{rate_diff:.2f}% higher Oracle success rate ({rate_b:.2f}% vs {rate_a:.2f}%)."
-                )
-                v_color = Colors.GREEN
-            elif rate_diff < -0.01:
-                verdict = (
-                    f"Baseline '{self.branch1}' had a higher Oracle success rate "
-                    f"(+{abs(rate_diff):.2f}% over candidate '{self.branch2}': {rate_a:.2f}% vs {rate_b:.2f}%)."
-                )
-                v_color = Colors.YELLOW
+            if self.is_same_branch:
+                if rate_diff > 0.01:
+                    verdict = (
+                        f"Configuration B outperformed Configuration A on branch '{self.branch1}' with a "
+                        f"+{rate_diff:.2f}% higher Oracle success rate ({rate_b:.2f}% vs {rate_a:.2f}%)."
+                    )
+                    v_color = Colors.GREEN
+                elif rate_diff < -0.01:
+                    verdict = (
+                        f"Configuration A had a higher Oracle success rate on branch '{self.branch1}' "
+                        f"(+{abs(rate_diff):.2f}% over Configuration B: {rate_a:.2f}% vs {rate_b:.2f}%)."
+                    )
+                    v_color = Colors.YELLOW
+                else:
+                    verdict = f"Both configurations demonstrated identical Oracle success rates on branch '{self.branch1}' ({rate_a:.2f}%)."
+                    v_color = Colors.CYAN
             else:
-                verdict = f"Both configurations demonstrated identical Oracle success rates ({rate_a:.2f}%)."
-                v_color = Colors.CYAN
+                if rate_diff > 0.01:
+                    verdict = (
+                        f"Candidate branch '{self.branch2}' outperformed baseline '{self.branch1}' with a "
+                        f"+{rate_diff:.2f}% higher Oracle success rate ({rate_b:.2f}% vs {rate_a:.2f}%)."
+                    )
+                    v_color = Colors.GREEN
+                elif rate_diff < -0.01:
+                    verdict = (
+                        f"Baseline '{self.branch1}' had a higher Oracle success rate "
+                        f"(+{abs(rate_diff):.2f}% over candidate '{self.branch2}': {rate_a:.2f}% vs {rate_b:.2f}%)."
+                    )
+                    v_color = Colors.YELLOW
+                else:
+                    verdict = f"Both configurations demonstrated identical Oracle success rates ({rate_a:.2f}%)."
+                    v_color = Colors.CYAN
         else:
             rate_a = float(stats_a.get("verified_percentage", 0.0))
             rate_b = float(stats_b.get("verified_percentage", 0.0))
             rate_diff = rate_b - rate_a
 
-            if rate_diff > 0.01:
-                verdict = (
-                    f"Candidate branch '{self.branch2}' outperformed baseline '{self.branch1}' with a "
-                    f"+{rate_diff:.2f}% higher factual verification rate."
-                )
-                v_color = Colors.GREEN
-            elif rate_diff < -0.01:
-                verdict = (
-                    f"Baseline '{self.branch1}' had a higher factual verification rate "
-                    f"(+{abs(rate_diff):.2f}% over candidate '{self.branch2}')."
-                )
-                v_color = Colors.YELLOW
+            if self.is_same_branch:
+                if rate_diff > 0.01:
+                    verdict = (
+                        f"Configuration B outperformed Configuration A on branch '{self.branch1}' with a "
+                        f"+{rate_diff:.2f}% higher factual verification rate ({rate_b:.2f}% vs {rate_a:.2f}%)."
+                    )
+                    v_color = Colors.GREEN
+                elif rate_diff < -0.01:
+                    verdict = (
+                        f"Configuration A had a higher factual verification rate on branch '{self.branch1}' "
+                        f"(+{abs(rate_diff):.2f}% over Configuration B)."
+                    )
+                    v_color = Colors.YELLOW
+                else:
+                    verdict = f"Both configurations demonstrated identical factual verification rates on branch '{self.branch1}' ({rate_a:.2f}%)."
+                    v_color = Colors.CYAN
             else:
-                verdict = f"Both configurations demonstrated identical factual verification rates ({rate_a:.2f}%)."
-                v_color = Colors.CYAN
+                if rate_diff > 0.01:
+                    verdict = (
+                        f"Candidate branch '{self.branch2}' outperformed baseline '{self.branch1}' with a "
+                        f"+{rate_diff:.2f}% higher factual verification rate."
+                    )
+                    v_color = Colors.GREEN
+                elif rate_diff < -0.01:
+                    verdict = (
+                        f"Baseline '{self.branch1}' had a higher factual verification rate "
+                        f"(+{abs(rate_diff):.2f}% over candidate '{self.branch2}')."
+                    )
+                    v_color = Colors.YELLOW
+                else:
+                    verdict = f"Both configurations demonstrated identical factual verification rates ({rate_a:.2f}%)."
+                    v_color = Colors.CYAN
 
         print(f"{v_color}{Colors.BOLD}VERDICT: {verdict}{Colors.RESET}\n")
 
         # Save structured comparison JSON and Markdown report
         comparison_record = {
             "is_vs_mode": self.is_vs_mode,
+            "is_same_branch": self.is_same_branch,
             "is_reverify_mode": getattr(self, "is_reverify_mode", False),
             "reverify_src_dir": str(self.reverify_src_dir) if getattr(self, "reverify_src_dir", None) else None,
             "baseline": self.branch1,
@@ -1717,8 +1797,14 @@ class ABTestRunner:
             mode_desc = f"Re-verify Mode (Re-audited at {data['sample_percent']}%)"
         elif data.get("is_vs_mode"):
             mode_desc = "VS Mode (Report vs Branch)"
+        elif data.get("is_same_branch"):
+            mode_desc = f"Same-Branch Config Comparison (Config A vs Config B on {data['baseline']})"
         else:
             mode_desc = "Standard Branch vs Branch"
+
+        col_hdr_a = "Case A (Config A)" if data.get("is_same_branch") else "Baseline"
+        col_hdr_b = "Case B (Config B)" if data.get("is_same_branch") else "Candidate"
+        col_hdr_d = "Delta (Case B - Case A)" if data.get("is_same_branch") else "Delta (Candidate - Baseline)"
 
         lines = [
             "# A/B Testing Verification Comparison Report",
@@ -1728,8 +1814,8 @@ class ABTestRunner:
         if data.get("reverify_src_dir"):
             lines.append(f"- **Source Run Directory:** `{data['reverify_src_dir']}`")
         lines.extend([
-            f"- **Baseline:** `{data['baseline']}`" + (f" (`{data['baseline_report_path']}`)" if data.get('baseline_report_path') else ""),
-            f"- **Candidate:** `{data['candidate']}`",
+            f"- **Baseline / Case A:** `{data['baseline']}`" + (f" (`{data['baseline_report_path']}`)" if data.get('baseline_report_path') else ""),
+            f"- **Candidate / Case B:** `{data['candidate']}`",
             f"- **Target Books:** `{data['num_books']}`",
             f"- **Sample Rate:** `{data['sample_percent']}%` (Mode: `{data['mode']}`)",
             f"- **Generated:** `{data['timestamp']}`",
@@ -1739,26 +1825,29 @@ class ABTestRunner:
             "",
             "### 📊 Comparative Metrics",
             "",
-            "| Metric | Baseline | Candidate | Delta (Candidate - Baseline) |",
+            f"| Metric | {col_hdr_a} | {col_hdr_b} | {col_hdr_d} |",
             "| :--- | :--- | :--- | :--- |",
         ])
         for m in data.get("metrics", []):
             lines.append(f"| {m['metric']} | {m['branch_a']} | {m['branch_b']} | {m['delta']} |")
 
+        tag_a = "Case A (Config A)" if data.get("is_same_branch") else f"Baseline (`{data['baseline']}`)"
+        tag_b = "Case B (Config B)" if data.get("is_same_branch") else f"Candidate (`{data['candidate']}`)"
+
         if data.get("omissions_count"):
             lines.extend([
                 "",
                 "### 🔍 Chunk Omissions Summary",
-                f"- **Baseline (`{data['baseline']}`):** {data['omissions_count']['baseline']} chunks with omissions",
-                f"- **Candidate (`{data['candidate']}`):** {data['omissions_count']['candidate']} chunks with omissions",
+                f"- **{tag_a}:** {data['omissions_count']['baseline']} chunks with omissions",
+                f"- **{tag_b}:** {data['omissions_count']['candidate']} chunks with omissions",
                 "",
             ])
         else:
             lines.extend([
                 "",
                 "### 🔍 Discrepancies Summary",
-                f"- **Baseline (`{data['baseline']}`):** {data['discrepancies_count']['baseline']} discrepancies",
-                f"- **Candidate (`{data['candidate']}`):** {data['discrepancies_count']['candidate']} discrepancies",
+                f"- **{tag_a}:** {data['discrepancies_count']['baseline']} discrepancies",
+                f"- **{tag_b}:** {data['discrepancies_count']['candidate']} discrepancies",
                 "",
             ])
 
@@ -1802,19 +1891,21 @@ Examples:
     )
     parser.add_argument(
         "arg1",
-        help="Name of Branch A (baseline), OR mode keyword 'vs'/'reverify'/'cross-check', OR path to baseline verification report.",
+        nargs="?",
+        default=None,
+        help="Name of Branch A (baseline), OR mode keyword 'vs'/'reverify'/'cross-check', OR path to baseline verification report, OR books/percent for same-branch run.",
     )
     parser.add_argument(
         "arg2",
         nargs="?",
         default=None,
-        help="Name of Branch B (candidate), OR path to baseline report if arg1 is 'vs', OR path to run if arg1 is 'reverify'/'cross-check'.",
+        help="Name of Branch B (candidate), OR path to baseline report if arg1 is 'vs', OR path to run if arg1 is 'reverify'/'cross-check', OR books/percent in single-branch mode.",
     )
     parser.add_argument(
         "arg3",
         nargs="?",
         default=None,
-        help="Name of Branch B if 'vs <report> <branch2>' format is used, OR percent if 'reverify <run> [percent]' is used, OR blocks if 'cross-check <run> [blocks]' is used, OR books in 2-branch mode.",
+        help="Name of Branch B if 'vs <report> <branch2>' format is used, OR percent if 'reverify <run> [percent]' is used, OR blocks if 'cross-check <run> [blocks]' is used, OR books/percent in 2-branch mode.",
     )
     parser.add_argument(
         "arg4",
@@ -1827,6 +1918,13 @@ Examples:
         nargs="?",
         default=None,
         help="Optional 5th positional argument (e.g. percent).",
+    )
+    parser.add_argument(
+        "--same-branch",
+        "-s",
+        dest="same_branch",
+        action="store_true",
+        help="Run A/B test on the same branch comparing Config A vs Config B (default when 0 or 1 branch is provided).",
     )
     parser.add_argument(
         "--vs",
@@ -1948,6 +2046,15 @@ Examples:
     branch2: str = ""
     num_blocks: int = args.blocks
 
+    def _is_number(val: Optional[Any]) -> bool:
+        if val is None:
+            return False
+        try:
+            float(val)
+            return True
+        except (ValueError, TypeError):
+            return False
+
     if args.cross_check_path:
         cross_check_path = args.cross_check_path
         if args.arg1 and not args.blocks:
@@ -1955,7 +2062,7 @@ Examples:
                 num_blocks = int(args.arg1)
             except ValueError:
                 pass
-    elif args.arg1.lower() in ("cross-check", "--cross-check", "cross_check"):
+    elif args.arg1 and args.arg1.lower() in ("cross-check", "--cross-check", "cross_check"):
         if not args.arg2:
             parser.error("In 'cross-check' mode, specify previous A/B test run directory: 'cross-check <path_to_abtest_result> [number_blocks]'")
         cross_check_path = args.arg2
@@ -1973,7 +2080,7 @@ Examples:
                 args.percent = float(args.arg1)
             except ValueError:
                 pass
-    elif args.arg1.lower() in ("reverify", "--reverify"):
+    elif args.arg1 and args.arg1.lower() in ("reverify", "--reverify"):
         if not args.arg2:
             parser.error("In 'reverify' mode, specify previous A/B test run directory: 'reverify <path_to_abtest_result> [percent]'")
         reverify_path = args.arg2
@@ -1985,7 +2092,7 @@ Examples:
     elif args.vs_report:
         # Invoked with --vs <report> <branch2> [books] [percent]
         baseline_report = args.vs_report
-        branch2 = args.arg1
+        branch2 = args.arg1 or ""
         branch1 = f"Report ({Path(baseline_report).name})"
         if args.arg2 is not None:
             if "." in str(args.arg2) and args.percent is None:
@@ -1997,7 +2104,7 @@ Examples:
         if args.arg3 is not None and args.percent is None:
             try: args.percent = float(args.arg3)
             except ValueError: pass
-    elif args.arg1.lower() == "vs":
+    elif args.arg1 and args.arg1.lower() == "vs":
         # Invoked with: vs <report> <branch2> [books] [percent]
         if not args.arg2 or not args.arg3:
             parser.error("In 'vs' mode, specify baseline report path and candidate branch: 'vs <report_path> <branch2> [books] [percent]'")
@@ -2014,7 +2121,7 @@ Examples:
         if args.arg5 is not None and args.percent is None:
             try: args.percent = float(args.arg5)
             except ValueError: pass
-    elif os.path.isfile(os.path.expanduser(args.arg1)) or args.arg1.endswith(".json"):
+    elif args.arg1 and (os.path.isfile(os.path.expanduser(args.arg1)) or args.arg1.endswith(".json")):
         # Invoked with: <report.json> <branch2> [books] [percent]
         if not args.arg2:
             parser.error("Specify candidate branch when providing baseline report: '<report_path> <branch2>'")
@@ -2031,22 +2138,88 @@ Examples:
         if args.arg4 is not None and args.percent is None:
             try: args.percent = float(args.arg4)
             except ValueError: pass
-    else:
-        # Standard: <branch1> <branch2> [books] [percent]
-        if not args.arg2:
-            parser.error("Specify both branches: '<branch1> <branch2>' (or use 'vs <report_path> <branch2>')")
-        branch1 = args.arg1
-        branch2 = args.arg2
-        if args.arg3 is not None:
-            if "." in str(args.arg3) and args.percent is None:
+    elif args.arg1 is None:
+        # Invoked without any branch arguments: run on active branch with Config A vs Config B
+        branch1 = ""
+        branch2 = ""
+    elif _is_number(args.arg1):
+        # Invoked with number of books (or percent) without branch names: e.g. ./ab_test.py 5 or ./ab_test.py 5 1.0
+        branch1 = ""
+        branch2 = ""
+        if "." in str(args.arg1) and args.percent is None:
+            try: args.percent = float(args.arg1)
+            except ValueError: pass
+        else:
+            try: args.books = int(args.arg1)
+            except ValueError: pass
+        if args.arg2 is not None:
+            if "." in str(args.arg2) and args.percent is None:
+                try: args.percent = float(args.arg2)
+                except ValueError: pass
+            elif args.books is None or args.books == 5:
+                try: args.books = int(args.arg2)
+                except ValueError: pass
+        if args.arg3 is not None and args.percent is None:
+            try: args.percent = float(args.arg3)
+            except ValueError: pass
+    elif args.arg1.lower() in ("same-branch", "--same-branch", "same_branch"):
+        # Explicit keyword: 'same-branch' [branch] [books] [percent]
+        if args.arg2 and not _is_number(args.arg2):
+            branch1 = args.arg2
+            branch2 = args.arg2
+            if args.arg3 is not None:
+                if "." in str(args.arg3) and args.percent is None:
+                    try: args.percent = float(args.arg3)
+                    except ValueError: pass
+                else:
+                    try: args.books = int(args.arg3)
+                    except ValueError: pass
+            if args.arg4 is not None and args.percent is None:
+                try: args.percent = float(args.arg4)
+                except ValueError: pass
+        else:
+            branch1 = ""
+            branch2 = ""
+            if args.arg2 is not None:
+                if "." in str(args.arg2) and args.percent is None:
+                    try: args.percent = float(args.arg2)
+                    except ValueError: pass
+                else:
+                    try: args.books = int(args.arg2)
+                    except ValueError: pass
+            if args.arg3 is not None and args.percent is None:
                 try: args.percent = float(args.arg3)
                 except ValueError: pass
-            else:
-                try: args.books = int(args.arg3)
+    else:
+        # args.arg1 is a branch name
+        if args.same_branch or args.arg2 is None or _is_number(args.arg2):
+            # Single-branch mode: same branch for both Case A and Case B
+            branch1 = args.arg1
+            branch2 = args.arg1
+            if args.arg2 is not None and _is_number(args.arg2):
+                if "." in str(args.arg2) and args.percent is None:
+                    try: args.percent = float(args.arg2)
+                    except ValueError: pass
+                else:
+                    try: args.books = int(args.arg2)
+                    except ValueError: pass
+            if args.arg3 is not None and args.percent is None and _is_number(args.arg3):
+                try: args.percent = float(args.arg3)
                 except ValueError: pass
-        if args.arg4 is not None and args.percent is None:
-            try: args.percent = float(args.arg4)
-            except ValueError: pass
+        else:
+            # 2-branch mode: <branch1> <branch2> [books] [percent]
+            branch1 = args.arg1
+            branch2 = args.arg2
+            if args.arg3 is not None:
+                if "." in str(args.arg3) and args.percent is None:
+                    try: args.percent = float(args.arg3)
+                    except ValueError: pass
+                else:
+                    try: args.books = int(args.arg3)
+                    except ValueError: pass
+            if args.arg4 is not None and args.percent is None:
+                try: args.percent = float(args.arg4)
+                except ValueError: pass
 
     if cross_check_path:
         # Resolve source run directory
@@ -2136,6 +2309,7 @@ Examples:
             branch1=branch1,
             branch2=branch2,
             baseline_report=baseline_report,
+            same_branch=args.same_branch,
             num_books=args.books,
             percent=args.percent,
             mode=args.mode,

@@ -195,3 +195,151 @@ def test_runner_resolves_config_percent_and_mode(tmp_path: Path):
     assert runner_explicit.mode == "ideas"
     assert runner_explicit.timeout == 90
 
+
+def test_runner_same_branch_resolution(tmp_path: Path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+
+    # 1. No branches provided: defaults to active branch (e.g. master) for both
+    runner_no_branch = ABTestRunner(
+        repo_dir=str(repo_dir),
+        dry_run=True,
+    )
+    assert runner_no_branch.is_same_branch is True
+    assert runner_no_branch.branch1 == runner_no_branch.branch2
+    assert "cfgA_vs_cfgB" in runner_no_branch.session_dir.name
+
+    # 2. Single branch provided: sets branch2 equal to branch1
+    runner_single_branch = ABTestRunner(
+        branch1="feature-eval",
+        repo_dir=str(repo_dir),
+        dry_run=True,
+    )
+    assert runner_single_branch.is_same_branch is True
+    assert runner_single_branch.branch1 == "feature-eval"
+    assert runner_single_branch.branch2 == "feature-eval"
+    assert "feature-eval_cfgA_vs_cfgB" in runner_single_branch.session_dir.name
+
+    # 3. Explicit same_branch=True with different branch2 argument: forces same branch
+    runner_forced_same = ABTestRunner(
+        branch1="main",
+        branch2="other",
+        same_branch=True,
+        repo_dir=str(repo_dir),
+        dry_run=True,
+    )
+    assert runner_forced_same.is_same_branch is True
+    assert runner_forced_same.branch1 == "main"
+    assert runner_forced_same.branch2 == "main"
+
+    # 4. Two different branches: standard multi-branch mode
+    runner_two_branches = ABTestRunner(
+        branch1="main",
+        branch2="feature-x",
+        repo_dir=str(repo_dir),
+        dry_run=True,
+    )
+    assert runner_two_branches.is_same_branch is False
+    assert runner_two_branches.branch1 == "main"
+    assert runner_two_branches.branch2 == "feature-x"
+    assert "main_vs_feature-x" in runner_two_branches.session_dir.name
+
+
+def test_runner_same_branch_execute_flow_dry_run(tmp_path: Path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+
+    base_cfg = {"llm_model": "base-model", "verification": {"percent": 1.0}}
+    with open(repo_dir / "config.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(base_cfg, f)
+
+    overlay_b = {"llm_model": "model-b-custom"}
+    with open(repo_dir / "config-b.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(overlay_b, f)
+
+    out_dir = tmp_path / "ab_test_runs"
+    runner = ABTestRunner(
+        branch1="main",
+        repo_dir=str(repo_dir),
+        output_dir=str(out_dir),
+        dry_run=True,
+    )
+    session_dir = runner.execute_flow()
+    assert session_dir.is_dir()
+
+    # Check generated files
+    sum_json = session_dir / "comparison_summary.json"
+    sum_md = session_dir / "comparison_summary.md"
+    assert sum_json.is_file()
+    assert sum_md.is_file()
+
+    import json
+    with open(sum_json, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    assert data["is_same_branch"] is True
+    assert data["baseline"] == "main"
+    assert data["candidate"] == "main"
+
+    with open(sum_md, "r", encoding="utf-8") as f:
+        md_text = f.read()
+
+    assert "Same-Branch Config Comparison" in md_text
+    assert "Case A (Config A)" in md_text
+    assert "Case B (Config B)" in md_text
+
+
+def test_ab_test_cli_same_branch_invocations(tmp_path: Path):
+    import subprocess
+    script_path = Path(__file__).parent.parent / "scripts" / "ab_test.py"
+    repo_dir = Path(__file__).parent.parent
+
+    # Test 1: No branch argument
+    res = subprocess.run(
+        [sys.executable, str(script_path), "--dry-run", "--output-dir", str(tmp_path / "out1")],
+        cwd=str(repo_dir),
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0
+    assert "Same-Branch Configuration Comparison" in res.stdout
+    assert "CASE A" in res.stdout
+    assert "CASE B" in res.stdout
+
+    # Test 2: Single branch argument
+    res = subprocess.run(
+        [sys.executable, str(script_path), "master", "--dry-run", "--output-dir", str(tmp_path / "out2")],
+        cwd=str(repo_dir),
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0
+    assert "Same-Branch Configuration Comparison" in res.stdout
+    assert "Target Branch:" in res.stdout
+    assert "master" in res.stdout
+
+    # Test 3: Number of books without branch (e.g. '3 1.0')
+    res = subprocess.run(
+        [sys.executable, str(script_path), "3", "1.0", "--dry-run", "--output-dir", str(tmp_path / "out3")],
+        cwd=str(repo_dir),
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0
+    assert "Same-Branch Configuration Comparison" in res.stdout
+    assert "Target Books:" in res.stdout
+    assert "3" in res.stdout
+
+    # Test 4: --same-branch flag
+    res = subprocess.run(
+        [sys.executable, str(script_path), "--same-branch", "--dry-run", "--output-dir", str(tmp_path / "out4")],
+        cwd=str(repo_dir),
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0
+    assert "Same-Branch Configuration Comparison" in res.stdout
+
+

@@ -396,6 +396,14 @@ class ObsidianExporter:
         return self.output_dir
 
 
+_XML_INVALID_RE = re.compile(r"[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]")
+
+
+def _clean_xml_attr(val: Any) -> str:
+    s = json.dumps(val) if isinstance(val, (list, dict)) else str(val)
+    return _XML_INVALID_RE.sub("", s)
+
+
 class GraphMLExporter:
     """Exports graph in standard GraphML format for Gephi, Cytoscape Desktop, and yEd."""
 
@@ -407,15 +415,11 @@ class GraphMLExporter:
         # Ensure all attribute values are primitive strings/ints for GraphML writer
         g_copy = nx.DiGraph()
         for n, attrs in store.graph.nodes(data=True):
-            clean_attrs = {}
-            for k, v in attrs.items():
-                clean_attrs[k] = json.dumps(v) if isinstance(v, (list, dict)) else str(v)
+            clean_attrs = {k: _clean_xml_attr(v) for k, v in attrs.items()}
             g_copy.add_node(n, **clean_attrs)
 
         for u, v, attrs in store.graph.edges(data=True):
-            clean_attrs = {}
-            for k, val in attrs.items():
-                clean_attrs[k] = json.dumps(val) if isinstance(val, (list, dict)) else str(val)
+            clean_attrs = {k: _clean_xml_attr(val) for k, val in attrs.items()}
             g_copy.add_edge(u, v, **clean_attrs)
 
         nx.write_graphml(g_copy, str(self.output_path))
@@ -433,15 +437,11 @@ class GEXFExporter:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         g_copy = nx.DiGraph()
         for n, attrs in store.graph.nodes(data=True):
-            clean_attrs = {}
-            for k, v in attrs.items():
-                clean_attrs[k] = json.dumps(v) if isinstance(v, (list, dict)) else str(v)
+            clean_attrs = {k: _clean_xml_attr(v) for k, v in attrs.items()}
             g_copy.add_node(n, **clean_attrs)
 
         for u, v, attrs in store.graph.edges(data=True):
-            clean_attrs = {}
-            for k, val in attrs.items():
-                clean_attrs[k] = json.dumps(val) if isinstance(val, (list, dict)) else str(val)
+            clean_attrs = {k: _clean_xml_attr(val) for k, val in attrs.items()}
             g_copy.add_edge(u, v, **clean_attrs)
 
         nx.write_gexf(g_copy, str(self.output_path))

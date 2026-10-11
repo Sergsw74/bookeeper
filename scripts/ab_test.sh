@@ -3,22 +3,27 @@
 # Independent A/B Testing Runner for Bookeeper Branches & VS Mode
 #
 # Usage:
-#   # 1. Standard Branch vs Branch:
+#   # 1. Same-Branch Mode with 2 configs (No branch or single branch):
+#   ./ab_test.sh [num_books=5] [percent=1.0] [extra_args...]
+#   ./ab_test.sh <branch> [num_books=5] [percent=1.0] [extra_args...]
+#   ./ab_test.sh --same-branch [<branch>] [num_books=5] [percent=1.0] [extra_args...]
+#
+#   # 2. Standard Branch vs Branch:
 #   ./ab_test.sh <branch1> <branch2> [num_books=5] [percent=1.0] [extra_args...]
 #
-#   # 2. VS Mode (Existing Baseline Report vs Candidate Branch):
+#   # 3. VS Mode (Existing Baseline Report vs Candidate Branch):
 #   ./ab_test.sh vs <baseline_report_path> <branch2> [num_books=5] [percent=1.0] [extra_args...]
 #   ./ab_test.sh --vs <baseline_report_path> <branch2> [num_books=5] [percent=1.0] [extra_args...]
 #
-#   # 3. Re-verify Mode (Reuse Knowledge Graphs & Re-run Verification with New Percent):
+#   # 4. Re-verify Mode (Reuse Knowledge Graphs & Re-run Verification with New Percent):
 #   ./ab_test.sh reverify <path_to_abtest_result> [percent=5.0] [extra_args...]
 #   ./ab_test.sh --reverify <path_to_abtest_result> [percent=5.0] [extra_args...]
 #
-#   # 4. Config Customization (Auto-applied or explicit):
+#   # 5. Config Customization (Auto-applied or explicit):
 #   #   Places config-a.yaml and config-b.yaml in repo root to automatically overlay
-#   #   over config.yaml for Branch A and Branch B respectively.
+#   #   over config.yaml for Case A and Case B respectively.
 #   #   Or pass explicitly:
-#   ./ab_test.sh <branch1> <branch2> 5 1.0 --config-a ./custom-a.yaml --config-b ./custom-b.yaml
+#   ./ab_test.sh 5 1.0 --config-a ./custom-a.yaml --config-b ./custom-b.yaml
 # ==============================================================================
 
 set -euo pipefail
@@ -35,7 +40,7 @@ if [ ! -x "$PYTHON_EXEC" ]; then
     PYTHON_EXEC="$(command -v python3 || command -v python)"
 fi
 
-if [ $# -eq 0 ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     exec "$PYTHON_EXEC" "${SCRIPT_DIR}/ab_test.py" --help
 fi
 
@@ -89,24 +94,5 @@ if [ "${1:-}" = "vs" ] || [ "${1:-}" = "--vs" ]; then
     exec "$PYTHON_EXEC" "${SCRIPT_DIR}/ab_test.py" vs "$REPORT" "$BRANCH2" "${ARGS[@]}" "$@"
 fi
 
-# Standard 2-branch mode
-BRANCH1="${1:-}"
-BRANCH2="${2:-}"
-BOOKS="${3:-}"
-PERCENT="${4:-}"
-
-if [ -z "$BRANCH1" ] || [ -z "$BRANCH2" ]; then
-    echo "Usage: $0 <branch1> <branch2> [num_books] [percent] [extra_args...]"
-    echo "   or: $0 vs <baseline_report.json> <candidate_branch> [num_books] [percent] [extra_args...]"
-    exit 1
-fi
-
-shift 2
-if [ $# -ge 1 ]; then shift; fi
-if [ $# -ge 1 ]; then shift; fi
-
-ARGS=()
-if [ -n "$BOOKS" ]; then ARGS+=(--books "$BOOKS"); fi
-if [ -n "$PERCENT" ]; then ARGS+=(--percent "$PERCENT"); fi
-
-exec "$PYTHON_EXEC" "${SCRIPT_DIR}/ab_test.py" "$BRANCH1" "$BRANCH2" "${ARGS[@]}" "$@"
+# Standard 2-branch or same-branch mode: forward all arguments directly to ab_test.py
+exec "$PYTHON_EXEC" "${SCRIPT_DIR}/ab_test.py" "$@"

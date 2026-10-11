@@ -73,7 +73,12 @@ bookeeper/
 │       │   └── neo4j_exporter.py # Real-time Rich progress bar & Cypher MERGE upsert
 │       └── rag/              # Hybrid retrieval
 │           └── lightrag_engine.py # LightRAG wrapper with failover pool
-└── tests/                    # Pytest test suite (115+ unit & integration tests)
+├── archive_downloader/       # Standalone arXiv & scientific paper downloader
+│   ├── run.py                # Standalone CLI runner
+│   ├── pyproject.toml        # Subproject package specification
+│   ├── src/archive_downloader/ # Parser, indexer, downloader, and OPF generator
+│   └── tests/                # Unit & integration tests
+└── tests/                    # Pytest test suite (200+ unit & integration tests)
 ```
 
 ---
@@ -577,6 +582,31 @@ bookeeper config
 bookeeper list-books --limit 20
 bookeeper list-books --search "Redwall"
 ```
+
+---
+
+### 📥 Archive Downloader (arXiv Crawler)
+
+A standalone subproject located in `archive_downloader/` to crawl, index, and download papers and books from arXiv feeds (*e.g.* `https://arxiv.org/list/cs.AI/recent`) with pagination, deduplication, and Calibre `.opf` metadata:
+
+```bash
+# 1. Download up to 100 most recent articles into ./downloads:
+python archive_downloader/run.py download --limit 100
+
+# 2. Download into a custom directory:
+python archive_downloader/run.py download --limit 50 --output-dir ./arxiv_papers
+
+# 3. Only count and download new articles:
+python archive_downloader/run.py download --limit 20 --new-only
+
+# 4. View index status, categories, and disk usage:
+python archive_downloader/run.py status
+
+# 5. Inspect an arXiv URL and preview articles without downloading:
+python archive_downloader/run.py inspect --limit 10
+```
+
+See [`archive_downloader/README.md`](archive_downloader/README.md) for full documentation.
 
 ---
 

@@ -1,0 +1,10 @@
+# Ignore downloaded books and index files
+downloads/
+*.pdf
+*.epub
+*.opf
+*.mobi
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage

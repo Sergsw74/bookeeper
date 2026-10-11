@@ -4027,11 +4027,11 @@ def test_run_command(
     timeout: int = typer.Option(
         60, "--request-timeout", "--timeout", help="HTTP timeout in seconds for Ollama LLM requests (default: 60s)."
     ),
-    percent: float = typer.Option(
-        1.0, "--percent", "-p", help="Percentage of ideas to randomly verify (default: 1.0 for 1%)."
+    percent: Optional[float] = typer.Option(
+        None, "--percent", "-p", help="Percentage of ideas to randomly verify (default: from config.yaml or 1.0)."
     ),
-    mode: str = typer.Option(
-        "ideas", "--mode", "-m", help="Verification mode (default: 'ideas')."
+    mode: Optional[str] = typer.Option(
+        None, "--mode", "-m", help="Verification mode (default: from config.yaml or 'ideas')."
     ),
     model: Optional[str] = typer.Option(
         None, "--model", help="Optional override LLM model for build-graph."
@@ -4057,12 +4057,16 @@ def test_run_command(
         console.print("[bold red]book-cnt must be at least 1[/bold red]")
         raise typer.Exit(1)
 
+    eff_cfg = _get_effective_settings(config_path, calibre_path, model=model)
+    effective_percent = percent if percent is not None else (eff_cfg.verification.percent if eff_cfg.verification.percent is not None else 1.0)
+    effective_mode = mode or eff_cfg.verification.mode or "ideas"
+
     console.print(
         Panel.fit(
             f"[bold cyan]🧪 Test Run Pipeline Initiated[/bold cyan]\n"
             f"• Target Books: [bold green]{book_cnt}[/bold green] (from scratch)\n"
             f"• Build Parameters: [dim]--from-scratch --no-lightrag --clean-export --timeout {timeout}[/dim]\n"
-            f"• Verification: [bold green]{percent}%[/bold green] (mode: [cyan]{mode}[/cyan])",
+            f"• Verification: [bold green]{effective_percent}%[/bold green] (mode: [cyan]{effective_mode}[/cyan])",
             title="bookeeper test-run",
             border_style="cyan",
         )
@@ -4091,7 +4095,6 @@ def test_run_command(
             raise
 
     # Verify that Stage 1 successfully populated books in the knowledge graph
-    eff_cfg = _get_effective_settings(config_path, calibre_path, model=model)
     kg_file = eff_cfg.resolved_output_dir / "knowledge_graph.json"
     if kg_file.is_file():
         chk_store = ConceptGraphStore()
@@ -4106,13 +4109,13 @@ def test_run_command(
 
     # 2. Automatically Run Verification
     console.print(
-        f"\n[bold yellow]═══ Stage 2/2: Verifying Knowledge Graph Integrity ({percent}%, mode: {mode}) ═══[/bold yellow]\n"
+        f"\n[bold yellow]═══ Stage 2/2: Verifying Knowledge Graph Integrity ({effective_percent}%, mode: {effective_mode}) ═══[/bold yellow]\n"
     )
     try:
         verify_command(
             config_path=config_path,
-            percent=percent,
-            mode=mode,
+            percent=effective_percent,
+            mode=effective_mode,
             model=verifier_model,
         )
     except typer.Exit as e:

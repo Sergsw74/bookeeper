@@ -153,3 +153,45 @@ def test_prepare_branch_config_explicit_flags(tmp_path: Path):
     assert merged["base_key"] == "base_val"
     assert merged["shared"] == 10
     assert merged["extra_a"] is True
+
+
+def test_runner_resolves_config_percent_and_mode(tmp_path: Path):
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+
+    cfg = {
+        "request_timeout": 45,
+        "verification": {
+            "percent": 0.3,
+            "mode": "chunk",
+        },
+    }
+    with open(repo_dir / "config.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f)
+
+    # 1. When omitted, inherits 0.3%, 'chunk', 45s from config.yaml
+    runner_default = ABTestRunner(
+        branch1="main",
+        branch2="feat",
+        repo_dir=str(repo_dir),
+        dry_run=True,
+    )
+    assert runner_default.percent == 0.3
+    assert runner_default.mode == "chunk"
+    assert runner_default.timeout == 45
+
+    # 2. When overridden with explicit parameters, honors explicit parameters
+    runner_explicit = ABTestRunner(
+        branch1="main",
+        branch2="feat",
+        percent=2.5,
+        mode="ideas",
+        timeout=90,
+        repo_dir=str(repo_dir),
+        dry_run=True,
+    )
+    assert runner_explicit.percent == 2.5
+    assert runner_explicit.mode == "ideas"
+    assert runner_explicit.timeout == 90
+

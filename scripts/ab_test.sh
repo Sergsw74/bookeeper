@@ -57,42 +57,47 @@ fi
 if [ "${1:-}" = "reverify" ] || [ "${1:-}" = "--reverify" ]; then
     if [ $# -lt 2 ]; then
         echo "Error: In 'reverify' mode, specify path to previous A/B test run directory."
-        echo "Usage: $0 reverify <path_to_abtest_result> [percent=5.0] [extra_args...]"
+        echo "Usage: $0 reverify <path_to_abtest_result> [percent] [extra_args...]"
         exit 1
     fi
     RUN_PATH="$2"
-    PERCENT="${3:-5.0}"
+    PERCENT="${3:-}"
     shift 2
     if [ $# -ge 1 ]; then shift; fi
-    exec "$PYTHON_EXEC" "${SCRIPT_DIR}/ab_test.py" reverify "$RUN_PATH" --percent "$PERCENT" "$@"
+    ARGS=()
+    if [ -n "$PERCENT" ]; then ARGS+=(--percent "$PERCENT"); fi
+    exec "$PYTHON_EXEC" "${SCRIPT_DIR}/ab_test.py" reverify "$RUN_PATH" "${ARGS[@]}" "$@"
 fi
 
 # Check for VS mode keyword or flag
 if [ "${1:-}" = "vs" ] || [ "${1:-}" = "--vs" ]; then
     if [ $# -lt 3 ]; then
         echo "Error: In 'vs' mode, specify baseline report path and candidate branch."
-        echo "Usage: $0 vs <baseline_report.json> <candidate_branch> [num_books=5] [percent=1.0] [extra_args...]"
+        echo "Usage: $0 vs <baseline_report.json> <candidate_branch> [num_books] [percent] [extra_args...]"
         exit 1
     fi
     REPORT="$2"
     BRANCH2="$3"
-    BOOKS="${4:-5}"
-    PERCENT="${5:-1.0}"
+    BOOKS="${4:-}"
+    PERCENT="${5:-}"
     shift 3
     if [ $# -ge 1 ]; then shift; fi
     if [ $# -ge 1 ]; then shift; fi
-    exec "$PYTHON_EXEC" "${SCRIPT_DIR}/ab_test.py" vs "$REPORT" "$BRANCH2" --books "$BOOKS" --percent "$PERCENT" "$@"
+    ARGS=()
+    if [ -n "$BOOKS" ]; then ARGS+=(--books "$BOOKS"); fi
+    if [ -n "$PERCENT" ]; then ARGS+=(--percent "$PERCENT"); fi
+    exec "$PYTHON_EXEC" "${SCRIPT_DIR}/ab_test.py" vs "$REPORT" "$BRANCH2" "${ARGS[@]}" "$@"
 fi
 
 # Standard 2-branch mode
 BRANCH1="${1:-}"
 BRANCH2="${2:-}"
-BOOKS="${3:-5}"
-PERCENT="${4:-1.0}"
+BOOKS="${3:-}"
+PERCENT="${4:-}"
 
 if [ -z "$BRANCH1" ] || [ -z "$BRANCH2" ]; then
-    echo "Usage: $0 <branch1> <branch2> [num_books=5] [percent=1.0] [extra_args...]"
-    echo "   or: $0 vs <baseline_report.json> <candidate_branch> [num_books=5] [percent=1.0] [extra_args...]"
+    echo "Usage: $0 <branch1> <branch2> [num_books] [percent] [extra_args...]"
+    echo "   or: $0 vs <baseline_report.json> <candidate_branch> [num_books] [percent] [extra_args...]"
     exit 1
 fi
 
@@ -100,4 +105,8 @@ shift 2
 if [ $# -ge 1 ]; then shift; fi
 if [ $# -ge 1 ]; then shift; fi
 
-exec "$PYTHON_EXEC" "${SCRIPT_DIR}/ab_test.py" "$BRANCH1" "$BRANCH2" --books "$BOOKS" --percent "$PERCENT" "$@"
+ARGS=()
+if [ -n "$BOOKS" ]; then ARGS+=(--books "$BOOKS"); fi
+if [ -n "$PERCENT" ]; then ARGS+=(--percent "$PERCENT"); fi
+
+exec "$PYTHON_EXEC" "${SCRIPT_DIR}/ab_test.py" "$BRANCH1" "$BRANCH2" "${ARGS[@]}" "$@"

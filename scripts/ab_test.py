@@ -105,6 +105,39 @@ def log_header(msg: str) -> None:
 class ABTestRunner:
     """Manages git checkouts, test execution, archiving, and statistical comparison."""
 
+    @classmethod
+    def _resolve_config_defaults(
+        cls, base_config: Optional[Path], repo_dir: Path
+    ) -> Tuple[float, str, int]:
+        """Read verification.percent, verification.mode, and request_timeout from base config."""
+        cand = base_config if (base_config and base_config.is_file()) else None
+        if not cand:
+            for name in ("config.yaml", "config.yml", "config.yaml.example"):
+                p = repo_dir / name
+                if p.is_file():
+                    cand = p
+                    break
+        pct = 1.0
+        mode = "ideas"
+        timeout = 60
+        if cand and cand.is_file() and yaml is not None:
+            try:
+                with open(cand, "r", encoding="utf-8") as f:
+                    data = yaml.safe_load(f) or {}
+                ver_cfg = data.get("verification", {})
+                if isinstance(ver_cfg, dict):
+                    if "percent" in ver_cfg and ver_cfg["percent"] is not None:
+                        pct = float(ver_cfg["percent"])
+                    if "mode" in ver_cfg and ver_cfg["mode"]:
+                        mode = str(ver_cfg["mode"])
+                elif "percent" in data and data["percent"] is not None:
+                    pct = float(data["percent"])
+                if "request_timeout" in data and data["request_timeout"] is not None:
+                    timeout = int(data["request_timeout"])
+            except Exception:
+                pass
+        return pct, mode, timeout
+
     def __init__(
         self,
         branch1: str,
@@ -113,10 +146,10 @@ class ABTestRunner:
         reverify_src_dir: Optional[str] = None,
         cross_check_src_dir: Optional[str] = None,
         num_books: int = 5,
-        percent: float = 1.0,
+        percent: Optional[float] = None,
         blocks: int = 20,
-        mode: str = "ideas",
-        timeout: int = 60,
+        mode: Optional[str] = None,
+        timeout: Optional[int] = None,
         repo_dir: Optional[str] = None,
         output_dir: Optional[str] = None,
         extra_args: Optional[str] = None,
@@ -128,10 +161,10 @@ class ABTestRunner:
     ):
         self.branch2 = branch2
         self.num_books = num_books
-        self.percent = percent
+        self._raw_percent = percent
+        self._raw_mode = mode
+        self._raw_timeout = timeout
         self.blocks = blocks
-        self.mode = mode
-        self.timeout = timeout
         self.extra_args = extra_args or ""
         self.dry_run = dry_run
         self.print_chunks = print_chunks
@@ -207,6 +240,14 @@ class ABTestRunner:
             self.bookeeper_cmd = str(venv_bin)
         else:
             self.bookeeper_cmd = "bookeeper"
+
+        # Resolve config defaults from base config (config.yaml) if not explicitly set
+        cfg_percent, cfg_mode, cfg_timeout = self._resolve_config_defaults(
+            self.base_config_path, self.repo_dir
+        )
+        self.percent: float = self._raw_percent if self._raw_percent is not None else cfg_percent
+        self.mode: str = self._raw_mode or cfg_mode or "ideas"
+        self.timeout: int = self._raw_timeout if self._raw_timeout is not None else (cfg_timeout or 60)
 
         # Resolve archive directory
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -794,6 +835,10 @@ class ABTestRunner:
         branch_cfg = branch_dir / "config.yaml"
         if branch_cfg.is_file():
             cmd.extend(["--config", str(branch_cfg)])
+        elif self.base_config_path and self.base_config_path.is_file():
+            cmd.extend(["--config", str(self.base_config_path)])
+        elif (self.repo_dir / "config.yaml").is_file():
+            cmd.extend(["--config", str(self.repo_dir / "config.yaml")])
 
         if self.extra_args:
             cmd.extend(self.extra_args.split())
@@ -1003,6 +1048,10 @@ class ABTestRunner:
                     raise FileNotFoundError(
                         f"Missing knowledge_graph.json for {branch_lbl} at {kg}. Cannot verify without a knowledge graph."
                     )
+
+        # Prepare / refresh branch configurations in new_dir_a and new_dir_b
+        self.prepare_branch_config("A", new_dir_a)
+        self.prepare_branch_config("B", new_dir_b)
 
         # 2. Git handling
         self.initial_branch = self.get_current_branch()
@@ -1763,7 +1812,19 @@ Examples:
         "arg3",
         nargs="?",
         default=None,
-        help="Name of Branch B if 'vs <report> <branch2>' format is used, OR percent if 'reverify <run> [percent]' is used, OR blocks if 'cross-check <run> [blocks]' is used.",
+        help="Name of Branch B if 'vs <report> <branch2>' format is used, OR percent if 'reverify <run> [percent]' is used, OR blocks if 'cross-check <run> [blocks]' is used, OR books in 2-branch mode.",
+    )
+    parser.add_argument(
+        "arg4",
+        nargs="?",
+        default=None,
+        help="Optional 4th positional argument (e.g. books or percent).",
+    )
+    parser.add_argument(
+        "arg5",
+        nargs="?",
+        default=None,
+        help="Optional 5th positional argument (e.g. percent).",
     )
     parser.add_argument(
         "--vs",
@@ -1810,14 +1871,14 @@ Examples:
         "--percent",
         "-p",
         type=float,
-        default=1.0,
+        default=None,
         help="Percentage of ideas/chunks to verify (default: 1.0 for 1%%).",
     )
     parser.add_argument(
         "--mode",
         "-m",
         type=str,
-        default="ideas",
+        default=None,
         choices=["ideas", "chunking", "chunk", "cross-check"],
         help="Verification mode: 'ideas', 'chunking', 'chunk', or 'cross-check' (default: ideas).",
     )
@@ -1825,7 +1886,7 @@ Examples:
         "--timeout",
         "-t",
         type=int,
-        default=60,
+        default=None,
         help="Ollama request timeout in seconds (default: 60).",
     )
     parser.add_argument(
@@ -1905,7 +1966,7 @@ Examples:
             num_blocks = args.blocks
     elif args.reverify_path:
         reverify_path = args.reverify_path
-        if args.arg1 and not args.percent:
+        if args.arg1 is not None and args.percent is None:
             try:
                 args.percent = float(args.arg1)
             except ValueError:
@@ -1914,36 +1975,76 @@ Examples:
         if not args.arg2:
             parser.error("In 'reverify' mode, specify previous A/B test run directory: 'reverify <path_to_abtest_result> [percent]'")
         reverify_path = args.arg2
-        if args.arg3:
+        if args.arg3 is not None and args.percent is None:
             try:
                 args.percent = float(args.arg3)
             except ValueError:
                 parser.error(f"Invalid verification percentage: '{args.arg3}'")
     elif args.vs_report:
-        # Invoked with --vs <report> <branch2>
+        # Invoked with --vs <report> <branch2> [books] [percent]
         baseline_report = args.vs_report
         branch2 = args.arg1
         branch1 = f"Report ({Path(baseline_report).name})"
+        if args.arg2 is not None:
+            if "." in str(args.arg2) and args.percent is None:
+                try: args.percent = float(args.arg2)
+                except ValueError: pass
+            else:
+                try: args.books = int(args.arg2)
+                except ValueError: pass
+        if args.arg3 is not None and args.percent is None:
+            try: args.percent = float(args.arg3)
+            except ValueError: pass
     elif args.arg1.lower() == "vs":
-        # Invoked with: vs <report> <branch2>
+        # Invoked with: vs <report> <branch2> [books] [percent]
         if not args.arg2 or not args.arg3:
-            parser.error("In 'vs' mode, specify baseline report path and candidate branch: 'vs <report_path> <branch2>'")
+            parser.error("In 'vs' mode, specify baseline report path and candidate branch: 'vs <report_path> <branch2> [books] [percent]'")
         baseline_report = args.arg2
         branch2 = args.arg3
         branch1 = f"Report ({Path(baseline_report).name})"
+        if args.arg4 is not None:
+            if "." in str(args.arg4) and args.percent is None:
+                try: args.percent = float(args.arg4)
+                except ValueError: pass
+            else:
+                try: args.books = int(args.arg4)
+                except ValueError: pass
+        if args.arg5 is not None and args.percent is None:
+            try: args.percent = float(args.arg5)
+            except ValueError: pass
     elif os.path.isfile(os.path.expanduser(args.arg1)) or args.arg1.endswith(".json"):
-        # Invoked with: <report.json> <branch2>
+        # Invoked with: <report.json> <branch2> [books] [percent]
         if not args.arg2:
             parser.error("Specify candidate branch when providing baseline report: '<report_path> <branch2>'")
         baseline_report = args.arg1
         branch2 = args.arg2
         branch1 = f"Report ({Path(baseline_report).name})"
+        if args.arg3 is not None:
+            if "." in str(args.arg3) and args.percent is None:
+                try: args.percent = float(args.arg3)
+                except ValueError: pass
+            else:
+                try: args.books = int(args.arg3)
+                except ValueError: pass
+        if args.arg4 is not None and args.percent is None:
+            try: args.percent = float(args.arg4)
+            except ValueError: pass
     else:
-        # Standard: <branch1> <branch2>
+        # Standard: <branch1> <branch2> [books] [percent]
         if not args.arg2:
             parser.error("Specify both branches: '<branch1> <branch2>' (or use 'vs <report_path> <branch2>')")
         branch1 = args.arg1
         branch2 = args.arg2
+        if args.arg3 is not None:
+            if "." in str(args.arg3) and args.percent is None:
+                try: args.percent = float(args.arg3)
+                except ValueError: pass
+            else:
+                try: args.books = int(args.arg3)
+                except ValueError: pass
+        if args.arg4 is not None and args.percent is None:
+            try: args.percent = float(args.arg4)
+            except ValueError: pass
 
     if cross_check_path:
         # Resolve source run directory
@@ -1975,6 +2076,9 @@ Examples:
                 extra_args=args.extra_args,
                 dry_run=args.dry_run,
                 print_chunks=args.print_chunks,
+                base_config=args.base_config,
+                config_a=args.config_a,
+                config_b=args.config_b,
             )
             runner.cross_check_flow(dir_a, dir_b, num_blocks=num_blocks)
         except KeyboardInterrupt:
@@ -2012,6 +2116,9 @@ Examples:
                 output_dir=args.output_dir,
                 extra_args=args.extra_args,
                 dry_run=args.dry_run,
+                base_config=args.base_config,
+                config_a=args.config_a,
+                config_b=args.config_b,
             )
             runner.reverify_flow(dir_a, dir_b, is_base_a, is_base_b)
         except KeyboardInterrupt:

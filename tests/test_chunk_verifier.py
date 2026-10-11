@@ -179,7 +179,7 @@ def test_verify_chunks_execution(populated_chunk_store, mock_pool):
     """Test verify_chunks pipeline on graph store with mock NLI atomic assertions per-chunk evaluation."""
     from bookeeper.processing.qa_probe import AtomicAssertionItem, NLIAssertionEvaluation, NLISystemBlockMetrics
 
-    def mock_evaluate_claims(w_raw, ideas, pool, model_name, assertions=None, system_label="old"):
+    def mock_evaluate_claims(w_raw, ideas, pool, model_name, assertions=None, system_label="old", *args, **kwargs):
         if "Deliberate practice" in w_raw:
             a1 = AtomicAssertionItem(claim_id=1, assertion="Deliberate practice requires focused attention.", is_cross_boundary=False)
             a2 = AtomicAssertionItem(claim_id=2, assertion="Feedback loops provide constant iterative signals.", is_cross_boundary=True)
@@ -277,7 +277,7 @@ def test_cli_verify_chunk_mode(populated_chunk_store, tmp_path, mock_pool):
 
     out_file = tmp_path / "verification_report.json"
 
-    def mock_evaluate_claims(w_raw, ideas, pool, model_name, assertions=None, system_label="old"):
+    def mock_evaluate_claims(w_raw, ideas, pool, model_name, assertions=None, system_label="old", *args, **kwargs):
         a1 = AtomicAssertionItem(claim_id=1, assertion="Deliberate practice requires focused attention.", is_cross_boundary=False)
         e1 = NLIAssertionEvaluation(claim_id=1, assertion=a1.assertion, classification="SUPPORTED", score=1.0, verdict="PASS")
         m = NLISystemBlockMetrics(

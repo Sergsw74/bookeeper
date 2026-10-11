@@ -263,7 +263,7 @@ QASystemBlockMetrics = NLISystemBlockMetrics
 def format_ideas_for_context(ideas: List[Any]) -> str:
     """
     Format deduplicated Concept objects or dictionary ideas into structured Markdown blocks
-    including supporting quotes and detailed explanations.
+    including concept name, short description, full description, and supporting quotes.
     """
     if not ideas:
         return "(No knowledge claims extracted for this block)"
@@ -272,31 +272,33 @@ def format_ideas_for_context(ideas: List[Any]) -> str:
     for idx, idea in enumerate(ideas, 1):
         if isinstance(idea, Concept):
             name = idea.name or "Unnamed Concept"
-            explanation = (
-                getattr(idea, "detailed_explanation", "")
-                or getattr(idea, "brief_description", "")
-                or getattr(idea, "summary", "")
-                or ""
-            ).strip()
+            brief = (getattr(idea, "brief_description", "") or getattr(idea, "summary", "") or "").strip()
+            detailed = (getattr(idea, "detailed_explanation", "") or "").strip()
             quote = (getattr(idea, "supporting_quote", "") or getattr(idea, "quote", "") or "").strip()
         elif isinstance(idea, dict):
             name = idea.get("name") or "Unnamed Concept"
-            explanation = (
-                idea.get("detailed_explanation")
-                or idea.get("brief_description")
-                or idea.get("summary")
-                or ""
-            ).strip()
+            brief = (idea.get("brief_description") or idea.get("summary") or "").strip()
+            detailed = (idea.get("detailed_explanation") or "").strip()
             quote = (idea.get("supporting_quote") or idea.get("quote") or "").strip()
         else:
             name = str(idea).strip()
-            explanation = ""
+            brief = ""
+            detailed = ""
             quote = ""
 
-        block = f"[{idx}] Concept: {name}\n    Explanation: {explanation}"
+        block_lines = [f"[{idx}] Concept: {name}"]
+        if brief and detailed and brief != detailed:
+            block_lines.append(f"    Short Description: {brief}")
+            block_lines.append(f"    Explanation: {detailed}")
+        elif detailed:
+            block_lines.append(f"    Explanation: {detailed}")
+        elif brief:
+            block_lines.append(f"    Explanation: {brief}")
+        else:
+            block_lines.append("    Explanation: (No description provided)")
         if quote:
-            block += f'\n    Direct Context/Quote: "{quote}"'
-        formatted_blocks.append(block)
+            block_lines.append(f'    Direct Context/Quote: "{quote}"')
+        formatted_blocks.append("\n".join(block_lines))
 
     return "\n\n".join(formatted_blocks)
 
@@ -511,19 +513,33 @@ def generate_qa_probes(
 # ==============================================================================
 
 
-def build_nli_verifier_prompt(formatted_claims: str, assertion: str) -> str:
+def build_nli_verifier_prompt(
+    formatted_claims: str,
+    assertion: str,
+    question: Optional[str] = None,
+) -> str:
     """
     Construct prompt for Natural Language Inference entailment verification against knowledge base claims.
+    Supports either an assertion, a question, or a question + assertion pair.
     """
+    target_lines = []
+    if question and question.strip() and question.strip() != assertion.strip():
+        target_lines.append(f'Question: "{question.strip()}"')
+        target_lines.append(f'Target Assertion: "{assertion.strip()}"')
+    else:
+        target_lines.append(f'Target Assertion: "{assertion.strip()}"')
+
+    target_block = "\n".join(target_lines)
+
     return (
         "You are an objective Natural Language Inference (NLI) evaluator.\n"
-        "Given the Extracted Knowledge Base below, determine whether the Target Assertion is supported by the verified claims.\n\n"
+        "Given the Extracted Knowledge Base below, determine whether the Target Question / Assertion is supported by the verified claims.\n\n"
         f"Extracted Knowledge Base:\n\"\"\"\n{formatted_claims}\n\"\"\"\n\n"
-        f'Target Assertion: "{assertion}"\n\n'
+        f"Target to Verify:\n{target_block}\n\n"
         "Choose exactly ONE classification:\n"
-        "- SUPPORTED: The assertion's core facts and relationships are explicitly stated or logically entailed by the knowledge base.\n"
-        "- CONTRADICTED: The knowledge base explicitly states something that conflicts with the assertion.\n"
-        "- NOT_MENTIONED: The knowledge base lacks sufficient facts to verify whether the assertion is true.\n\n"
+        "- SUPPORTED: The question's answer or assertion's core facts and relationships are explicitly stated, explained, or logically entailed by the knowledge base.\n"
+        "- CONTRADICTED: The knowledge base explicitly states something that conflicts with or negates the question/assertion.\n"
+        "- NOT_MENTIONED: The knowledge base lacks sufficient facts or explanations to verify/answer the question/assertion.\n\n"
         "Return strictly valid JSON:\n"
         "{\n"
         '  "classification": "SUPPORTED" | "CONTRADICTED" | "NOT_MENTIONED",\n'
@@ -537,19 +553,20 @@ def verify_assertion_entailment(
     assertion: str,
     pool: OllamaPool,
     model_name: str,
+    question: Optional[str] = None,
 ) -> Tuple[Literal["SUPPORTED", "CONTRADICTED", "NOT_MENTIONED"], str]:
     """
-    Classify whether Target Assertion is SUPPORTED, CONTRADICTED, or NOT_MENTIONED
+    Classify whether Target Assertion/Question is SUPPORTED, CONTRADICTED, or NOT_MENTIONED
     by the extracted knowledge base context.
     Returns (classification, rationale).
     """
     if not claims_context.strip() or "(No knowledge claims extracted" in claims_context:
         return "NOT_MENTIONED", "Knowledge base contains no claims for this block."
 
-    if not assertion.strip():
-        return "NOT_MENTIONED", "Target assertion is empty."
+    if not assertion.strip() and not (question and question.strip()):
+        return "NOT_MENTIONED", "Target assertion and question are empty."
 
-    prompt = build_nli_verifier_prompt(claims_context, assertion)
+    prompt = build_nli_verifier_prompt(claims_context, assertion, question=question)
 
     try:
         raw_text, _ = pool.generate(model_name, prompt, temperature=0.0)
@@ -586,6 +603,111 @@ def verify_assertion_entailment(
     except Exception as exc:
         logger.warning(f"NLI classification failed for assertion '{assertion[:40]}': {exc}")
         return "NOT_MENTIONED", f"Evaluation error: {exc}"
+
+
+def generate_chunk_probes(
+    chunk_text: str,
+    pool: OllamaPool,
+    model_name: str,
+    num_probes: int = 1,
+) -> List[AtomicAssertionItem]:
+    """
+    Formulate question-assertion probe(s) for a selected chunk using the Oracle model
+    to test whether the chunk's core idea, event, or mechanism was captured.
+    """
+    prompt = (
+        "You are an expert NLP benchmark auditor evaluating knowledge graph extraction quality.\n"
+        f"Analyze the text chunk below and formulate exactly {num_probes} clear, specific question(s) "
+        "that test whether the core conceptual idea, key event, mechanism, or principle described in this chunk "
+        "has been captured and preserved.\n\n"
+        "CONSTRAINTS:\n"
+        "1. Focus on the PRIMARY concept or substantive factual relationship described in the chunk.\n"
+        "2. Formulate a specific question that tests this core knowledge in natural language.\n"
+        "3. Provide the factual declarative statement (assertion) that directly answers the question.\n"
+        "4. Include a direct verbatim quote from the chunk supporting the answer.\n\n"
+        f"Chunk Text:\n\"\"\"\n{chunk_text[:5000]}\n\"\"\"\n\n"
+        "Return strictly valid JSON:\n"
+        "[\n"
+        "  {\n"
+        '    "question_id": 1,\n'
+        '    "question": "<specific factual question testing the chunk\'s core concept>",\n'
+        '    "assertion": "<concise declarative factual statement answering the question>",\n'
+        '    "source_quote": "<verbatim sentence from chunk text>"\n'
+        "  }\n"
+        "]\n"
+    )
+
+    try:
+        raw_text, _ = pool.generate(model_name, prompt, temperature=0.0)
+        items = parse_json_array_safely(raw_text)
+
+        probes: List[AtomicAssertionItem] = []
+        for idx, item in enumerate(items, 1):
+            if not isinstance(item, dict):
+                continue
+            qid = item.get("question_id", item.get("claim_id", idx))
+            try:
+                qid = int(qid)
+            except (ValueError, TypeError):
+                qid = idx
+
+            question_text = str(item.get("question") or "").strip()
+            assertion_text = str(item.get("assertion") or item.get("claim") or question_text).strip()
+            if not question_text and assertion_text:
+                question_text = f"Is the following fact verified: {assertion_text}"
+
+            source_quote = str(item.get("source_quote") or item.get("gold_answer") or "").strip()
+            if not source_quote:
+                refs = item.get("source_sentence_references", [])
+                if isinstance(refs, list) and refs:
+                    source_quote = str(refs[0]).strip()
+                elif isinstance(refs, str) and refs.strip():
+                    source_quote = refs.strip()
+
+            if question_text or assertion_text:
+                probes.append(
+                    AtomicAssertionItem(
+                        claim_id=qid,
+                        question_id=qid,
+                        question=question_text or assertion_text,
+                        assertion=assertion_text or question_text,
+                        source_quote=source_quote,
+                        is_cross_boundary=False,
+                    )
+                )
+
+        if probes:
+            return probes
+    except Exception as exc:
+        logger.warning(f"Chunk probe generation failed: {exc}")
+
+    # Deterministic fallback extracting key sentence from chunk
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", chunk_text) if len(s.strip()) > 15]
+    if sentences:
+        s0 = sentences[0]
+        words = [w for w in re.findall(r"[A-Z][a-z]+|\b\w{4,}\b", s0) if w.lower() not in ("what", "that", "this", "there", "they", "then", "with", "from")]
+        anchor = words[0] if words else "the core concept"
+        return [
+            AtomicAssertionItem(
+                claim_id=1,
+                question_id=1,
+                question=f"What key fact or principle is established regarding {anchor}?",
+                assertion=s0,
+                source_quote=s0,
+                is_cross_boundary=False,
+            )
+        ]
+
+    return [
+        AtomicAssertionItem(
+            claim_id=1,
+            question_id=1,
+            question="What is the central concept discussed in this chunk?",
+            assertion=chunk_text[:150],
+            source_quote=chunk_text[:150],
+            is_cross_boundary=False,
+        )
+    ]
 
 
 # Legacy helper functions preserved for backward compatibility
@@ -665,21 +787,27 @@ def evaluate_claims_atomic_assertions(
     model_name: str,
     assertions: Optional[List[AtomicAssertionItem]] = None,
     system_label: Literal["old", "new"] = "old",
+    num_probes: int = 1,
+    is_chunk_mode: bool = False,
 ) -> Tuple[List[AtomicAssertionItem], NLISystemBlockMetrics]:
     """
-    Evaluate NLI entailment of atomic assertions for W_raw against a single claims knowledge base.
+    Evaluate NLI entailment of atomic assertions/questions for W_raw against a single claims knowledge base.
     Returns:
       (assertions, system_metrics)
     """
     if assertions is None:
-        assertions = generate_atomic_assertions(w_raw, pool, model_name)
+        if is_chunk_mode:
+            assertions = generate_chunk_probes(w_raw, pool, model_name, num_probes=num_probes)
+        else:
+            assertions = generate_atomic_assertions(w_raw, pool, model_name)
 
     claims = format_ideas_as_claims(ideas)
     evals: List[NLIAssertionEvaluation] = []
 
     for a in assertions:
-        prompt = build_nli_verifier_prompt(claims, a.assertion)
-        cls, rat = verify_assertion_entailment(claims, a.assertion, pool, model_name)
+        q_text = getattr(a, "question", None) or a.assertion
+        prompt = build_nli_verifier_prompt(claims, a.assertion, question=q_text)
+        cls, rat = verify_assertion_entailment(claims, a.assertion, pool, model_name, question=q_text)
         verdict: Literal["PASS", "FAIL"] = "PASS" if cls == "SUPPORTED" else "FAIL"
 
         evals.append(
@@ -693,7 +821,7 @@ def evaluate_claims_atomic_assertions(
                 verifier_prompt=prompt,
                 # compatibility
                 question_id=a.claim_id,
-                question=a.assertion,
+                question=q_text,
                 gold_answer=a.source_quote or a.assertion,
                 is_cross_sentence=a.is_cross_boundary,
                 predicted_answer=cls,

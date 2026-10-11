@@ -481,7 +481,11 @@ def get_ideas_for_chunks(graph_store: ConceptGraphStore, chunk_node_ids: List[st
     for cid in chunk_node_ids:
         nid = cid if str(cid).startswith("chunk:") else f"chunk:{cid}"
         if not graph_store.graph.has_node(nid):
-            continue
+            nid_alt = cid.replace("chunk:", "") if str(cid).startswith("chunk:") else cid
+            if graph_store.graph.has_node(nid_alt):
+                nid = nid_alt
+            else:
+                continue
 
         # Look in predecessors and successors for Concept nodes
         for neighbor in list(graph_store.graph.neighbors(nid)) + list(graph_store.graph.predecessors(nid)):
@@ -495,22 +499,19 @@ def get_ideas_for_chunks(graph_store: ConceptGraphStore, chunk_node_ids: List[st
                     edge_rev = graph_store.graph.get_edge_data(neighbor, nid) or {}
                     edge_attrs = {**edge_rev, **edge_fwd}
 
-                    brief = (
-                        cattrs.get("brief_description")
-                        or edge_attrs.get("brief_description")
-                        or cattrs.get("summary")
-                        or edge_attrs.get("summary")
-                        or ""
-                    )
-                    detailed = (
-                        cattrs.get("detailed_explanation")
-                        or edge_attrs.get("detailed_explanation")
-                        or ""
-                    )
+                    # Chunk-specific edge descriptions are most specific to this chunk; fallback to concept node
+                    edge_brief = str(edge_attrs.get("brief_description") or edge_attrs.get("summary") or "").strip()
+                    node_brief = str(cattrs.get("brief_description") or cattrs.get("summary") or "").strip()
+                    brief = edge_brief or node_brief
+
+                    edge_detailed = str(edge_attrs.get("detailed_explanation") or "").strip()
+                    node_detailed = str(cattrs.get("detailed_explanation") or "").strip()
+                    detailed = edge_detailed or node_detailed
+
                     quote = (
-                        cattrs.get("supporting_quote")
-                        or edge_attrs.get("quote")
+                        edge_attrs.get("quote")
                         or edge_attrs.get("supporting_quote")
+                        or cattrs.get("supporting_quote")
                         or None
                     )
                     category = cattrs.get("category") or edge_attrs.get("category") or "Idea"

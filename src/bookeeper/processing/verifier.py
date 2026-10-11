@@ -28,6 +28,7 @@ from bookeeper.processing.cross_checker import (
     CrossCheckReport,
     CrossCheckSummary,
     SystemBlockMetrics,
+    get_ideas_for_chunks,
     run_cross_check,
 )
 from bookeeper.processing.extractor import Concept
@@ -40,6 +41,7 @@ from bookeeper.processing.qa_probe import (
     evaluate_claims_atomic_assertions,
     format_ideas_for_context,
     generate_atomic_assertions,
+    generate_chunk_probes,
     verify_assertion_entailment,
 )
 
@@ -1450,18 +1452,16 @@ def verify_chunks(
     concurrency: int = 3,
     timeout: int = 300,
     progress_callback: Optional[Callable[..., None]] = None,
+    num_probes_per_chunk: int = 1,
 ) -> ChunkVerificationReport:
     """
     Verify Knowledge Graph idea extraction quality by auditing sampled chunks against an Oracle model.
     1. Randomly samples `percent`% of chunks from knowledge_graph.json / chunk_store.
-    2. Runs Oracle idea extraction on each chunk's text using the verifier model.
-    3. Retrieves original run ideas for that chunk from knowledge graph edges.
-    4. Uses EntityDeduplicator to match Oracle ideas against original ideas.
-    5. Computes Success Rate (matched ideas vs Oracle) and Fail Rate (missed ideas vs original ideas).
+    2. Uses Oracle model to formulate benchmark question(s) for the selected chunk in ternary answer format.
+    3. Retrieves ideas extracted from that chunk with complete metadata (short description, full description, quotes).
+    4. Evaluates NLI entailment in ternary format: SUPPORTED (+1.0), NOT_MENTIONED (-0.25), CONTRADICTED (-1.0).
+    5. Computes QA Recall, Net Semantic Integrity, Calibrated Fidelity, and Seam Integrity per chunk and roll-up.
     """
-    from bookeeper.processing.deduplicator import EntityDeduplicator
-    from bookeeper.processing.extractor import Concept, KnowledgeExtractor
-
     start_time = time.time()
 
     all_chunk_nodes = [
@@ -1544,52 +1544,21 @@ def verify_chunks(
         cid, text, bid, btitle, stitle = chunk_item
         t_start = time.time()
 
-        # 1. Retrieve Original Ideas from Knowledge Graph
-        orig_concepts: List[Concept] = []
-        seen_orig_names = set()
+        # 1. Retrieve Original Ideas extracted from this chunk with complete metadata (short & full descriptions, quotes)
+        orig_concepts = get_ideas_for_chunks(store, [cid])
 
-        # Incoming edges: (:Concept) -[:SUPPORTED_BY]-> (:Chunk)
-        for src, _, edata in store.graph.in_edges(cid, data=True):
-            if edata.get("relation") == "SUPPORTED_BY" and store.graph.nodes[src].get("type") == "Concept":
-                cnode = store.graph.nodes[src]
-                cname = cnode.get("name", src.replace("concept:", ""))
-                if cname not in seen_orig_names:
-                    seen_orig_names.add(cname)
-                    orig_concepts.append(
-                        Concept(
-                            name=cname,
-                            category=cnode.get("category", "Concept"),
-                            brief_description=cnode.get("brief_description", "") or cnode.get("summary", ""),
-                            detailed_explanation=cnode.get("detailed_explanation", ""),
-                        )
-                    )
-
-        # Outgoing edges: (:Chunk) -[:SUPPORTS_IDEA]-> (:Concept)
-        for _, tgt, edata in store.graph.out_edges(cid, data=True):
-            if edata.get("relation") == "SUPPORTS_IDEA" and store.graph.nodes[tgt].get("type") == "Concept":
-                cnode = store.graph.nodes[tgt]
-                cname = cnode.get("name", tgt.replace("concept:", ""))
-                if cname not in seen_orig_names:
-                    seen_orig_names.add(cname)
-                    orig_concepts.append(
-                        Concept(
-                            name=cname,
-                            category=cnode.get("category", "Concept"),
-                            brief_description=cnode.get("brief_description", "") or cnode.get("summary", ""),
-                            detailed_explanation=cnode.get("detailed_explanation", ""),
-                        )
-                    )
-
-        # 2. Extract Atomic Assertions & Evaluate NLI Entailment against Chunk's Knowledge Base Claims
+        # 2. Formulate Question for Selected Chunk & Evaluate Entailment in Ternary Answer Format
         try:
             assertions, metrics = evaluate_claims_atomic_assertions(
                 w_raw=text,
                 ideas=orig_concepts,
                 pool=pool,
                 model_name=model_name,
+                num_probes=num_probes_per_chunk,
+                is_chunk_mode=True,
             )
         except Exception as exc:
-            logger.warning(f"Atomic assertion NLI audit failed for chunk '{cid}': {exc}")
+            logger.warning(f"Chunk question NLI audit failed for chunk '{cid}': {exc}")
             assertions = []
             metrics = None
 
@@ -1597,13 +1566,13 @@ def verify_chunks(
 
         if metrics is not None:
             missed_assertions = [
-                e.assertion
+                getattr(e, "question", None) or e.assertion
                 for e in metrics.evaluations
                 if e.classification in ("NOT_MENTIONED", "AGAINST", "CONTRADICTED")
             ]
             matched_assertions = [
                 ChunkMatchedPair(
-                    oracle_idea_name=e.assertion,
+                    oracle_idea_name=getattr(e, "question", None) or e.assertion,
                     original_idea_name="Claims Context",
                     similarity_score=1.0 if e.classification == "SUPPORTED" else 0.0,
                     match_method="nli_entailment",
@@ -1621,7 +1590,7 @@ def verify_chunks(
                 section_title=stitle,
                 chunk_text_snippet=text[:150],
                 original_ideas=[c.name for c in orig_concepts],
-                oracle_ideas=[a.assertion for a in assertions],
+                oracle_ideas=[getattr(a, "question", None) or a.assertion for a in assertions],
                 probes=assertions,
                 assertions=assertions,
                 evaluations=metrics.evaluations,

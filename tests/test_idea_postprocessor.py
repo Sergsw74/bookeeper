@@ -240,7 +240,7 @@ def test_dual_pass_branching_and_graph_update(mock_graph_store):
         weight=8,
     )
 
-    mock_pool.execute_with_failover.return_value = (synthesized_output, "http://localhost:11434")
+    mock_pool.execute_with_failover.return_value = synthesized_output
 
     postprocessor = IdeaPostProcessor(
         pool=mock_pool,

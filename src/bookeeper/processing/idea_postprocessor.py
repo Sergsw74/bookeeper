@@ -634,11 +634,14 @@ class IdeaPostProcessor:
                 raise RuntimeError(f"Could not synthesize idea on {url}")
 
             try:
-                result, node_url = self.pool.execute_with_failover(
+                input_chars = len(system_prompt) + len(user_prompt)
+                result = self.pool.execute_with_failover(
                     _invoke_fn,
-                    task_name=f"dual_pass:{cluster.canonical_name}",
+                    retries=self.retries,
+                    model_name=self.model_name,
+                    capability="llm",
+                    input_chars=input_chars,
                     task_type="llm",
-                    max_retries=self.retries,
                 )
                 return result
             except Exception as e:

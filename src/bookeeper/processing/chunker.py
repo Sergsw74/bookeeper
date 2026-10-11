@@ -16,6 +16,7 @@ from langchain_core.embeddings import Embeddings
 from pydantic import BaseModel, Field
 
 from bookeeper.calibre.parser import Section
+from bookeeper.processing.rolling_semantic_chunker import RollingWindowSemanticChunker
 
 logger = logging.getLogger(__name__)
 
@@ -105,15 +106,23 @@ class HierarchicalChunker:
         self._semantic_splitter = None
         if self.embeddings is not None:
             try:
-                from langchain_experimental.text_splitter import SemanticChunker
-
-                self._semantic_splitter = SemanticChunker(
-                    embeddings=self.embeddings,
-                    breakpoint_threshold_type=self.breakpoint_threshold_type,
-                    breakpoint_threshold_amount=self.breakpoint_threshold_amount,
+                self._semantic_splitter = RollingWindowSemanticChunker(
+                    embedding_model=self.embeddings,
+                    similarity_threshold=0.65,
+                    max_chunk_tokens=max(100, int(self.max_chunk_chars / 4)),
+                    min_chunk_tokens=max(25, int(self.min_chunk_chars / 4)),
                 )
             except Exception as e:
-                logger.warning(f"Could not initialize SemanticChunker with embeddings: {e}")
+                try:
+                    from langchain_experimental.text_splitter import SemanticChunker
+
+                    self._semantic_splitter = SemanticChunker(
+                        embeddings=self.embeddings,
+                        breakpoint_threshold_type=self.breakpoint_threshold_type,
+                        breakpoint_threshold_amount=self.breakpoint_threshold_amount,
+                    )
+                except Exception as ex:
+                    logger.warning(f"Could not initialize semantic splitter with embeddings: {e} / {ex}")
 
     @property
     def embedding_stats(self) -> dict:

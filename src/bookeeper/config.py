@@ -323,7 +323,7 @@ class VerificationConfig(BaseModel):
         description="Failover cooldown duration in seconds for verification tasks (default: 60s).",
     )
     debug: bool = Field(
-        default=True,
+        default=False,
         description="Whether to generate detailed debug JSON output with raw prompts and responses.",
     )
     debug_output: Optional[str] = Field(

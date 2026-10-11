@@ -3083,7 +3083,7 @@ def _execute_single_verification(
             embedding_model=embedding_model,
             embedding_url=embedding_url,
         )
-    effective_debug = debug if debug is not None else getattr(cfg.verification, "debug", True)
+    effective_debug = debug if debug is not None else getattr(cfg.verification, "debug", False)
     effective_cooldown = cooldown if cooldown is not None else cfg.resolved_verification_cooldown_seconds
     effective_mode = (mode or cfg.verification.mode).strip().lower()
 
@@ -4296,7 +4296,7 @@ def verify_command(
     debug: Optional[bool] = typer.Option(
         None,
         "--debug/--no-debug",
-        help="Generate detailed debug JSON with raw prompts, questions, sentences, and responses (default: True).",
+        help="Generate detailed debug JSON with raw prompts, questions, sentences, and responses (default: False).",
     ),
     debug_output: Optional[str] = typer.Option(
         None,

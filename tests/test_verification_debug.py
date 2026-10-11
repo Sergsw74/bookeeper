@@ -311,6 +311,7 @@ def test_cli_verify_saves_stats_and_debug_files(tmp_path):
                 "chunk",
                 "--percent",
                 "100.0",
+                "--debug",
                 "--output",
                 str(out_report),
                 "--stats-output",
@@ -335,6 +336,88 @@ def test_cli_verify_saves_stats_and_debug_files(tmp_path):
     assert "sentences" in debug_content["debug_items"][0]
     assert "ideas_context" in debug_content["debug_items"][0]
     assert "question_generation" in debug_content["debug_items"][0]
+
+
+def test_cli_verify_debug_disabled_by_default(tmp_path):
+    """Test that bookeeper verify does not generate debug JSON when --debug is not specified."""
+    kg_file = tmp_path / "knowledge_graph.json"
+    dummy_kg = {
+        "nodes": [
+            {"id": "book:1", "type": "Book", "title": "Test Book", "author": "Author"},
+            {"id": "c1", "type": "Chunk", "book_id": 1, "text": "Deliberate practice is key. Regular feedback helps."},
+            {
+                "id": "idea:1",
+                "type": "Concept",
+                "name": "Deliberate Practice",
+                "chunk_ids": ["c1"],
+                "brief_description": "Deliberate practice",
+                "detailed_explanation": "Detailed explanation of deliberate practice.",
+            },
+        ],
+        "edges": [{"source": "idea:1", "target": "c1", "type": "EXTRACTED_FROM"}],
+    }
+    kg_file.write_text(json.dumps(dummy_kg), encoding="utf-8")
+
+    out_report = tmp_path / "custom_report.json"
+    out_stats = tmp_path / "custom_stats.json"
+    out_debug = tmp_path / "custom_debug.json"
+
+    def mock_eval_claims(probe_oracle, verifier_pool, claims, probes, chunk_text, **kwargs):
+        a = AtomicAssertionItem(
+            claim_id=1,
+            question="What is key?",
+            assertion="Deliberate practice is key.",
+            source_quote="Deliberate practice is key.",
+        )
+        e = NLIAssertionEvaluation(
+            claim_id=1,
+            question="What is key?",
+            assertion=a.assertion,
+            classification="SUPPORTED",
+            score=1.0,
+            verdict="PASS",
+            rationale="Supported",
+        )
+        m = NLISystemBlockMetrics(
+            system="old",
+            total_probes=1,
+            passed_probes=1,
+            failed_probes=0,
+            qa_recall=1.0,
+            evaluations=[e],
+            supported_count=1,
+            net_integrity_score=1.0,
+            calibrated_fidelity=1.0,
+        )
+        return [a], m
+
+    runner = CliRunner()
+    with patch("bookeeper.cli.IdeaVerifier.warmup", return_value=True), \
+         patch("bookeeper.processing.verifier.evaluate_claims_atomic_assertions", side_effect=mock_eval_claims):
+        res = runner.invoke(
+            app,
+            [
+                "verify",
+                "--graph-file",
+                str(kg_file),
+                "--mode",
+                "chunk",
+                "--percent",
+                "100.0",
+                "--output",
+                str(out_report),
+                "--stats-output",
+                str(out_stats),
+                "--debug-output",
+                str(out_debug),
+            ],
+        )
+
+    assert res.exit_code == 0
+    assert out_report.is_file()
+    assert out_stats.is_file()
+    # Debug file should NOT be created because debug is disabled by default
+    assert not out_debug.is_file()
 
 
 def test_ab_test_compare_consumes_verification_stats(tmp_path):

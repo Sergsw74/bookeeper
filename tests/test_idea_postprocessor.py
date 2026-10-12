@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+from rich.console import Console
 from typer.testing import CliRunner
 
 from bookeeper.cli import app
@@ -480,4 +481,52 @@ def test_process_graph_header_and_periodic_stats():
     assert report.single_occurrence_clusters_count == 3
     assert report.synthesized_count == 12
     assert len(progress_events) == 15
+
+
+def test_process_graph_loading_progress():
+    """Verify that process_graph outputs progress during concept scanning, embeddings, and clustering."""
+    store = ConceptGraphStore()
+    chk = HierarchicalChunk(
+        chunk_id="c1",
+        chunk_idx=1,
+        book_id=1,
+        book_title="Book",
+        chapter_idx=1,
+        chapter_title="Ch1",
+        section_title="Sec1",
+        breadcrumb="Book > Ch1",
+        text="Sample text",
+        char_count=20,
+        word_count=4,
+    )
+    store.add_chunk(chk)
+    store.add_idea_support_link(
+        concept_name="CQRS Architecture",
+        chunk=chk,
+        quote="Quote CQRS",
+        brief_description="Command query responsibility segregation",
+    )
+    store.add_idea_support_link(
+        concept_name="Event Sourcing",
+        chunk=chk,
+        quote="Quote Event Sourcing",
+        brief_description="Storing domain events",
+    )
+
+    test_console = Console(record=True, width=120)
+    pp = IdeaPostProcessor(
+        pool=None,
+        embeddings=MockEmbeddings(),
+        similarity_threshold=0.92,
+        min_occurrences=1,
+    )
+
+    report = pp.process_graph(store, console=test_console)
+    output_text = test_console.export_text()
+
+    # Verify loading stage outputs
+    assert "Collected 2 normalized idea clusters" in output_text
+    assert "Generated semantic embeddings for 2 clusters" in output_text
+    assert "Cosine similarity clustering complete" in output_text
+    assert report.total_clusters == 2
 

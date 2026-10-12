@@ -4708,7 +4708,9 @@ def postprocess_ideas_command(
     )
 
     store = ConceptGraphStore()
-    store.load(target_graph)
+    with console.status(f"[bold cyan]Loading Knowledge Graph from {target_graph.name}...[/bold cyan]", spinner="dots"):
+        store.load(target_graph)
+    console.print(f"[bold green]✓[/bold green] [dim]Loaded Knowledge Graph: {len(store.graph.nodes)} nodes, {len(store.graph.edges)} edges[/dim]")
 
     postprocessor = IdeaPostProcessor.from_settings(
         cfg,

@@ -35,6 +35,7 @@ from rich.progress import (
     SpinnerColumn,
     TaskProgressColumn,
     TextColumn,
+    TimeElapsedColumn,
 )
 from rich.text import Text
 
@@ -353,114 +354,135 @@ class IdeaPostProcessor:
     # --------------------------------------------------------------------------
 
     def collect_observations_from_graph(
-        self, store: ConceptGraphStore
+        self,
+        store: ConceptGraphStore,
+        console: Optional[Console] = None,
     ) -> Dict[str, IdeaCluster]:
         """
         Step 1a: Collect all idea objects from the graph, normalize names, and group
         ideas sharing an identical normalized name into the same cluster.
         """
+        status = None
+        if console is not None:
+            status = console.status(
+                "[bold cyan]Scanning Knowledge Graph & normalizing idea mentions...[/bold cyan]",
+                spinner="dots",
+            )
+            status.start()
+
         clusters_by_norm: Dict[str, IdeaCluster] = {}
-
-        # 1. Inspect all Concept nodes
-        for node_id, attrs in store.graph.nodes(data=True):
-            if attrs.get("type") != "Concept" and not attrs.get("is_idea"):
-                continue
-
-            raw_name = attrs.get("name") or node_id.replace("concept:", "")
-            norm_name = normalize_idea_name(raw_name)
-            if not norm_name:
-                continue
-
-            brief = attrs.get("brief_description") or attrs.get("summary") or ""
-            detailed = attrs.get("detailed_explanation") or attrs.get("summary") or ""
-            cat = attrs.get("category") or "Idea"
-            weight = int(attrs.get("weight") or 5)
-            clean_cand = clean_canonical_name(raw_name)
-
-            if norm_name not in clusters_by_norm:
-                clusters_by_norm[norm_name] = IdeaCluster(
-                    canonical_name=clean_cand,
-                    normalized_name=norm_name,
-                    category=cat,
-                    max_weight=weight,
-                )
-
-            cluster = clusters_by_norm[norm_name]
-            cluster.aliases.add(raw_name)
-            if clean_cand:
-                cluster.aliases.add(clean_cand)
-
-            # Update canonical name if current has leading determiner or candidate is better capitalized
-            if bool(re.match(r"^(?:the|a|an)\s+", cluster.canonical_name, re.IGNORECASE)):
-                cluster.canonical_name = clean_cand
-            elif len(clean_cand) > len(cluster.canonical_name) and not clean_cand.islower():
-                cluster.canonical_name = clean_cand
-
-            # 2. Gather edges connecting this concept to Chunks
-            # SUPPORTED_BY edges (Concept -> Chunk)
-            chunk_edges = []
-            for _, target, edge_data in store.graph.out_edges(node_id, data=True):
-                if edge_data.get("relation") == "SUPPORTED_BY":
-                    chunk_edges.append((target, edge_data))
-
-            # SUPPORTS_IDEA edges (Chunk -> Concept)
-            for source, _, edge_data in store.graph.in_edges(node_id, data=True):
-                if edge_data.get("relation") == "SUPPORTS_IDEA":
-                    chunk_edges.append((source, edge_data))
-
-            seen_chunk_ids_for_node: Set[str] = set()
-
-            for chunk_nid, edge_data in chunk_edges:
-                chunk_node = store.graph.nodes.get(chunk_nid, {})
-                chunk_id = str(chunk_node.get("chunk_id") or edge_data.get("chunk_id") or chunk_nid.replace("chunk:", ""))
-                if chunk_id in seen_chunk_ids_for_node:
+        try:
+            # 1. Inspect all Concept nodes
+            for node_id, attrs in store.graph.nodes(data=True):
+                if attrs.get("type") != "Concept" and not attrs.get("is_idea"):
                     continue
-                seen_chunk_ids_for_node.add(chunk_id)
 
-                b_id = int(chunk_node.get("book_id") or 0)
-                ch_idx = int(chunk_node.get("chapter_idx") or 0)
-                c_idx = int(chunk_node.get("chunk_idx") or 0)
-                pos = (
-                    chunk_node.get("breadcrumb")
-                    or f"{chunk_node.get('chapter_title', f'Chapter {ch_idx}')} > {chunk_node.get('section_title', '')}"
-                ).strip(" >")
+                raw_name = attrs.get("name") or node_id.replace("concept:", "")
+                norm_name = normalize_idea_name(raw_name)
+                if not norm_name:
+                    continue
 
-                quote = edge_data.get("quote") or ""
-                edge_brief = edge_data.get("brief_description") or brief
-                edge_detailed = edge_data.get("detailed_explanation") or detailed
+                brief = attrs.get("brief_description") or attrs.get("summary") or ""
+                detailed = attrs.get("detailed_explanation") or attrs.get("summary") or ""
+                cat = attrs.get("category") or "Idea"
+                weight = int(attrs.get("weight") or 5)
+                clean_cand = clean_canonical_name(raw_name)
 
-                obs = IdeaObservation(
-                    concept_name=raw_name,
-                    chunk_id=chunk_id,
-                    book_id=b_id,
-                    chapter_idx=ch_idx,
-                    chunk_idx=c_idx,
-                    position_str=pos,
-                    local_brief=edge_brief,
-                    local_detailed=edge_detailed,
-                    quote=quote,
-                    weight=weight,
-                    category=cat,
-                )
-                cluster.add_observation(obs)
+                if norm_name not in clusters_by_norm:
+                    clusters_by_norm[norm_name] = IdeaCluster(
+                        canonical_name=clean_cand,
+                        normalized_name=norm_name,
+                        category=cat,
+                        max_weight=weight,
+                    )
 
-            # If concept has no chunk edges at all, record a single node observation
-            if not seen_chunk_ids_for_node:
-                cluster.add_observation(
-                    IdeaObservation(
+                cluster = clusters_by_norm[norm_name]
+                cluster.aliases.add(raw_name)
+                if clean_cand:
+                    cluster.aliases.add(clean_cand)
+
+                # Update canonical name if current has leading determiner or candidate is better capitalized
+                if bool(re.match(r"^(?:the|a|an)\s+", cluster.canonical_name, re.IGNORECASE)):
+                    cluster.canonical_name = clean_cand
+                elif len(clean_cand) > len(cluster.canonical_name) and not clean_cand.islower():
+                    cluster.canonical_name = clean_cand
+
+                # 2. Gather edges connecting this concept to Chunks
+                # SUPPORTED_BY edges (Concept -> Chunk)
+                chunk_edges = []
+                for _, target, edge_data in store.graph.out_edges(node_id, data=True):
+                    if edge_data.get("relation") == "SUPPORTED_BY":
+                        chunk_edges.append((target, edge_data))
+
+                # SUPPORTS_IDEA edges (Chunk -> Concept)
+                for source, _, edge_data in store.graph.in_edges(node_id, data=True):
+                    if edge_data.get("relation") == "SUPPORTS_IDEA":
+                        chunk_edges.append((source, edge_data))
+
+                seen_chunk_ids_for_node: Set[str] = set()
+
+                for chunk_nid, edge_data in chunk_edges:
+                    chunk_node = store.graph.nodes.get(chunk_nid, {})
+                    chunk_id = str(chunk_node.get("chunk_id") or edge_data.get("chunk_id") or chunk_nid.replace("chunk:", ""))
+                    if chunk_id in seen_chunk_ids_for_node:
+                        continue
+                    seen_chunk_ids_for_node.add(chunk_id)
+
+                    b_id = int(chunk_node.get("book_id") or 0)
+                    ch_idx = int(chunk_node.get("chapter_idx") or 0)
+                    c_idx = int(chunk_node.get("chunk_idx") or 0)
+                    pos = (
+                        chunk_node.get("breadcrumb")
+                        or f"{chunk_node.get('chapter_title', f'Chapter {ch_idx}')} > {chunk_node.get('section_title', '')}"
+                    ).strip(" >")
+
+                    quote = edge_data.get("quote") or ""
+                    edge_brief = edge_data.get("brief_description") or brief
+                    edge_detailed = edge_data.get("detailed_explanation") or detailed
+
+                    obs = IdeaObservation(
                         concept_name=raw_name,
-                        chunk_id=None,
-                        local_brief=brief,
-                        local_detailed=detailed,
+                        chunk_id=chunk_id,
+                        book_id=b_id,
+                        chapter_idx=ch_idx,
+                        chunk_idx=c_idx,
+                        position_str=pos,
+                        local_brief=edge_brief,
+                        local_detailed=edge_detailed,
+                        quote=quote,
                         weight=weight,
                         category=cat,
                     )
-                )
+                    cluster.add_observation(obs)
+
+                # If concept has no chunk edges at all, record a single node observation
+                if not seen_chunk_ids_for_node:
+                    cluster.add_observation(
+                        IdeaObservation(
+                            concept_name=raw_name,
+                            chunk_id=None,
+                            local_brief=brief,
+                            local_detailed=detailed,
+                            weight=weight,
+                            category=cat,
+                        )
+                    )
+        finally:
+            if status is not None:
+                status.stop()
+
+        if console is not None:
+            total_cand = sum(len(c.aliases) for c in clusters_by_norm.values())
+            console.print(
+                f"[bold green]✓[/bold green] [dim]Collected {len(clusters_by_norm)} normalized idea clusters ({total_cand} mentions)[/dim]"
+            )
 
         return clusters_by_norm
 
     def cluster_by_semantic_similarity(
-        self, clusters: List[IdeaCluster]
+        self,
+        clusters: List[IdeaCluster],
+        console: Optional[Console] = None,
     ) -> List[IdeaCluster]:
         """
         Step 1b: Semantic Similarity Clustering (Within Same Book / Corpus).
@@ -472,9 +494,43 @@ class IdeaPostProcessor:
 
         # Generate texts for embedding
         texts = [f"{c.canonical_name}: {c.get_representative_brief()}" for c in clusters]
+        emb_model = getattr(self.embeddings, "model", "embeddings")
+        batch_size = 16
 
         try:
-            vectors_raw = self.embeddings.embed_documents(texts)
+            vectors_raw = []
+            if console is not None and len(texts) > 0:
+                emb_progress = Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold cyan]Generating Semantic Embeddings:[/bold cyan]"),
+                    BarColumn(bar_width=25),
+                    TaskProgressColumn(),
+                    MofNCompleteColumn(),
+                    TextColumn(f"[dim]• {emb_model}[/dim]"),
+                    TimeElapsedColumn(),
+                    console=console,
+                )
+                with emb_progress:
+                    task = emb_progress.add_task("embed", total=len(texts))
+                    for i in range(0, len(texts), batch_size):
+                        batch = texts[i : i + batch_size]
+                        vecs = self.embeddings.embed_documents(batch)
+                        vectors_raw.extend(vecs)
+                        emb_progress.update(task, advance=len(batch))
+            else:
+                vectors_raw = self.embeddings.embed_documents(texts)
+
+            if len(vectors_raw) != len(clusters):
+                logger.warning(
+                    f"Mismatch between clusters ({len(clusters)}) and embeddings ({len(vectors_raw)}). Skipping semantic merge."
+                )
+                return clusters
+
+            if console is not None:
+                console.print(
+                    f"[bold green]✓[/bold green] [dim]Generated semantic embeddings for {len(texts)} clusters ({emb_model})[/dim]"
+                )
+
             # Normalize vectors to unit norm
             vectors = []
             for v in vectors_raw:
@@ -483,44 +539,64 @@ class IdeaPostProcessor:
                 vectors.append(arr / norm if norm > 0 else arr)
         except Exception as e:
             logger.warning(f"Error computing cluster embeddings: {e}. Skipping semantic merge.")
+            if console is not None:
+                console.print(f"[yellow]⚠ Semantic embedding skipped: {e}[/yellow]")
             return clusters
 
-        for i, cluster in enumerate(clusters):
-            cluster.embedding = vectors[i]
+        status = None
+        if console is not None:
+            status = console.status(
+                f"[bold cyan]Clustering concepts via cosine similarity (>= {self.similarity_threshold})...[/bold cyan]",
+                spinner="dots",
+            )
+            status.start()
 
-        merged: List[IdeaCluster] = []
-        consumed_indices: Set[int] = set()
+        try:
+            for i, cluster in enumerate(clusters):
+                cluster.embedding = vectors[i]
 
-        for i in range(len(clusters)):
-            if i in consumed_indices:
-                continue
+            merged: List[IdeaCluster] = []
+            consumed_indices: Set[int] = set()
 
-            current = clusters[i]
-            consumed_indices.add(i)
-
-            # Search remaining clusters for cosine similarity >= threshold
-            for j in range(i + 1, len(clusters)):
-                if j in consumed_indices:
+            for i in range(len(clusters)):
+                if i in consumed_indices:
                     continue
 
-                other = clusters[j]
-                if current.embedding is not None and other.embedding is not None:
-                    sim = float(np.dot(current.embedding, other.embedding))
-                    if sim >= self.similarity_threshold:
-                        logger.info(
-                            f"Semantic merge ({sim:.3f} >= {self.similarity_threshold}): "
-                            f"'{other.canonical_name}' into '{current.canonical_name}'"
-                        )
-                        # Merge other into current
-                        current.aliases.update(other.aliases)
-                        current.aliases.add(other.canonical_name)
-                        for obs in other.observations:
-                            current.add_observation(obs)
-                        current.chunk_ids.update(other.chunk_ids)
-                        current.max_weight = max(current.max_weight, other.max_weight)
-                        consumed_indices.add(j)
+                current = clusters[i]
+                consumed_indices.add(i)
 
-            merged.append(current)
+                # Search remaining clusters for cosine similarity >= threshold
+                for j in range(i + 1, len(clusters)):
+                    if j in consumed_indices:
+                        continue
+
+                    other = clusters[j]
+                    if current.embedding is not None and other.embedding is not None:
+                        sim = float(np.dot(current.embedding, other.embedding))
+                        if sim >= self.similarity_threshold:
+                            logger.info(
+                                f"Semantic merge ({sim:.3f} >= {self.similarity_threshold}): "
+                                f"'{other.canonical_name}' into '{current.canonical_name}'"
+                            )
+                            # Merge other into current
+                            current.aliases.update(other.aliases)
+                            current.aliases.add(other.canonical_name)
+                            for obs in other.observations:
+                                current.add_observation(obs)
+                            current.chunk_ids.update(other.chunk_ids)
+                            current.max_weight = max(current.max_weight, other.max_weight)
+                            consumed_indices.add(j)
+
+                merged.append(current)
+        finally:
+            if status is not None:
+                status.stop()
+
+        if console is not None:
+            merged_diff = len(clusters) - len(merged)
+            console.print(
+                f"[bold green]✓[/bold green] [dim]Cosine similarity clustering complete: {len(merged)} canonical ideas ({merged_diff} merged)[/dim]"
+            )
 
         return merged
 
@@ -856,12 +932,12 @@ class IdeaPostProcessor:
         t_start = time.perf_counter()
 
         # 1. Deterministic normalization grouping
-        clusters_by_norm = self.collect_observations_from_graph(store)
+        clusters_by_norm = self.collect_observations_from_graph(store, console=console)
         initial_clusters = list(clusters_by_norm.values())
         total_input_concepts = sum(len(c.aliases) for c in initial_clusters)
 
         # 2. Semantic similarity clustering
-        merged_clusters = self.cluster_by_semantic_similarity(initial_clusters)
+        merged_clusters = self.cluster_by_semantic_similarity(initial_clusters, console=console)
         merged_diff = len(initial_clusters) - len(merged_clusters)
         total_clusters = len(merged_clusters)
 
@@ -906,7 +982,17 @@ class IdeaPostProcessor:
                 console=console,
             )
             tot_task = progress.add_task("total", total=total_clusters, completed=0, stats_line="")
-            cur_line = Text.from_markup("[bold blue]Current Idea:[/bold blue] Initializing consolidation...")
+            first_c = merged_clusters[0]
+            if first_c.total_occurrences >= self.min_occurrences:
+                first_init_text = (
+                    f"[bold blue]Current Idea:[/bold blue] '{first_c.canonical_name}' "
+                    f"({first_c.total_occurrences} mentions) | [bold yellow]Consolidating with {self.model_name}...[/bold yellow]"
+                )
+            else:
+                first_init_text = (
+                    f"[bold blue]Current Idea:[/bold blue] '{first_c.canonical_name}' | [dim]Bypassing (single-occurrence)[/dim]"
+                )
+            cur_line = Text.from_markup(first_init_text)
 
             with Live(Group(cur_line, progress), console=console, refresh_per_second=10) as live:
                 for idx, cluster in enumerate(merged_clusters, start=1):

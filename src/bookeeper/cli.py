@@ -2441,7 +2441,7 @@ def build_graph(
                 console.print("\n[bold cyan]═══ Running Dual-Pass Idea Postprocessor & Synthesis ═══[/bold cyan]")
                 try:
                     postprocessor = IdeaPostProcessor.from_settings(cfg)
-                    pp_report = postprocessor.process_graph(store)
+                    pp_report = postprocessor.process_graph(store, console=console)
                     console.print(
                         f"[bold green]✓ Idea Postprocessing Complete ({pp_report.duration_seconds:.2f}s):[/bold green] "
                         f"{pp_report.total_clusters} clusters ({pp_report.multi_occurrence_clusters_count} synthesized, "
@@ -4718,7 +4718,7 @@ def postprocess_ideas_command(
     if min_occurrences is not None:
         postprocessor.min_occurrences = eff_min_occ
 
-    report = postprocessor.process_graph(store)
+    report = postprocessor.process_graph(store, console=console)
 
     dest_graph = Path(output_graph).expanduser().resolve() if output_graph else target_graph
     store.save(dest_graph)

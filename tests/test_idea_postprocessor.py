@@ -363,3 +363,121 @@ dual_pass:
         updated_store = ConceptGraphStore()
         updated_store.load(graph_file)
         assert updated_store.graph.nodes["concept:Event Sourcing"]["brief_description"] == "Consolidated brief definition."
+
+
+def test_process_graph_header_and_periodic_stats():
+    """Verify that process_graph displays the model & filtered count header, and prints stats every 10 ideas."""
+    from rich.console import Console
+
+    store = ConceptGraphStore()
+    store.add_book(1, title="Test Architecture", author="Architect")
+
+    # Add 12 concepts, each on 2 chunks (multi-occurrence)
+    for i in range(1, 13):
+        chk_a = HierarchicalChunk(
+            chunk_id=f"c_{i}_a",
+            chunk_idx=i * 2 - 1,
+            book_id=1,
+            book_title="Test Architecture",
+            chapter_idx=1,
+            chapter_title="Chapter 1",
+            section_title=f"Sec {i}",
+            breadcrumb=f"Book > Ch1 > Sec {i}",
+            text=f"Text for concept {i} in chunk A.",
+            char_count=40,
+            word_count=8,
+        )
+        chk_b = HierarchicalChunk(
+            chunk_id=f"c_{i}_b",
+            chunk_idx=i * 2,
+            book_id=1,
+            book_title="Test Architecture",
+            chapter_idx=1,
+            chapter_title="Chapter 1",
+            section_title=f"Sec {i}",
+            breadcrumb=f"Book > Ch1 > Sec {i}",
+            text=f"Text for concept {i} in chunk B.",
+            char_count=40,
+            word_count=8,
+        )
+        store.add_chunk(chk_a)
+        store.add_chunk(chk_b)
+        store.add_idea_support_link(
+            concept_name=f"Pattern {i}",
+            chunk=chk_a,
+            quote=f"Quote for pattern {i} in A",
+            brief_description=f"Brief {i}",
+        )
+        store.add_idea_support_link(
+            concept_name=f"Pattern {i}",
+            chunk=chk_b,
+            quote=f"Quote for pattern {i} in B",
+            brief_description=f"Brief {i}",
+        )
+
+    # Add 3 single-occurrence concepts
+    for j in range(1, 4):
+        chk_s = HierarchicalChunk(
+            chunk_id=f"s_{j}",
+            chunk_idx=30 + j,
+            book_id=1,
+            book_title="Test Architecture",
+            chapter_idx=1,
+            chapter_title="Chapter 1",
+            section_title=f"Single {j}",
+            breadcrumb="Book > Ch1 > Single",
+            text=f"Single occurrence text {j}.",
+            char_count=30,
+            word_count=6,
+        )
+        store.add_chunk(chk_s)
+        store.add_idea_support_link(
+            concept_name=f"Single Idea {j}",
+            chunk=chk_s,
+            quote=f"Single quote {j}",
+            brief_description=f"Single brief {j}",
+        )
+
+    mock_pool = MagicMock()
+    mock_pool.nodes = [OllamaServerNode(url="http://localhost:11434", priority=1)]
+    mock_pool.execute_with_failover.return_value = ConsolidatedIdeaOutput(
+        brief_description="Synthesized description.",
+        detailed_explanation="Synthesized detailed explanation.",
+        related_entities=[],
+        category="Pattern",
+        weight=7,
+    )
+
+    test_console = Console(record=True, width=120)
+    pp = IdeaPostProcessor(
+        pool=mock_pool,
+        model_name="custom-synth:7b",
+        similarity_threshold=0.92,
+        min_occurrences=2,
+    )
+
+    progress_events = []
+    def _track(c, tot, name, stats):
+        progress_events.append((c, tot, name, stats))
+
+    report = pp.process_graph(store, console=test_console, on_progress=_track)
+    output_text = test_console.export_text()
+
+    # 1. Header contains consolidation model and filtering summary
+    assert "Consolidation Model:       custom-synth:7b" in output_text or "custom-synth:7b" in output_text
+    assert "12" in output_text  # 12 multi-occurrence ideas filtered in
+    assert "3" in output_text   # 3 single-occurrence ideas bypassed
+
+    # 2. Periodic statistical line every 10 ideas
+    # Total clusters = 15 (12 multi + 3 single) -> stats printed at 10/15 and 15/15
+    assert "10/15 ideas" in output_text
+    assert "15/15 ideas" in output_text
+    assert "[Idea Postprocessor]" in output_text
+
+    # 3. Report numbers match
+    assert report.total_clusters == 15
+    assert report.multi_occurrence_clusters_count == 12
+    assert report.single_occurrence_clusters_count == 3
+    assert report.synthesized_count == 12
+    assert len(progress_events) == 15
+

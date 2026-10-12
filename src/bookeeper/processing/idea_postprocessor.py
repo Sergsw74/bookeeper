@@ -15,15 +15,28 @@ import json
 import logging
 import re
 import shutil
+import sys
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 from langchain_core.embeddings import Embeddings
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 from pydantic import BaseModel, Field
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+)
+from rich.text import Text
 
 from bookeeper.calibre.parser import BookParser
 from bookeeper.config import Settings
@@ -38,6 +51,16 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 # Helper & Normalization Functions
 # ==============================================================================
+
+
+def _format_eta(seconds: Optional[float]) -> str:
+    """Format remaining seconds as (min, sec), e.g. '2m 15s' or '0m 45s'."""
+    if seconds is None:
+        return "--m --s"
+    if seconds <= 0:
+        return "0m 00s"
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m {s:02d}s"
 
 
 def normalize_idea_name(name: str) -> str:
@@ -815,7 +838,12 @@ class IdeaPostProcessor:
     # Main Postprocessing Pipeline
     # --------------------------------------------------------------------------
 
-    def process_graph(self, store: ConceptGraphStore) -> IdeaPostProcessorReport:
+    def process_graph(
+        self,
+        store: ConceptGraphStore,
+        console: Optional[Console] = None,
+        on_progress: Optional[Callable[[int, int, str, Dict[str, Any]], None]] = None,
+    ) -> IdeaPostProcessorReport:
         """
         Execute full two-pass aggregation and synthesis pipeline on the graph:
         1. Group ideas deterministically by normalized name.
@@ -825,7 +853,7 @@ class IdeaPostProcessor:
         4. Overwrite/upsert canonical concept nodes and provenance/relational edges.
         """
         t0 = time.time()
-        logger.info("Starting IdeaPostProcessor second-pass aggregation...")
+        t_start = time.perf_counter()
 
         # 1. Deterministic normalization grouping
         clusters_by_norm = self.collect_observations_from_graph(store)
@@ -835,43 +863,157 @@ class IdeaPostProcessor:
         # 2. Semantic similarity clustering
         merged_clusters = self.cluster_by_semantic_similarity(initial_clusters)
         merged_diff = len(initial_clusters) - len(merged_clusters)
+        total_clusters = len(merged_clusters)
+
+        target_multi = [c for c in merged_clusters if c.total_occurrences >= self.min_occurrences]
+        target_single = [c for c in merged_clusters if c.total_occurrences < self.min_occurrences]
+
+        # Display Section Header
+        if console is not None:
+            header_text = (
+                f"[bold cyan]🧠 Two-Pass Idea Aggregation & Synthesis (Pass 2)[/bold cyan]\n"
+                f"• Consolidation Model:       [bold green]{self.model_name}[/bold green]\n"
+                f"• Total Concepts in Graph:   [bold]{total_input_concepts}[/bold]\n"
+                f"• Resolved Entity Clusters:  [bold]{total_clusters}[/bold] (Merged: [yellow]{merged_diff}[/yellow] via cosine sim >= {self.similarity_threshold})\n"
+                f"• Multi-Occurrence Ideas:    [bold green]{len(target_multi)}[/bold green] (filtered in for LLM consolidation, >= {self.min_occurrences} mentions)\n"
+                f"• Single-Occurrence Ideas:   [dim]{len(target_single)} (filtered out / bypassed to conserve compute)[/dim]\n"
+                f"• Cosine Similarity Thresh:  [bold yellow]{self.similarity_threshold}[/bold yellow]"
+            )
+            console.print(Panel.fit(header_text, title="Idea Postprocessor", border_style="cyan"))
+        else:
+            logger.info(
+                f"Starting IdeaPostProcessor (model={self.model_name}): {total_input_concepts} raw concepts -> "
+                f"{total_clusters} clusters ({len(target_multi)} multi-occurrence filtered for synthesis, "
+                f"{len(target_single)} single-occurrence bypassed)."
+            )
 
         single_occ_count = 0
         multi_occ_count = 0
         synthesized_count = 0
         total_edges_added = 0
-        synthesized_names = []
-        bypassed_names = []
+        synthesized_names: List[str] = []
+        bypassed_names: List[str] = []
 
-        # 3 & 4. Branch by mention count and apply to graph
-        for cluster in merged_clusters:
-            # Check occurrence count
-            if cluster.total_occurrences < self.min_occurrences:
-                # Single-occurrence cluster (N = 1): pass through as-is, bypass LLM
-                single_occ_count += 1
-                bypassed_names.append(cluster.canonical_name)
-                # Ensure canonical normalization and edges are up to date
-                default_output = ConsolidatedIdeaOutput(
-                    brief_description=cluster.get_representative_brief(),
-                    detailed_explanation=cluster.get_representative_detailed(),
-                    related_entities=[],
-                    category=cluster.category,
-                    weight=cluster.max_weight,
-                )
-                edges_added = self.apply_consolidation_to_graph(store, cluster, default_output)
-                total_edges_added += edges_added
-            else:
-                # Multi-occurrence cluster (N >= 2): submit to LLM consolidation
-                multi_occ_count += 1
-                logger.info(
-                    f"Consolidating multi-occurrence idea '{cluster.canonical_name}' "
-                    f"({cluster.total_occurrences} mentions across {len(cluster.chunk_ids)} chunks)..."
-                )
-                output = self.synthesize_cluster(cluster)
-                edges_added = self.apply_consolidation_to_graph(store, cluster, output)
-                total_edges_added += edges_added
-                synthesized_count += 1
-                synthesized_names.append(cluster.canonical_name)
+        # 3 & 4. Branch by mention count and apply to graph with live progress
+        if console is not None and total_clusters > 0:
+            progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[bold cyan]Consolidation Progress:[/bold cyan]"),
+                BarColumn(bar_width=25),
+                TaskProgressColumn(),
+                MofNCompleteColumn(),
+                TextColumn("{task.fields[stats_line]}"),
+                console=console,
+            )
+            tot_task = progress.add_task("total", total=total_clusters, completed=0, stats_line="")
+            cur_line = Text.from_markup("[bold blue]Current Idea:[/bold blue] Initializing consolidation...")
+
+            with Live(Group(cur_line, progress), console=console, refresh_per_second=10) as live:
+                for idx, cluster in enumerate(merged_clusters, start=1):
+                    is_multi = cluster.total_occurrences >= self.min_occurrences
+                    if is_multi:
+                        cur_text = (
+                            f"[bold blue]Current Idea:[/bold blue] '{cluster.canonical_name}' "
+                            f"({cluster.total_occurrences} mentions) | [bold yellow]Consolidating with {self.model_name}...[/bold yellow]"
+                        )
+                        live.update(Group(Text.from_markup(cur_text), progress))
+                        output = self.synthesize_cluster(cluster)
+                        edges_added = self.apply_consolidation_to_graph(store, cluster, output)
+                        total_edges_added += edges_added
+                        synthesized_count += 1
+                        multi_occ_count += 1
+                        synthesized_names.append(cluster.canonical_name)
+                        status_badge = "[bold green]✓ Synthesized[/bold green]"
+                    else:
+                        default_output = ConsolidatedIdeaOutput(
+                            brief_description=cluster.get_representative_brief(),
+                            detailed_explanation=cluster.get_representative_detailed(),
+                            related_entities=[],
+                            category=cluster.category,
+                            weight=cluster.max_weight,
+                        )
+                        edges_added = self.apply_consolidation_to_graph(store, cluster, default_output)
+                        total_edges_added += edges_added
+                        single_occ_count += 1
+                        bypassed_names.append(cluster.canonical_name)
+                        status_badge = "[dim]Bypassed (single-occurrence)[/dim]"
+
+                    completed = idx
+                    cur_text = f"[bold blue]Current Idea:[/bold blue] '{cluster.canonical_name}' | {status_badge}"
+
+                    elapsed = time.perf_counter() - t_start
+                    rate = (completed / elapsed) if elapsed > 0 else 0.0
+                    if completed > 0 and total_clusters > completed and rate > 0:
+                        rem_sec = (total_clusters - completed) / rate
+                        eta_str = _format_eta(rem_sec)
+                    elif completed >= total_clusters:
+                        eta_str = "0m 00s"
+                    else:
+                        eta_str = "--m --s"
+
+                    rate_str = f"{rate:.2f} idea/s" if rate > 0 else "-- idea/s"
+                    stats_str = (
+                        f" | [bold yellow]{rate_str}[/bold yellow] | ETA: {eta_str} | "
+                        f"[bold green]✓ {synthesized_count} synthesized[/bold green] | "
+                        f"[dim]{single_occ_count} bypassed[/dim]"
+                    )
+
+                    progress.update(tot_task, completed=completed, total=total_clusters, stats_line=stats_str)
+                    live.update(Group(Text.from_markup(cur_text), progress))
+
+                    # Periodic statistical line info every 10 ideas (or on final completion)
+                    if completed % 10 == 0 or completed == total_clusters:
+                        pct = (completed / total_clusters * 100) if total_clusters > 0 else 100.0
+                        console.print(
+                            f"[bold cyan][Idea Postprocessor][/bold cyan] {completed}/{total_clusters} ideas ({pct:.1f}%)"
+                            f" | {rate_str} | ETA: {eta_str} | [bold green]✓ {synthesized_count} synthesized[/bold green]"
+                            f" | [dim]{single_occ_count} bypassed[/dim] | +{total_edges_added} edges"
+                        )
+                        sys.stdout.flush()
+
+                    if on_progress:
+                        on_progress(completed, total_clusters, cluster.canonical_name, {
+                            "synthesized": synthesized_count,
+                            "bypassed": single_occ_count,
+                            "edges_added": total_edges_added,
+                        })
+        else:
+            for idx, cluster in enumerate(merged_clusters, start=1):
+                is_multi = cluster.total_occurrences >= self.min_occurrences
+                if is_multi:
+                    output = self.synthesize_cluster(cluster)
+                    edges_added = self.apply_consolidation_to_graph(store, cluster, output)
+                    total_edges_added += edges_added
+                    synthesized_count += 1
+                    multi_occ_count += 1
+                    synthesized_names.append(cluster.canonical_name)
+                else:
+                    default_output = ConsolidatedIdeaOutput(
+                        brief_description=cluster.get_representative_brief(),
+                        detailed_explanation=cluster.get_representative_detailed(),
+                        related_entities=[],
+                        category=cluster.category,
+                        weight=cluster.max_weight,
+                    )
+                    edges_added = self.apply_consolidation_to_graph(store, cluster, default_output)
+                    total_edges_added += edges_added
+                    single_occ_count += 1
+                    bypassed_names.append(cluster.canonical_name)
+
+                completed = idx
+                if completed % 10 == 0 or completed == total_clusters:
+                    pct = (completed / total_clusters * 100) if total_clusters > 0 else 100.0
+                    logger.info(
+                        f"[Idea Postprocessor] {completed}/{total_clusters} ideas ({pct:.1f}%)"
+                        f" | Synthesized: {synthesized_count} | Bypassed: {single_occ_count} | Edges: +{total_edges_added}"
+                    )
+
+                if on_progress:
+                    on_progress(completed, total_clusters, cluster.canonical_name, {
+                        "synthesized": synthesized_count,
+                        "bypassed": single_occ_count,
+                        "edges_added": total_edges_added,
+                    })
 
         duration = time.time() - t0
         report = IdeaPostProcessorReport(

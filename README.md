@@ -12,10 +12,11 @@ The documentation is split into specialized subchapters stored in the [`docs/`](
 
 | Chapter | Description |
 | :--- | :--- |
+| 🔄 **[Recommended Workflow](docs/workflow.md)** | **Start here**: Calibration via small A/B tests, building knowledge graph, export, and optional POC post-processing. |
 | 🚀 **[Getting Started](docs/get-started.md)** | Prerequisites, installation (`uv`/`pip`), configuration walkthrough, and basic commands. |
 | 🏗️ **[Building the Knowledge Graph](docs/building-graph.md)** | Graph extraction pipeline, input sources (Calibre & downloads), offline rebuilds, pruning, and exporters (Obsidian, Neo4j, GraphML). |
 | 🔍 **[Decoupled Hybrid RAG](docs/rag.md)** | LightRAG vector/graph indexing from cached chunks and multi-mode querying (`hybrid`, `local`, `global`). |
-| 🧪 **[Two-Pass Idea Post-Processing (POC)](docs/post-processing.md)** | **Experimental POC** (very low performance improvement): second-pass entity synthesis, clustering, and state checkpointing. |
+| 🧪 **[Two-Pass Idea Post-Processing (POC)](docs/post-processing.md)** | **Experimental POC** (very low performance improvement, not finalized): second-pass entity synthesis, clustering, and state checkpointing. |
 | 🔬 **[A/B Testing & Benchmarking](docs/ab-tests.md)** | Automated test harness, same-branch vs branch-vs-branch testing, configuration overlays, and delta reporting. |
 | 🛡️ **[Factual Verification & Auditing](docs/verification.md)** | Multi-mode verification suite: Ideas Grounding, Chunk Coherence, Dual-KG Cross-Checking, and Oracle QA probes. |
 

@@ -4675,6 +4675,18 @@ def postprocess_ideas_command(
     export_obsidian: Optional[str] = typer.Option(
         None, "--export-obsidian", help="Custom destination directory for Obsidian Markdown vault to refresh after consolidation."
     ),
+    state_file: Optional[str] = typer.Option(
+        None, "--state-file", help="Custom path for postprocessing state checkpoint JSON file (defaults to output_dir/.bookeeper_dual_pass_state.json)."
+    ),
+    resume: bool = typer.Option(
+        True, "--resume/--no-resume", help="Auto-continue and resume from existing state file if present (default: True)."
+    ),
+    reset_state: bool = typer.Option(
+        False, "--reset-state", help="Reset/discard existing postprocessing state file and start from scratch."
+    ),
+    checkpoint_interval: int = typer.Option(
+        100, "--checkpoint-interval", help="Save postprocessor state checkpoint every N ideas (default: 100)."
+    ),
 ):
     """
     Execute Two-Pass Idea Aggregation and Synthesis on a Knowledge Graph:
@@ -4682,6 +4694,7 @@ def postprocess_ideas_command(
     2. Chronological observation linearization and top 3-5 quote selection.
     3. Branching: N=1 passes through; N>=2 synthesized via LLM consolidation.
     4. Graph overwrite with unified brief_description, detailed_explanation, :MENTIONED_IN, and :RELATES_TO edges.
+    Supports persistent state checkpoints (every 100 ideas) and auto-continue.
     """
     cfg = get_settings(config_path)
     output_dir = cfg.resolved_output_dir
@@ -4694,6 +4707,11 @@ def postprocess_ideas_command(
     eff_model = model or cfg.resolved_dual_pass_model
     eff_thresh = similarity_threshold if similarity_threshold is not None else cfg.dual_pass.similarity_threshold
     eff_min_occ = min_occurrences if min_occurrences is not None else cfg.dual_pass.min_occurrences
+    eff_state_path = Path(state_file).expanduser().resolve() if state_file else cfg.resolved_dual_pass_state_file
+
+    if reset_state and eff_state_path.is_file():
+        eff_state_path.unlink()
+        console.print(f"[bold yellow]Reset existing postprocessing state file at {eff_state_path}.[/bold yellow]")
 
     console.print(
         Panel.fit(
@@ -4701,7 +4719,9 @@ def postprocess_ideas_command(
             f"• Knowledge Graph: [bold]{target_graph}[/bold]\n"
             f"• Consolidation Model: [bold green]{eff_model}[/bold green]\n"
             f"• Cosine Similarity Threshold: [bold yellow]{eff_thresh}[/bold yellow]\n"
-            f"• Multi-Occurrence Threshold: [bold]{eff_min_occ}+ mentions[/bold]",
+            f"• Multi-Occurrence Threshold: [bold]{eff_min_occ}+ mentions[/bold]\n"
+            f"• State Checkpoint File: [bold]{eff_state_path.name}[/bold] (saves every {checkpoint_interval} ideas)\n"
+            f"• Auto-Continue (Resume): [bold green]{'Enabled' if resume else 'Disabled'}[/bold green]",
             title="bookeeper postprocess-ideas",
             border_style="cyan",
         )
@@ -4716,6 +4736,9 @@ def postprocess_ideas_command(
         cfg,
         model_name=eff_model,
         similarity_threshold=eff_thresh,
+        state_file=eff_state_path,
+        checkpoint_interval=checkpoint_interval,
+        resume=resume,
     )
     if min_occurrences is not None:
         postprocessor.min_occurrences = eff_min_occ
@@ -4739,8 +4762,10 @@ def postprocess_ideas_command(
         f"• Resolved Clusters: [bold]{report.total_clusters}[/bold] (Merged: [yellow]{report.merged_clusters_count}[/yellow])\n"
         f"• Synthesized Multi-Occurrence Ideas: [bold green]{report.synthesized_count}[/bold green]\n"
         f"• Bypassed Single-Occurrence Ideas: [dim]{report.single_occurrence_clusters_count}[/dim]\n"
+        f"• Resumed from State Checkpoint: [bold cyan]{report.resumed_count}[/bold cyan]\n"
         f"• Provenance & Relational Edges Added: [bold cyan]{report.edges_added_count}[/bold cyan]\n"
         f"• Updated Knowledge Graph saved to: [bold]{dest_graph}[/bold]\n"
+        f"• State Checkpoint saved to: [bold]{eff_state_path}[/bold]\n"
     )
 
 

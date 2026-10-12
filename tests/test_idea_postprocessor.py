@@ -22,6 +22,7 @@ from bookeeper.processing.idea_postprocessor import (
     IdeaObservation,
     IdeaPostProcessor,
     IdeaPostProcessorReport,
+    IdeaPostProcessorState,
     normalize_idea_name,
     prune_near_duplicate_quotes,
 )
@@ -366,6 +367,63 @@ dual_pass:
         assert updated_store.graph.nodes["concept:Event Sourcing"]["brief_description"] == "Consolidated brief definition."
 
 
+def test_postprocess_ideas_cli_state_file(tmp_path: Path, mock_graph_store):
+    """Test CLI postprocess-ideas saving and auto-resuming from state file."""
+    runner = CliRunner()
+    graph_file = tmp_path / "knowledge_graph.json"
+    state_file = tmp_path / "custom_state.json"
+    mock_graph_store.save(graph_file)
+
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(f"output_dir: {tmp_path}\n")
+
+    with patch.object(IdeaPostProcessor, "synthesize_cluster") as mock_synth:
+        mock_synth.return_value = ConsolidatedIdeaOutput(
+            brief_description="CLI brief definition.",
+            detailed_explanation="CLI detailed explanation.",
+            related_entities=[],
+            category="Pattern",
+            weight=8,
+        )
+
+        res = runner.invoke(
+            app,
+            [
+                "postprocess-ideas",
+                "--graph-file",
+                str(graph_file),
+                "--config",
+                str(cfg_file),
+                "--state-file",
+                str(state_file),
+                "--checkpoint-interval",
+                "1",
+            ],
+        )
+
+        assert res.exit_code == 0
+        assert state_file.is_file()
+        assert "State Checkpoint saved to" in res.stdout
+
+        # Second CLI run: should auto-continue and report resumed count
+        mock_synth.reset_mock()
+        res2 = runner.invoke(
+            app,
+            [
+                "postprocess-ideas",
+                "--graph-file",
+                str(graph_file),
+                "--config",
+                str(cfg_file),
+                "--state-file",
+                str(state_file),
+            ],
+        )
+        assert res2.exit_code == 0
+        assert mock_synth.call_count == 0  # Reused from state file!
+        assert "Resumed from State Checkpoint:" in res2.stdout
+
+
 def test_process_graph_header_and_periodic_stats():
     """Verify that process_graph displays the model & filtered count header, and prints stats every 10 ideas."""
     from rich.console import Console
@@ -529,4 +587,205 @@ def test_process_graph_loading_progress():
     assert "Generated semantic embeddings for 2 clusters" in output_text
     assert "Cosine similarity clustering complete" in output_text
     assert report.total_clusters == 2
+
+
+def test_idea_postprocessor_state_persistence(tmp_path):
+    """Verify that IdeaPostProcessorState serializes and deserializes properly."""
+    state_file = tmp_path / "postprocess_state.json"
+    state = IdeaPostProcessorState(state_file)
+    assert not state_file.is_file()
+
+    cluster = IdeaCluster(
+        canonical_name="Event Sourcing",
+        normalized_name="event sourcing",
+        chunk_ids={"c1", "c2"},
+    )
+    output = ConsolidatedIdeaOutput(
+        brief_description="Captures state as events.",
+        detailed_explanation="Comprehensive event sourcing explanation.",
+        related_entities=["CQRS"],
+        category="Pattern",
+        weight=8,
+    )
+
+    state.record_processed(cluster, output, status="synthesized")
+    state.save()
+
+    assert state_file.is_file()
+
+    # Load in new state instance
+    loaded_state = IdeaPostProcessorState(state_file)
+    assert loaded_state.is_processed("Event Sourcing")
+    cached = loaded_state.get_output("Event Sourcing")
+    assert cached is not None
+    assert cached.brief_description == "Captures state as events."
+    assert cached.related_entities == ["CQRS"]
+    assert cached.weight == 8
+
+
+def test_process_graph_state_checkpoint_and_auto_continue(tmp_path):
+    """
+    Verify:
+    1. Saving checkpoint every N ideas creates state file on disk.
+    2. Subsequent run with existing state file auto-continues and reuses cached outputs without calling LLM.
+    """
+    state_file = tmp_path / "dual_pass_state.json"
+
+    def _build_store():
+        s = ConceptGraphStore()
+        for i in range(1, 6):
+            chk_a = HierarchicalChunk(
+                chunk_id=f"c_a_{i}",
+                chunk_idx=i * 2 - 1,
+                book_id=1,
+                book_title="Test Book",
+                chapter_idx=1,
+                chapter_title="Ch1",
+                section_title="Sec1",
+                breadcrumb="Book > Ch1",
+                text=f"Content A for pattern {i}.",
+                char_count=30,
+                word_count=5,
+            )
+            chk_b = HierarchicalChunk(
+                chunk_id=f"c_b_{i}",
+                chunk_idx=i * 2,
+                book_id=1,
+                book_title="Test Book",
+                chapter_idx=1,
+                chapter_title="Ch1",
+                section_title="Sec1",
+                breadcrumb="Book > Ch1",
+                text=f"Content B for pattern {i}.",
+                char_count=30,
+                word_count=5,
+            )
+            s.add_chunk(chk_a)
+            s.add_chunk(chk_b)
+            # Add two links across distinct chunks to make it multi-occurrence (N=2)
+            s.add_idea_support_link(
+                concept_name=f"Architecture Pattern {i}",
+                chunk=chk_a,
+                quote=f"Quote {i}",
+                brief_description=f"Brief {i}",
+            )
+            s.add_idea_support_link(
+                concept_name=f"Architecture Pattern {i}",
+                chunk=chk_b,
+                quote=f"Quote B {i}",
+                brief_description=f"Brief B {i}",
+            )
+        return s
+
+    store1 = _build_store()
+    mock_pool = MagicMock()
+    mock_pool.nodes = [OllamaServerNode(url="http://localhost:11434", priority=1)]
+    mock_pool.execute_with_failover.return_value = ConsolidatedIdeaOutput(
+        brief_description="Synthesized description.",
+        detailed_explanation="Synthesized detailed explanation.",
+        related_entities=["Related Concept"],
+        category="Architecture",
+        weight=9,
+    )
+
+    # First run: interval=2, 5 ideas -> saves checkpoints at 2, 4, 5
+    pp1 = IdeaPostProcessor(
+        pool=mock_pool,
+        embeddings=None,
+        min_occurrences=2,
+        state_file=state_file,
+        checkpoint_interval=2,
+        resume=True,
+    )
+    report1 = pp1.process_graph(store1)
+    assert report1.total_clusters == 5
+    assert report1.synthesized_count == 5
+    assert report1.resumed_count == 0
+    assert mock_pool.execute_with_failover.call_count == 5
+    assert state_file.is_file()
+
+    # Second run: auto-continue with existing state file
+    store2 = _build_store()
+    mock_pool.reset_mock()
+
+    test_console = Console(record=True, width=120)
+    pp2 = IdeaPostProcessor(
+        pool=mock_pool,
+        embeddings=None,
+        min_occurrences=2,
+        state_file=state_file,
+        checkpoint_interval=2,
+        resume=True,
+    )
+    report2 = pp2.process_graph(store2, console=test_console)
+    output_text = test_console.export_text()
+
+    # LLM was NOT invoked because all ideas were auto-continued from the state file!
+    assert mock_pool.execute_with_failover.call_count == 0
+    assert report2.total_clusters == 5
+    assert report2.synthesized_count == 5
+    assert report2.resumed_count == 5
+
+    # Graph was properly updated with the cached definitions
+    node_data = store2.graph.nodes["concept:Architecture Pattern 1"]
+    assert node_data["brief_description"] == "Synthesized description."
+    assert "dual_pass_state.json" in output_text
+    assert "Auto-continuing" in output_text or "Resumed from State" in output_text
+
+
+def test_process_graph_state_reset(tmp_path):
+    """Verify that when resume=False, the state file is reset and ideas are re-synthesized."""
+    state_file = tmp_path / "dual_pass_state.json"
+    s = ConceptGraphStore()
+    chk_a = HierarchicalChunk(
+        chunk_id="c1",
+        chunk_idx=1,
+        book_id=1,
+        book_title="Test Book",
+        chapter_idx=1,
+        chapter_title="Ch1",
+        section_title="Sec1",
+        breadcrumb="Book > Ch1",
+        text="Content A.",
+        char_count=20,
+        word_count=3,
+    )
+    chk_b = HierarchicalChunk(
+        chunk_id="c2",
+        chunk_idx=2,
+        book_id=1,
+        book_title="Test Book",
+        chapter_idx=1,
+        chapter_title="Ch1",
+        section_title="Sec1",
+        breadcrumb="Book > Ch1",
+        text="Content B.",
+        char_count=20,
+        word_count=3,
+    )
+    s.add_chunk(chk_a)
+    s.add_chunk(chk_b)
+    s.add_idea_support_link(concept_name="Idea A", chunk=chk_a, quote="Q1", brief_description="B1")
+    s.add_idea_support_link(concept_name="Idea A", chunk=chk_b, quote="Q2", brief_description="B2")
+
+    mock_pool = MagicMock()
+    mock_pool.nodes = [OllamaServerNode(url="http://localhost:11434", priority=1)]
+    mock_pool.execute_with_failover.return_value = ConsolidatedIdeaOutput(
+        brief_description="Desc",
+        detailed_explanation="Expl",
+        related_entities=[],
+    )
+
+    # First run
+    pp1 = IdeaPostProcessor(pool=mock_pool, embeddings=None, min_occurrences=2, state_file=state_file, resume=True)
+    pp1.process_graph(s)
+    assert mock_pool.execute_with_failover.call_count == 1
+
+    # Second run with resume=False
+    mock_pool.reset_mock()
+    pp2 = IdeaPostProcessor(pool=mock_pool, embeddings=None, min_occurrences=2, state_file=state_file, resume=False)
+    report2 = pp2.process_graph(s)
+    # LLM was called again because resume=False reset the state
+    assert mock_pool.execute_with_failover.call_count == 1
+    assert report2.resumed_count == 0
 

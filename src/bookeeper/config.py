@@ -387,6 +387,14 @@ class DualPassConfig(BaseModel):
         default=0.1,
         description="Sampling temperature for consolidation LLM (default: 0.1).",
     )
+    state_file: Optional[str] = Field(
+        default=None,
+        description="Path to postprocessor state checkpoint JSON file (defaults to output_dir/.bookeeper_dual_pass_state.json).",
+    )
+    checkpoint_interval: int = Field(
+        default=100,
+        description="Save postprocessing state checkpoint every N ideas (default: 100).",
+    )
 
 
 class Settings(BaseSettings):
@@ -675,6 +683,16 @@ class Settings(BaseSettings):
             p = Path(self.state_file).expanduser().resolve()
         else:
             p = self.resolved_output_dir / ".bookeeper_state.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+
+    @property
+    def resolved_dual_pass_state_file(self) -> Path:
+        """Return expanded Path for dual pass postprocessor state file."""
+        if self.dual_pass.state_file:
+            p = Path(self.dual_pass.state_file).expanduser().resolve()
+        else:
+            p = self.resolved_output_dir / ".bookeeper_dual_pass_state.json"
         p.parent.mkdir(parents=True, exist_ok=True)
         return p
 

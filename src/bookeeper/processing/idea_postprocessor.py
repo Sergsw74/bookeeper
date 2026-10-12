@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -258,11 +261,122 @@ class IdeaPostProcessorReport(BaseModel):
     single_occurrence_clusters_count: int = 0
     multi_occurrence_clusters_count: int = 0
     synthesized_count: int = 0
+    resumed_count: int = 0
     merged_clusters_count: int = 0
     edges_added_count: int = 0
     duration_seconds: float = 0.0
     synthesized_ideas: List[str] = Field(default_factory=list)
     bypassed_ideas: List[str] = Field(default_factory=list)
+
+
+# ==============================================================================
+# Persistent Checkpoint State Management
+# ==============================================================================
+
+
+class IdeaPostProcessorState:
+    """
+    Persistent checkpoint state manager for two-pass idea postprocessing.
+    Saves progress every N ideas (default: 100) and enables auto-continue on resume.
+    """
+
+    def __init__(self, state_path: Path | str):
+        self.state_path = Path(state_path).expanduser().resolve()
+        self.version: int = 1
+        self.created_at: float = time.time()
+        self.updated_at: float = time.time()
+        self.total_clusters: int = 0
+        self.model_name: str = ""
+        self.similarity_threshold: float = 0.92
+        self.min_occurrences: int = 2
+        self.processed_ideas: Dict[str, Dict[str, Any]] = {}
+        self.load()
+
+    def load(self) -> bool:
+        """Load state from disk. Returns True if existing valid state was loaded."""
+        if not self.state_path.is_file():
+            return False
+        try:
+            with open(self.state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self.version = data.get("version", 1)
+                self.created_at = data.get("created_at", self.created_at)
+                self.updated_at = data.get("updated_at", time.time())
+                self.total_clusters = data.get("total_clusters", 0)
+                self.model_name = data.get("model_name", "")
+                self.similarity_threshold = data.get("similarity_threshold", 0.92)
+                self.min_occurrences = data.get("min_occurrences", 2)
+                self.processed_ideas = data.get("processed_ideas", {})
+                return True
+        except Exception as e:
+            logger.warning(f"Could not load postprocessor state from {self.state_path} ({e}); starting fresh.")
+        return False
+
+    def save(self) -> None:
+        """Atomically persist state to disk using a temporary file rename."""
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            self.updated_at = time.time()
+            data = {
+                "version": self.version,
+                "created_at": self.created_at,
+                "updated_at": self.updated_at,
+                "total_clusters": self.total_clusters,
+                "model_name": self.model_name,
+                "similarity_threshold": self.similarity_threshold,
+                "min_occurrences": self.min_occurrences,
+                "completed_count": len(self.processed_ideas),
+                "processed_ideas": self.processed_ideas,
+            }
+            dir_name = self.state_path.parent
+            with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+                json.dump(data, tf, indent=2, ensure_ascii=False)
+                temp_name = tf.name
+            os.replace(temp_name, self.state_path)
+            logger.debug(f"Saved postprocessor state ({len(self.processed_ideas)} ideas) to {self.state_path}")
+        except Exception as e:
+            logger.warning(f"Failed to persist postprocessor state to {self.state_path}: {e}")
+
+    def is_processed(self, canonical_name: str) -> bool:
+        """Check if an idea has already been processed in this state."""
+        return canonical_name in self.processed_ideas
+
+    def get_output(self, canonical_name: str) -> Optional[ConsolidatedIdeaOutput]:
+        """Retrieve cached ConsolidatedIdeaOutput for an idea if present."""
+        rec = self.processed_ideas.get(canonical_name)
+        if not rec or "output" not in rec:
+            return None
+        try:
+            return ConsolidatedIdeaOutput.model_validate(rec["output"])
+        except Exception as e:
+            logger.warning(f"Failed to validate cached ConsolidatedIdeaOutput for '{canonical_name}': {e}")
+            return None
+
+    def record_processed(
+        self,
+        cluster: IdeaCluster,
+        output: ConsolidatedIdeaOutput,
+        status: str = "synthesized",
+    ) -> None:
+        """Record a processed idea cluster and its consolidated output."""
+        self.processed_ideas[cluster.canonical_name] = {
+            "canonical_name": cluster.canonical_name,
+            "normalized_name": cluster.normalized_name,
+            "total_occurrences": cluster.total_occurrences,
+            "status": status,
+            "output": output.model_dump(),
+            "timestamp": time.time(),
+        }
+
+    def clear(self) -> None:
+        """Clear all in-memory and on-disk state."""
+        self.processed_ideas.clear()
+        if self.state_path.is_file():
+            try:
+                self.state_path.unlink()
+            except Exception as e:
+                logger.warning(f"Could not remove state file {self.state_path}: {e}")
 
 
 # ==============================================================================
@@ -286,6 +400,9 @@ class IdeaPostProcessor:
         temperature: float = 0.1,
         timeout: int = 60,
         retries: int = 1,
+        state_file: Optional[Path | str] = None,
+        checkpoint_interval: int = 100,
+        resume: bool = True,
     ):
         self.pool = pool
         self.embeddings = embeddings
@@ -296,6 +413,9 @@ class IdeaPostProcessor:
         self.temperature = temperature
         self.timeout = timeout
         self.retries = retries
+        self.state_file = Path(state_file).expanduser().resolve() if state_file else None
+        self.checkpoint_interval = checkpoint_interval
+        self.resume = resume
 
     @classmethod
     def from_settings(
@@ -305,6 +425,9 @@ class IdeaPostProcessor:
         similarity_threshold: Optional[float] = None,
         pool: Optional[OllamaPool] = None,
         embeddings: Optional[Embeddings] = None,
+        state_file: Optional[Path | str] = None,
+        checkpoint_interval: Optional[int] = None,
+        resume: Optional[bool] = None,
     ) -> "IdeaPostProcessor":
         """Instantiate IdeaPostProcessor using application settings."""
         eff_model = model_name or settings.resolved_dual_pass_model
@@ -318,6 +441,13 @@ class IdeaPostProcessor:
         temp = settings.dual_pass.temperature
         t_out = getattr(settings, "request_timeout", 60)
         retries = getattr(settings, "max_retries", 1)
+        eff_state_file = state_file or getattr(settings, "resolved_dual_pass_state_file", None)
+        eff_interval = (
+            checkpoint_interval
+            if checkpoint_interval is not None
+            else getattr(settings.dual_pass, "checkpoint_interval", 100)
+        )
+        eff_resume = resume if resume is not None else True
 
         # Initialize pool if not provided
         if pool is None:
@@ -347,6 +477,9 @@ class IdeaPostProcessor:
             temperature=temp,
             timeout=t_out,
             retries=retries,
+            state_file=eff_state_file,
+            checkpoint_interval=eff_interval,
+            resume=eff_resume,
         )
 
     # --------------------------------------------------------------------------
@@ -910,6 +1043,38 @@ class IdeaPostProcessor:
 
         return edges_added
 
+    def _process_single_cluster(
+        self,
+        cluster: IdeaCluster,
+        state_manager: Optional[IdeaPostProcessorState] = None,
+    ) -> Tuple[ConsolidatedIdeaOutput, bool, bool]:
+        """
+        Synthesize or retrieve cached cluster output.
+        Returns: (output, is_multi, was_resumed)
+        """
+        is_multi = cluster.total_occurrences >= self.min_occurrences
+        if state_manager and self.resume:
+            cached = state_manager.get_output(cluster.canonical_name)
+            if cached is not None:
+                return cached, is_multi, True
+
+        if is_multi:
+            output = self.synthesize_cluster(cluster)
+            if state_manager:
+                state_manager.record_processed(cluster, output, status="synthesized")
+            return output, True, False
+        else:
+            default_output = ConsolidatedIdeaOutput(
+                brief_description=cluster.get_representative_brief(),
+                detailed_explanation=cluster.get_representative_detailed(),
+                related_entities=[],
+                category=cluster.category,
+                weight=cluster.max_weight,
+            )
+            if state_manager:
+                state_manager.record_processed(cluster, default_output, status="bypassed")
+            return default_output, False, False
+
     # --------------------------------------------------------------------------
     # Main Postprocessing Pipeline
     # --------------------------------------------------------------------------
@@ -927,6 +1092,7 @@ class IdeaPostProcessor:
         3. For N == 1: pass through as-is (bypass LLM).
            For N >= 2: synthesize cohesive brief and detailed explanations with LLM.
         4. Overwrite/upsert canonical concept nodes and provenance/relational edges.
+        Supports state file checkpointing (save every N ideas) and auto-continue.
         """
         t0 = time.time()
         t_start = time.perf_counter()
@@ -944,8 +1110,35 @@ class IdeaPostProcessor:
         target_multi = [c for c in merged_clusters if c.total_occurrences >= self.min_occurrences]
         target_single = [c for c in merged_clusters if c.total_occurrences < self.min_occurrences]
 
+        # Checkpoint state manager setup
+        state_manager: Optional[IdeaPostProcessorState] = None
+        resumed_count = 0
+        if self.state_file:
+            state_manager = IdeaPostProcessorState(self.state_file)
+            state_manager.model_name = self.model_name
+            state_manager.similarity_threshold = self.similarity_threshold
+            state_manager.min_occurrences = self.min_occurrences
+            state_manager.total_clusters = total_clusters
+            if not self.resume:
+                state_manager.clear()
+            elif len(state_manager.processed_ideas) > 0:
+                resumed_count = len(state_manager.processed_ideas)
+                if console is not None:
+                    console.print(
+                        f"[bold cyan]• Found existing postprocessor state file: [bold]{state_manager.state_path.name}[/bold] "
+                        f"({resumed_count} ideas previously processed). Auto-continuing...[/bold cyan]"
+                    )
+
         # Display Section Header
         if console is not None:
+            resumed_info = (
+                f"\n• Resumed from State:       [bold green]{resumed_count}[/bold green] ideas (auto-continued from {state_manager.state_path.name})"
+                if resumed_count > 0 and state_manager else ""
+            )
+            checkpoint_info = (
+                f"\n• State Checkpoint File:    [bold]{state_manager.state_path}[/bold] (saves every {self.checkpoint_interval} ideas)"
+                if state_manager else ""
+            )
             header_text = (
                 f"[bold cyan]🧠 Two-Pass Idea Aggregation & Synthesis (Pass 2)[/bold cyan]\n"
                 f"• Consolidation Model:       [bold green]{self.model_name}[/bold green]\n"
@@ -954,152 +1147,171 @@ class IdeaPostProcessor:
                 f"• Multi-Occurrence Ideas:    [bold green]{len(target_multi)}[/bold green] (filtered in for LLM consolidation, >= {self.min_occurrences} mentions)\n"
                 f"• Single-Occurrence Ideas:   [dim]{len(target_single)} (filtered out / bypassed to conserve compute)[/dim]\n"
                 f"• Cosine Similarity Thresh:  [bold yellow]{self.similarity_threshold}[/bold yellow]"
+                f"{checkpoint_info}"
+                f"{resumed_info}"
             )
             console.print(Panel.fit(header_text, title="Idea Postprocessor", border_style="cyan"))
         else:
             logger.info(
                 f"Starting IdeaPostProcessor (model={self.model_name}): {total_input_concepts} raw concepts -> "
                 f"{total_clusters} clusters ({len(target_multi)} multi-occurrence filtered for synthesis, "
-                f"{len(target_single)} single-occurrence bypassed)."
+                f"{len(target_single)} single-occurrence bypassed, resumed: {resumed_count})."
             )
 
         single_occ_count = 0
         multi_occ_count = 0
         synthesized_count = 0
         total_edges_added = 0
+        actual_resumed_count = 0
         synthesized_names: List[str] = []
         bypassed_names: List[str] = []
 
-        # 3 & 4. Branch by mention count and apply to graph with live progress
-        if console is not None and total_clusters > 0:
-            progress = Progress(
-                SpinnerColumn(),
-                TextColumn("[bold cyan]Consolidation Progress:[/bold cyan]"),
-                BarColumn(bar_width=25),
-                TaskProgressColumn(),
-                MofNCompleteColumn(),
-                TextColumn("{task.fields[stats_line]}"),
-                console=console,
-            )
-            tot_task = progress.add_task("total", total=total_clusters, completed=0, stats_line="")
-            first_c = merged_clusters[0]
-            if first_c.total_occurrences >= self.min_occurrences:
-                first_init_text = (
-                    f"[bold blue]Current Idea:[/bold blue] '{first_c.canonical_name}' "
-                    f"({first_c.total_occurrences} mentions) | [bold yellow]Consolidating with {self.model_name}...[/bold yellow]"
+        try:
+            # 3 & 4. Branch by mention count and apply to graph with live progress
+            if console is not None and total_clusters > 0:
+                progress = Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold cyan]Consolidation Progress:[/bold cyan]"),
+                    BarColumn(bar_width=25),
+                    TaskProgressColumn(),
+                    MofNCompleteColumn(),
+                    TextColumn("{task.fields[stats_line]}"),
+                    console=console,
                 )
-            else:
-                first_init_text = (
-                    f"[bold blue]Current Idea:[/bold blue] '{first_c.canonical_name}' | [dim]Bypassing (single-occurrence)[/dim]"
-                )
-            cur_line = Text.from_markup(first_init_text)
-
-            with Live(Group(cur_line, progress), console=console, refresh_per_second=10) as live:
-                for idx, cluster in enumerate(merged_clusters, start=1):
-                    is_multi = cluster.total_occurrences >= self.min_occurrences
-                    if is_multi:
-                        cur_text = (
-                            f"[bold blue]Current Idea:[/bold blue] '{cluster.canonical_name}' "
-                            f"({cluster.total_occurrences} mentions) | [bold yellow]Consolidating with {self.model_name}...[/bold yellow]"
+                tot_task = progress.add_task("total", total=total_clusters, completed=0, stats_line="")
+                first_c = merged_clusters[0]
+                first_is_cached = bool(state_manager and state_manager.is_processed(first_c.canonical_name))
+                if first_c.total_occurrences >= self.min_occurrences:
+                    if first_is_cached:
+                        first_init_text = f"[bold blue]Current Idea:[/bold blue] '{first_c.canonical_name}' | [bold green]✓ Synthesized (resumed)[/bold green]"
+                    else:
+                        first_init_text = (
+                            f"[bold blue]Current Idea:[/bold blue] '{first_c.canonical_name}' "
+                            f"({first_c.total_occurrences} mentions) | [bold yellow]Consolidating with {self.model_name}...[/bold yellow]"
                         )
-                        live.update(Group(Text.from_markup(cur_text), progress))
-                        output = self.synthesize_cluster(cluster)
+                else:
+                    first_init_text = (
+                        f"[bold blue]Current Idea:[/bold blue] '{first_c.canonical_name}' | [dim]Bypassing (single-occurrence)[/dim]"
+                    )
+                cur_line = Text.from_markup(first_init_text)
+
+                with Live(Group(cur_line, progress), console=console, refresh_per_second=10) as live:
+                    for idx, cluster in enumerate(merged_clusters, start=1):
+                        is_multi = cluster.total_occurrences >= self.min_occurrences
+                        is_cached = bool(state_manager and state_manager.is_processed(cluster.canonical_name))
+
+                        if is_multi and not is_cached:
+                            cur_text = (
+                                f"[bold blue]Current Idea:[/bold blue] '{cluster.canonical_name}' "
+                                f"({cluster.total_occurrences} mentions) | [bold yellow]Consolidating with {self.model_name}...[/bold yellow]"
+                            )
+                            live.update(Group(Text.from_markup(cur_text), progress))
+
+                        output, _, was_resumed = self._process_single_cluster(cluster, state_manager)
                         edges_added = self.apply_consolidation_to_graph(store, cluster, output)
                         total_edges_added += edges_added
+
+                        if was_resumed:
+                            actual_resumed_count += 1
+
+                        if is_multi:
+                            synthesized_count += 1
+                            multi_occ_count += 1
+                            synthesized_names.append(cluster.canonical_name)
+                            status_badge = "[bold green]✓ Synthesized (resumed)[/bold green]" if was_resumed else "[bold green]✓ Synthesized[/bold green]"
+                        else:
+                            single_occ_count += 1
+                            bypassed_names.append(cluster.canonical_name)
+                            status_badge = "[dim]Bypassed (resumed)[/dim]" if was_resumed else "[dim]Bypassed (single-occurrence)[/dim]"
+
+                        completed = idx
+                        cur_text = f"[bold blue]Current Idea:[/bold blue] '{cluster.canonical_name}' | {status_badge}"
+
+                        elapsed = time.perf_counter() - t_start
+                        rate = (completed / elapsed) if elapsed > 0 else 0.0
+                        if completed > 0 and total_clusters > completed and rate > 0:
+                            rem_sec = (total_clusters - completed) / rate
+                            eta_str = _format_eta(rem_sec)
+                        elif completed >= total_clusters:
+                            eta_str = "0m 00s"
+                        else:
+                            eta_str = "--m --s"
+
+                        rate_str = f"{rate:.2f} idea/s" if rate > 0 else "-- idea/s"
+                        resumed_stats = f" | [cyan]{actual_resumed_count} resumed[/cyan]" if actual_resumed_count > 0 else ""
+                        stats_str = (
+                            f" | [bold yellow]{rate_str}[/bold yellow] | ETA: {eta_str} | "
+                            f"[bold green]✓ {synthesized_count} synthesized[/bold green] | "
+                            f"[dim]{single_occ_count} bypassed[/dim]{resumed_stats}"
+                        )
+
+                        progress.update(tot_task, completed=completed, total=total_clusters, stats_line=stats_str)
+                        live.update(Group(Text.from_markup(cur_text), progress))
+
+                        # Save checkpoint every checkpoint_interval (default: 100)
+                        if state_manager and (completed % self.checkpoint_interval == 0 or completed == total_clusters):
+                            state_manager.save()
+                            if completed % self.checkpoint_interval == 0 and completed < total_clusters:
+                                console.print(
+                                    f"[bold cyan][Idea Postprocessor][/bold cyan] [dim]💾 Checkpoint saved at {completed}/{total_clusters} ideas -> {state_manager.state_path.name}[/dim]"
+                                )
+                                sys.stdout.flush()
+
+                        # Periodic statistical line info every 10 ideas (or on final completion)
+                        if completed % 10 == 0 or completed == total_clusters:
+                            pct = (completed / total_clusters * 100) if total_clusters > 0 else 100.0
+                            console.print(
+                                f"[bold cyan][Idea Postprocessor][/bold cyan] {completed}/{total_clusters} ideas ({pct:.1f}%)"
+                                f" | {rate_str} | ETA: {eta_str} | [bold green]✓ {synthesized_count} synthesized[/bold green]"
+                                f" | [dim]{single_occ_count} bypassed[/dim]{resumed_stats} | +{total_edges_added} edges"
+                            )
+                            sys.stdout.flush()
+
+                        if on_progress:
+                            on_progress(completed, total_clusters, cluster.canonical_name, {
+                                "synthesized": synthesized_count,
+                                "bypassed": single_occ_count,
+                                "resumed": actual_resumed_count,
+                                "edges_added": total_edges_added,
+                            })
+            else:
+                for idx, cluster in enumerate(merged_clusters, start=1):
+                    output, is_multi, was_resumed = self._process_single_cluster(cluster, state_manager)
+                    edges_added = self.apply_consolidation_to_graph(store, cluster, output)
+                    total_edges_added += edges_added
+
+                    if was_resumed:
+                        actual_resumed_count += 1
+
+                    if is_multi:
                         synthesized_count += 1
                         multi_occ_count += 1
                         synthesized_names.append(cluster.canonical_name)
-                        status_badge = "[bold green]✓ Synthesized[/bold green]"
                     else:
-                        default_output = ConsolidatedIdeaOutput(
-                            brief_description=cluster.get_representative_brief(),
-                            detailed_explanation=cluster.get_representative_detailed(),
-                            related_entities=[],
-                            category=cluster.category,
-                            weight=cluster.max_weight,
-                        )
-                        edges_added = self.apply_consolidation_to_graph(store, cluster, default_output)
-                        total_edges_added += edges_added
                         single_occ_count += 1
                         bypassed_names.append(cluster.canonical_name)
-                        status_badge = "[dim]Bypassed (single-occurrence)[/dim]"
 
                     completed = idx
-                    cur_text = f"[bold blue]Current Idea:[/bold blue] '{cluster.canonical_name}' | {status_badge}"
+                    if state_manager and (completed % self.checkpoint_interval == 0 or completed == total_clusters):
+                        state_manager.save()
 
-                    elapsed = time.perf_counter() - t_start
-                    rate = (completed / elapsed) if elapsed > 0 else 0.0
-                    if completed > 0 and total_clusters > completed and rate > 0:
-                        rem_sec = (total_clusters - completed) / rate
-                        eta_str = _format_eta(rem_sec)
-                    elif completed >= total_clusters:
-                        eta_str = "0m 00s"
-                    else:
-                        eta_str = "--m --s"
-
-                    rate_str = f"{rate:.2f} idea/s" if rate > 0 else "-- idea/s"
-                    stats_str = (
-                        f" | [bold yellow]{rate_str}[/bold yellow] | ETA: {eta_str} | "
-                        f"[bold green]✓ {synthesized_count} synthesized[/bold green] | "
-                        f"[dim]{single_occ_count} bypassed[/dim]"
-                    )
-
-                    progress.update(tot_task, completed=completed, total=total_clusters, stats_line=stats_str)
-                    live.update(Group(Text.from_markup(cur_text), progress))
-
-                    # Periodic statistical line info every 10 ideas (or on final completion)
                     if completed % 10 == 0 or completed == total_clusters:
                         pct = (completed / total_clusters * 100) if total_clusters > 0 else 100.0
-                        console.print(
-                            f"[bold cyan][Idea Postprocessor][/bold cyan] {completed}/{total_clusters} ideas ({pct:.1f}%)"
-                            f" | {rate_str} | ETA: {eta_str} | [bold green]✓ {synthesized_count} synthesized[/bold green]"
-                            f" | [dim]{single_occ_count} bypassed[/dim] | +{total_edges_added} edges"
+                        logger.info(
+                            f"[Idea Postprocessor] {completed}/{total_clusters} ideas ({pct:.1f}%)"
+                            f" | Synthesized: {synthesized_count} | Bypassed: {single_occ_count} | Resumed: {actual_resumed_count} | Edges: +{total_edges_added}"
                         )
-                        sys.stdout.flush()
 
                     if on_progress:
                         on_progress(completed, total_clusters, cluster.canonical_name, {
                             "synthesized": synthesized_count,
                             "bypassed": single_occ_count,
+                            "resumed": actual_resumed_count,
                             "edges_added": total_edges_added,
                         })
-        else:
-            for idx, cluster in enumerate(merged_clusters, start=1):
-                is_multi = cluster.total_occurrences >= self.min_occurrences
-                if is_multi:
-                    output = self.synthesize_cluster(cluster)
-                    edges_added = self.apply_consolidation_to_graph(store, cluster, output)
-                    total_edges_added += edges_added
-                    synthesized_count += 1
-                    multi_occ_count += 1
-                    synthesized_names.append(cluster.canonical_name)
-                else:
-                    default_output = ConsolidatedIdeaOutput(
-                        brief_description=cluster.get_representative_brief(),
-                        detailed_explanation=cluster.get_representative_detailed(),
-                        related_entities=[],
-                        category=cluster.category,
-                        weight=cluster.max_weight,
-                    )
-                    edges_added = self.apply_consolidation_to_graph(store, cluster, default_output)
-                    total_edges_added += edges_added
-                    single_occ_count += 1
-                    bypassed_names.append(cluster.canonical_name)
-
-                completed = idx
-                if completed % 10 == 0 or completed == total_clusters:
-                    pct = (completed / total_clusters * 100) if total_clusters > 0 else 100.0
-                    logger.info(
-                        f"[Idea Postprocessor] {completed}/{total_clusters} ideas ({pct:.1f}%)"
-                        f" | Synthesized: {synthesized_count} | Bypassed: {single_occ_count} | Edges: +{total_edges_added}"
-                    )
-
-                if on_progress:
-                    on_progress(completed, total_clusters, cluster.canonical_name, {
-                        "synthesized": synthesized_count,
-                        "bypassed": single_occ_count,
-                        "edges_added": total_edges_added,
-                    })
+        finally:
+            if state_manager:
+                state_manager.save()
 
         duration = time.time() - t0
         report = IdeaPostProcessorReport(
@@ -1108,6 +1320,7 @@ class IdeaPostProcessor:
             single_occurrence_clusters_count=single_occ_count,
             multi_occurrence_clusters_count=multi_occ_count,
             synthesized_count=synthesized_count,
+            resumed_count=actual_resumed_count,
             merged_clusters_count=merged_diff,
             edges_added_count=total_edges_added,
             duration_seconds=round(duration, 2),
@@ -1117,6 +1330,6 @@ class IdeaPostProcessor:
 
         logger.info(
             f"IdeaPostProcessor completed in {duration:.2f}s: "
-            f"{len(merged_clusters)} clusters ({multi_occ_count} synthesized, {single_occ_count} bypassed)."
+            f"{len(merged_clusters)} clusters ({multi_occ_count} synthesized, {single_occ_count} bypassed, {actual_resumed_count} resumed)."
         )
         return report

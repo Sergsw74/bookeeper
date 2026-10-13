@@ -119,6 +119,14 @@ lightrag_dir: "./output/lightrag"
 lightrag_embedding_dim: 768
 lightrag_mode: "hybrid"  # Default retrieval mode: 'hybrid', 'local', 'global', 'naive', or 'mix'
 
+# Throughput, Concurrency & In-Memory Batching:
+lightrag_max_parallel_insert: 6     # Number of documents/chunks parsed in parallel (default: 6)
+lightrag_llm_max_async: 16          # Max concurrent entity/relation extraction calls to Ollama (default: 16)
+lightrag_embedding_batch_num: 64    # Number of text chunks sent in a single batch to embedding endpoint (default: 64)
+lightrag_embedding_max_async: 32    # Concurrent async embedding workers (default: 32)
+lightrag_ollama_keep_alive: "-1"    # Ollama keep_alive parameter ('-1' keeps models pinned in RAM/VRAM)
+
+
 # ==============================================================================
 # Neo4j Graph Database Export Configuration
 # ==============================================================================

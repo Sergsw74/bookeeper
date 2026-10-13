@@ -2364,7 +2364,17 @@ def build_graph(
                         valid_chunks = [r["chunk"] for r in successful_results]
                         if valid_chunks:
                             console.print(f"  [dim cyan]Indexing {len(valid_chunks)} chunk(s) into LightRAG engine...[/dim cyan]")
-                            lightrag_engine.insert_chunks(valid_chunks, book_title=btitle, book_id=bid)
+                            with console.status(f"[cyan]Indexing LightRAG ({len(valid_chunks)} chunks)...[/cyan]") as lrag_status:
+                                def _on_inline_progress(done: int, tot: int):
+                                    lrag_status.update(f"[cyan]Indexing LightRAG: {done}/{tot} chunks ({int(done/tot*100)}%)...[/cyan]")
+
+                                lightrag_engine.insert_chunks(
+                                    valid_chunks,
+                                    book_title=btitle,
+                                    book_id=bid,
+                                    batch_size=getattr(cfg, "lightrag_max_parallel_insert", 6) * 2,
+                                    on_progress=_on_inline_progress,
+                                )
                             console.print(f"  [dim green]✓ Indexed into LightRAG.[/dim green]")
                     except Exception as e:
                         console.print(f"  [yellow]Warning: LightRAG indexing failed for '{btitle}': {e}[/yellow]")
@@ -2984,19 +2994,64 @@ def build_rag(
     )
 
     total_chunks_indexed = 0
-    console.print(f"[bold green]Starting LightRAG indexing for {len(target_ids)} book(s)...[/bold green]")
-    for bid in target_ids:
-        chunks = chunk_store.load_chunks(bid)
-        btitle = chunk_store.get_book_title(bid) or f"Book {bid}"
-        if not chunks:
-            continue
-        console.print(f"  [dim cyan]Indexing {len(chunks)} chunk(s) for Book #{bid} ('{btitle}')...[/dim cyan]")
-        try:
-            indexed = engine.insert_chunks(chunks, book_title=btitle, book_id=bid)
-            total_chunks_indexed += indexed
-            console.print(f"  [bold green]✓ Indexed {indexed} chunk(s) into LightRAG.[/bold green]")
-        except Exception as e:
-            console.print(f"  [bold red]✗ Failed to index Book #{bid}:[/bold red] {e}")
+    console.print(f"[bold green]Starting LightRAG indexing for {len(target_ids)} book(s)...[/bold green]\n")
+
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TaskProgressColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]{task.description}[/bold cyan]"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("• ETA:"),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        book_task = progress.add_task("[bold cyan]Books[/bold cyan]", total=len(target_ids))
+        chunk_task = progress.add_task("[dim cyan]Chunks[/dim cyan]", total=1)
+
+        for bid in target_ids:
+            chunks = chunk_store.load_chunks(bid)
+            btitle = chunk_store.get_book_title(bid) or f"Book {bid}"
+            if not chunks:
+                progress.advance(book_task, 1)
+                continue
+
+            progress.update(
+                chunk_task,
+                description=f"[dim cyan]#{bid} {btitle[:30]}[/dim cyan]",
+                completed=0,
+                total=len(chunks),
+            )
+
+            def _on_chunk_progress(completed: int, total: int):
+                progress.update(chunk_task, completed=completed, total=total)
+
+            try:
+                indexed = engine.insert_chunks(
+                    chunks,
+                    book_title=btitle,
+                    book_id=bid,
+                    batch_size=getattr(cfg, "lightrag_max_parallel_insert", 6) * 2,
+                    on_progress=_on_chunk_progress,
+                )
+                total_chunks_indexed += indexed
+            except Exception as e:
+                console.print(f"  [bold red]✗ Failed to index Book #{bid} ('{btitle}'):[/bold red] {e}")
+
+            progress.advance(book_task, 1)
 
     console.print(
         f"\n[bold green]✓ LightRAG build complete:[/bold green] "

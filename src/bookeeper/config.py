@@ -745,6 +745,27 @@ class Settings(BaseSettings):
         default="hybrid",
         description="Default retrieval mode for LightRAG queries ('hybrid', 'local', 'global', 'naive', or 'mix').",
     )
+    lightrag_max_parallel_insert: int = Field(
+        default=6,
+        description="Max parallel document insertion pipelines in LightRAG (default: 6).",
+    )
+    lightrag_llm_max_async: int = Field(
+        default=16,
+        description="Max concurrent entity/relation extraction calls to Ollama pool (default: 16).",
+    )
+    lightrag_embedding_batch_num: int = Field(
+        default=64,
+        description="Number of text chunks sent in a single batch to embedding endpoint (default: 64).",
+    )
+    lightrag_embedding_max_async: int = Field(
+        default=32,
+        description="Max concurrent async embedding workers in LightRAG (default: 32).",
+    )
+    lightrag_ollama_keep_alive: str = Field(
+        default="-1",
+        description="Ollama keep_alive parameter for LightRAG requests ('-1' keeps models pinned in RAM/VRAM).",
+    )
+
 
     # Neo4j Graph Database Export
     neo4j: Neo4jConfig = Field(

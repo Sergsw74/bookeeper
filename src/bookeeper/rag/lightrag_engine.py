@@ -37,6 +37,11 @@ class LightRAGEngine:
         embedding_dim: int = 768,
         max_token_size: int = 8192,
         embedding_pool: Optional[OllamaPool] = None,
+        max_parallel_insert: int = 6,
+        llm_max_async: int = 16,
+        embedding_batch_num: int = 64,
+        embedding_max_async: int = 32,
+        keep_alive: str = "-1",
     ):
         self.working_dir = Path(working_dir).expanduser().resolve()
         self.working_dir.mkdir(parents=True, exist_ok=True)
@@ -46,6 +51,11 @@ class LightRAGEngine:
         self.embedding_model = embedding_model
         self.embedding_dim = embedding_dim
         self.max_token_size = max_token_size
+        self.max_parallel_insert = max_parallel_insert
+        self.llm_max_async = llm_max_async
+        self.embedding_batch_num = embedding_batch_num
+        self.embedding_max_async = embedding_max_async
+        self.keep_alive = keep_alive
 
         self._rag: Optional[LightRAG] = None
         self._initialized = False
@@ -79,12 +89,14 @@ class LightRAGEngine:
             pool = OllamaPool(
                 servers=settings.resolved_ollama_servers,
                 cooldown_seconds=cd,
+                max_tasks_per_server=4,
             )
         if embedding_pool is None:
+            # Raise concurrency limit for embedding workers to match OLLAMA_NUM_PARALLEL
             embedding_pool = OllamaPool(
                 servers=settings.resolved_embedding_servers,
                 cooldown_seconds=cd,
-                max_tasks_per_server=1,
+                max_tasks_per_server=8,
             )
         return cls(
             working_dir=target_dir,
@@ -93,6 +105,11 @@ class LightRAGEngine:
             embedding_model=settings.embedding_model,
             embedding_dim=settings.lightrag_embedding_dim,
             embedding_pool=embedding_pool,
+            max_parallel_insert=getattr(settings, "lightrag_max_parallel_insert", 6),
+            llm_max_async=getattr(settings, "lightrag_llm_max_async", 16),
+            embedding_batch_num=getattr(settings, "lightrag_embedding_batch_num", 64),
+            embedding_max_async=getattr(settings, "lightrag_embedding_max_async", 32),
+            keep_alive=getattr(settings, "lightrag_ollama_keep_alive", "-1"),
         )
 
     def _call_ollama(
@@ -245,6 +262,7 @@ class LightRAGEngine:
         llm_model = self.llm_model
         embedding_model = self.embedding_model
         embedding_dim = self.embedding_dim
+        keep_alive = self.keep_alive
 
         async def _llm_func(
             prompt: str,
@@ -263,6 +281,7 @@ class LightRAGEngine:
                 "model": llm_model,
                 "messages": messages,
                 "stream": False,
+                "keep_alive": keep_alive,
             }
             res = await asyncio.to_thread(call_ollama, "/api/chat", data, timeout=240, use_embedding_pool=False)
             return res.get("message", {}).get("content", "")
@@ -274,6 +293,7 @@ class LightRAGEngine:
             data = {
                 "model": embedding_model,
                 "input": texts,
+                "keep_alive": keep_alive,
             }
             res = await asyncio.to_thread(call_ollama, "/api/embed", data, timeout=120, use_embedding_pool=True)
             embeddings = res.get("embeddings", [])
@@ -283,7 +303,7 @@ class LightRAGEngine:
                     single_res = await asyncio.to_thread(
                         call_ollama,
                         "/api/embed",
-                        {"model": embedding_model, "input": [t]},
+                        {"model": embedding_model, "input": [t], "keep_alive": keep_alive},
                         timeout=60,
                         use_embedding_pool=True,
                     )
@@ -303,6 +323,13 @@ class LightRAGEngine:
                 max_token_size=self.max_token_size,
                 func=_embed_func,
             ),
+            # Concurrency & Throughput parameters
+            max_parallel_insert=self.max_parallel_insert,
+            llm_model_max_async=self.llm_max_async,
+            embedding_batch_num=self.embedding_batch_num,
+            embedding_func_max_async=self.embedding_max_async,
+            enable_llm_cache=True,
+            enable_llm_cache_for_entity_extract=True,
         )
         await self._rag.initialize_storages()
         self._initialized = True
@@ -339,10 +366,14 @@ class LightRAGEngine:
         chunks: List[HierarchicalChunk],
         book_title: str,
         book_id: int,
+        batch_size: int = 12,
+        on_progress: Optional[Any] = None,
     ) -> int:
         """
         Incrementally index structured hierarchical chunks into LightRAG.
         Each chunk is formatted with its macro chapter/subtitle context header.
+        Submits in parallel batches to allow live progress updates and avoid
+        giant memory spikes on multi-hundred chunk books.
         """
         await self.ainitialize()
         assert self._rag is not None
@@ -353,7 +384,6 @@ class LightRAGEngine:
         documents: List[str] = []
         doc_ids: List[str] = []
         for c in chunks:
-            # Preserve hierarchical breadcrumb and context
             header = f"# Book: {book_title}\n"
             if c.chapter_title:
                 header += f"## Chapter: {c.chapter_title}\n"
@@ -364,17 +394,42 @@ class LightRAGEngine:
             documents.append(content)
             doc_ids.append(f"book_{book_id}_chunk_{c.chunk_id}")
 
-        await self._rag.ainsert(documents, ids=doc_ids)
-        return len(documents)
+        total_docs = len(documents)
+        completed_docs = 0
+
+        # Subdivide into batches for responsive progress reporting
+        effective_batch_size = max(1, batch_size)
+        for i in range(0, total_docs, effective_batch_size):
+            batch_docs = documents[i : i + effective_batch_size]
+            batch_ids = doc_ids[i : i + effective_batch_size]
+            await self._rag.ainsert(batch_docs, ids=batch_ids)
+            completed_docs += len(batch_docs)
+            if on_progress:
+                try:
+                    on_progress(completed_docs, total_docs)
+                except Exception:
+                    pass
+
+        return total_docs
 
     def insert_chunks(
         self,
         chunks: List[HierarchicalChunk],
         book_title: str,
         book_id: int,
+        batch_size: int = 12,
+        on_progress: Optional[Any] = None,
     ) -> int:
-        """Synchronous chunk indexing."""
-        return asyncio.run(self.ainsert_chunks(chunks, book_title=book_title, book_id=book_id))
+        """Synchronous chunk indexing with optional progress tracking."""
+        return asyncio.run(
+            self.ainsert_chunks(
+                chunks,
+                book_title=book_title,
+                book_id=book_id,
+                batch_size=batch_size,
+                on_progress=on_progress,
+            )
+        )
 
     async def aquery(
         self,

@@ -116,21 +116,41 @@ bookeeper query "Explain the two-phase commit protocol." --mode naive
 
 ---
 
-## 5. Configuration Options
+## 5. Configuration & Performance Tuning
 
-Configure LightRAG settings in `config.yaml`:
+Configure LightRAG settings and throughput concurrency in `config.yaml`:
 
 ```yaml
 # Enable or disable automatic LightRAG indexing during build-graph:
-enable_lightrag: false
+enable_lightrag: true
 
 # Working directory for LightRAG graph and vector indices:
 lightrag_dir: "output/lightrag"
 
 # LLM and Embedding models for LightRAG:
-llm_model: "qwen2.5:3b"
-embedding_model: "nomic-embed-text"
+llm_model: "qwen2.5:7b-instruct-q4_K_M"
+embedding_model: "bge-m3:latest"
+lightrag_embedding_dim: 1024
+
+# --- Throughput & Concurrency Tuning ---
+lightrag_max_parallel_insert: 6     # Number of documents/chunks parsed in parallel (default: 6)
+lightrag_llm_max_async: 16          # Max concurrent entity/relation extraction calls to Ollama (default: 16)
+lightrag_embedding_batch_num: 64    # Number of text chunks sent in a single batch to embedding endpoint (default: 64)
+lightrag_embedding_max_async: 32    # Concurrent async embedding workers (default: 32)
+lightrag_ollama_keep_alive: "-1"    # Keeps models permanently pinned in RAM/VRAM to prevent unload thrashing
 ```
+
+### Preventing Ollama VRAM/RAM Thrashing
+If your LLM and embedding model share the same Ollama server instances, configure the following on your Ollama host:
+```bash
+export OLLAMA_MAX_LOADED_MODELS=3
+export OLLAMA_NUM_PARALLEL=4
+```
+Combined with `lightrag_ollama_keep_alive: "-1"`, this keeps weights permanently mapped into GPU/system memory and avoids model unload/reload thrashing during heavy ingestion.
+
+### Live Progress Bar & Status
+When indexing with `bookeeper build-rag`, Bookkeeper renders a live Rich progress bar tracking both overall books and individual chunk batches with active ETAs, elapsed time, and completion percentages.
+
 
 ---
 

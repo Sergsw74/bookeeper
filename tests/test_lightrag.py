@@ -138,3 +138,22 @@ def test_cli_query_empty_directory_exits():
         assert result.exit_code != 0
         assert "is empty or does not exist" in " ".join(result.output.split())
         assert "bookeeper build-graph --lightrag" in result.output
+
+
+def test_lightrag_detect_embedding_dim(tmp_path, mock_pool):
+    """Verify detect_embedding_dim probes Ollama and returns detected vector size."""
+    engine = LightRAGEngine(
+        working_dir=tmp_path,
+        pool=mock_pool,
+        embedding_model="bge-m3:latest",
+        embedding_dim=768,  # configured as 768
+    )
+
+    with patch.object(engine, "_call_ollama") as mock_call:
+        mock_call.return_value = {"embeddings": [[0.0] * 1024]}
+        detected = engine.detect_embedding_dim()
+        assert detected == 1024
+        assert mock_call.called
+        assert mock_call.call_args[0][0] == "/api/embed"
+        assert mock_call.call_args[1]["use_embedding_pool"] is True
+

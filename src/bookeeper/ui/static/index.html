@@ -1,0 +1,1066 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bookeeper | Idea-Based Search Engine</title>
+  <!-- Cytoscape for Interactive Graph Visualization -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+  <!-- Marked for Markdown Rendering in Detail Panel & Synthesis -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+  <style>
+    :root {
+      --bg-dark: #0f172a;
+      --bg-panel: #1e293b;
+      --bg-card: #334155;
+      --bg-card-hover: #475569;
+      --border: #334155;
+      --border-accent: #6366f1;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent: #6366f1;
+      --accent-hover: #4f46e5;
+      --concept-color: #f59e0b;
+      --book-color: #3b82f6;
+      --section-color: #10b981;
+      --chunk-color: #94a3b8;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg-dark);
+      color: var(--text-main);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* Top Navigation & Central Search Bar */
+    header {
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      z-index: 10;
+    }
+
+    .top-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .logo-area {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 1.25rem;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+
+    .logo-badge {
+      background: linear-gradient(135deg, #6366f1, #8b5cf6);
+      color: white;
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      font-weight: 800;
+    }
+
+    .nav-tabs {
+      display: flex;
+      gap: 6px;
+      background: var(--bg-dark);
+      padding: 4px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+    }
+
+    .nav-tab-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      padding: 6px 14px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .nav-tab-btn:hover {
+      color: var(--text-main);
+    }
+
+    .nav-tab-btn.active {
+      background: var(--bg-panel);
+      color: white;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+    }
+
+    /* Central Search Container */
+    .search-wrapper {
+      max-width: 900px;
+      width: 100%;
+      margin: 0 auto;
+      display: flex;
+      gap: 8px;
+    }
+
+    .search-input-box {
+      flex: 1;
+      position: relative;
+    }
+
+    .search-input {
+      width: 100%;
+      background: var(--bg-dark);
+      border: 1px solid var(--border);
+      color: var(--text-main);
+      padding: 12px 16px 12px 42px;
+      border-radius: 10px;
+      font-size: 0.95rem;
+      outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+
+    .search-input:focus {
+      border-color: var(--border-accent);
+      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.25);
+    }
+
+    .search-icon {
+      position: absolute;
+      left: 14px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--text-muted);
+      font-size: 1.1rem;
+      pointer-events: none;
+    }
+
+    .search-btn {
+      background: var(--accent);
+      color: white;
+      border: none;
+      padding: 0 24px;
+      border-radius: 10px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .search-btn:hover {
+      background: var(--accent-hover);
+    }
+
+    .search-btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    .mode-select {
+      background: var(--bg-dark);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 0 12px;
+      border-radius: 10px;
+      font-size: 0.85rem;
+      cursor: pointer;
+      outline: none;
+    }
+
+    /* Main Content Layout */
+    main {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* Views: Search Pane vs Debug Tab */
+    .view-pane {
+      width: 100%;
+      height: 100%;
+      display: none;
+    }
+
+    .view-pane.active {
+      display: flex;
+    }
+
+    /* Two-Column Results Pane */
+    .results-container {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      overflow: hidden;
+    }
+
+    /* Left Column: Graph Visualization */
+    .graph-column {
+      flex: 6;
+      background: #090d16;
+      position: relative;
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+    }
+
+    #cy {
+      width: 100%;
+      height: 100%;
+    }
+
+    .graph-controls {
+      position: absolute;
+      top: 14px;
+      left: 14px;
+      background: rgba(30, 41, 59, 0.85);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--border);
+      padding: 6px;
+      border-radius: 8px;
+      display: flex;
+      gap: 4px;
+      z-index: 5;
+    }
+
+    .ctrl-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-main);
+      padding: 6px 10px;
+      border-radius: 4px;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .ctrl-btn:hover {
+      background: var(--bg-card);
+    }
+
+    .graph-legend {
+      position: absolute;
+      bottom: 14px;
+      left: 14px;
+      background: rgba(30, 41, 59, 0.85);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--border);
+      padding: 8px 12px;
+      border-radius: 8px;
+      display: flex;
+      gap: 12px;
+      font-size: 0.75rem;
+      z-index: 5;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .legend-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+    }
+
+    /* Right Column: Detail Panel (Obsidian Note Style) */
+    .detail-column {
+      flex: 4;
+      background: var(--bg-panel);
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+      border-left: 1px solid var(--border);
+    }
+
+    .detail-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(15, 23, 42, 0.6);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .detail-title {
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .detail-badge {
+      font-size: 0.75rem;
+      padding: 2px 8px;
+      border-radius: 4px;
+      background: var(--bg-card);
+      color: var(--text-muted);
+    }
+
+    .detail-body {
+      padding: 20px;
+      overflow-y: auto;
+      line-height: 1.6;
+    }
+
+    /* Obsidian Style Frontmatter Box */
+    .frontmatter-card {
+      background: var(--bg-dark);
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--accent);
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin-bottom: 20px;
+      font-family: monospace;
+      font-size: 0.85rem;
+    }
+
+    .fm-row {
+      display: flex;
+      margin-bottom: 4px;
+    }
+
+    .fm-label {
+      width: 110px;
+      color: var(--text-muted);
+    }
+
+    .fm-value {
+      color: #38bdf8;
+      word-break: break-all;
+    }
+
+    /* Obsidian Style Headings and Wiki-links */
+    .note-heading {
+      font-size: 1.1rem;
+      font-weight: 700;
+      margin: 20px 0 10px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--border);
+      color: #f1f5f9;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .wikilink {
+      display: inline-block;
+      background: rgba(99, 102, 241, 0.15);
+      color: #a5b4fc;
+      border: 1px solid rgba(99, 102, 241, 0.3);
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.85rem;
+      cursor: pointer;
+      text-decoration: none;
+      transition: all 0.2s;
+      margin: 2px 0;
+    }
+
+    .wikilink:hover {
+      background: var(--accent);
+      color: #fff;
+    }
+
+    .quote-box {
+      background: rgba(15, 23, 42, 0.5);
+      border-left: 3px solid #64748b;
+      padding: 10px 14px;
+      margin: 8px 0;
+      border-radius: 0 6px 6px 0;
+      font-style: italic;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+    }
+
+    .relation-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .relation-item {
+      background: var(--bg-dark);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .rel-badge {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #f59e0b;
+      font-weight: 700;
+    }
+
+    /* Synthesis Overview Box */
+    .synthesis-card {
+      background: linear-gradient(180deg, rgba(30, 41, 59, 0.8), rgba(15, 23, 42, 0.8));
+      border: 1px solid rgba(99, 102, 241, 0.4);
+      border-radius: 8px;
+      padding: 14px;
+      margin-bottom: 20px;
+    }
+
+    .synthesis-card h3 {
+      font-size: 0.9rem;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #818cf8;
+      margin-bottom: 8px;
+    }
+
+    /* Debug Tab & Observability Section */
+    .debug-container {
+      width: 100%;
+      height: 100%;
+      overflow-y: auto;
+      padding: 24px;
+      background: #090d16;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .debug-card {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+
+    .debug-card-header {
+      padding: 12px 18px;
+      background: rgba(15, 23, 42, 0.7);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-weight: 700;
+      font-size: 0.95rem;
+    }
+
+    .debug-tag {
+      font-size: 0.75rem;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-family: monospace;
+    }
+
+    .debug-tag.success { background: #065f46; color: #34d399; }
+    .debug-tag.error { background: #7f1d1d; color: #f87171; }
+    .debug-tag.info { background: #1e3a8a; color: #60a5fa; }
+
+    .debug-code-box {
+      padding: 16px;
+      background: #0f172a;
+      overflow-x: auto;
+      font-family: "JetBrains Mono", Consolas, Monaco, monospace;
+      font-size: 0.85rem;
+      color: #e2e8f0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 400px;
+      line-height: 1.5;
+    }
+
+    /* Loading Spinner Overlay */
+    .loading-overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.75);
+      backdrop-filter: blur(4px);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      z-index: 50;
+      display: none;
+    }
+
+    .spinner {
+      width: 44px;
+      height: 44px;
+      border: 4px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header & Central Search -->
+  <header>
+    <div class="top-bar">
+      <div class="logo-area">
+        <span>📖 Bookeeper</span>
+        <span class="logo-badge">Idea Engine</span>
+      </div>
+      <div class="nav-tabs">
+        <button class="nav-tab-btn active" id="tab-btn-graph" onclick="switchTab('graph')">
+          🌐 Graph & Explorer
+        </button>
+        <button class="nav-tab-btn" id="tab-btn-lightrag" onclick="switchTab('lightrag')">
+          ⚡ LightRAG WebUI
+          <span id="lightrag-status-badge" class="debug-tag info" style="display:none;">Online</span>
+        </button>
+        <button class="nav-tab-btn" id="tab-btn-debug" onclick="switchTab('debug')">
+          🔬 Debug & Observability
+          <span id="debug-count-badge" class="debug-tag info" style="display:none;">0</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Search Bar -->
+    <div class="search-wrapper">
+      <div class="search-input-box">
+        <span class="search-icon">🔍</span>
+        <input 
+          type="text" 
+          id="search-input" 
+          class="search-input" 
+          placeholder="Ask a question or search concepts (e.g. 'What are time horizons in AI difficulty estimation?')..."
+          onkeydown="if(event.key === 'Enter') executeSearch()"
+        />
+      </div>
+      <select id="search-mode" class="mode-select" title="LightRAG Dual-Level Mode">
+        <option value="hybrid" selected>Hybrid (Local + Global)</option>
+        <option value="local">Local (Direct Entities)</option>
+        <option value="global">Global (Thematic)</option>
+        <option value="mix">Mix (Vector + Graph)</option>
+      </select>
+      <select id="search-denoise" class="mode-select" title="Noise Reduction & Super-Hub Filter">
+        <option value="strict">Denoise: Strict (Degree &lt; 60)</option>
+        <option value="standard" selected>Denoise: Standard (Degree &lt; 120)</option>
+        <option value="relaxed">Denoise: Relaxed (Degree &lt; 250)</option>
+      </select>
+      <button class="search-btn" id="search-btn" onclick="executeSearch()">
+        <span>Search Ideas</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Main Work Area -->
+  <main>
+    <!-- View 1: Results Pane (Graph + Detail) -->
+    <div class="view-pane active" id="pane-graph">
+      <div class="results-container">
+        <!-- Left: Interactive Graph -->
+        <div class="graph-column">
+          <div class="graph-controls">
+            <button class="ctrl-btn" onclick="cyResetZoom()" title="Reset Zoom">Fit View</button>
+            <button class="ctrl-btn" onclick="cyReLayout('cose')" title="Physics Layout">Cose Layout</button>
+            <button class="ctrl-btn" onclick="cyReLayout('concentric')" title="Concentric Layout">Concentric</button>
+          </div>
+
+          <div id="cy"></div>
+
+          <div class="graph-legend">
+            <div class="legend-item"><div class="legend-dot" style="background: #f59e0b;"></div> Concept / Idea</div>
+            <div class="legend-item"><div class="legend-dot" style="background: #3b82f6;"></div> Book</div>
+            <div class="legend-item"><div class="legend-dot" style="background: #10b981;"></div> Section</div>
+            <div class="legend-item"><div class="legend-dot" style="background: #94a3b8;"></div> Chunk</div>
+          </div>
+        </div>
+
+        <!-- Right: Detail Panel (Obsidian Note Style) -->
+        <div class="detail-column" id="detail-panel">
+          <div class="detail-header">
+            <div class="detail-title" id="node-detail-title">
+              <span>💡</span> Select a Node
+            </div>
+            <span class="detail-badge" id="node-detail-category">Idea</span>
+          </div>
+          <div class="detail-body" id="node-detail-content">
+            <div style="color: var(--text-muted); text-align: center; padding-top: 40px;">
+              Enter a search query or click on any node in the graph to view its Obsidian-formatted knowledge page.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- View 2: Embedded LightRAG WebUI -->
+    <div class="view-pane" id="pane-lightrag" style="flex-direction: column;">
+      <div style="background: var(--bg-panel); border-bottom: 1px solid var(--border); padding: 8px 16px; display: flex; align-items: center; justify-content: space-between;">
+        <div style="font-size: 0.85rem; color: var(--text-muted); display: flex; align-items: center; gap: 8px;">
+          <span>⚡ Embedded LightRAG Engine:</span>
+          <span id="lightrag-endpoint-label" style="font-family: monospace; color: #a5b4fc;">Checking status...</span>
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <a id="lightrag-open-webui" href="#" target="_blank" class="ctrl-btn" style="text-decoration:none; padding:4px 10px; font-size:0.8rem; background:rgba(99,102,241,0.2); border:1px solid var(--border-accent); border-radius:6px; display:none;">Open WebUI in New Tab ↗</a>
+          <a id="lightrag-open-workspace" href="#" target="_blank" class="ctrl-btn" style="text-decoration:none; padding:4px 10px; font-size:0.8rem; background:rgba(16,185,129,0.2); border:1px solid var(--section-color); border-radius:6px; display:none;">Open Workspace Query ↗</a>
+        </div>
+      </div>
+      <div style="flex: 1; position: relative;" id="lightrag-frame-container">
+        <iframe id="lightrag-iframe" style="width: 100%; height: 100%; border: none; background: #0f172a;" src="about:blank"></iframe>
+        <div id="lightrag-offline-notice" style="display: none; position: absolute; inset: 0; align-items: center; justify-content: center; flex-direction: column; gap: 14px; background: var(--bg-dark); color: var(--text-muted);">
+          <div style="font-size: 2.2rem;">⚡</div>
+          <div style="font-weight: 600; font-size: 1.1rem; color: var(--text-main);">LightRAG Server is not running</div>
+          <div style="max-width: 500px; text-align: center; font-size: 0.9rem; line-height: 1.5;">
+            To start the embedded LightRAG WebUI alongside Bookeeper, start the UI with:
+            <br/><br/>
+            <code>bookeeper ui --lightrag-server</code>
+            <br/>or<br/>
+            <code>bookeeper lightrag-server</code>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- View 3: Dedicated Debug Tab -->
+    <div class="view-pane" id="pane-debug">
+      <div class="debug-container" id="debug-log-list">
+        <div style="color: var(--text-muted); text-align: center; padding-top: 40px;">
+          No telemetry logged yet. Execute a search to inspect exact LightRAG prompts and Neo4j Cypher queries.
+        </div>
+      </div>
+    </div>
+
+    <!-- Loading Indicator -->
+    <div class="loading-overlay" id="loading-overlay">
+      <div class="spinner"></div>
+      <div id="loading-status-text" style="font-weight: 600; color: #e2e8f0;">Synthesizing query with LightRAG...</div>
+    </div>
+  </main>
+
+  <script>
+    let cyInstance = null;
+    let latestTelemetry = null;
+    let telemetryHistory = [];
+
+    // Initialize Cytoscape container
+    function initCytoscape() {
+      cyInstance = cytoscape({
+        container: document.getElementById('cy'),
+        style: [
+          {
+            selector: 'node',
+            style: {
+              'label': 'data(label)',
+              'color': '#f8fafc',
+              'font-size': '11px',
+              'text-valign': 'bottom',
+              'text-margin-y': 5,
+              'background-color': 'data(color)',
+              'width': 'mapData(weight, 1, 10, 24, 46)',
+              'height': 'mapData(weight, 1, 10, 24, 46)',
+              'border-width': 2,
+              'border-color': '#0f172a',
+              'text-outline-color': '#0f172a',
+              'text-outline-width': 2,
+              'transition-property': 'background-color, border-color, width, height',
+              'transition-duration': '0.2s'
+            }
+          },
+          {
+            selector: 'node:selected',
+            style: {
+              'border-color': '#ffffff',
+              'border-width': 4,
+              'box-shadow': '0 0 15px rgba(255,255,255,0.8)'
+            }
+          },
+          {
+            selector: 'edge',
+            style: {
+              'width': 1.8,
+              'line-color': '#475569',
+              'target-arrow-color': '#475569',
+              'target-arrow-shape': 'triangle',
+              'curve-style': 'bezier',
+              'label': 'data(label)',
+              'font-size': '8px',
+              'color': '#94a3b8',
+              'text-rotation': 'autorotate',
+              'text-background-color': '#090d16',
+              'text-background-opacity': 0.8,
+              'text-background-padding': 2,
+              'opacity': 0.8
+            }
+          }
+        ],
+        layout: { name: 'cose', animate: false }
+      });
+
+      // Node Click handler
+      cyInstance.on('tap', 'node', function(evt) {
+        const node = evt.target;
+        loadNodeDetails(node.data('id'));
+      });
+    }
+
+    let lightragServerInfo = null;
+
+    async function checkLightRAGStatus() {
+      try {
+        const resp = await fetch('/api/health');
+        const data = await resp.json();
+        if (data.lightrag_server) {
+          lightragServerInfo = data.lightrag_server;
+          const badge = document.getElementById('lightrag-status-badge');
+          const label = document.getElementById('lightrag-endpoint-label');
+          const btnWeb = document.getElementById('lightrag-open-webui');
+          const btnWork = document.getElementById('lightrag-open-workspace');
+          const iframe = document.getElementById('lightrag-iframe');
+          const offlineNotice = document.getElementById('lightrag-offline-notice');
+
+          if (lightragServerInfo.embedded_running && lightragServerInfo.webui_url) {
+            badge.style.display = 'inline-block';
+            badge.textContent = 'Online';
+            badge.className = 'debug-tag success';
+            label.textContent = lightragServerInfo.webui_url;
+            btnWeb.href = lightragServerInfo.webui_url;
+            btnWeb.style.display = 'inline-block';
+            if (lightragServerInfo.workspace_url) {
+              btnWork.href = lightragServerInfo.workspace_url;
+              btnWork.style.display = 'inline-block';
+            }
+            if (!iframe.src || iframe.src === 'about:blank') {
+              iframe.src = lightragServerInfo.webui_url;
+            }
+            offlineNotice.style.display = 'none';
+            iframe.style.display = 'block';
+          } else {
+            badge.style.display = 'inline-block';
+            badge.textContent = 'Offline';
+            badge.className = 'debug-tag error';
+            label.textContent = 'Offline (Launch with --lightrag-server)';
+            offlineNotice.style.display = 'flex';
+            iframe.style.display = 'none';
+          }
+        }
+      } catch (err) {
+        console.warn('Health check failed:', err);
+      }
+    }
+
+    function switchTab(tab) {
+      document.querySelectorAll('.nav-tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.view-pane').forEach(p => p.classList.remove('active'));
+
+      if (tab === 'graph') {
+        document.getElementById('tab-btn-graph').classList.add('active');
+        document.getElementById('pane-graph').classList.add('active');
+        if (cyInstance) cyInstance.resize();
+      } else if (tab === 'lightrag') {
+        document.getElementById('tab-btn-lightrag').classList.add('active');
+        document.getElementById('pane-lightrag').classList.add('active');
+        checkLightRAGStatus();
+      } else if (tab === 'debug') {
+        document.getElementById('tab-btn-debug').classList.add('active');
+        document.getElementById('pane-debug').classList.add('active');
+      }
+    }
+
+    async function executeSearch() {
+      const query = document.getElementById('search-input').value.trim();
+      if (!query) return;
+
+      const mode = document.getElementById('search-mode').value;
+      const denoise_level = document.getElementById('search-denoise') ? document.getElementById('search-denoise').value : 'standard';
+      const overlay = document.getElementById('loading-overlay');
+      const searchBtn = document.getElementById('search-btn');
+      
+      overlay.style.display = 'flex';
+      searchBtn.disabled = true;
+
+      try {
+        const resp = await fetch('/api/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query, mode, denoise_level, top_k: 40, graph_limit: 60 })
+        });
+        const data = await resp.json();
+        
+        if (data.error) {
+          alert('Search Error: ' + data.error);
+          return;
+        }
+
+        renderSearchResults(data);
+
+        // Store telemetry and update Debug Tab
+        if (data.telemetry) {
+          latestTelemetry = data.telemetry;
+          telemetryHistory.unshift(data.telemetry);
+          renderDebugTab();
+        }
+
+        // Auto-select primary node if returned
+        if (data.selected_node_id) {
+          loadNodeDetails(data.selected_node_id, data.answer);
+        }
+
+      } catch (err) {
+        alert('Failed to connect to search API: ' + err.message);
+      } finally {
+        overlay.style.display = 'none';
+        searchBtn.disabled = false;
+      }
+    }
+
+    function renderSearchResults(data) {
+      if (!cyInstance) initCytoscape();
+
+      const elements = [];
+      const nodes = data.graph.nodes || [];
+      const edges = data.graph.edges || [];
+
+      nodes.forEach(n => {
+        elements.push({
+          group: 'nodes',
+          data: {
+            id: n.id,
+            label: n.name.length > 25 ? n.name.substring(0, 23) + '...' : n.name,
+            fullName: n.name,
+            color: n.color || '#8b5cf6',
+            weight: n.weight || 5,
+            category: n.category
+          }
+        });
+      });
+
+      edges.forEach(e => {
+        elements.push({
+          group: 'edges',
+          data: {
+            id: e.id,
+            source: e.source,
+            target: e.target,
+            label: e.type.replace(/_/g, ' ').toLowerCase()
+          }
+        });
+      });
+
+      cyInstance.elements().remove();
+      cyInstance.add(elements);
+      cyInstance.layout({
+        name: 'cose',
+        idealEdgeLength: 100,
+        nodeOverlap: 20,
+        refresh: 20,
+        fit: true,
+        padding: 30,
+        randomize: false,
+        componentSpacing: 100,
+        nodeRepulsion: 400000,
+        edgeElasticity: 100,
+        nestingFactor: 5,
+        gravity: 80,
+        numIter: 1000,
+        initialTemp: 200,
+        coolingFactor: 0.95,
+        minTemp: 1.0
+      }).run();
+    }
+
+    async function loadNodeDetails(nodeId, optionalSynthesis = null) {
+      const container = document.getElementById('node-detail-content');
+      const titleEl = document.getElementById('node-detail-title');
+      const catEl = document.getElementById('node-detail-category');
+
+      try {
+        const resp = await fetch(`/api/node?id=${encodeURIComponent(nodeId)}`);
+        const data = await resp.json();
+        if (data.error) {
+          container.innerHTML = `<div style="color:#f87171;">${data.error}</div>`;
+          return;
+        }
+
+        const node = data.node;
+        const props = node.properties || {};
+
+        titleEl.innerHTML = `<span>${node.icon || '💡'}</span> ${node.name}`;
+        catEl.textContent = node.category || 'Idea';
+        catEl.style.backgroundColor = node.color ? node.color + '33' : 'var(--bg-card)';
+        catEl.style.color = node.color || '#fff';
+
+        let html = '';
+
+        // 1. Dual-Level Synthesis Box if available
+        if (optionalSynthesis) {
+          html += `
+            <div class="synthesis-card">
+              <h3>🤖 LightRAG Synthesis Answer</h3>
+              <div style="font-size:0.9rem; line-height:1.5;">${marked.parse(optionalSynthesis)}</div>
+            </div>
+          `;
+        }
+
+        // 2. Obsidian YAML Frontmatter Box
+        html += `
+          <div class="frontmatter-card">
+            <div class="fm-row"><span class="fm-label">title:</span><span class="fm-value">"${node.name}"</span></div>
+            <div class="fm-row"><span class="fm-label">type:</span><span class="fm-value">${node.labels.join(', ')}</span></div>
+            <div class="fm-row"><span class="fm-label">category:</span><span class="fm-value">"${node.category}"</span></div>
+            <div class="fm-row"><span class="fm-label">weight:</span><span class="fm-value">${node.weight}/10</span></div>
+            <div class="fm-row"><span class="fm-label">occurrences:</span><span class="fm-value">${node.occurrences}</span></div>
+          </div>
+        `;
+
+        // 3. Summary & Detailed Explanation
+        if (props.summary || props.brief_description) {
+          html += `<div class="note-heading">📝 Summary</div>`;
+          html += `<blockquote class="quote-box">${props.summary || props.brief_description}</blockquote>`;
+        }
+
+        if (props.detailed_explanation && props.detailed_explanation !== props.brief_description) {
+          html += `<div class="note-heading">🔬 Detailed Explanation</div>`;
+          html += `<div style="font-size:0.9rem; margin-bottom:15px;">${marked.parse(props.detailed_explanation)}</div>`;
+        }
+
+        // 4. Books Featuring this Idea
+        if (data.books && data.books.length > 0) {
+          html += `<div class="note-heading">📚 Featured in Books</div><div style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:15px;">`;
+          data.books.forEach(b => {
+            html += `<span class="wikilink" onclick="loadNodeDetails('${b.target_id}')">[[${b.target_name}]]</span>`;
+          });
+          html += `</div>`;
+        }
+
+        // 5. Related Conceptual Links
+        if (data.related_concepts && data.related_concepts.length > 0) {
+          html += `<div class="note-heading">🧠 Related Ideas & Concepts</div><div class="relation-list">`;
+          data.related_concepts.forEach(c => {
+            html += `
+              <div class="relation-item">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                  <span class="wikilink" onclick="loadNodeDetails('${c.target_id}')">[[${c.target_name}]]</span>
+                  <span class="rel-badge">${c.rel_type}</span>
+                </div>
+              </div>
+            `;
+          });
+          html += `</div>`;
+        }
+
+        // 6. Evidence & Supporting Sections
+        if (data.evidence && data.evidence.length > 0) {
+          html += `<div class="note-heading">📑 Supporting Evidence & Chunks</div>`;
+          data.evidence.forEach(ev => {
+            html += `
+              <div class="relation-item" style="margin-bottom:8px;">
+                <div style="display:flex; justify-content:space-between;">
+                  <span style="font-size:0.8rem; color:#94a3b8;">${ev.breadcrumb || ev.target_name}</span>
+                  <span class="rel-badge">${ev.rel_type}</span>
+                </div>
+                ${ev.quote ? `<div class="quote-box">"${ev.quote}"</div>` : ''}
+              </div>
+            `;
+          });
+        }
+
+        container.innerHTML = html;
+
+        // Highlight selected node in Cytoscape
+        if (cyInstance) {
+          cyInstance.nodes().unselect();
+          const targetCyNode = cyInstance.getElementById(nodeId);
+          if (targetCyNode) targetCyNode.select();
+        }
+
+      } catch (err) {
+        container.innerHTML = `<div style="color:#f87171;">Failed to load node: ${err.message}</div>`;
+      }
+    }
+
+    function renderDebugTab() {
+      const container = document.getElementById('debug-log-list');
+      const badge = document.getElementById('debug-count-badge');
+      if (!latestTelemetry) return;
+
+      badge.style.display = 'inline-block';
+      badge.textContent = telemetryHistory.length;
+
+      let html = '';
+      telemetryHistory.forEach((t, idx) => {
+        const timeStr = new Date(t.timestamp * 1000).toLocaleTimeString();
+        const rag = t.lightrag || {};
+        const neo = t.neo4j || {};
+
+        html += `
+          <div class="debug-card">
+            <div class="debug-card-header">
+              <span>Query #${telemetryHistory.length - idx}: "${t.query}"</span>
+              <div style="display:flex; gap:8px;">
+                <span class="debug-tag ${rag.status === 'success' ? 'success' : 'error'}">LightRAG: ${rag.status || 'N/A'} (${rag.duration_seconds || 0}s)</span>
+                <span class="debug-tag ${neo.status === 'success' ? 'success' : 'error'}">Neo4j: ${neo.status || 'N/A'} (${neo.duration_seconds || 0}s)</span>
+                <span class="debug-tag info">${timeStr}</span>
+              </div>
+            </div>
+            
+            <div style="padding:14px; border-bottom:1px solid var(--border); background:rgba(30, 41, 59, 0.4);">
+              <h4 style="font-size:0.85rem; color:#818cf8; margin-bottom:6px;">1. Exact Prompt sent to LightRAG:</h4>
+              <div class="debug-code-box">${rag.exact_query || t.query} (mode: ${rag.mode || 'hybrid'}, top_k: ${rag.top_k})</div>
+            </div>
+
+            <div style="padding:14px; border-bottom:1px solid var(--border); background:rgba(30, 41, 59, 0.2);">
+              <h4 style="font-size:0.85rem; color:#34d399; margin-bottom:6px;">2. Raw Response & Identified Concepts from LightRAG:</h4>
+              <div style="margin-bottom:8px; font-size:0.85rem;"><strong>Identified Concepts:</strong> ${(rag.identified_concepts || []).map(c => `<code>${c}</code>`).join(', ') || 'None'}</div>
+              <div class="debug-code-box">${rag.raw_response || rag.note || rag.error || 'No response.'}</div>
+            </div>
+
+            <div style="padding:14px; background:rgba(30, 41, 59, 0.4);">
+              <h4 style="font-size:0.85rem; color:#f59e0b; margin-bottom:6px;">3. Exact Cypher Executed in Neo4j:</h4>
+              <div class="debug-code-box">${neo.exact_cypher || 'No query executed'}\n\n// Parameters: ${JSON.stringify(neo.parameters || {}, null, 2)}</div>
+            </div>
+          </div>
+        `;
+      });
+
+      container.innerHTML = html;
+    }
+
+    function cyResetZoom() {
+      if (cyInstance) cyInstance.fit(30);
+    }
+
+    function cyReLayout(layoutName) {
+      if (cyInstance) cyInstance.layout({ name: layoutName, animate: true, animationDuration: 400 }).run();
+    }
+
+    // Auto-initialize Cytoscape and check LightRAG server status on page load
+    window.addEventListener('DOMContentLoaded', () => {
+      initCytoscape();
+      checkLightRAGStatus();
+    });
+  </script>
+</body>
+</html>

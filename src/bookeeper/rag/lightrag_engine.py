@@ -203,10 +203,40 @@ class LightRAGEngine:
 
         return np.array(embeddings, dtype=np.float32)
 
+    def detect_embedding_dim(self) -> int:
+        """Probe embedding model to detect output vector dimension."""
+        try:
+            res = self._call_ollama(
+                "/api/embed",
+                {"model": self.embedding_model, "input": ["dimension probe"]},
+                timeout=30,
+                use_embedding_pool=True,
+            )
+            embeddings = res.get("embeddings", [])
+            if embeddings and len(embeddings[0]) > 0:
+                detected_dim = len(embeddings[0])
+                return detected_dim
+        except Exception as e:
+            logger.warning(
+                f"Failed to auto-detect embedding dimension for '{self.embedding_model}': {e}. "
+                f"Falling back to configured dimension {self.embedding_dim}."
+            )
+        return self.embedding_dim
+
     async def ainitialize(self) -> None:
         """Initialize the LightRAG instance and persistent storages."""
         if self._rag is not None and self._initialized:
             return
+
+        # Auto-detect or sync actual embedding dimension from Ollama model
+        detected_dim = await asyncio.to_thread(self.detect_embedding_dim)
+        if detected_dim and detected_dim != self.embedding_dim:
+            logger.warning(
+                f"LightRAG embedding dimension mismatch detected: configured={self.embedding_dim}, "
+                f"detected={detected_dim} for model '{self.embedding_model}'. "
+                f"Automatically updating embedding_dim to {detected_dim}."
+            )
+            self.embedding_dim = detected_dim
 
         # Use closure functions rather than bound methods (self._llm_model_func)
         # because LightRAG's __post_init__ runs dataclasses.asdict(self) which
@@ -234,7 +264,7 @@ class LightRAGEngine:
                 "messages": messages,
                 "stream": False,
             }
-            res = await asyncio.to_thread(call_ollama, "/api/chat", data, timeout=240)
+            res = await asyncio.to_thread(call_ollama, "/api/chat", data, timeout=240, use_embedding_pool=False)
             return res.get("message", {}).get("content", "")
 
         async def _embed_func(
@@ -245,7 +275,7 @@ class LightRAGEngine:
                 "model": embedding_model,
                 "input": texts,
             }
-            res = await asyncio.to_thread(call_ollama, "/api/embed", data, timeout=120)
+            res = await asyncio.to_thread(call_ollama, "/api/embed", data, timeout=120, use_embedding_pool=True)
             embeddings = res.get("embeddings", [])
             if not embeddings or len(embeddings) != len(texts):
                 embeddings = []
@@ -255,6 +285,7 @@ class LightRAGEngine:
                         "/api/embed",
                         {"model": embedding_model, "input": [t]},
                         timeout=60,
+                        use_embedding_pool=True,
                     )
                     em_list = single_res.get("embeddings", [[]])
                     if em_list and len(em_list[0]) == embedding_dim:

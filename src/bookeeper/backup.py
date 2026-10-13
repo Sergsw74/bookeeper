@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import zipfile
@@ -64,7 +65,99 @@ EXCLUDED_EXACT_FILENAMES = {
 }
 
 
+import base64
+
+# Characters strictly forbidden on Windows NTFS / FAT32 filesystems
+_WINDOWS_FORBIDDEN_CHARS = set('\\/*?:"<>|')
+
+# Reserved device names forbidden on Windows
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+}
+
+
+def is_path_component_unsupported(name: str) -> bool:
+    """Check if a directory or filename component is unsupported on Windows or cross-platform filesystems."""
+    if not name:
+        return True
+    # Control characters (\x00-\x1f, \x7f-\x9f) or Windows forbidden characters
+    if any(ord(c) < 32 or (127 <= ord(c) <= 159) or c in _WINDOWS_FORBIDDEN_CHARS for c in name):
+        return True
+    # Trailing dot or trailing space
+    if name.endswith(" ") or name.endswith("."):
+        return True
+    # Reserved device names
+    if "." in name and not name.startswith("."):
+        stem, _ = name.rsplit(".", 1)
+        if stem.endswith(" ") or stem.endswith("."):
+            return True
+        if stem.upper() in _WINDOWS_RESERVED_NAMES:
+            return True
+    else:
+        if name.upper() in _WINDOWS_RESERVED_NAMES:
+            return True
+    return False
+
+
+def encode_safe_component(name: str) -> str:
+    """
+    Encode an unsupported filename or folder name component into a safe cross-platform name
+    using base64 (@b64_<encoded>.<ext>).
+    """
+    if not is_path_component_unsupported(name):
+        return name
+    if "." in name and not name.startswith("."):
+        stem, ext = name.rsplit(".", 1)
+        if not is_path_component_unsupported(ext):
+            b64 = base64.urlsafe_b64encode(stem.encode("utf-8")).decode("ascii").rstrip("=")
+            return f"@b64_{b64}.{ext}"
+    b64 = base64.urlsafe_b64encode(name.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"@b64_{b64}"
+
+
+def decode_safe_component(name: str) -> str:
+    """Decode a @b64_<encoded> component back to its original name."""
+    m = re.match(r"^@b64_([A-Za-z0-9_-]+)(?:\.([^.]+))?$", name)
+    if not m:
+        return name
+    raw_b64 = m.group(1)
+    ext = m.group(2)
+    padding = "=" * (-len(raw_b64) % 4)
+    decoded = base64.urlsafe_b64decode((raw_b64 + padding).encode("ascii")).decode("utf-8", errors="replace")
+    if ext is not None:
+        return f"{decoded}.{ext}"
+    return decoded
+
+
+def encode_safe_relative_path(rel_path: str) -> str:
+    """Encode any unsupported path components in a relative path into safe base64-encoded names."""
+    parts = [p for p in rel_path.replace("\\", "/").split("/") if p]
+    return "/".join(encode_safe_component(p) for p in parts)
+
+
+def decode_safe_relative_path(rel_path: str) -> str:
+    """Decode any base64-encoded components in a relative path back to original form."""
+    parts = [p for p in rel_path.replace("\\", "/").split("/") if p]
+    return "/".join(decode_safe_component(p) for p in parts)
+
+
+def sanitize_archive_relative_path(rel_path: str) -> str:
+    """
+    Sanitize an archive relative path for safe writing on all OS filesystems (including Windows).
+    If a component contains unsupported special or control characters (e.g. newlines),
+    it is encoded into a safe base64 representation.
+    """
+    # 1. Decode any existing @b64 components first
+    decoded_path = decode_safe_relative_path(rel_path)
+    # 2. Encode any unsupported components with base64
+    return encode_safe_relative_path(decoded_path)
+
+
+
 def detect_archive_format(path: Path) -> str:
+
     """
     Detect whether an archive is '7z' or 'zip' based on file extension or magic bytes.
     """
@@ -191,7 +284,7 @@ def collect_knowledge_files(
                         rel_note = fpath.relative_to(odir).as_posix()
                         items[f"obsidian_vault/{rel_note}"] = fpath
 
-    result = [(p, arcname) for arcname, p in items.items()]
+    result = [(p, encode_safe_relative_path(arcname)) for arcname, p in items.items()]
     result.sort(key=lambda x: x[1])
     return result
 
@@ -518,11 +611,10 @@ def restore_backup(
 
     if fmt == "7z":
         with py7zr.SevenZipFile(archive_path, "r") as sz:
-            # py7zr extractall unpacks everything
             for item in sz.list():
                 if not item.is_directory and item.filename != "backup_metadata.json":
-                    # Path traversal safety check
-                    dest = (target_dir / item.filename).resolve()
+                    safe_rel = sanitize_archive_relative_path(item.filename)
+                    dest = (target_dir / safe_rel).resolve()
                     if not dest.is_relative_to(target_dir):
                         logger.warning(f"Skipping dangerous archive path: {item.filename}")
                         continue
@@ -530,6 +622,11 @@ def restore_backup(
                     restored_bytes += item.uncompressed or 0
                     if progress_callback:
                         progress_callback(restored_count, total_files, item.filename)
+
+            # Sanitize internal filenames before extraction so py7zr creates safe filenames on Windows
+            for f in sz.files:
+                if not f.is_directory and f.filename != "backup_metadata.json":
+                    f._file_info["filename"] = sanitize_archive_relative_path(f.filename)
 
             sz.extractall(path=target_dir)
 
@@ -543,7 +640,8 @@ def restore_backup(
                         logger.warning(f"Skipping dangerous archive path: {info.filename}")
                         continue
 
-                    dest = (target_dir / info.filename).resolve()
+                    safe_rel = sanitize_archive_relative_path(info.filename)
+                    dest = (target_dir / safe_rel).resolve()
                     if not dest.is_relative_to(target_dir):
                         logger.warning(f"Skipping path outside target directory: {info.filename}")
                         continue

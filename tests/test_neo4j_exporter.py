@@ -395,3 +395,24 @@ def test_neo4j_export_chunk_next_prev_relationships():
     assert "MATCH (target:`Chunk`" in prev_queries[0]
 
 
+def test_neo4j_routing_error_fallback_to_bolt():
+    """Verify that routing failure on neo4j:// protocol automatically switches to bolt://."""
+    mock_routing_driver = MagicMock()
+    mock_routing_driver.verify_connectivity.side_effect = RuntimeError("Unable to retrieve routing information")
+
+    mock_bolt_driver = MagicMock()
+    mock_bolt_driver.verify_connectivity.return_value = None
+
+    drivers = [mock_routing_driver, mock_bolt_driver]
+
+    with patch("bookeeper.graph.neo4j_exporter.GraphDatabase.driver", side_effect=drivers):
+        exporter = Neo4jExporter(uri="neo4j://192.168.50.20:7687")
+        assert exporter.uri == "neo4j://192.168.50.20:7687"
+        success = exporter.verify_connectivity()
+        assert success is True
+        assert exporter.uri == "bolt://192.168.50.20:7687"
+        assert mock_routing_driver.verify_connectivity.called
+        assert mock_bolt_driver.verify_connectivity.called
+
+
+

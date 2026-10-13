@@ -159,10 +159,42 @@ class Neo4jExporter:
         self.close()
 
     def verify_connectivity(self) -> bool:
-        """Verify driver connectivity to Neo4j database."""
+        """
+        Verify driver connectivity to Neo4j database.
+        Automatically falls back from neo4j:// routing protocol to bolt:// direct connection
+        if the target is a standalone instance that does not support routing tables.
+        """
         driver = self.get_driver()
-        driver.verify_connectivity()
-        return True
+        try:
+            driver.verify_connectivity()
+            return True
+        except Exception as e:
+            err_msg = str(e).lower()
+            routing_err = "routing" in err_msg or "unable to retrieve routing" in err_msg
+            if routing_err:
+                fallback_scheme = None
+                if self.uri.startswith("neo4j://"):
+                    fallback_scheme = "bolt://"
+                    orig_prefix = "neo4j://"
+                elif self.uri.startswith("neo4j+s://"):
+                    fallback_scheme = "bolt+s://"
+                    orig_prefix = "neo4j+s://"
+                elif self.uri.startswith("neo4j+ssc://"):
+                    fallback_scheme = "bolt+ssc://"
+                    orig_prefix = "neo4j+ssc://"
+
+                if fallback_scheme:
+                    fallback_uri = self.uri.replace(orig_prefix, fallback_scheme, 1)
+                    logger.warning(
+                        f"Neo4j routing failed ('{e}'). Standalone instance detected. "
+                        f"Automatically switching protocol from '{self.uri}' to direct connection '{fallback_uri}'."
+                    )
+                    self.close()
+                    self.uri = fallback_uri
+                    driver = self.get_driver()
+                    driver.verify_connectivity()
+                    return True
+            raise
 
     def ensure_constraints(self, session, labels: list[str]):
         """
@@ -190,8 +222,8 @@ class Neo4jExporter:
         Delete all nodes and relationships in the target Neo4j database (clean start).
         Uses iterative or batched detach delete to handle graphs cleanly.
         """
-        driver = self.get_driver()
         self.verify_connectivity()
+        driver = self.get_driver()
         deleted_count = 0
         with driver.session(database=self.database) as session:
             result = session.run("MATCH (n) RETURN count(n) AS cnt")
@@ -231,8 +263,8 @@ class Neo4jExporter:
         - Edges: MERGE (source)-[r:REL]->(target), ON CREATE SET props, ON MATCH SET props
         - show_progress=True: Displays rich real-time progress bars for nodes and relationships
         """
-        driver = self.get_driver()
         self.verify_connectivity()
+        driver = self.get_driver()
 
         use_progress = show_progress and Progress is not None
         target_console = console or (Console() if Console is not None else None)

@@ -643,6 +643,13 @@ class Settings(BaseSettings):
             return False
         return True
 
+    @property
+    def embedding_dim(self) -> int:
+        """Alias for lightrag_embedding_dim for vector embeddings."""
+        return self.lightrag_embedding_dim
+
+
+
     def calculate_pool_concurrency(self, num_servers: int) -> int:
         """
         Calculate active concurrent tasks limit in the task pipeline:

@@ -19,10 +19,16 @@ logger = logging.getLogger(__name__)
 
 
 def sanitize_filename(name: str) -> str:
-    """Sanitize title or concept name for safe filenames across OS filesystems."""
+    """Sanitize title or concept name for safe filenames across OS filesystems (POSIX & Windows)."""
     clean = BookParser.repair_mojibake(name)
-    clean = re.sub(r'[\\/*?:"<>|]', "", clean).strip()
+    # Replace control characters (including \n, \r, \t, etc.) with space
+    clean = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", clean)
+    # Remove characters forbidden on Windows and common filesystems: \ / * ? : " < > |
+    clean = re.sub(r'[\\/*?:"<>|]', "", clean)
+    # Collapse multiple consecutive whitespace characters and strip leading/trailing spaces and dots
+    clean = re.sub(r"\s+", " ", clean).strip(" .")
     return clean or "Untitled"
+
 
 
 class ObsidianExporter:
@@ -141,16 +147,21 @@ class ObsidianExporter:
                 for cat, items in sorted(grouped.items()):
                     content.append(f"### {cat}")
                     for iname, ibrief in items:
-                        if ibrief:
-                            content.append(f"- **[[{iname}]]**: {ibrief}")
+                        safe_iname = sanitize_filename(iname)
+                        if safe_iname != iname:
+                            link = f"[[{safe_iname}|{iname}]]"
                         else:
-                            content.append(f"- [[{iname}]]")
+                            link = f"[[{safe_iname}]]"
+                        if ibrief:
+                            content.append(f"- **{link}**: {ibrief}")
+                        else:
+                            content.append(f"- {link}")
                     content.append("")
 
             if child_sections:
                 content.append("## 📑 Sections & Chapter Hierarchy")
                 for s in child_sections:
-                    sec_note_name = f"{title} - {s}"
+                    sec_note_name = sanitize_filename(f"{title} - {s}")
                     content.append(f"- [[{sec_note_name}|{s}]]")
                 content.append("")
 
@@ -185,9 +196,11 @@ class ObsidianExporter:
             for _, c_id, edge in g.out_edges(node_id, data=True):
                 if edge.get("relation") == "DISCUSSES":
                     c_name = g.nodes.get(c_id, {}).get("name", c_id.replace("concept:", ""))
+                    safe_c_name = sanitize_filename(c_name)
+                    link = f"[[{safe_c_name}|{c_name}]]" if safe_c_name != c_name else f"[[{safe_c_name}]]"
                     edge_sum = edge.get("summary", "")
                     quote = edge.get("quote", "")
-                    entry = f"- [[{c_name}]]"
+                    entry = f"- {link}"
                     if edge_sum:
                         entry += f": {edge_sum}"
                     if quote:
@@ -273,16 +286,20 @@ class ObsidianExporter:
             for _, tgt_id, edge in g.out_edges(node_id, data=True):
                 if edge.get("relation") not in ["DISCUSSES", "SUPPORTED_BY", "HAS_SECTION", "HAS_CHUNK", "FEATURED_IN", "EXPLORES_IDEA"]:
                     tgt_name = g.nodes.get(tgt_id, {}).get("name", tgt_id.replace("concept:", ""))
+                    safe_tgt = sanitize_filename(tgt_name)
+                    link = f"[[{safe_tgt}|{tgt_name}]]" if safe_tgt != tgt_name else f"[[{safe_tgt}]]"
                     rel = edge.get("relation", "RELATES_TO")
-                    related_out.append(f"- **{rel}** -> [[{tgt_name}]]")
+                    related_out.append(f"- **{rel}** -> {link}")
 
             # 3d. Incoming relations from other concepts
             related_in = []
             for src_id, _, edge in g.in_edges(node_id, data=True):
                 if edge.get("relation") not in ["DISCUSSES", "HAS_SECTION", "HAS_CHUNK", "SUPPORTS_IDEA", "EXPLORES_IDEA", "FEATURED_IN"]:
                     src_name = g.nodes.get(src_id, {}).get("name", src_id.replace("concept:", ""))
+                    safe_src = sanitize_filename(src_name)
+                    link = f"[[{safe_src}|{src_name}]]" if safe_src != src_name else f"[[{safe_src}]]"
                     rel = edge.get("relation", "RELATES_TO")
-                    related_in.append(f"- [[{src_name}]] -> **{rel}**")
+                    related_in.append(f"- {link} -> **{rel}**")
 
             cat_tag = re.sub(r"[^\w-]", "", category.lower().replace(" ", "-")) or "idea"
             c_content = [
@@ -385,8 +402,10 @@ class ObsidianExporter:
                 moc.append(f"## {cat}")
                 # Sort concepts by weight descending, then alphabetically by name
                 for n, w in sorted(items, key=lambda x: (-x[1], x[0])):
+                    safe_n = sanitize_filename(n)
+                    link = f"[[{safe_n}|{n}]]" if safe_n != n else f"[[{safe_n}]]"
                     weight_badge = f" `(w: {w})`" if w is not None else ""
-                    moc.append(f"- [[{n}]]{weight_badge}")
+                    moc.append(f"- {link}{weight_badge}")
                 moc.append("")
 
             with open(index_path, "w", encoding="utf-8") as f:

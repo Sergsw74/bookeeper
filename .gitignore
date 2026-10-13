@@ -73,6 +73,8 @@ obsidian_vault/
 graph_exports/
 logs/
 *.log
+*.zip
+*.7z
 
 # 8. OS & Editor Metadata
 .DS_Store

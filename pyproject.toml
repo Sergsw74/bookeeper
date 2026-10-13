@@ -45,6 +45,12 @@ dependencies = [
     "striprtf>=0.0.26",
     "rarfile>=4.0",
     "py7zr>=0.20.0",
+    "fastapi>=0.143.0",
+    "uvicorn>=0.54.0",
+    "pyjwt>=2.15.1",
+    "bcrypt>=5.0.0",
+    "python-multipart>=0.0.32",
+    "aiofiles>=25.1.0",
 ]
 
 [project.optional-dependencies]

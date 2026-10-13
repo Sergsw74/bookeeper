@@ -114,6 +114,8 @@ state_file: null
 # Automatically distributes LLM synthesis and nomic-embed-text embeddings across the Ollama pool.
 enable_lightrag: true
 lightrag_dir: "./output/lightrag"
+# Embedding dimension for LightRAG: 1024 for bge-m3 / bge-large, 768 for nomic-embed-text.
+# Automatically auto-detected if dimension differs from Ollama server output.
 lightrag_embedding_dim: 768
 lightrag_mode: "hybrid"  # Default retrieval mode: 'hybrid', 'local', 'global', 'naive', or 'mix'
 

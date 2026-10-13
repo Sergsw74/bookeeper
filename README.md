@@ -15,6 +15,7 @@ The documentation is split into specialized subchapters stored in the [`docs/`](
 | 🔄 **[Recommended Workflow](docs/workflow.md)** | **Start here**: Calibration via small A/B tests, building knowledge graph, export, and optional POC post-processing. |
 | 🚀 **[Getting Started](docs/get-started.md)** | Prerequisites, installation (`uv`/`pip`), configuration walkthrough, and basic commands. |
 | 🏗️ **[Building the Knowledge Graph](docs/building-graph.md)** | Graph extraction pipeline, input sources (Calibre & downloads), offline rebuilds, pruning, and exporters (Obsidian, Neo4j, GraphML). |
+| 🌐 **[Interactive Web UI & Search](docs/ui.md)** | **Idea-Based Search Engine**: Interactive Cytoscape Neo4j graph, Obsidian note panel, smart denoiser, and embedded LightRAG WebUI. |
 | 🔍 **[Decoupled Hybrid RAG](docs/rag.md)** | LightRAG vector/graph indexing from cached chunks and multi-mode querying (`hybrid`, `local`, `global`). |
 | 🧪 **[Two-Pass Idea Post-Processing (POC)](docs/post-processing.md)** | **Experimental POC** (very low performance improvement, not finalized): second-pass entity synthesis, clustering, and state checkpointing. |
 | 🔬 **[A/B Testing & Benchmarking](docs/ab-tests.md)** | Automated test harness, same-branch vs branch-vs-branch testing, configuration overlays, and delta reporting. |
@@ -28,6 +29,8 @@ Bookkeeper provides a rich set of CLI commands. Below is a high-level overview o
 
 | Command | Syntax Example | Primary Purpose | Detailed Guide |
 | :--- | :--- | :--- | :--- |
+| **`ui`** | `bookeeper ui --lightrag-server` | Launches interactive Web UI with Neo4j graph visualization, Obsidian panel, and LightRAG WebUI. | [Web UI Guide](docs/ui.md) |
+| **`lightrag-ui`** | `bookeeper lightrag-ui --port 9621` | Starts the official embedded LightRAG FastAPI server with document manager and workspace query UI. | [Web UI Guide](docs/ui.md) |
 | **`build-graph`** | `bookeeper build-graph --limit 5` | Extracts concepts, chunks, and relationships from books into `knowledge_graph.json`. | [Building Graph](docs/building-graph.md) |
 | **`rebuild-graph`** | `bookeeper rebuild-graph` | Fast offline rebuild of the graph from `.book_states/` in seconds without LLM inference. | [Building Graph](docs/building-graph.md) |
 | **`query`** | `bookeeper query "Explain Paxos"` | Queries the library using LightRAG hybrid retrieval (local entity graphs + global summaries). | [Hybrid RAG](docs/rag.md) |

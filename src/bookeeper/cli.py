@@ -2887,6 +2887,16 @@ def export_neo4j_command(
         result = exporter.export(store, clean=effective_clean, show_progress=True, console=console)
     except Exception as e:
         console.print(f"[bold red]✗ Neo4j export failed:[/bold red] {e}")
+        err_str = str(e).lower()
+        if "errno 65" in err_str or "no route to host" in err_str:
+            console.print(
+                "\n[bold yellow]ℹ macOS Local Network Privacy Restriction Detected (Errno 65: No route to host)[/bold yellow]\n"
+                "[dim]macOS Sequoia blocks third-party Python environments from accessing LAN IP addresses until granted permission.[/dim]\n\n"
+                "[bold cyan]How to resolve:[/bold cyan]\n"
+                "  1. Open [bold]System Settings[/bold] -> [bold]Privacy & Security[/bold] -> [bold]Local Network[/bold].\n"
+                "  2. Find your terminal application ([bold]Terminal[/bold], [bold]iTerm[/bold], [bold]VS Code[/bold], etc.) and toggle it [bold green]ON[/bold green].\n"
+                "     (If it is already ON, toggle it [bold red]OFF[/bold red] and back [bold green]ON[/bold green], then restart your terminal.)\n"
+            )
         raise typer.Exit(1)
 
     # Display results table
@@ -2968,6 +2978,10 @@ def build_rag(
         engine.clean()
 
     engine.initialize()
+    console.print(
+        f"  [dim]Engine: LLM='{engine.llm_model}' | Embed='{engine.embedding_model}' ({engine.embedding_dim}d) "
+        f"at {engine.working_dir}[/dim]"
+    )
 
     total_chunks_indexed = 0
     console.print(f"[bold green]Starting LightRAG indexing for {len(target_ids)} book(s)...[/bold green]")
@@ -5547,5 +5561,110 @@ def restore_command(
     console.print(f"[bold green]✓ Knowledge successfully restored to:[/bold green] [bold cyan]{target_dir}[/bold cyan]\n")
 
 
+@app.command("ui")
+def ui_command(
+    host: str = typer.Option("127.0.0.1", "--host", "-h", help="Host interface to bind the web server (default: 127.0.0.1)."),
+    port: int = typer.Option(8000, "--port", "-p", help="HTTP port to listen on (default: 8000)."),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml configuration file."),
+    lightrag_dir: Optional[str] = typer.Option(None, "--lightrag-dir", help="Path to LightRAG storage directory."),
+    start_lightrag_server: bool = typer.Option(False, "--lightrag-server", help="Also start embedded LightRAG FastAPI server with official WebUI/Workspace on port 9621."),
+    lightrag_port: int = typer.Option(9621, "--lightrag-port", help="Port for the embedded LightRAG server (default: 9621)."),
+):
+    """
+    Launch the interactive Bookeeper Idea-Based Search Engine Web UI.
+    Provides a central natural language search bar, an interactive 2-column results pane
+    (Cytoscape Neo4j graph on the left, Obsidian-style detail note on the right),
+    an embedded LightRAG WebUI tab, and an observability Debug Tab displaying exact LightRAG and Neo4j telemetry.
+    """
+    from bookeeper.ui.backend import SearchEngineBackend
+    from bookeeper.ui.lightrag_server import LightRAGServerManager
+    from bookeeper.ui.server import run_server
+
+    cfg = _get_effective_settings(config_path)
+    target_lightrag = Path(lightrag_dir).expanduser().resolve() if lightrag_dir else cfg.resolved_lightrag_dir
+
+    backend = SearchEngineBackend(config=cfg, lightrag_dir=target_lightrag, neo4j_config=cfg.neo4j)
+
+    lightrag_mgr = None
+    if start_lightrag_server:
+        console.print(f"[cyan]Initializing embedded LightRAG FastAPI server on {host}:{lightrag_port}...[/cyan]")
+        lightrag_mgr = LightRAGServerManager(config=cfg, working_dir=target_lightrag, host=host, port=lightrag_port)
+        if lightrag_mgr.start():
+            console.print(f"[bold green]✓ Embedded LightRAG WebUI active at:[/bold green] [bold cyan]{lightrag_mgr.webui_url}[/bold cyan]")
+        else:
+            console.print(f"[yellow]Warning: Could not start embedded LightRAG server on port {lightrag_port}.[/yellow]")
+
+    server = run_server(host=host, port=port, backend=backend, lightrag_mgr=lightrag_mgr, auto_port=True)
+    actual_port = server.server_port
+
+    if actual_port != port:
+        console.print(f"[yellow]Note: Port {port} was already in use. Switched to available port {actual_port}.[/yellow]")
+
+    console.print(f"\n[bold cyan]Starting Bookeeper Idea-Based Search Engine UI...[/bold cyan]")
+    console.print(f"  • [bold white]Web Interface:[/bold white] [bold green]http://{host}:{actual_port}/[/bold green]")
+    if lightrag_mgr and lightrag_mgr.is_alive():
+        console.print(f"  • [bold white]LightRAG WebUI:[/bold white] [bold cyan]{lightrag_mgr.webui_url}[/bold cyan]")
+        console.print(f"  • [bold white]LightRAG Workspace:[/bold white] [bold cyan]{lightrag_mgr.workspace_url}[/bold cyan]")
+    console.print(f"  • [bold white]Neo4j URI:[/bold white] {cfg.neo4j.uri} (database: '{cfg.neo4j.database}')")
+    console.print(f"  • [bold white]LightRAG Storage:[/bold white] {target_lightrag}")
+    console.print("[dim]Press Ctrl+C to terminate the web server.[/dim]\n")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Shutting down Bookeeper UI server...[/yellow]")
+    finally:
+        server.server_close()
+        backend.close()
+        if lightrag_mgr:
+            lightrag_mgr.stop()
+
+
+@app.command("lightrag-ui")
+def lightrag_ui_command(
+    host: str = typer.Option("127.0.0.1", "--host", "-h", help="Host interface to bind the LightRAG server (default: 127.0.0.1)."),
+    port: int = typer.Option(9621, "--port", "-p", help="Port for the LightRAG server (default: 9621)."),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml configuration file."),
+    lightrag_dir: Optional[str] = typer.Option(None, "--lightrag-dir", help="Path to LightRAG storage directory."),
+):
+    """
+    Launch the official LightRAG FastAPI server with embedded WebUI and Workspace query interface.
+    Uses Bookeeper's indexed LightRAG storage directory and configured Ollama models.
+    """
+    from bookeeper.ui.lightrag_server import LightRAGServerManager
+
+    cfg = _get_effective_settings(config_path)
+    target_lightrag = Path(lightrag_dir).expanduser().resolve() if lightrag_dir else cfg.resolved_lightrag_dir
+
+    if not target_lightrag.exists():
+        console.print(f"[bold red]LightRAG storage directory not found:[/bold red] {target_lightrag}")
+        console.print("[yellow]Please run 'bookeeper build-graph --lightrag' first to populate the storage.[/yellow]")
+        raise typer.Exit(1)
+
+    console.print(f"\n[bold cyan]Starting Official LightRAG Server & WebUI...[/bold cyan]")
+    console.print(f"  • [bold white]Storage Directory:[/bold white] {target_lightrag}")
+    console.print(f"  • [bold white]LLM Model:[/bold white] {cfg.llm_model} ({cfg.ollama_base_url})")
+    console.print(f"  • [bold white]Embedding Model:[/bold white] {cfg.embedding_model} (dim: {cfg.embedding_dim})")
+    console.print(f"  • [bold white]WebUI Interface:[/bold white] [bold green]http://{host}:{port}/webui/[/bold green]")
+    console.print(f"  • [bold white]Workspace Query:[/bold white] [bold green]http://{host}:{port}/workspace/[/bold green]")
+    console.print(f"  • [bold white]API Documentation:[/bold white] [bold green]http://{host}:{port}/docs[/bold green]")
+    console.print("[dim]Press Ctrl+C to terminate the server.[/dim]\n")
+
+    mgr = LightRAGServerManager(config=cfg, working_dir=target_lightrag, host=host, port=port)
+    if not mgr.start(wait_ready=True):
+        console.print(f"[bold red]Failed to start LightRAG server on port {port}.[/bold red]")
+        raise typer.Exit(1)
+
+    try:
+        while True:
+            import time
+            time.sleep(1)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Shutting down LightRAG server...[/yellow]")
+    finally:
+        mgr.stop()
+
+
 if __name__ == "__main__":
     app()
+

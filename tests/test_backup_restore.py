@@ -262,3 +262,57 @@ def test_cli_backup_and_restore(mock_output_dir: Path, tmp_path: Path):
     assert "Knowledge successfully restored" in res_restore.stdout
     assert (restore_dir / "knowledge_graph.json").is_file()
     assert (restore_dir / "obsidian_vault" / "00_Index.md").is_file()
+
+
+def test_restore_backup_sanitizes_unclean_windows_filenames(tmp_path: Path):
+    """
+    Verify that an archive containing filenames with newlines, control chars,
+    or characters illegal on Windows (e.g. from POSIX vault creation) can be
+    safely restored on Windows by encoding unsupported characters via base64.
+    """
+    import zipfile
+    from bookeeper.backup import (
+        decode_safe_relative_path,
+        encode_safe_relative_path,
+        sanitize_archive_relative_path,
+    )
+
+    # Check sanitize_archive_relative_path helper directly
+    raw_path = "obsidian_vault/Concepts/Complexity Class Σ 0\n2.md"
+    safe = sanitize_archive_relative_path(raw_path)
+    assert safe == "obsidian_vault/Concepts/@b64_Q29tcGxleGl0eSBDbGFzcyDOoyAwCjI.md"
+    assert "\n" not in safe
+    assert decode_safe_relative_path(safe) == raw_path
+
+    trailing_dot_path = "obsidian_vault/Concepts/trailing dot. .md"
+    safe_trailing = sanitize_archive_relative_path(trailing_dot_path)
+    assert safe_trailing == "obsidian_vault/Concepts/@b64_dHJhaWxpbmcgZG90LiA.md"
+    assert decode_safe_relative_path(safe_trailing) == trailing_dot_path
+
+    # Create a mock zip with invalid Windows filenames
+    archive_path = tmp_path / "legacy_windows_incompatible.zip"
+    with zipfile.ZipFile(archive_path, "w") as zf:
+        zf.writestr("obsidian_vault/Concepts/Complexity Class Σ 0\n2.md", "# Complexity Class\n")
+        zf.writestr("obsidian_vault/Concepts/Matrix V r\nj.md", "# Matrix Note\n")
+        zf.writestr("obsidian_vault/Concepts/test:invalid*char?.md", "# Invalid Chars\n")
+
+    target_dir = tmp_path / "restored_safe"
+    res = restore_backup(archive_path, target_dir=target_dir)
+
+    assert res["files_restored"] == 3
+    assert (target_dir / "obsidian_vault" / "Concepts" / "@b64_Q29tcGxleGl0eSBDbGFzcyDOoyAwCjI.md").is_file()
+    assert (target_dir / "obsidian_vault" / "Concepts" / "@b64_TWF0cml4IFYgcgpq.md").is_file()
+    assert (target_dir / "obsidian_vault" / "Concepts" / "@b64_dGVzdDppbnZhbGlkKmNoYXI_.md").is_file()
+
+
+def test_sanitize_filename_windows_compatibility():
+    """Verify sanitize_filename handles newlines, tabs, and invalid Windows filesystem chars."""
+    from bookeeper.graph.exporters import sanitize_filename
+
+    assert sanitize_filename("Complexity Class Σ 0\n2") == "Complexity Class Σ 0 2"
+    assert sanitize_filename("Matrix V r\nj") == "Matrix V r j"
+    assert sanitize_filename("Invalid: <name> *with? \"quotes\" | pipes") == "Invalid name with quotes pipes"
+    assert sanitize_filename("Trailing dots and spaces. . ") == "Trailing dots and spaces"
+    assert sanitize_filename("\tTabs and \r\n multiple   spaces\t") == "Tabs and multiple spaces"
+
+

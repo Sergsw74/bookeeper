@@ -780,6 +780,37 @@ def inspect_backup(archive_path: Path) -> Dict[str, Any]:
     }
 
 
+def resolve_target_books_dir(
+    target_dir: Path,
+    metadata: Optional[Dict[str, Any]] = None,
+    explicit_books_dir: Optional[Path] = None,
+) -> Path:
+    """
+    Resolve destination directory for books during full backup restoration.
+    If explicit_books_dir is passed, it is used directly.
+    Otherwise, resolves relative to target_dir (or target_dir.parent if target_dir is named 'output' or 'out').
+    """
+    if explicit_books_dir:
+        return explicit_books_dir.expanduser().resolve()
+
+    target_dir = target_dir.expanduser().resolve()
+    base_dir = target_dir.parent if target_dir.name.lower() in ("output", "out") else target_dir
+
+    meta = metadata or {}
+    rel = meta.get("books_dir_relative")
+    if rel and not Path(rel).is_absolute():
+        return (base_dir / rel).resolve()
+
+    if (base_dir / "archive_downloader" / "downloads").exists():
+        return (base_dir / "archive_downloader" / "downloads").resolve()
+    if (base_dir / "downloads").exists():
+        return (base_dir / "downloads").resolve()
+    if (base_dir / "books").exists():
+        return (base_dir / "books").resolve()
+
+    return (base_dir / "archive_downloader" / "downloads").resolve()
+
+
 def restore_backup(
     archive_path: Path,
     target_dir: Path,
@@ -805,17 +836,12 @@ def restore_backup(
 
     target_books_dir: Optional[Path] = None
     if is_full:
-        if books_dir:
-            target_books_dir = books_dir.expanduser().resolve()
-        else:
-            meta = inspection.get("metadata") or {}
-            rel = meta.get("books_dir_relative")
-            if rel and not Path(rel).is_absolute():
-                target_books_dir = (Path.cwd() / rel).resolve()
-            elif (target_dir.parent / "archive_downloader" / "downloads").exists():
-                target_books_dir = (target_dir.parent / "archive_downloader" / "downloads").resolve()
-            else:
-                target_books_dir = (target_dir.parent / "downloads").resolve()
+        meta = inspection.get("metadata") or {}
+        target_books_dir = resolve_target_books_dir(
+            target_dir=target_dir,
+            metadata=meta,
+            explicit_books_dir=books_dir,
+        )
 
     if dry_run:
         return {
@@ -833,6 +859,9 @@ def restore_backup(
     cleaned_stats = {}
     if clean:
         cleaned_stats = clean_knowledge_artifacts(target_dir)
+        if is_full and target_books_dir:
+            cleaned_book_stats = clean_book_artifacts(target_books_dir)
+            cleaned_stats["files_removed"] = cleaned_stats.get("files_removed", 0) + cleaned_book_stats.get("files_removed", 0)
 
     target_dir.mkdir(parents=True, exist_ok=True)
     if is_full and target_books_dir:
@@ -914,13 +943,14 @@ def restore_backup(
                     if progress_callback:
                         progress_callback(restored_count, total_files, info.filename)
 
-    # Remove backup_metadata.json if extracted into target_dir
-    extracted_meta = target_dir / "backup_metadata.json"
-    if extracted_meta.is_file():
-        try:
-            extracted_meta.unlink()
-        except Exception:
-            pass
+    # Create a convenience symlink target_dir / 'books' -> target_books_dir if appropriate
+    if is_full and target_books_dir and target_books_dir.is_dir():
+        books_alias = target_dir / "books"
+        if not books_alias.exists() and target_books_dir.resolve() != books_alias.resolve():
+            try:
+                books_alias.symlink_to(target_books_dir, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                pass
 
     return {
         "dry_run": False,

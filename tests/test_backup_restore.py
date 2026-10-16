@@ -500,5 +500,51 @@ def test_full_backup_7z(mock_output_dir: Path, mock_books_dir: Path, tmp_path: P
     assert (restore_books / "index.json").is_file()
 
 
+def test_full_restore_without_explicit_books_dir_uses_output_dir(mock_output_dir: Path, mock_books_dir: Path, tmp_path: Path):
+    """
+    Verify that when restoring a full backup with --output-dir (and without --books-dir),
+    the books are extracted relative to the specified output directory rather than defaulting
+    to the current working directory.
+    """
+    archive_dest = tmp_path / "server_backup.zip"
+    create_backup(
+        source_dir=mock_output_dir,
+        destination=archive_dest,
+        format_type="zip",
+        backup_type="full",
+        books_dir=mock_books_dir,
+        indexed_only=True,
+    )
+
+    # Server target folder simulating /srv/.../bookeeper
+    server_dir = tmp_path / "server_mount" / "bookeeper"
+
+    # Run CLI restore with ONLY -o / --output-dir
+    res = runner.invoke(
+        app,
+        [
+            "restore",
+            str(archive_dest),
+            "-o",
+            str(server_dir),
+            "--clean",
+        ],
+    )
+    assert res.exit_code == 0
+    assert "Full Restoration Summary" in res.stdout
+
+    # Verify Knowledge graph is in server_dir
+    assert (server_dir / "knowledge_graph.json").is_file()
+
+    # Verify Books are extracted under server_dir / archive_downloader / downloads
+    expected_books_dir = server_dir / "archive_downloader" / "downloads"
+    assert (expected_books_dir / "Test Book.pdf").is_file()
+    assert (expected_books_dir / "Test Book.opf").is_file()
+    assert (expected_books_dir / "index.json").is_file()
+    assert "Book Files Restored" in res.stdout
+    assert "Full Restoration Summary" in res.stdout
+
+
+
 
 

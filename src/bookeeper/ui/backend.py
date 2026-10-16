@@ -145,11 +145,26 @@ class SearchEngineBackend:
             if p.is_dir():
                 return p
 
-        # 3. Standard fallback locations
+        # 3. Locations relative to resolved output_dir
+        out_dir = getattr(self.config, "resolved_output_dir", None)
+        if out_dir:
+            out_p = Path(out_dir).expanduser().resolve()
+            for candidate in (
+                out_p / "archive_downloader" / "downloads",
+                out_p / "downloads",
+                out_p / "books",
+                out_p.parent / "archive_downloader" / "downloads",
+                out_p.parent / "downloads",
+                out_p.parent / "books",
+            ):
+                if candidate.is_dir():
+                    return candidate
+
+        # 4. Standard fallback locations
         for candidate in (
             Path("archive_downloader/downloads").resolve(),
             Path("./downloads").resolve(),
-            getattr(self.config, "resolved_output_dir", Path("output")) / "downloads",
+            Path("./books").resolve(),
         ):
             if candidate.is_dir():
                 return candidate

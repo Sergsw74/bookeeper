@@ -87,6 +87,7 @@ from bookeeper.backup import (
     create_backup,
     detect_archive_format,
     inspect_backup,
+    resolve_target_books_dir,
     restore_backup,
 )
 from bookeeper.rag.lightrag_engine import LightRAGEngine
@@ -5579,11 +5580,7 @@ def restore_command(
 
     cfg = _get_effective_settings(config_path, calibre_path)
     target_dir = Path(output_dir).expanduser().resolve() if output_dir else cfg.resolved_output_dir
-    target_books_dir = (
-        Path(books_dir).expanduser().resolve()
-        if books_dir
-        else (cfg.resolved_books_dir or Path("archive_downloader/downloads").resolve())
-    )
+    explicit_books_dir = Path(books_dir).expanduser().resolve() if books_dir else None
 
     if dry_run:
         console.print(f"[bold cyan]Inspecting archive [bold white]{archive_file}[/bold white] (Dry Run)...[/bold cyan]")
@@ -5593,10 +5590,22 @@ def restore_command(
             console.print(f"[bold red]Failed to inspect archive:[/bold red] {e}")
             raise typer.Exit(1)
 
+        is_full = info.get("backup_type") == "full" or info.get("categories", {}).get("books", 0) > 0
+        computed_books_dir = None
+        if is_full:
+            computed_books_dir = resolve_target_books_dir(
+                target_dir=target_dir,
+                metadata=info.get("metadata"),
+                explicit_books_dir=explicit_books_dir,
+            )
+
         table = Table(title=f"Archive Inspection: {archive_file.name}", border_style="cyan")
         table.add_column("Category", style="bold")
         table.add_column("Count", justify="right", style="cyan")
         table.add_row("Backup Type", info.get("backup_type", "knowledge").upper(), style="bold magenta")
+        table.add_row("Target Directory (Knowledge)", str(target_dir))
+        if is_full and computed_books_dir:
+            table.add_row("Target Directory (Books)", str(computed_books_dir))
         for cat, cnt in info["categories"].items():
             table.add_row(cat.replace("_", " ").title(), str(cnt))
         table.add_row("Total Files", f"{info['total_files']:,}", style="bold green")
@@ -5635,7 +5644,7 @@ def restore_command(
             result = restore_backup(
                 archive_path=archive_file,
                 target_dir=target_dir,
-                books_dir=target_books_dir,
+                books_dir=explicit_books_dir,
                 clean=clean,
                 dry_run=False,
                 progress_callback=_on_progress,
@@ -5658,7 +5667,7 @@ def restore_command(
     table.add_row("Backup Type", result.get("backup_type", "knowledge").upper())
     table.add_row("Target Directory (Knowledge)", str(target_dir))
     if is_full:
-        table.add_row("Target Directory (Books)", str(result.get("target_books_dir") or target_books_dir))
+        table.add_row("Target Directory (Books)", str(result.get("target_books_dir") or explicit_books_dir or (target_dir / "archive_downloader" / "downloads")))
     table.add_row("Format", result["format"].upper())
     if clean:
         cl = result.get("cleaned", {})

@@ -6,9 +6,10 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Coroutine, Dict, List, Optional, TypeVar, Union
 
 import numpy as np
 
@@ -20,6 +21,99 @@ from bookeeper.processing.chunker import HierarchicalChunk
 from bookeeper.processing.extractor import OllamaPool
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+
+class _LoopThread:
+    """A dedicated daemon thread running a persistent asyncio event loop for LightRAG operations."""
+
+    def __init__(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="LightRAGEventLoop")
+        self._thread.start()
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def run_sync(self, coro: Coroutine[Any, Any, T], timeout: Optional[float] = None) -> T:
+        """Run coroutine in the dedicated event loop and return its result."""
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=timeout)
+
+    def stop(self, timeout: float = 10.0) -> None:
+        """Cleanly cancel all pending tasks, drain workers, and shut down the event loop."""
+        if not self._loop.is_running():
+            return
+
+        async def _cleanup():
+            current = asyncio.current_task()
+            tasks = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+            for t in tasks:
+                t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await self._loop.shutdown_asyncgens()
+            except Exception:
+                pass
+            self._loop.stop()
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(_cleanup(), self._loop)
+            future.result(timeout=timeout)
+        except Exception:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+
+        if self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+
+        if not self._loop.is_running() and not self._loop.is_closed():
+            try:
+                self._loop.close()
+            except Exception:
+                pass
+
+
+def _normalize_keep_alive(val: Any) -> Any:
+    """
+    Normalize keep_alive value for Ollama API.
+    Ollama requires duration strings (e.g. '5m', '1h') or integers (e.g. -1 for indefinite, 0 to unload).
+    String "-1" causes Ollama to fail with 'time: missing unit in duration "-1"'.
+    """
+    if val is None:
+        return -1
+    if isinstance(val, (int, float)):
+        return int(val)
+    if isinstance(val, str):
+        v = val.strip()
+        if v in ("-1", "0") or v.isdigit() or (v.startswith("-") and v[1:].isdigit()):
+            return int(v)
+        return v
+    return -1
+
+
+def _clean_json_str(text: str) -> str:
+    """Clean model response by removing thinking tags, markdown code blocks, and extra text."""
+    if not text:
+        return ""
+    text = text.strip()
+    if "<think>" in text and "</think>" in text:
+        text = text.split("</think>")[-1].strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    start_brace = text.find("{")
+    if start_brace != -1:
+        end_brace = text.rfind("}")
+        if end_brace > start_brace:
+            return text[start_brace : end_brace + 1]
+    return text
 
 
 class LightRAGEngine:
@@ -41,7 +135,7 @@ class LightRAGEngine:
         llm_max_async: int = 16,
         embedding_batch_num: int = 64,
         embedding_max_async: int = 32,
-        keep_alive: str = "-1",
+        keep_alive: Union[str, int] = -1,
     ):
         self.working_dir = Path(working_dir).expanduser().resolve()
         self.working_dir.mkdir(parents=True, exist_ok=True)
@@ -55,13 +149,59 @@ class LightRAGEngine:
         self.llm_max_async = llm_max_async
         self.embedding_batch_num = embedding_batch_num
         self.embedding_max_async = embedding_max_async
-        self.keep_alive = keep_alive
+        self.keep_alive = _normalize_keep_alive(keep_alive)
 
         self._rag: Optional[LightRAG] = None
+        self._initialized = False
+        self._loop_thread: Optional[_LoopThread] = None
+
+    def close(self) -> None:
+        """Clean up resources, finalize storages, shut down all worker queues, and terminate event loop."""
+        if self._rag is not None and self._loop_thread is not None:
+            async def _finalize_rag():
+                rag = self._rag
+                if rag is None:
+                    return
+
+                # 1. Finalize storages
+                if hasattr(rag, "finalize_storages"):
+                    try:
+                        await rag.finalize_storages()
+                    except Exception:
+                        pass
+
+                # 2. Shutdown all role LLM worker queues
+                states = getattr(rag, "_role_llm_states", {}) or {}
+                for state in states.values():
+                    if hasattr(state, "wrapped") and hasattr(state.wrapped, "shutdown"):
+                        try:
+                            await state.wrapped.shutdown(graceful=False)
+                        except Exception:
+                            pass
+
+                # 3. Shutdown embedding worker queue
+                if hasattr(rag, "embedding_func") and rag.embedding_func:
+                    fn = getattr(rag.embedding_func, "func", None)
+                    if hasattr(fn, "shutdown"):
+                        try:
+                            await fn.shutdown(graceful=False)
+                        except Exception:
+                            pass
+
+            try:
+                self._run_sync(_finalize_rag(), timeout=30)
+            except Exception:
+                pass
+
+        if self._loop_thread is not None:
+            self._loop_thread.stop()
+            self._loop_thread = None
+        self._rag = None
         self._initialized = False
 
     def clean(self) -> None:
         """Purge all stored LightRAG graph, vector, and index files in working_dir."""
+        self.close()
         if self.working_dir.exists():
             for item in self.working_dir.iterdir():
                 if item.is_dir():
@@ -73,6 +213,12 @@ class LightRAGEngine:
                         pass
         self._rag = None
         self._initialized = False
+
+    def _run_sync(self, coro: Coroutine[Any, Any, T], timeout: Optional[float] = None) -> T:
+        """Execute a coroutine synchronously inside the persistent LightRAG event loop."""
+        if self._loop_thread is None:
+            self._loop_thread = _LoopThread()
+        return self._loop_thread.run_sync(coro, timeout=timeout)
 
     @classmethod
     def from_settings(
@@ -135,7 +281,10 @@ class LightRAGEngine:
                     headers={"Content-Type": "application/json"},
                 )
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
+                    parsed = json.loads(resp.read().decode("utf-8"))
+                    if isinstance(parsed, dict) and "error" in parsed:
+                        raise RuntimeError(f"Ollama error from {url}: {parsed['error']}")
+                    return parsed
             except Exception:
                 # 2. Resilient fallback to curl for macOS Sequoia LAN routing
                 if shutil.which("curl"):
@@ -154,7 +303,10 @@ class LightRAGEngine:
                     ]
                     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
                     if res.returncode == 0 and res.stdout.strip():
-                        return json.loads(res.stdout)
+                        parsed = json.loads(res.stdout)
+                        if isinstance(parsed, dict) and "error" in parsed:
+                            raise RuntimeError(f"Ollama error from {url}: {parsed['error']}")
+                        return parsed
                 raise
 
         target_pool = self.embedding_pool if use_embedding_pool else self.pool
@@ -277,14 +429,73 @@ class LightRAGEngine:
                 messages.extend(history_messages)
             messages.append({"role": "user", "content": prompt})
 
-            data = {
+            data: Dict[str, Any] = {
                 "model": llm_model,
                 "messages": messages,
                 "stream": False,
                 "keep_alive": keep_alive,
             }
+
+            # Forward JSON mode to Ollama when structured output is requested (e.g. LightRAG keyword extraction)
+            response_format = kwargs.get("response_format")
+            is_json_requested = bool(
+                response_format
+                or kwargs.get("format") == "json"
+                or "high_level_keywords" in prompt
+                or "json_object" in str(response_format)
+            )
+            if is_json_requested:
+                data["format"] = "json"
+
             res = await asyncio.to_thread(call_ollama, "/api/chat", data, timeout=240, use_embedding_pool=False)
-            return res.get("message", {}).get("content", "")
+            content = res.get("message", {}).get("content", "")
+
+            if is_json_requested:
+                content = _clean_json_str(content)
+                parsed: Dict[str, Any] = {}
+                try:
+                    if content:
+                        parsed = json.loads(content)
+                        if not isinstance(parsed, dict):
+                            parsed = {}
+                except Exception:
+                    parsed = {}
+
+                # Guarantee valid high-signal keywords for LightRAG dual-level retrieval
+                if "high_level_keywords" in prompt:
+                    hl = parsed.get("high_level_keywords") or []
+                    ll = parsed.get("low_level_keywords") or []
+                    if not isinstance(hl, list):
+                        hl = [str(hl)] if hl else []
+                    if not isinstance(ll, list):
+                        ll = [str(ll)] if ll else []
+
+                    # If one list is empty, balance with the other
+                    if not hl and ll:
+                        hl = list(ll)
+                    elif not ll and hl:
+                        ll = list(hl)
+                    elif not hl and not ll:
+                        # Fallback: extract key subject terms directly from prompt's User Query
+                        query_part = prompt.split("User Query:")[-1].strip() if "User Query:" in prompt else prompt
+                        stopwords = {
+                            "what", "which", "where", "when", "how", "why", "who", "whom", "whose",
+                            "user", "query", "language", "english", "please", "identify", "extract",
+                            "from", "with", "that", "this", "these", "those", "about", "into", "over",
+                        }
+                        words = [
+                            w for w in re.findall(r"\b[A-Za-z0-9_-]{3,}\b", query_part)
+                            if w.lower() not in stopwords
+                        ]
+                        fallback_term = " ".join(words[:4]) if words else "query"
+                        hl = [fallback_term]
+                        ll = words[:4] if words else [fallback_term]
+
+                    parsed["high_level_keywords"] = hl
+                    parsed["low_level_keywords"] = ll
+                    content = json.dumps(parsed)
+
+            return content
 
         async def _embed_func(
             texts: List[str],
@@ -337,7 +548,7 @@ class LightRAGEngine:
 
     def initialize(self) -> None:
         """Synchronous initialization of storages."""
-        asyncio.run(self.ainitialize())
+        self._run_sync(self.ainitialize())
 
     async def ainsert_text(
         self,
@@ -359,7 +570,7 @@ class LightRAGEngine:
         file_path: Optional[str] = None,
     ) -> str:
         """Synchronous document insertion."""
-        return asyncio.run(self.ainsert_text(text, doc_id=doc_id, file_path=file_path))
+        return self._run_sync(self.ainsert_text(text, doc_id=doc_id, file_path=file_path))
 
     async def ainsert_chunks(
         self,
@@ -421,7 +632,7 @@ class LightRAGEngine:
         on_progress: Optional[Any] = None,
     ) -> int:
         """Synchronous chunk indexing with optional progress tracking."""
-        return asyncio.run(
+        return self._run_sync(
             self.ainsert_chunks(
                 chunks,
                 book_title=book_title,
@@ -457,6 +668,8 @@ class LightRAGEngine:
 
         param = QueryParam(mode=m, top_k=top_k, chunk_top_k=chunk_top_k)
         result = await self._rag.aquery(query, param=param)
+        if hasattr(result, "content") and result.content is not None:
+            return str(result.content)
         return str(result)
 
     def query(
@@ -467,19 +680,31 @@ class LightRAGEngine:
         chunk_top_k: int = 20,
     ) -> str:
         """Synchronous dual-level query."""
-        return asyncio.run(self.aquery(query, mode=mode, top_k=top_k, chunk_top_k=chunk_top_k))
+        return self._run_sync(self.aquery(query, mode=mode, top_k=top_k, chunk_top_k=chunk_top_k))
 
     def get_stats(self) -> Dict[str, Any]:
         """Inspect LightRAG graph and storage stats."""
         graph_file = self.working_dir / "graph_chunk_entity_relation.graphml"
         nodes_count = 0
         edges_count = 0
+        node_types: Dict[str, int] = {}
         if graph_file.is_file():
             try:
                 import networkx as nx
+                from collections import Counter
                 g = nx.read_graphml(str(graph_file))
                 nodes_count = g.number_of_nodes()
                 edges_count = g.number_of_edges()
+                node_types = dict(Counter(data.get("entity_type") or "unknown" for _, data in g.nodes(data=True)))
+            except Exception:
+                pass
+
+        chunks_file = self.working_dir / "kv_store_text_chunks.json"
+        chunks_count = 0
+        if chunks_file.is_file():
+            try:
+                with open(chunks_file, "r", encoding="utf-8") as f:
+                    chunks_count = len(json.load(f))
             except Exception:
                 pass
 
@@ -488,6 +713,8 @@ class LightRAGEngine:
             "graphml_exists": graph_file.is_file(),
             "nodes_count": nodes_count,
             "edges_count": edges_count,
+            "chunks_count": chunks_count,
+            "node_types": node_types,
             "llm_model": self.llm_model,
             "embedding_model": self.embedding_model,
         }

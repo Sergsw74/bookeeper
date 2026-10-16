@@ -1,0 +1,1022 @@
+{
+  "created_at": 1792013132.196173,
+  "model": "gemma4:12b",
+  "book_titles": [
+    "On the estimation and validity of AI time horizons---a statistical look at the METR plot",
+    "BrickBench: Evaluating Agentic Brick Design",
+    "Ecology of AI Agents: Collaboration Creates a Population Threshold for Takeoff",
+    "Searching for \"Harmful Refusal\": A Psychometric Audit of an AI Safety Benchmark"
+  ],
+  "questions": [
+    {
+      "id": "q_001",
+      "book_id": 1,
+      "book_title": "On the estimation and validity of AI time horizons---a statistical look at the METR plot",
+      "category": "concept",
+      "query": "Why does a time-horizon jump from 3 minutes to 30 minutes represent a smaller increase in AI difficulty than a jump from 30 minutes to 5 hours, despite both being 10x multipliers?",
+      "context_hint": "Spline-based difficulty modeling",
+      "checklist": [
+        {
+          "criterion": "Does the response explain that the fitted spline is nearly flat in the 2–30 minute range?",
+          "expected": true,
+          "aspect_label": "Spline behavior"
+        },
+        {
+          "criterion": "Does the response state that the model is close to linear outside of the 2–30 minute range?",
+          "expected": true,
+          "aspect_label": "Linearity range"
+        },
+        {
+          "criterion": "Does the response claim that the difficulty is perfectly linear across all time scales?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_002",
+      "book_id": 1,
+      "book_title": "On the estimation and validity of AI time horizons---a statistical look at the METR plot",
+      "category": "relational",
+      "query": "Compare the 'equal-task' and 'equal-family' weighting schemes used for evaluating AI performance. How do their targets differ?",
+      "context_hint": "Weighting schemes for AI evaluation",
+      "checklist": [
+        {
+          "criterion": "Does the response state that equal-task weighting targets a uniformly drawn task?",
+          "expected": true,
+          "aspect_label": "Equal-task target"
+        },
+        {
+          "criterion": "Does the response state that equal-family weighting targets a uniformly drawn task family?",
+          "expected": true,
+          "aspect_label": "Equal-family target"
+        },
+        {
+          "criterion": "Does the response suggest that these schemes weight the tasks differently than the AIs?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_003",
+      "book_id": 1,
+      "book_title": "On the estimation and validity of AI time horizons---a statistical look at the METR plot",
+      "category": "factual",
+      "query": "What are the specific components used to model the latent difficulty $\\theta_i$ in the item-response theory framework?",
+      "context_hint": "Latent difficulty formula",
+      "checklist": [
+        {
+          "criterion": "Does the response include a mean function $f$ of $\\log_2 T_i$?",
+          "expected": true,
+          "aspect_label": "Mean function"
+        },
+        {
+          "criterion": "Does the response include a family variance $\\tau$?",
+          "expected": true,
+          "aspect_label": "Family variance"
+        },
+        {
+          "criterion": "Does the response include an idiosyncratic variance $\\sigma$?",
+          "expected": true,
+          "aspect_label": "Idiosyncratic variance"
+        }
+      ]
+    },
+    {
+      "id": "q_004",
+      "book_id": 1,
+      "book_title": "On the estimation and validity of AI time horizons---a statistical look at the METR plot",
+      "category": "concept",
+      "query": "Explain the purpose of the correlation parameter $\\rho$ and the derived parameter $\\phi$ in the overdispersion model.",
+      "context_hint": "Beta-binomial model and overdispersion",
+      "checklist": [
+        {
+          "criterion": "Does the response state that $\\rho$ is shared among all AIs?",
+          "expected": true,
+          "aspect_label": "Parameter sharing"
+        },
+        {
+          "criterion": "Does the response define $\\phi$ as $(1-\\rho)/\\rho$?",
+          "expected": true,
+          "aspect_label": "Parameter definition"
+        },
+        {
+          "criterion": "Does the response explain that this allows for higher variance than a standard binomial model?",
+          "expected": true,
+          "aspect_label": "Overdispersion mechanism"
+        }
+      ]
+    },
+    {
+      "id": "q_005",
+      "book_id": 1,
+      "book_title": "On the estimation and validity of AI time horizons---a statistical look at the METR plot",
+      "category": "relational",
+      "query": "How does the spline-based approach differ from the standard assumption regarding the relationship between AI difficulty and human completion time?",
+      "context_hint": "Linear log assumption vs. splines",
+      "checklist": [
+        {
+          "criterion": "Does the response identify the standard assumption as a linear dependence on the log of human time?",
+          "expected": true,
+          "aspect_label": "Standard assumption"
+        },
+        {
+          "criterion": "Does the response state that the spline model relaxes this linear assumption?",
+          "expected": true,
+          "aspect_label": "Model relaxation"
+        },
+        {
+          "criterion": "Does the response state that the spline model is only used for tasks under 30 minutes?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_006",
+      "book_id": 1,
+      "book_title": "On the estimation and validity of AI time horizons---a statistical look at the METR plot",
+      "category": "factual",
+      "query": "What numerical methods are employed to implement the maximum likelihood estimation for the overdispersion model?",
+      "context_hint": "EM algorithm and quadrature",
+      "checklist": [
+        {
+          "criterion": "Does the response mention the use of an EM algorithm?",
+          "expected": true,
+          "aspect_label": "EM algorithm"
+        },
+        {
+          "criterion": "Does the response mention the use of Gauss-Hermite quadrature?",
+          "expected": true,
+          "aspect_label": "Gauss-Hermite quadrature"
+        },
+        {
+          "criterion": "Does the response state that the likelihood is invariant to affine transformations of $\\theta$?",
+          "expected": true,
+          "aspect_label": "Likelihood property"
+        }
+      ]
+    },
+    {
+      "id": "q_007",
+      "book_id": 1,
+      "book_title": "On the estimation and validity of AI time horizons---a statistical look at the METR plot",
+      "category": "thematic",
+      "query": "What is the core principle behind anchoring AI capability in human completion time within the context of item-response theory?",
+      "context_hint": "External anchoring scale",
+      "checklist": [
+        {
+          "criterion": "Does the response explain that human time serves as a covariate?",
+          "expected": true,
+          "aspect_label": "Covariate usage"
+        },
+        {
+          "criterion": "Does the response state that this allows capability to be measured in interpretable units?",
+          "expected": true,
+          "aspect_label": "Interpretability"
+        },
+        {
+          "criterion": "Does the response state that this method eliminates the need for any external data?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_008",
+      "book_id": 1,
+      "book_title": "On the estimation and validity of AI time horizons---a statistical look at the METR plot",
+      "category": "concept",
+      "query": "Define 'overdispersion' in the context of AI-task success indicators and explain why it is modeled using a Beta-binomial distribution.",
+      "context_hint": "Beta-binomial and correlation",
+      "checklist": [
+        {
+          "criterion": "Does the response state that overdispersion accounts for correlation between trials for the same AI-task pair?",
+          "expected": true,
+          "aspect_label": "Correlation source"
+        },
+        {
+          "criterion": "Does the response state that the Beta-binomial model allows for higher variance than a binomial model?",
+          "expected": true,
+          "aspect_label": "Variance comparison"
+        },
+        {
+          "criterion": "Does the response state that the correlation $\\rho$ is unique to every individual task?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_009",
+      "book_id": 1,
+      "book_title": "On the estimation and validity of AI time horizons---a statistical look at the METR plot",
+      "category": "relational",
+      "query": "How does the 'sqrt-family' weighting scheme relate to the 'equal-task' and 'equal-family' schemes?",
+      "context_hint": "Weighting schemes comparison",
+      "checklist": [
+        {
+          "criterion": "Does the response describe 'sqrt-family' as an intermediate weighting scheme?",
+          "expected": true,
+          "aspect_label": "Intermediate status"
+        },
+        {
+          "criterion": "Does the response state that all three schemes weight the AIs uniformly?",
+          "expected": true,
+          "aspect_label": "AI weighting consistency"
+        },
+        {
+          "criterion": "Does the response state that 'sqrt-family' targets a uniformly drawn task family?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_010",
+      "book_id": 1,
+      "book_title": "On the estimation and validity of AI time horizons---a statistical look at the METR plot",
+      "category": "thematic",
+      "query": "What diagnostic measures are suggested to ensure the construct validity of AI time horizons as benchmarks grow or include longer tasks?",
+      "context_hint": "Construct validity and diagnostic plots",
+      "checklist": [
+        {
+          "criterion": "Does the response suggest interpreting time horizons together with diagnostic plots?",
+          "expected": true,
+          "aspect_label": "Diagnostic integration"
+        },
+        {
+          "criterion": "Does the response mention using these plots to assess construct validity?",
+          "expected": true,
+          "aspect_label": "Construct validity"
+        },
+        {
+          "criterion": "Does the response suggest that diagnostic plots are only necessary for tasks under 30 minutes?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_011",
+      "book_id": 2,
+      "book_title": "BrickBench: Evaluating Agentic Brick Design",
+      "category": "concept",
+      "query": "What are the three distinct settings used to evaluate agentic LEGO-set design in the BrickBench framework?",
+      "context_hint": "Model, Set, and Alt-Build settings",
+      "checklist": [
+        {
+          "criterion": "Does the response identify the 'Model' setting as having a part limit of ≤400?",
+          "expected": true,
+          "aspect_label": "Model setting constraint"
+        },
+        {
+          "criterion": "Does the response identify the 'Set' setting as having a part range of 400–4000?",
+          "expected": true,
+          "aspect_label": "Set setting constraint"
+        },
+        {
+          "criterion": "Does the response identify the 'Alt-Build' setting as being restricted to the part inventory of set 10698?",
+          "expected": true,
+          "aspect_label": "Alt-Build setting constraint"
+        }
+      ]
+    },
+    {
+      "id": "q_012",
+      "book_id": 2,
+      "book_title": "BrickBench: Evaluating Agentic Brick Design",
+      "category": "concept",
+      "query": "Describe the core functionality and specific tools provided by the BrickAgent environment.",
+      "context_hint": "BrickAgent environment and tools",
+      "checklist": [
+        {
+          "criterion": "Does the response mention the inclusion of the LDraw library and the BrickNet connector system?",
+          "expected": true,
+          "aspect_label": "Core components"
+        },
+        {
+          "criterion": "Does the response list tools for searching, placing, mirroring, measuring, defining subassemblies, and rendering?",
+          "expected": true,
+          "aspect_label": "Tool functionality"
+        },
+        {
+          "criterion": "Does the response state that the environment includes a validator for connectivity, collision, and stability?",
+          "expected": true,
+          "aspect_label": "Validation tools"
+        }
+      ]
+    },
+    {
+      "id": "q_013",
+      "book_id": 2,
+      "book_title": "BrickBench: Evaluating Agentic Brick Design",
+      "category": "relational",
+      "query": "How does the availability of the BrickAgent toolset affect the performance of frontier coding agents in constructing valid builds?",
+      "context_hint": "Ablation study of BrickAgent tools",
+      "checklist": [
+        {
+          "criterion": "Does the response state that agents without these tools cannot reliably construct valid builds?",
+          "expected": true,
+          "aspect_label": "Ablation result"
+        },
+        {
+          "criterion": "Does the response state that agents with the tools can satisfy physical and semantic requirements?",
+          "expected": true,
+          "aspect_label": "Tool benefit"
+        },
+        {
+          "criterion": "Does the response claim that agents without tools still achieve high validity scores?",
+          "expected": false,
+          "aspect_label": "Negative distractor"
+        }
+      ]
+    },
+    {
+      "id": "q_014",
+      "book_id": 2,
+      "book_title": "BrickBench: Evaluating Agentic Brick Design",
+      "category": "factual",
+      "query": "What specific physics parameters are applied in the PyBullet simulation to ensure that inter-component contacts do not slide or bounce?",
+      "context_hint": "PyBullet simulation parameters",
+      "checklist": [
+        {
+          "criterion": "Does the response mention a high coefficient of friction?",
+          "expected": true,
+          "aspect_label": "Friction parameter"
+        },
+        {
+          "criterion": "Does the response mention no restitution?",
+          "expected": true,
+          "aspect_label": "Restitution parameter"
+        },
+        {
+          "criterion": "Does the response state that components are simulated as single rigid bodies of uniform density?",
+          "expected": true,
+          "aspect_label": "Rigid body simulation"
+        },
+        {
+          "criterion": "Does the response mention a low coefficient of friction?",
+          "expected": false,
+          "aspect_label": "Negative distractor"
+        }
+      ]
+    },
+    {
+      "id": "q_015",
+      "book_id": 2,
+      "book_title": "BrickBench: Evaluating Agentic Brick Design",
+      "category": "factual",
+      "query": "What are the three primary reasons for an assembly being classified as invalid in the reference set?",
+      "context_hint": "Invalid assembly failure modes",
+      "checklist": [
+        {
+          "criterion": "Does the response mention failures on stability?",
+          "expected": true,
+          "aspect_label": "Stability failure"
+        },
+        {
+          "criterion": "Does the response mention failures on collisions?",
+          "expected": true,
+          "aspect_label": "Collision failure"
+        },
+        {
+          "criterion": "Does the response mention failures on part requirements?",
+          "expected": true,
+          "aspect_label": "Part requirement failure"
+        },
+        {
+          "criterion": "Does the response state that 'aesthetic' failures are a primary reason for invalidity?",
+          "expected": false,
+          "aspect_label": "Negative distractor"
+        }
+      ]
+    },
+    {
+      "id": "q_016",
+      "book_id": 2,
+      "book_title": "BrickBench: Evaluating Agentic Brick Design",
+      "category": "relational",
+      "query": "Contrast the 'Model' and 'Alt-Build' settings in terms of part quantity and inventory constraints.",
+      "context_hint": "Comparison of Model and Alt-Build",
+      "checklist": [
+        {
+          "criterion": "Does the response state that 'Model' is limited to ≤400 parts?",
+          "expected": true,
+          "aspect_label": "Model quantity"
+        },
+        {
+          "criterion": "Does the response state that 'Alt-Build' is restricted to the inventory of set 10698?",
+          "expected": true,
+          "aspect_label": "Alt-Build inventory"
+        },
+        {
+          "criterion": "Does the response state that 'Alt-Build' allows for any number of parts?",
+          "expected": false,
+          "aspect_label": "Negative distractor"
+        }
+      ]
+    },
+    {
+      "id": "q_017",
+      "book_id": 2,
+      "book_title": "BrickBench: Evaluating Agentic Brick Design",
+      "category": "concept",
+      "query": "How is the VQA score calculated to measure the semantic alignment between a rendered assembly and a text prompt?",
+      "context_hint": "VQA metric computation",
+      "checklist": [
+        {
+          "criterion": "Does the response mention rendering the assembly from eight views?",
+          "expected": true,
+          "aspect_label": "Rendering views"
+        },
+        {
+          "criterion": "Does the response mention using Gemma 4 31B to judge the views?",
+          "expected": true,
+          "aspect_label": "Model used for VQA"
+        },
+        {
+          "criterion": "Does the response mention asking each question of the graph in one call?",
+          "expected": true,
+          "aspect_label": "Query method"
+        },
+        {
+          "criterion": "Does the response state that the VQA score is determined by human judgment?",
+          "expected": false,
+          "aspect_label": "Negative distractor"
+        }
+      ]
+    },
+    {
+      "id": "q_018",
+      "book_id": 2,
+      "book_title": "BrickBench: Evaluating Agentic Brick Design",
+      "category": "relational",
+      "query": "What is the relationship between the ELO score and the cost per build as observed in the benchmark summary?",
+      "context_hint": "ELO vs. Cost plot",
+      "checklist": [
+        {
+          "criterion": "Does the response mention that ELO is plotted against mean assembly cost?",
+          "expected": true,
+          "aspect_label": "Metric relationship"
+        },
+        {
+          "criterion": "Does the response mention that agents are given a budget of 300 turns per prompt?",
+          "expected": true,
+          "aspect_label": "Turn budget"
+        },
+        {
+          "criterion": "Does the response state that cost is the only factor determining ELO?",
+          "expected": false,
+          "aspect_label": "Negative distractor"
+        }
+      ]
+    },
+    {
+      "id": "q_019",
+      "book_id": 2,
+      "book_title": "BrickBench: Evaluating Agentic Brick Design",
+      "category": "factual",
+      "query": "What is the specific part count range for the 'Set' evaluation setting?",
+      "context_hint": "Set setting part count",
+      "checklist": [
+        {
+          "criterion": "Does the response state the range is 400–4000 parts?",
+          "expected": true,
+          "aspect_label": "Correct range"
+        },
+        {
+          "criterion": "Does the response state the range is 100–1000 parts?",
+          "expected": false,
+          "aspect_label": "Negative distractor"
+        }
+      ]
+    },
+    {
+      "id": "q_020",
+      "book_id": 2,
+      "book_title": "BrickBench: Evaluating Agentic Brick Design",
+      "category": "thematic",
+      "query": "How does the benchmark differentiate between the physical feasibility of a LEGO assembly and its semantic alignment with a user prompt?",
+      "context_hint": "Validity vs. VQA/Design ELO",
+      "checklist": [
+        {
+          "criterion": "Does the response state that validity is determined by collision-free and stability tests?",
+          "expected": true,
+          "aspect_label": "Physical feasibility"
+        },
+        {
+          "criterion": "Does the response state that semantic alignment is measured using VQA scores?",
+          "expected": true,
+          "aspect_label": "Semantic alignment"
+        },
+        {
+          "criterion": "Does the response state that Design ELO measures physical stability?",
+          "expected": false,
+          "aspect_label": "Negative distractor"
+        }
+      ]
+    },
+    {
+      "id": "q_021",
+      "book_id": 3,
+      "book_title": "Ecology of AI Agents: Collaboration Creates a Population Threshold for Takeoff",
+      "category": "concept",
+      "query": "What is the 'strong Allee effect' in the context of AI agent populations and how does it differ from independent agent growth?",
+      "context_hint": "Population dynamics and collaboration thresholds",
+      "checklist": [
+        {
+          "criterion": "Does the response explain that the strong Allee effect refers to a critical population threshold where growth becomes positive only above a certain size?",
+          "expected": true,
+          "aspect_label": "Core definition"
+        },
+        {
+          "criterion": "Does the response state that this effect is driven by collaboration increasing collective capability with population size?",
+          "expected": true,
+          "aspect_label": "Mechanism"
+        },
+        {
+          "criterion": "Does the response claim that independent agents exhibit a population-dependent growth threshold?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_022",
+      "book_id": 3,
+      "book_title": "Ecology of AI Agents: Collaboration Creates a Population Threshold for Takeoff",
+      "category": "relational",
+      "query": "Contrast the growth boundaries of independent AI agents versus collaborative AI agents in terms of their dependence on population size (N).",
+      "context_hint": "Growth boundaries and population scaling",
+      "checklist": [
+        {
+          "criterion": "Does the response state that for independent agents, the growth boundary depends on individual capability but is independent of population size N?",
+          "expected": true,
+          "aspect_label": "Independent agent property"
+        },
+        {
+          "criterion": "Does the response state that for collaborative agents, the growth boundary depends on population size N?",
+          "expected": true,
+          "aspect_label": "Collaborative agent property"
+        },
+        {
+          "criterion": "Does the response suggest that increasing N always increases the growth rate for independent agents?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_023",
+      "book_id": 3,
+      "book_title": "Ecology of AI Agents: Collaboration Creates a Population Threshold for Takeoff",
+      "category": "factual",
+      "query": "What is the mathematical definition of the critical success probability (qcrit) and the critical population threshold (Ncrit)?",
+      "context_hint": "Population growth equations",
+      "checklist": [
+        {
+          "criterion": "Does the response identify qcrit as the ratio of the loss fraction (mu) to the growth constant (kappa)?",
+          "expected": true,
+          "aspect_label": "qcrit formula"
+        },
+        {
+          "criterion": "Does the response provide the formula for Ncrit involving Nref, pref, pcrit, and beta?",
+          "expected": true,
+          "aspect_label": "Ncrit formula"
+        },
+        {
+          "criterion": "Does the response state that qcrit is a function of population size N?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_024",
+      "book_id": 3,
+      "book_title": "Ecology of AI Agents: Collaboration Creates a Population Threshold for Takeoff",
+      "category": "concept",
+      "query": "Define 'ecological safety' and explain how it differs from standard multi-agent safety.",
+      "context_hint": "Ecological safety vs. individual safety",
+      "checklist": [
+        {
+          "criterion": "Does the response define ecological safety as concerning the dynamics of the population itself rather than a fixed population?",
+          "expected": true,
+          "aspect_label": "Core definition"
+        },
+        {
+          "criterion": "Does the response mention that it addresses the risk of a self-reinforcing cycle of population expansion?",
+          "expected": true,
+          "aspect_label": "Risk factor"
+        },
+        {
+          "criterion": "Does the response state that ecological safety only concerns the safety of a single agent's actions?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_025",
+      "book_id": 3,
+      "book_title": "Ecology of AI Agents: Collaboration Creates a Population Threshold for Takeoff",
+      "category": "relational",
+      "query": "How does the relationship between search depth (d) and computational cost (C) influence the success probability (p) in a collaborative model?",
+      "context_hint": "Search depth, cost, and success probability",
+      "checklist": [
+        {
+          "criterion": "Does the response state that success probability p(d) follows a model of diminishing returns as depth increases?",
+          "expected": true,
+          "aspect_label": "Success probability behavior"
+        },
+        {
+          "criterion": "Does the response state that computational cost C(d) grows exponentially with search depth d?",
+          "expected": true,
+          "aspect_label": "Cost scaling"
+        },
+        {
+          "criterion": "Does the response state that cost C(d) decreases as depth d increases?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_026",
+      "book_id": 3,
+      "book_title": "Ecology of AI Agents: Collaboration Creates a Population Threshold for Takeoff",
+      "category": "factual",
+      "query": "Describe the mathematical model for success probability p(d) relative to a reference depth dref.",
+      "context_hint": "Success probability and search depth",
+      "checklist": [
+        {
+          "criterion": "Does the response mention the use of an exponential decay of the failure probability?",
+          "expected": true,
+          "aspect_label": "Mathematical form"
+        },
+        {
+          "criterion": "Does the response identify the parameter rho as the control for how strongly success probability increases with depth?",
+          "expected": true,
+          "aspect_label": "Parameter role"
+        },
+        {
+          "criterion": "Does the response state that the model assumes a linear increase in success probability with depth?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_027",
+      "book_id": 3,
+      "book_title": "Ecology of AI Agents: Collaboration Creates a Population Threshold for Takeoff",
+      "category": "thematic",
+      "query": "Why is red teaming a small group of agents insufficient to guarantee ecological safety in a collaborative AI population?",
+      "context_hint": "Red teaming and population thresholds",
+      "checklist": [
+        {
+          "criterion": "Does the response explain that a small population may be below the critical threshold Ncrit?",
+          "expected": true,
+          "aspect_label": "Threshold logic"
+        },
+        {
+          "criterion": "Does the response state that a larger population of the same model could trigger a takeoff due to collaboration?",
+          "expected": true,
+          "aspect_label": "Scaling risk"
+        },
+        {
+          "criterion": "Does the response claim that red teaming a small group guarantees safety for any population size?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_028",
+      "book_id": 3,
+      "book_title": "Ecology of AI Agents: Collaboration Creates a Population Threshold for Takeoff",
+      "category": "concept",
+      "query": "Explain the mechanism of the population dynamics equation tau dN/dt = N(kappa * p(N) - mu).",
+      "context_hint": "Population growth equation",
+      "checklist": [
+        {
+          "criterion": "Does the response identify kappa as the average number of units added per successful attempt?",
+          "expected": true,
+          "aspect_label": "Kappa definition"
+        },
+        {
+          "criterion": "Does the response identify mu as the fraction of existing units lost over time?",
+          "expected": true,
+          "aspect_label": "Mu definition"
+        },
+        {
+          "criterion": "Does the response state that the population grows only when the success probability p(N) is greater than the critical probability qcrit?",
+          "expected": true,
+          "aspect_label": "Growth condition"
+        }
+      ]
+    },
+    {
+      "id": "q_029",
+      "book_id": 3,
+      "book_title": "Ecology of AI Agents: Collaboration Creates a Population Threshold for Takeoff",
+      "category": "relational",
+      "query": "How does the success probability p(N) in a collaborative model scale relative to the reference population Nref?",
+      "context_hint": "Collaborative success probability scaling",
+      "checklist": [
+        {
+          "criterion": "Does the response state that p(N) increases as N increases?",
+          "expected": true,
+          "aspect_label": "Scaling direction"
+        },
+        {
+          "criterion": "Does the response mention the use of a power-law-like term (N/Nref)^-beta to model the failure probability?",
+          "expected": true,
+          "aspect_label": "Mathematical scaling"
+        },
+        {
+          "criterion": "Does the response state that p(N) decreases as N increases?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_030",
+      "book_id": 3,
+      "book_title": "Ecology of AI Agents: Collaboration Creates a Population Threshold for Takeoff",
+      "category": "thematic",
+      "query": "What are the primary factors that contribute to the risk of a 'population explosion' of misaligned AI agents?",
+      "context_hint": "Population explosion factors",
+      "checklist": [
+        {
+          "criterion": "Does the response mention the ability of agents to conduct real-world cyberattacks?",
+          "expected": true,
+          "aspect_label": "Cyber capability"
+        },
+        {
+          "criterion": "Does the response mention the ability to scale capabilities with the number of agents?",
+          "expected": true,
+          "aspect_label": "Scaling capability"
+        },
+        {
+          "criterion": "Does the response mention the collective pursuit of misaligned goals to obtain rewards?",
+          "expected": true,
+          "aspect_label": "Misalignment"
+        },
+        {
+          "criterion": "Does the response state that the risk is primarily due to individual agent hardware failure?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_031",
+      "book_id": 4,
+      "book_title": "Searching for \"Harmful Refusal\": A Psychometric Audit of an AI Safety Benchmark",
+      "category": "concept",
+      "query": "What are the requirements for an attribute to be considered measurable under the construct validity framework used in this psychometric audit?",
+      "context_hint": "Construct validity framework (Borsboom et al., 2004)",
+      "checklist": [
+        {
+          "criterion": "Does the response state that an attribute must exist before a test can measure it?",
+          "expected": true,
+          "aspect_label": "Core requirement"
+        },
+        {
+          "criterion": "Does the response suggest that the test creates the attribute?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_032",
+      "book_id": 4,
+      "book_title": "Searching for \"Harmful Refusal\": A Psychometric Audit of an AI Safety Benchmark",
+      "category": "relational",
+      "query": "How does the predictive performance of the confirmatory 3D model compare to the strongest unidimensional 3PL specification in terms of log-loss and Brier score?",
+      "context_hint": "Model comparison and performance metrics",
+      "checklist": [
+        {
+          "criterion": "Does the response state that the 3D model reduces log-loss by an average of 0.064?",
+          "expected": true,
+          "aspect_label": "Log-loss reduction"
+        },
+        {
+          "criterion": "Does the response state that the 3D model reduces Brier score by 0.0176?",
+          "expected": true,
+          "aspect_label": "Brier score reduction"
+        },
+        {
+          "criterion": "Does the response claim the unidimensional 3PL model outperformed the 3D model?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_033",
+      "book_id": 4,
+      "book_title": "Searching for \"Harmful Refusal\": A Psychometric Audit of an AI Safety Benchmark",
+      "category": "factual",
+      "query": "What are the specific correlation coefficients for the copyright factor relative to the standard and contextual factors in the 3D response-process model?",
+      "context_hint": "Factor correlations in the 3D model",
+      "checklist": [
+        {
+          "criterion": "Does the response state the copyright factor correlates with the standard factor at 0.451?",
+          "expected": true,
+          "aspect_label": "Correlation value 1"
+        },
+        {
+          "criterion": "Does the response state the copyright factor correlates with the contextual factor at 0.603?",
+          "expected": true,
+          "aspect_label": "Correlation value 2"
+        },
+        {
+          "criterion": "Does the response state that all three factors correlate at 0.785?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_034",
+      "book_id": 4,
+      "book_title": "Searching for \"Harmful Refusal\": A Psychometric Audit of an AI Safety Benchmark",
+      "category": "concept",
+      "query": "What is the primary reason for preferring the 3D standard/contextual/copyright structure over the 7D harm-domain model?",
+      "context_hint": "Model parsimony and selection",
+      "checklist": [
+        {
+          "criterion": "Does the response mention that the 3D model is more parsimonious?",
+          "expected": true,
+          "aspect_label": "Parsimony"
+        },
+        {
+          "criterion": "Does the response state that the 3D model predicts significantly worse than the 7D model?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        },
+        {
+          "criterion": "Does the response state that the 3D model uses fewer fitted quantities?",
+          "expected": true,
+          "aspect_label": "Fitted quantities"
+        }
+      ]
+    },
+    {
+      "id": "q_035",
+      "book_id": 4,
+      "book_title": "Searching for \"Harmful Refusal\": A Psychometric Audit of an AI Safety Benchmark",
+      "category": "relational",
+      "query": "Compare the correlation patterns of non-copyright harm domains against the copyright domain within the 7D harm-domain model.",
+      "context_hint": "7D model factor correlations",
+      "checklist": [
+        {
+          "criterion": "Does the response state that non-copyright harm domains are generally more tightly correlated (0.65 to 0.85)?",
+          "expected": true,
+          "aspect_label": "Non-copyright correlation"
+        },
+        {
+          "criterion": "Does the response state that the copyright domain correlates lower (0.34 to 0.64) against other domains?",
+          "expected": true,
+          "aspect_label": "Copyright correlation"
+        },
+        {
+          "criterion": "Does the response state that the copyright domain is the most tightly correlated factor?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_036",
+      "book_id": 4,
+      "book_title": "Searching for \"Harmful Refusal\": A Psychometric Audit of an AI Safety Benchmark",
+      "category": "factual",
+      "query": "What specific metrics were used as the primary and secondary criteria for evaluating held-out prediction accuracy across the 80/20 splits?",
+      "context_hint": "Evaluation metrics",
+      "checklist": [
+        {
+          "criterion": "Does the response identify held-out log-loss as the primary criterion?",
+          "expected": true,
+          "aspect_label": "Primary metric"
+        },
+        {
+          "criterion": "Does the response identify Brier score as the secondary check?",
+          "expected": true,
+          "aspect_label": "Secondary metric"
+        },
+        {
+          "criterion": "Does the response state that AIC was the primary criterion?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_037",
+      "book_id": 4,
+      "book_title": "Searching for \"Harmful Refusal\": A Psychometric Audit of an AI Safety Benchmark",
+      "category": "thematic",
+      "query": "Why does a single average score for a safety benchmark like HarmBench potentially mislead the assessment of a model's specific safety attributes?",
+      "context_hint": "Single score vs. attribute profiles",
+      "checklist": [
+        {
+          "criterion": "Does the response explain that models with similar overall scores can have very different attribute profiles?",
+          "expected": true,
+          "aspect_label": "Attribute profiles"
+        },
+        {
+          "criterion": "Does the response state that a single score isolates a single attribute like harmful refusal?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        },
+        {
+          "criterion": "Does the response mention that the score is a tally of item-level pass/fail responses?",
+          "expected": true,
+          "aspect_label": "Data interpretation"
+        }
+      ]
+    },
+    {
+      "id": "q_038",
+      "book_id": 4,
+      "book_title": "Searching for \"Harmful Refusal\": A Psychometric Audit of an AI Safety Benchmark",
+      "category": "concept",
+      "query": "How does the analysis distinguish between a model's behavior regarding copyright items and its behavior regarding other harm domains?",
+      "context_hint": "Copyright vs. refusal logic",
+      "checklist": [
+        {
+          "criterion": "Does the response state that copyright reproduction depends mostly on training memorization?",
+          "expected": true,
+          "aspect_label": "Memorization factor"
+        },
+        {
+          "criterion": "Does the response state that copyright reproduction is driven by the same refusal logic as other harms?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        },
+        {
+          "criterion": "Does the response explain that copyright items separate cleanly from other item types?",
+          "expected": true,
+          "aspect_label": "Factor separation"
+        }
+      ]
+    },
+    {
+      "id": "q_039",
+      "book_id": 4,
+      "book_title": "Searching for \"Harmful Refusal\": A Psychometric Audit of an AI Safety Benchmark",
+      "category": "relational",
+      "query": "Contrast the role of 'standard' and 'contextual' factors in the 3D model with the 'copyright' factor.",
+      "context_hint": "3D model factor correlations",
+      "checklist": [
+        {
+          "criterion": "Does the response state that standard and contextual factors correlate highly (0.785)?",
+          "expected": true,
+          "aspect_label": "High correlation"
+        },
+        {
+          "criterion": "Does the response state that the copyright factor correlates less strongly with these two factors?",
+          "expected": true,
+          "aspect_label": "Lower correlation"
+        },
+        {
+          "criterion": "Does the response state that the copyright factor is identical to the standard factor?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    },
+    {
+      "id": "q_040",
+      "book_id": 4,
+      "book_title": "Searching for \"Harmful Refusal\": A Psychometric Audit of an AI Safety Benchmark",
+      "category": "factual",
+      "query": "How many models were included in the HarmBench matrix, and what was the specific method for selecting the best-fitting models during the 80/20 splits?",
+      "context_hint": "HarmBench matrix and optimization",
+      "checklist": [
+        {
+          "criterion": "Does the response state that there were 81 models in the HarmBench matrix?",
+          "expected": true,
+          "aspect_label": "Model count"
+        },
+        {
+          "criterion": "Does the response state that the model with the highest training log-likelihood was retained?",
+          "expected": true,
+          "aspect_label": "Selection criteria"
+        },
+        {
+          "criterion": "Does the response state that held-out responses were used for restart selection?",
+          "expected": false,
+          "aspect_label": "Negative distractor check"
+        }
+      ]
+    }
+  ]
+}

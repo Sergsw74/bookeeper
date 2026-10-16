@@ -157,3 +157,41 @@ def test_lightrag_detect_embedding_dim(tmp_path, mock_pool):
         assert mock_call.call_args[0][0] == "/api/embed"
         assert mock_call.call_args[1]["use_embedding_pool"] is True
 
+
+def test_clean_json_str_utility():
+    """Verify _clean_json_str extracts valid JSON from fenced/think-tagged model output."""
+    from bookeeper.rag.lightrag_engine import _clean_json_str
+
+    sample_output = """<think>Extract keywords</think>
+Here is the JSON:
+```json
+{
+  "high_level_keywords": ["time horizon", "splines"],
+  "low_level_keywords": ["splines"]
+}
+```
+Hope this helps!"""
+
+    cleaned = _clean_json_str(sample_output)
+    parsed = json.loads(cleaned)
+    assert parsed["high_level_keywords"] == ["time horizon", "splines"]
+    assert parsed["low_level_keywords"] == ["splines"]
+
+
+def test_lightrag_engine_clean_shutdown(tmp_path, mock_pool):
+    """Verify LightRAGEngine.close() shuts down thread and worker tasks without leaving pending tasks."""
+    engine = LightRAGEngine(
+        working_dir=tmp_path / "store",
+        pool=mock_pool,
+    )
+    # Ensure loop thread is started
+    assert engine._loop_thread is None
+    engine._run_sync(engine.ainitialize()) if hasattr(engine, "ainitialize") else None
+    assert engine._loop_thread is not None
+
+    # Close should cleanly stop loop thread
+    engine.close()
+    assert engine._loop_thread is None
+    assert engine._rag is None
+
+

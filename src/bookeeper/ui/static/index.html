@@ -51,6 +51,7 @@
       flex-direction: column;
       gap: 12px;
       z-index: 10;
+      flex-shrink: 0;
     }
 
     .top-bar {
@@ -112,18 +113,27 @@
       box-shadow: 0 1px 3px rgba(0,0,0,0.3);
     }
 
-    /* Central Search Container */
+    /* Central Search Container - 2-Tier Spacious Layout */
     .search-wrapper {
-      max-width: 900px;
+      max-width: 1100px;
       width: 100%;
       margin: 0 auto;
       display: flex;
-      gap: 8px;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .search-main-row {
+      display: flex;
+      gap: 10px;
+      width: 100%;
     }
 
     .search-input-box {
       flex: 1;
       position: relative;
+      display: flex;
+      align-items: center;
     }
 
     .search-input {
@@ -131,9 +141,9 @@
       background: var(--bg-dark);
       border: 1px solid var(--border);
       color: var(--text-main);
-      padding: 12px 16px 12px 42px;
+      padding: 13px 44px 13px 46px;
       border-radius: 10px;
-      font-size: 0.95rem;
+      font-size: 1.05rem;
       outline: none;
       transition: border-color 0.2s, box-shadow 0.2s;
     }
@@ -145,27 +155,48 @@
 
     .search-icon {
       position: absolute;
-      left: 14px;
+      left: 16px;
       top: 50%;
       transform: translateY(-50%);
       color: var(--text-muted);
-      font-size: 1.1rem;
+      font-size: 1.2rem;
       pointer-events: none;
+    }
+
+    .search-clear-btn {
+      position: absolute;
+      right: 14px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      font-size: 1rem;
+      cursor: pointer;
+      padding: 4px;
+      display: none;
+      line-height: 1;
+      border-radius: 50%;
+    }
+    .search-clear-btn:hover {
+      color: #fff;
+      background: var(--bg-card);
     }
 
     .search-btn {
       background: var(--accent);
       color: white;
       border: none;
-      padding: 0 24px;
+      padding: 0 28px;
       border-radius: 10px;
-      font-size: 0.95rem;
+      font-size: 1rem;
       font-weight: 600;
       cursor: pointer;
       transition: background 0.2s;
       display: flex;
       align-items: center;
       gap: 8px;
+      white-space: nowrap;
     }
 
     .search-btn:hover {
@@ -177,20 +208,107 @@
       cursor: not-allowed;
     }
 
-    .mode-select {
+    /* Recombined Settings Toolbar */
+    .search-toolbar {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 6px 14px;
+    }
+
+    .toolbar-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .toolbar-label {
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      white-space: nowrap;
+    }
+
+    .toolbar-select {
       background: var(--bg-dark);
       border: 1px solid var(--border);
-      color: var(--text-muted);
-      padding: 0 12px;
-      border-radius: 10px;
-      font-size: 0.85rem;
+      color: var(--text-main);
+      padding: 5px 10px;
+      border-radius: 6px;
+      font-size: 0.82rem;
       cursor: pointer;
       outline: none;
+      transition: border-color 0.15s;
+    }
+
+    .toolbar-select:focus {
+      border-color: var(--accent);
+    }
+
+    .toolbar-separator {
+      width: 1px;
+      height: 18px;
+      background: var(--border);
+      margin: 0 4px;
+    }
+
+    /* Segmented Scope Controls */
+    .segmented-control {
+      display: flex;
+      background: var(--bg-dark);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 2px;
+      gap: 2px;
+    }
+
+    .seg-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      white-space: nowrap;
+    }
+
+    .seg-btn:hover {
+      color: var(--text-main);
+    }
+
+    .seg-btn.active {
+      background: var(--accent);
+      color: #fff;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.3);
+    }
+
+    .evidence-count-badge {
+      background: rgba(245, 158, 11, 0.2);
+      color: #f59e0b;
+      border: 1px solid #f59e0b;
+      border-radius: 10px;
+      padding: 1px 6px;
+      font-size: 0.7rem;
+      font-weight: bold;
+      margin-left: 4px;
     }
 
     /* Main Content Layout */
     main {
       flex: 1;
+      min-height: 0;
       display: flex;
       overflow: hidden;
       position: relative;
@@ -200,11 +318,22 @@
     .view-pane {
       width: 100%;
       height: 100%;
+      min-height: 0;
       display: none;
     }
 
     .view-pane.active {
       display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    #pane-debug {
+      flex: 1;
+      height: 100%;
+      min-height: 0;
+      overflow: hidden;
     }
 
     /* Two-Column Results Pane */
@@ -213,16 +342,18 @@
       height: 100%;
       display: flex;
       overflow: hidden;
+      position: relative;
     }
 
     /* Left Column: Graph Visualization */
     .graph-column {
-      flex: 6;
+      flex: 1 1 0%;
+      min-width: 300px;
       background: #090d16;
       position: relative;
-      border-right: 1px solid var(--border);
       display: flex;
       flex-direction: column;
+      overflow: hidden;
     }
 
     #cy {
@@ -259,6 +390,12 @@
       background: var(--bg-card);
     }
 
+    .ctrl-btn.active {
+      background: var(--accent);
+      color: white;
+      font-weight: 600;
+    }
+
     .graph-legend {
       position: absolute;
       bottom: 14px;
@@ -286,14 +423,113 @@
       border-radius: 50%;
     }
 
+    /* Draggable Splitter Divider */
+    .pane-resizer {
+      width: 6px;
+      cursor: col-resize;
+      background: rgba(148, 163, 184, 0.15);
+      position: relative;
+      z-index: 10;
+      transition: background 0.15s ease, box-shadow 0.15s ease;
+      flex-shrink: 0;
+      user-select: none;
+    }
+
+    .pane-resizer:hover,
+    .pane-resizer.dragging {
+      background: var(--accent);
+      box-shadow: 0 0 10px rgba(99, 102, 241, 0.6);
+    }
+
+    .pane-resizer::after {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 2px;
+      height: 28px;
+      background: rgba(255, 255, 255, 0.25);
+      border-radius: 2px;
+    }
+
     /* Right Column: Detail Panel (Obsidian Note Style) */
     .detail-column {
-      flex: 4;
+      width: 440px;
+      min-width: 280px;
+      max-width: calc(100% - 320px);
+      flex: 0 0 auto;
       background: var(--bg-panel);
       display: flex;
       flex-direction: column;
       overflow-y: auto;
       border-left: 1px solid var(--border);
+      position: relative;
+      transition: width 0.1s ease;
+    }
+
+    .detail-column.resizing {
+      transition: none;
+      user-select: none;
+    }
+
+    .detail-column.collapsed {
+      display: none !important;
+    }
+
+    /* Folding / Unfolding Buttons */
+    .btn-panel-fold {
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      border-radius: 6px;
+      width: 28px;
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 0.85rem;
+      transition: all 0.15s ease;
+    }
+
+    .btn-panel-fold:hover {
+      background: rgba(99, 102, 241, 0.2);
+      color: #fff;
+      border-color: var(--accent);
+    }
+
+    .btn-panel-unfold {
+      position: absolute;
+      top: 14px;
+      right: 14px;
+      background: rgba(15, 23, 42, 0.88);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--accent);
+      color: #f8fafc;
+      padding: 6px 14px;
+      border-radius: 8px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      z-index: 5;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+      transition: all 0.2s ease;
+      animation: fadeInBtn 0.2s ease-out;
+    }
+
+    .btn-panel-unfold:hover {
+      background: var(--accent);
+      color: #ffffff;
+      transform: translateY(-1px);
+    }
+
+    @keyframes fadeInBtn {
+      from { opacity: 0; transform: translateY(-4px); }
+      to { opacity: 1; transform: translateY(0); }
     }
 
     .detail-header {
@@ -423,6 +659,302 @@
       font-weight: 700;
     }
 
+    /* Evidence 1-Click Accordion & Reader Cards */
+    .evidence-accordion {
+      background: var(--bg-dark);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin-bottom: 8px;
+      overflow: hidden;
+      transition: all 0.2s ease;
+    }
+
+    .evidence-accordion:hover {
+      border-color: rgba(99, 102, 241, 0.4);
+    }
+
+    .evidence-accordion[open] {
+      border-color: rgba(99, 102, 241, 0.6);
+      background: rgba(15, 23, 42, 0.7);
+    }
+
+    .evidence-summary {
+      padding: 9px 12px;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      user-select: none;
+      font-size: 0.83rem;
+      background: rgba(30, 41, 59, 0.35);
+      list-style: none;
+    }
+
+    .evidence-summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .evidence-header-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      flex: 1;
+    }
+
+    .evidence-icon {
+      font-size: 0.95rem;
+      flex-shrink: 0;
+    }
+
+    .evidence-breadcrumb {
+      color: #cbd5e1;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .evidence-meta-badges {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .evidence-tag {
+      background: rgba(99, 102, 241, 0.15);
+      color: #a5b4fc;
+      border: 1px solid rgba(99, 102, 241, 0.25);
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-size: 0.68rem;
+      font-weight: 600;
+    }
+
+    .evidence-expand-badge {
+      background: var(--bg-card);
+      color: var(--text-muted);
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-size: 0.68rem;
+      border: 1px solid var(--border);
+    }
+
+    .evidence-details-body {
+      padding: 10px 14px;
+      border-top: 1px solid var(--border);
+      background: #090d16;
+      font-size: 0.85rem;
+    }
+
+    .evidence-text-content {
+      color: #e2e8f0;
+      line-height: 1.6;
+      font-size: 0.85rem;
+      margin-bottom: 8px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: rgba(15, 23, 42, 0.6);
+      padding: 10px 12px;
+      border-radius: 6px;
+      border-left: 3px solid #64748b;
+    }
+
+    .evidence-actions-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-top: 4px;
+    }
+
+    .btn-focus-chunk {
+      background: rgba(99, 102, 241, 0.2);
+      border: 1px solid var(--accent);
+      color: #c7d2fe;
+      padding: 3px 9px;
+      border-radius: 4px;
+      font-size: 0.73rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .btn-focus-chunk:hover {
+      background: var(--accent);
+      color: white;
+    }
+
+    /* Direct Book File Links & Download Buttons */
+    .evidence-book-btn {
+      background: rgba(16, 185, 129, 0.18) !important;
+      color: #6ee7b7 !important;
+      border: 1px solid rgba(16, 185, 129, 0.4) !important;
+      border-radius: 4px;
+      padding: 2px 7px;
+      font-size: 0.68rem;
+      font-weight: 600;
+      text-decoration: none !important;
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .evidence-book-btn:hover {
+      background: rgba(16, 185, 129, 0.35) !important;
+      color: #ecfdf5 !important;
+      border-color: #34d399 !important;
+      transform: translateY(-1px);
+    }
+
+    .evidence-download-btn {
+      background: rgba(59, 130, 246, 0.15) !important;
+      color: #93c5fd !important;
+      border: 1px solid rgba(59, 130, 246, 0.35) !important;
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-size: 0.68rem;
+      font-weight: 600;
+      text-decoration: none !important;
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .evidence-download-btn:hover {
+      background: rgba(59, 130, 246, 0.35) !important;
+      color: #ffffff !important;
+      border-color: #60a5fa !important;
+      transform: translateY(-1px);
+    }
+
+    .btn-book-action {
+      background: rgba(16, 185, 129, 0.15);
+      border: 1px solid rgba(16, 185, 129, 0.35);
+      color: #6ee7b7;
+      padding: 3px 9px;
+      border-radius: 4px;
+      font-size: 0.73rem;
+      font-weight: 600;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .btn-book-action:hover {
+      background: rgba(16, 185, 129, 0.3);
+      color: #ffffff;
+      border-color: #34d399;
+      text-decoration: none;
+    }
+
+    .btn-book-external {
+      background: rgba(245, 158, 11, 0.15);
+      border-color: rgba(245, 158, 11, 0.35);
+      color: #fcd34d;
+    }
+
+    .btn-book-external:hover {
+      background: rgba(245, 158, 11, 0.3);
+      color: #ffffff;
+      border-color: #fbbf24;
+      text-decoration: none;
+    }
+
+    .book-pill-card {
+      display: inline-flex;
+      align-items: center;
+      background: rgba(30, 41, 59, 0.7);
+      border: 1px solid #334155;
+      border-radius: 6px;
+      padding: 4px 8px;
+      gap: 6px;
+      font-size: 0.82rem;
+    }
+
+    .book-mini-btn {
+      background: rgba(16, 185, 129, 0.15);
+      border: 1px solid rgba(16, 185, 129, 0.35);
+      color: #6ee7b7;
+      border-radius: 3px;
+      padding: 1px 5px;
+      font-size: 0.68rem;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      transition: all 0.15s;
+    }
+
+    .book-mini-btn:hover {
+      background: #10b981;
+      color: #ffffff;
+      text-decoration: none;
+    }
+
+    .book-source-banner {
+      background: linear-gradient(135deg, rgba(30, 58, 138, 0.45), rgba(15, 23, 42, 0.75));
+      border: 1px solid rgba(59, 130, 246, 0.4);
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-bottom: 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .btn-download-primary {
+      background: #2563eb;
+      color: #ffffff;
+      border: 1px solid #3b82f6;
+      border-radius: 5px;
+      padding: 5px 12px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      transition: all 0.15s;
+    }
+
+    .btn-download-primary:hover {
+      background: #1d4ed8;
+      border-color: #60a5fa;
+      color: #ffffff;
+      text-decoration: none;
+    }
+
+    .btn-download-secondary {
+      background: rgba(59, 130, 246, 0.2);
+      color: #93c5fd;
+      border: 1px solid rgba(59, 130, 246, 0.4);
+      border-radius: 5px;
+      padding: 5px 12px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      transition: all 0.15s;
+    }
+
+    .btn-download-secondary:hover {
+      background: rgba(59, 130, 246, 0.35);
+      border-color: #60a5fa;
+      color: #ffffff;
+      text-decoration: none;
+    }
+
     /* Synthesis Overview Box */
     .synthesis-card {
       background: linear-gradient(180deg, rgba(30, 41, 59, 0.8), rgba(15, 23, 42, 0.8));
@@ -444,12 +976,55 @@
     .debug-container {
       width: 100%;
       height: 100%;
+      min-height: 0;
+      flex: 1;
       overflow-y: auto;
+      overflow-x: hidden;
       padding: 24px;
       background: #090d16;
       display: flex;
       flex-direction: column;
       gap: 20px;
+      scroll-behavior: smooth;
+    }
+
+    .debug-container::-webkit-scrollbar,
+    .debug-code-box::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+
+    .debug-container::-webkit-scrollbar-track,
+    .debug-code-box::-webkit-scrollbar-track {
+      background: rgba(15, 23, 42, 0.6);
+      border-radius: 4px;
+    }
+
+    .debug-container::-webkit-scrollbar-thumb,
+    .debug-code-box::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 4px;
+    }
+
+    .debug-container::-webkit-scrollbar-thumb:hover,
+    .debug-code-box::-webkit-scrollbar-thumb:hover {
+      background: #475569;
+    }
+
+    .debug-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0 4px 6px 4px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .debug-toolbar-title {
+      font-size: 0.85rem;
+      font-weight: 700;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
     }
 
     .debug-card {
@@ -457,17 +1032,134 @@
       border: 1px solid var(--border);
       border-radius: 10px;
       overflow: hidden;
+      flex-shrink: 0;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
     }
 
     .debug-card-header {
       padding: 12px 18px;
-      background: rgba(15, 23, 42, 0.7);
+      background: rgba(15, 23, 42, 0.85);
       border-bottom: 1px solid var(--border);
       display: flex;
       justify-content: space-between;
       align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
       font-weight: 700;
       font-size: 0.95rem;
+    }
+
+    .debug-query-title-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex: 1;
+      min-width: 0;
+      flex-wrap: wrap;
+    }
+
+    .debug-query-badge {
+      background: #312e81;
+      color: #c7d2fe;
+      padding: 3px 8px;
+      border-radius: 5px;
+      font-size: 0.8rem;
+      font-family: monospace;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .debug-query-text {
+      font-family: "JetBrains Mono", Consolas, Monaco, monospace;
+      font-size: 0.9rem;
+      color: #f8fafc;
+      background: rgba(15, 23, 42, 0.6);
+      padding: 4px 10px;
+      border-radius: 6px;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      word-break: break-word;
+      max-width: 100%;
+      user-select: all;
+    }
+
+    .debug-btn-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+
+    .debug-action-btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-main);
+      padding: 5px 12px;
+      border-radius: 6px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      transition: all 0.15s ease;
+      user-select: none;
+    }
+
+    .debug-action-btn:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--border-accent);
+      color: white;
+    }
+
+    .debug-action-btn.primary {
+      background: rgba(99, 102, 241, 0.25);
+      border-color: var(--accent);
+      color: #c7d2fe;
+    }
+
+    .debug-action-btn.primary:hover {
+      background: var(--accent);
+      color: white;
+    }
+
+    .debug-action-btn.copied {
+      background: #065f46 !important;
+      border-color: #10b981 !important;
+      color: #34d399 !important;
+    }
+
+    .debug-toggle-group {
+      display: inline-flex;
+      align-items: center;
+      background: rgba(15, 23, 42, 0.7);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 2px;
+      gap: 2px;
+    }
+
+    .debug-toggle-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: monospace;
+      transition: all 0.15s ease;
+      user-select: none;
+    }
+
+    .debug-toggle-btn:hover {
+      color: var(--text-main);
+    }
+
+    .debug-toggle-btn.active {
+      background: var(--accent);
+      color: white;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
     }
 
     .debug-tag {
@@ -475,23 +1167,47 @@
       padding: 2px 8px;
       border-radius: 4px;
       font-family: monospace;
+      white-space: nowrap;
     }
 
     .debug-tag.success { background: #065f46; color: #34d399; }
     .debug-tag.error { background: #7f1d1d; color: #f87171; }
     .debug-tag.info { background: #1e3a8a; color: #60a5fa; }
 
+    .clickable-term {
+      cursor: pointer;
+      background: rgba(99, 102, 241, 0.15);
+      color: #a5b4fc;
+      padding: 2px 7px;
+      border-radius: 4px;
+      border: 1px solid rgba(99, 102, 241, 0.25);
+      transition: all 0.15s ease;
+      display: inline-block;
+      margin: 2px 4px 2px 0;
+      font-size: 0.8rem;
+    }
+
+    .clickable-term:hover {
+      background: var(--accent);
+      color: white;
+      border-color: var(--accent);
+    }
+
     .debug-code-box {
       padding: 16px;
       background: #0f172a;
       overflow-x: auto;
+      overflow-y: auto;
       font-family: "JetBrains Mono", Consolas, Monaco, monospace;
       font-size: 0.85rem;
       color: #e2e8f0;
       white-space: pre-wrap;
       word-break: break-word;
-      max-height: 400px;
+      max-height: 380px;
       line-height: 1.5;
+      border-radius: 6px;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      transition: max-height 0.2s ease;
     }
 
     /* Loading Spinner Overlay */
@@ -518,8 +1234,140 @@
       animation: spin 0.8s linear infinite;
     }
 
-    @keyframes spin {
-      to { transform: rotate(360deg); }
+    /* Node Right-Click Floating Context Menu (Neo4j Browser style) */
+    .node-context-menu {
+      position: absolute;
+      z-index: 10000;
+      background: #0f172a;
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      border-radius: 10px;
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.75), 0 4px 12px rgba(0, 0, 0, 0.5);
+      padding: 6px;
+      min-width: 260px;
+      max-width: 320px;
+      backdrop-filter: blur(8px);
+      user-select: none;
+      animation: ctxMenuFadeIn 0.12s ease-out;
+    }
+
+    @keyframes ctxMenuFadeIn {
+      from { opacity: 0; transform: scale(0.96); }
+      to { opacity: 1; transform: scale(1); }
+    }
+
+    .context-menu-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px 8px 10px;
+    }
+
+    .context-menu-icon {
+      font-size: 1.1rem;
+    }
+
+    .context-menu-title {
+      font-weight: 600;
+      font-size: 0.85rem;
+      color: #f8fafc;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex: 1;
+    }
+
+    .context-menu-badge {
+      font-size: 0.68rem;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: rgba(99, 102, 241, 0.2);
+      color: #a5b4fc;
+      border: 1px solid rgba(99, 102, 241, 0.4);
+      white-space: nowrap;
+    }
+
+    .context-menu-divider {
+      height: 1px;
+      background: rgba(148, 163, 184, 0.15);
+      margin: 4px 0;
+    }
+
+    .context-menu-section-title {
+      font-size: 0.65rem;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+      padding: 4px 10px 2px 10px;
+    }
+
+    .context-menu-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      padding: 7px 10px;
+      border: none;
+      background: transparent;
+      border-radius: 6px;
+      color: var(--text-main);
+      cursor: pointer;
+      text-align: left;
+      transition: background 0.15s, color 0.15s;
+    }
+
+    .context-menu-item:hover {
+      background: rgba(99, 102, 241, 0.22);
+      color: #ffffff;
+    }
+
+    .cmi-icon {
+      font-size: 1rem;
+      width: 20px;
+      text-align: center;
+      flex-shrink: 0;
+    }
+
+    .cmi-text {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .cmi-main {
+      font-size: 0.82rem;
+      font-weight: 500;
+      color: #f1f5f9;
+      line-height: 1.2;
+    }
+
+    .cmi-sub {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      line-height: 1.2;
+      margin-top: 1px;
+    }
+
+    /* Floating Toast Notification */
+    .app-toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%) translateY(40px);
+      background: rgba(15, 23, 42, 0.95);
+      border: 1px solid var(--accent);
+      color: #f8fafc;
+      padding: 8px 18px;
+      border-radius: 20px;
+      font-size: 0.85rem;
+      font-weight: 500;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+      opacity: 0;
+      pointer-events: none;
+      transition: transform 0.25s ease, opacity 0.25s ease;
+      z-index: 20000;
+    }
+    .app-toast.show {
+      transform: translateX(-50%) translateY(0);
+      opacity: 1;
     }
   </style>
 </head>
@@ -536,10 +1384,6 @@
         <button class="nav-tab-btn active" id="tab-btn-graph" onclick="switchTab('graph')">
           🌐 Graph & Explorer
         </button>
-        <button class="nav-tab-btn" id="tab-btn-lightrag" onclick="switchTab('lightrag')">
-          ⚡ LightRAG WebUI
-          <span id="lightrag-status-badge" class="debug-tag info" style="display:none;">Online</span>
-        </button>
         <button class="nav-tab-btn" id="tab-btn-debug" onclick="switchTab('debug')">
           🔬 Debug & Observability
           <span id="debug-count-badge" class="debug-tag info" style="display:none;">0</span>
@@ -547,32 +1391,71 @@
       </div>
     </div>
 
-    <!-- Search Bar -->
+    <!-- 2-Tier Search & Controls -->
     <div class="search-wrapper">
-      <div class="search-input-box">
-        <span class="search-icon">🔍</span>
-        <input 
-          type="text" 
-          id="search-input" 
-          class="search-input" 
-          placeholder="Ask a question or search concepts (e.g. 'What are time horizons in AI difficulty estimation?')..."
-          onkeydown="if(event.key === 'Enter') executeSearch()"
-        />
+      <!-- Tier 1: Wide Prominent Query Bar -->
+      <div class="search-main-row">
+        <div class="search-input-box">
+          <span class="search-icon">🔍</span>
+          <input 
+            type="text" 
+            id="search-input" 
+            class="search-input" 
+            placeholder="Search ideas, concepts, or questions (e.g. 'task difficulty estimation', 'time horizon', 'kv cache')..."
+            onkeydown="if(event.key === 'Enter') executeSearch()"
+          />
+          <button id="search-clear-btn" class="search-clear-btn" onclick="clearSearchInput()" title="Clear search query">✕</button>
+        </div>
+        <button class="search-btn" id="search-btn" onclick="executeSearch()">
+          <span>🚀 Search Ideas</span>
+        </button>
       </div>
-      <select id="search-mode" class="mode-select" title="LightRAG Dual-Level Mode">
-        <option value="hybrid" selected>Hybrid (Local + Global)</option>
-        <option value="local">Local (Direct Entities)</option>
-        <option value="global">Global (Thematic)</option>
-        <option value="mix">Mix (Vector + Graph)</option>
-      </select>
-      <select id="search-denoise" class="mode-select" title="Noise Reduction & Super-Hub Filter">
-        <option value="strict">Denoise: Strict (Degree &lt; 60)</option>
-        <option value="standard" selected>Denoise: Standard (Degree &lt; 120)</option>
-        <option value="relaxed">Denoise: Relaxed (Degree &lt; 250)</option>
-      </select>
-      <button class="search-btn" id="search-btn" onclick="executeSearch()">
-        <span>Search Ideas</span>
-      </button>
+
+      <!-- Tier 2: Recombined Settings Toolbar -->
+      <div class="search-toolbar">
+        <div class="toolbar-group">
+          <span class="toolbar-label">Scope:</span>
+          <div class="segmented-control" id="search-mode-segmented">
+            <button class="seg-btn active" data-mode="ideas" onclick="setSearchMode('ideas')" title="Extract core ideas + 1-hop surrounding neighborhood">1-Hop Ideas</button>
+            <button class="seg-btn" data-mode="deep" onclick="setSearchMode('deep')" title="Explore 2-hop deep neighborhood connections">2-Hop Deep</button>
+            <button class="seg-btn" data-mode="hybrid" onclick="setSearchMode('hybrid')" title="Hybrid vector + neighborhood expansion">Hybrid</button>
+          </div>
+          <input type="hidden" id="search-mode" value="ideas" />
+        </div>
+
+        <div class="toolbar-separator"></div>
+
+        <div class="toolbar-group">
+          <label for="similarity-threshold" class="toolbar-label">Threshold:</label>
+          <select id="similarity-threshold" class="toolbar-select" title="Minimum embedding cosine similarity required for seed ideas">
+            <option value="0.80">≥ 0.80 (Strict)</option>
+            <option value="0.70" selected>≥ 0.70 (Standard)</option>
+            <option value="0.60">≥ 0.60 (Relaxed)</option>
+            <option value="0.50">≥ 0.50 (Broad)</option>
+          </select>
+        </div>
+
+        <div class="toolbar-group">
+          <label for="top-k-seeds" class="toolbar-label">Core Ideas:</label>
+          <select id="top-k-seeds" class="toolbar-select" title="Max seed ideas ranked by priority = cosine_similarity * node_weight">
+            <option value="4">Top 4</option>
+            <option value="5">Top 5</option>
+            <option value="6" selected>Top 6</option>
+            <option value="8">Top 8</option>
+          </select>
+        </div>
+
+        <div class="toolbar-separator"></div>
+
+        <div class="toolbar-group">
+          <label for="search-denoise" class="toolbar-label" title="Controls noise by stripping raw text chunks from the canvas">Detail / Noise:</label>
+          <select id="search-denoise" class="toolbar-select" title="Controls noise by stripping raw text chunks from the canvas vs showing full provenance">
+            <option value="focused">Focused (Pure Ideas & Books)</option>
+            <option value="standard" selected>Standard (Ideas + Key Chunks)</option>
+            <option value="detailed">Detailed (All Evidence Chunks)</option>
+          </select>
+        </div>
+      </div>
     </div>
   </header>
 
@@ -582,22 +1465,90 @@
     <div class="view-pane active" id="pane-graph">
       <div class="results-container">
         <!-- Left: Interactive Graph -->
-        <div class="graph-column">
+        <div class="graph-column" id="graph-column">
           <div class="graph-controls">
+            <button class="ctrl-btn active" data-layout="concentric" onclick="cyReLayout('concentric')" title="Weight-Centered Concentric Layout (Most relevant in center)">Centered Rings</button>
+            <button class="ctrl-btn" data-layout="star" onclick="cyReLayout('star')" title="Constellation Gravitational Layout: Core hub nodes anchor multi-constellation centers with gravitational physics">⭐ Star Layout</button>
+            <button class="ctrl-btn" data-layout="cose" onclick="cyReLayout('cose')" title="Physics-based Force Layout">Force Layout</button>
             <button class="ctrl-btn" onclick="cyResetZoom()" title="Reset Zoom">Fit View</button>
-            <button class="ctrl-btn" onclick="cyReLayout('cose')" title="Physics Layout">Cose Layout</button>
-            <button class="ctrl-btn" onclick="cyReLayout('concentric')" title="Concentric Layout">Concentric</button>
+            <div style="width: 1px; height: 18px; background: var(--border); margin: 0 4px; align-self: center;"></div>
+            <button class="ctrl-btn" id="btn-toggle-evidence" onclick="toggleEvidenceFilter()" title="1-Click Toggle: Show or Hide Page/Chunk Evidence Nodes on Canvas">
+              <span id="evidence-btn-icon">📄</span> <span id="evidence-btn-text">Evidence Chunks: Hidden</span> <span id="evidence-badge" class="evidence-count-badge">0</span>
+            </button>
           </div>
+
+          <!-- Floating Unfold Description Button (shown when detail panel is folded) -->
+          <button class="btn-panel-unfold" id="btn-unfold-panel" onclick="toggleDetailPanel()" title="Unfold Description Panel" style="display: none;">
+            <span>📖 Unfold Note</span> <span>❮</span>
+          </button>
 
           <div id="cy"></div>
 
+          <!-- Neo4j Browser-Style Right-Click Context Menu -->
+          <div id="node-context-menu" class="node-context-menu" style="display: none;">
+            <div class="context-menu-header">
+              <span class="context-menu-icon" id="ctx-node-icon">💡</span>
+              <span class="context-menu-title" id="ctx-node-title">Concept Name</span>
+              <span class="context-menu-badge" id="ctx-node-badge">Idea</span>
+            </div>
+            <div class="context-menu-divider"></div>
+            <div class="context-menu-section-title">EXPAND NEIGHBORHOOD (UNDIRECTED)</div>
+            <button class="context-menu-item" onclick="expandTargetNode('all')">
+              <span class="cmi-icon">🌐</span>
+              <div class="cmi-text">
+                <div class="cmi-main">Expand All Neighbors</div>
+                <div class="cmi-sub">Pull connected ideas, books, chunks & sections</div>
+              </div>
+            </button>
+            <button class="context-menu-item" onclick="expandTargetNode('Concept')">
+              <span class="cmi-icon">💡</span>
+              <div class="cmi-text">
+                <div class="cmi-main">Connected Ideas & Concepts</div>
+                <div class="cmi-sub">Pull related conceptual nodes</div>
+              </div>
+            </button>
+            <button class="context-menu-item" onclick="expandTargetNode('Book')">
+              <span class="cmi-icon">📚</span>
+              <div class="cmi-text">
+                <div class="cmi-main">Referenced Books</div>
+                <div class="cmi-sub">Pull source literature books</div>
+              </div>
+            </button>
+            <button class="context-menu-item" onclick="expandTargetNode('Chunk')">
+              <span class="cmi-icon">📄</span>
+              <div class="cmi-text">
+                <div class="cmi-main">Evidence Chunks</div>
+                <div class="cmi-sub">Pull supporting evidence text chunks</div>
+              </div>
+            </button>
+            <button class="context-menu-item" onclick="expandTargetNode('Section')">
+              <span class="cmi-icon">📑</span>
+              <div class="cmi-text">
+                <div class="cmi-main">Sections & Chapters</div>
+                <div class="cmi-sub">Pull hierarchical section headings</div>
+              </div>
+            </button>
+            <div class="context-menu-divider"></div>
+            <button class="context-menu-item" onclick="openDetailsFromContextMenu()">
+              <span class="cmi-icon">📖</span>
+              <div class="cmi-text">
+                <div class="cmi-main">Open Note Details</div>
+                <div class="cmi-sub">Inspect relations, frontmatter & citations</div>
+              </div>
+            </button>
+          </div>
+
           <div class="graph-legend">
-            <div class="legend-item"><div class="legend-dot" style="background: #f59e0b;"></div> Concept / Idea</div>
-            <div class="legend-item"><div class="legend-dot" style="background: #3b82f6;"></div> Book</div>
-            <div class="legend-item"><div class="legend-dot" style="background: #10b981;"></div> Section</div>
-            <div class="legend-item"><div class="legend-dot" style="background: #94a3b8;"></div> Chunk</div>
+            <div class="legend-item"><div class="legend-dot" style="background: #f59e0b; border: 2px solid #fde68a; border-radius: 50%; box-shadow: 0 0 6px #f59e0b;"></div> 🧠 Core Seed</div>
+            <div class="legend-item"><div class="legend-dot" style="background: #8b5cf6; border: 1.5px solid #c4b5fd; transform: rotate(45deg); border-radius: 2px;"></div> 💡 Idea (Diamond)</div>
+            <div class="legend-item"><div class="legend-dot" style="background: #2563eb; border: 1.5px solid #60a5fa; border-radius: 3px; width: 12px; height: 10px;"></div> 📚 Book (Card)</div>
+            <div class="legend-item"><div class="legend-dot" style="background: #0d9488; border: 1px solid #34d399; clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%); width: 11px; height: 11px; border-radius: 0;"></div> 📑 Section (Hexagon)</div>
+            <div class="legend-item"><div class="legend-dot" style="background: #334155; border: 1px dashed #64748b; border-radius: 0; width: 10px; height: 10px;"></div> 📄 Chunk (Page)</div>
           </div>
         </div>
+
+        <!-- Draggable Resizer Splitter -->
+        <div class="pane-resizer" id="pane-resizer" title="Drag to adjust proportion between Graph and Description (Double-click to reset 40%)"></div>
 
         <!-- Right: Detail Panel (Obsidian Note Style) -->
         <div class="detail-column" id="detail-panel">
@@ -605,50 +1556,27 @@
             <div class="detail-title" id="node-detail-title">
               <span>💡</span> Select a Node
             </div>
-            <span class="detail-badge" id="node-detail-category">Idea</span>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span class="detail-badge" id="node-detail-category">Idea</span>
+              <button class="btn-panel-fold" id="btn-fold-panel" onclick="toggleDetailPanel()" title="Fold / Hide Description Panel (Full Screen Graph)">
+                <span>❯</span>
+              </button>
+            </div>
           </div>
           <div class="detail-body" id="node-detail-content">
             <div style="color: var(--text-muted); text-align: center; padding-top: 40px;">
-              Enter a search query or click on any node in the graph to view its Obsidian-formatted knowledge page.
+              Enter an idea name or search query to explore concepts and their surrounding neighborhood notes.
             </div>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- View 2: Embedded LightRAG WebUI -->
-    <div class="view-pane" id="pane-lightrag" style="flex-direction: column;">
-      <div style="background: var(--bg-panel); border-bottom: 1px solid var(--border); padding: 8px 16px; display: flex; align-items: center; justify-content: space-between;">
-        <div style="font-size: 0.85rem; color: var(--text-muted); display: flex; align-items: center; gap: 8px;">
-          <span>⚡ Embedded LightRAG Engine:</span>
-          <span id="lightrag-endpoint-label" style="font-family: monospace; color: #a5b4fc;">Checking status...</span>
-        </div>
-        <div style="display: flex; gap: 8px;">
-          <a id="lightrag-open-webui" href="#" target="_blank" class="ctrl-btn" style="text-decoration:none; padding:4px 10px; font-size:0.8rem; background:rgba(99,102,241,0.2); border:1px solid var(--border-accent); border-radius:6px; display:none;">Open WebUI in New Tab ↗</a>
-          <a id="lightrag-open-workspace" href="#" target="_blank" class="ctrl-btn" style="text-decoration:none; padding:4px 10px; font-size:0.8rem; background:rgba(16,185,129,0.2); border:1px solid var(--section-color); border-radius:6px; display:none;">Open Workspace Query ↗</a>
-        </div>
-      </div>
-      <div style="flex: 1; position: relative;" id="lightrag-frame-container">
-        <iframe id="lightrag-iframe" style="width: 100%; height: 100%; border: none; background: #0f172a;" src="about:blank"></iframe>
-        <div id="lightrag-offline-notice" style="display: none; position: absolute; inset: 0; align-items: center; justify-content: center; flex-direction: column; gap: 14px; background: var(--bg-dark); color: var(--text-muted);">
-          <div style="font-size: 2.2rem;">⚡</div>
-          <div style="font-weight: 600; font-size: 1.1rem; color: var(--text-main);">LightRAG Server is not running</div>
-          <div style="max-width: 500px; text-align: center; font-size: 0.9rem; line-height: 1.5;">
-            To start the embedded LightRAG WebUI alongside Bookeeper, start the UI with:
-            <br/><br/>
-            <code>bookeeper ui --lightrag-server</code>
-            <br/>or<br/>
-            <code>bookeeper lightrag-server</code>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- View 3: Dedicated Debug Tab -->
+    <!-- View 2: Dedicated Debug & Telemetry Tab -->
     <div class="view-pane" id="pane-debug">
       <div class="debug-container" id="debug-log-list">
         <div style="color: var(--text-muted); text-align: center; padding-top: 40px;">
-          No telemetry logged yet. Execute a search to inspect exact LightRAG prompts and Neo4j Cypher queries.
+          No telemetry logged yet. Execute a search to inspect candidate terms and Neo4j Cypher queries.
         </div>
       </div>
     </div>
@@ -656,7 +1584,7 @@
     <!-- Loading Indicator -->
     <div class="loading-overlay" id="loading-overlay">
       <div class="spinner"></div>
-      <div id="loading-status-text" style="font-weight: 600; color: #e2e8f0;">Synthesizing query with LightRAG...</div>
+      <div id="loading-status-text" style="font-weight: 600; color: #e2e8f0;">Searching Knowledge Graph for ideas & neighborhood...</div>
     </div>
   </main>
 
@@ -665,7 +1593,419 @@
     let latestTelemetry = null;
     let telemetryHistory = [];
 
-    // Initialize Cytoscape container
+    let currentGraphLayout = 'concentric';
+
+    function computeConstellationLayout() {
+      const positions = {};
+      if (!cyInstance) return positions;
+
+      const visibleNodes = cyInstance.nodes(':visible');
+      const visibleEdges = cyInstance.edges(':visible');
+      const N = visibleNodes.length;
+      if (N === 0) return positions;
+
+      // 1. Calculate Prominence Score for each node:
+      // "So if some node has maximum points, maximum references, maximum links, it should be in the center of constellation."
+      const degMap = new Map();
+      const refWeightMap = new Map();
+      const adj = new Map();
+
+      visibleNodes.forEach(n => {
+        degMap.set(n.id(), 0);
+        refWeightMap.set(n.id(), 0);
+        adj.set(n.id(), []);
+      });
+
+      visibleEdges.forEach(e => {
+        const s = e.source().id();
+        const t = e.target().id();
+        const w = e.data('weight') || 5;
+        if (degMap.has(s) && degMap.has(t)) {
+          degMap.set(s, degMap.get(s) + 1);
+          degMap.set(t, degMap.get(t) + 1);
+          refWeightMap.set(s, refWeightMap.get(s) + w);
+          refWeightMap.set(t, refWeightMap.get(t) + w);
+          adj.get(s).push({ neighbor: t, weight: w });
+          adj.get(t).push({ neighbor: s, weight: w });
+        }
+      });
+
+      const prominenceScores = new Map();
+      visibleNodes.forEach(n => {
+        const d = degMap.get(n.id()) || 0;
+        const rw = refWeightMap.get(n.id()) || 0;
+        const w = n.data('weight') || 5;
+        const isSeed = !!(n.data('is_seed') || n.data('tier') === 'primary' || n.data('node_type') === 'seed');
+        // Prominence incorporates degree (links count), reference weights, node weight, and seed flag
+        const score = (d * 12) + (rw * 3) + (w * 4) + (isSeed ? 30 : 0);
+        prominenceScores.set(n.id(), score);
+      });
+
+      // Sort visible nodes by prominence descending
+      const sortedByProminence = visibleNodes.toArray().sort((a, b) => {
+        return (prominenceScores.get(b.id()) || 0) - (prominenceScores.get(a.id()) || 0);
+      });
+
+      // 2. Select Constellation Centers:
+      // "And there can be many constellations, and it shouldn't be just around one spot."
+      let K = 1;
+      if (N >= 20) {
+        K = Math.min(4, Math.max(2, Math.floor(N / 8)));
+      } else if (N >= 8) {
+        K = 2;
+      }
+
+      const constellationCenters = [];
+      const centerIds = new Set();
+
+      // Top prominence node is the primary constellation anchor
+      const primaryCenter = sortedByProminence[0];
+      constellationCenters.push(primaryCenter);
+      centerIds.add(primaryCenter.id());
+
+      // Find additional constellation centers (prefer separated nodes to avoid immediate duplicates)
+      for (let i = 1; i < sortedByProminence.length && constellationCenters.length < K; i++) {
+        const candidate = sortedByProminence[i];
+        const isAdjacent = adj.get(candidate.id())?.some(edge => centerIds.has(edge.neighbor));
+        if (!isAdjacent || constellationCenters.length + (sortedByProminence.length - i) <= K) {
+          constellationCenters.push(candidate);
+          centerIds.add(candidate.id());
+        }
+      }
+
+      for (let i = 1; i < sortedByProminence.length && constellationCenters.length < K; i++) {
+        const candidate = sortedByProminence[i];
+        if (!centerIds.has(candidate.id())) {
+          constellationCenters.push(candidate);
+          centerIds.add(candidate.id());
+        }
+      }
+
+      const actualK = constellationCenters.length;
+
+      // 3. Position Constellation Centers comfortably across the galactic sky
+      const centerCoords = new Map();
+      if (actualK === 1) {
+        centerCoords.set(constellationCenters[0].id(), { x: 0, y: 0 });
+      } else if (actualK === 2) {
+        // Space constellations 680px apart so each has spacious orbital territory
+        centerCoords.set(constellationCenters[0].id(), { x: -340, y: 0 });
+        centerCoords.set(constellationCenters[1].id(), { x: 340, y: 0 });
+      } else if (actualK === 3) {
+        // Triangular constellation arrangement
+        const R_centers = 380;
+        centerCoords.set(constellationCenters[0].id(), { x: 0, y: -R_centers });
+        centerCoords.set(constellationCenters[1].id(), { x: Math.round(R_centers * Math.cos(Math.PI / 6)), y: Math.round(R_centers * Math.sin(Math.PI / 6)) });
+        centerCoords.set(constellationCenters[2].id(), { x: -Math.round(R_centers * Math.cos(Math.PI / 6)), y: Math.round(R_centers * Math.sin(Math.PI / 6)) });
+      } else {
+        // Radial polygon layout for 4+ constellations
+        const R_centers = 290 + actualK * 32;
+        constellationCenters.forEach((c, idx) => {
+          const angle = (2 * Math.PI * idx) / actualK - Math.PI / 2;
+          centerCoords.set(c.id(), {
+            x: Math.round(R_centers * Math.cos(angle)),
+            y: Math.round(R_centers * Math.sin(angle))
+          });
+        });
+      }
+
+      // 4. Assign every member node to its closest / strongest constellation center
+      const nodeConstellation = new Map();
+      const nodeDepthFromCenter = new Map();
+
+      const queue = [];
+      constellationCenters.forEach((c, idx) => {
+        nodeConstellation.set(c.id(), idx);
+        nodeDepthFromCenter.set(c.id(), 0);
+        queue.push(c.id());
+      });
+
+      while (queue.length > 0) {
+        const currId = queue.shift();
+        const currCIdx = nodeConstellation.get(currId);
+        const currDepth = nodeDepthFromCenter.get(currId);
+        const neighbors = adj.get(currId) || [];
+        for (const edge of neighbors) {
+          const nbrId = edge.neighbor;
+          if (!nodeConstellation.has(nbrId)) {
+            nodeConstellation.set(nbrId, currCIdx);
+            nodeDepthFromCenter.set(nbrId, currDepth + 1);
+            queue.push(nbrId);
+          }
+        }
+      }
+
+      const clusterCounts = new Array(actualK).fill(0);
+      nodeConstellation.forEach(cIdx => { clusterCounts[cIdx]++; });
+      visibleNodes.forEach(n => {
+        if (!nodeConstellation.has(n.id())) {
+          let minC = 0;
+          for (let k = 1; k < actualK; k++) {
+            if (clusterCounts[k] < clusterCounts[minC]) minC = k;
+          }
+          nodeConstellation.set(n.id(), minC);
+          nodeDepthFromCenter.set(n.id(), 2);
+          clusterCounts[minC]++;
+        }
+      });
+
+      // 5. Initial Phyllotaxis Seeding (Golden Angle Fermat Spiral)
+      // Disperses member nodes naturally around their center so they never line up "one after another"
+      const currentPos = new Map();
+      const velocities = new Map();
+      const goldenAngle = 2.39996323; // 137.5 degrees
+
+      const constellationMembers = Array.from({ length: actualK }, () => []);
+      visibleNodes.forEach(n => {
+        if (!centerIds.has(n.id())) {
+          const cIdx = nodeConstellation.get(n.id());
+          constellationMembers[cIdx].push(n);
+        }
+      });
+
+      // Anchor constellation centers
+      constellationCenters.forEach((c, cIdx) => {
+        const centerPos = centerCoords.get(c.id());
+        currentPos.set(c.id(), { x: centerPos.x, y: centerPos.y, fixed: true });
+        velocities.set(c.id(), { vx: 0, vy: 0 });
+      });
+
+      // Seed surrounding member stars
+      constellationMembers.forEach((members, cIdx) => {
+        const cNode = constellationCenters[cIdx];
+        const centerPos = centerCoords.get(cNode.id());
+
+        // Sort by prominence so important notes orbit nearer the core
+        members.sort((a, b) => (prominenceScores.get(b.id()) || 0) - (prominenceScores.get(a.id()) || 0));
+
+        members.forEach((m, idx) => {
+          const r = 95 + Math.sqrt(idx + 1) * 46;
+          const theta = idx * goldenAngle;
+          const x = centerPos.x + r * Math.cos(theta);
+          const y = centerPos.y + r * Math.sin(theta);
+          currentPos.set(m.id(), { x, y, fixed: false });
+          velocities.set(m.id(), { vx: 0, vy: 0 });
+        });
+      });
+
+      // 6. Multi-Center Gravitational Physics Simulation (Spring-Electrical + Constellation Gravity)
+      // 85 steps of relaxation
+      const iterations = 85;
+      const allNodeIds = visibleNodes.toArray().map(n => n.id());
+      const nodeWidths = new Map();
+      visibleNodes.forEach(n => {
+        nodeWidths.set(n.id(), n.data('width') || 75);
+      });
+
+      for (let step = 0; step < iterations; step++) {
+        const forces = new Map();
+        allNodeIds.forEach(id => forces.set(id, { fx: 0, fy: 0 }));
+
+        // A. Constellation Gravity: Gravitational attraction towards member's constellation center
+        allNodeIds.forEach(id => {
+          const pos = currentPos.get(id);
+          if (pos.fixed) return;
+          const cIdx = nodeConstellation.get(id);
+          const cNode = constellationCenters[cIdx];
+          const cPos = centerCoords.get(cNode.id());
+
+          const dx = cPos.x - pos.x;
+          const dy = cPos.y - pos.y;
+          const dist = Math.sqrt(dx * dx + dy * dy) + 1;
+
+          const depth = nodeDepthFromCenter.get(id) || 1;
+          const idealR = 110 + depth * 55;
+          const gravStrength = 0.045;
+          const f = (dist - idealR) * gravStrength;
+
+          forces.get(id).fx += (dx / dist) * f;
+          forces.get(id).fy += (dy / dist) * f;
+        });
+
+        // B. Edge Spring Tension: Connected conceptual relationships pull elastically
+        visibleEdges.forEach(e => {
+          const s = e.source().id();
+          const t = e.target().id();
+          const p1 = currentPos.get(s);
+          const p2 = currentPos.get(t);
+          if (!p1 || !p2) return;
+
+          const dx = p2.x - p1.x;
+          const dy = p2.y - p1.y;
+          const dist = Math.sqrt(dx * dx + dy * dy) + 0.1;
+
+          const restLen = 135;
+          const springK = 0.035;
+          const f = (dist - restLen) * springK;
+
+          const fx = (dx / dist) * f;
+          const fy = (dy / dist) * f;
+
+          if (!p1.fixed) {
+            forces.get(s).fx += fx;
+            forces.get(s).fy += fy;
+          }
+          if (!p2.fixed) {
+            forces.get(t).fx -= fx;
+            forces.get(t).fy -= fy;
+          }
+        });
+
+        // C. Inter-Node Anti-Collision Repulsion
+        for (let i = 0; i < allNodeIds.length; i++) {
+          const idA = allNodeIds[i];
+          const posA = currentPos.get(idA);
+          const wA = nodeWidths.get(idA) || 75;
+          const cA = nodeConstellation.get(idA);
+
+          for (let j = i + 1; j < allNodeIds.length; j++) {
+            const idB = allNodeIds[j];
+            const posB = currentPos.get(idB);
+            const wB = nodeWidths.get(idB) || 75;
+            const cB = nodeConstellation.get(idB);
+
+            let dx = posA.x - posB.x;
+            let dy = posA.y - posB.y;
+            let dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < 0.1) {
+              dx = 1;
+              dy = 0;
+              dist = 1;
+            }
+
+            const minComfortDist = (wA + wB) / 2 + 28;
+
+            if (dist < 320) {
+              const repStrength = cA === cB ? 15000 : 28000; // Extra repulsion between different constellations
+              const fRep = repStrength / (dist * dist);
+              const fx = (dx / dist) * fRep;
+              const fy = (dy / dist) * fRep;
+
+              if (!posA.fixed) {
+                forces.get(idA).fx += fx;
+                forces.get(idA).fy += fy;
+              }
+              if (!posB.fixed) {
+                forces.get(idB).fx -= fx;
+                forces.get(idB).fy -= fy;
+              }
+            }
+
+            // Hard collision overlap prevention
+            if (dist < minComfortDist) {
+              const push = (minComfortDist - dist) * 2.0;
+              const fx = (dx / dist) * push;
+              const fy = (dy / dist) * push;
+
+              if (!posA.fixed) {
+                forces.get(idA).fx += fx;
+                forces.get(idA).fy += fy;
+              }
+              if (!posB.fixed) {
+                forces.get(idB).fx -= fx;
+                forces.get(idB).fy -= fy;
+              }
+            }
+          }
+        }
+
+        // D. Kinetic Damping & Integration
+        const damping = 0.72;
+        allNodeIds.forEach(id => {
+          const pos = currentPos.get(id);
+          if (pos.fixed) return;
+
+          const f = forces.get(id);
+          const v = velocities.get(id);
+
+          v.vx = (v.vx + f.fx) * damping;
+          v.vy = (v.vy + f.fy) * damping;
+
+          const speed = Math.sqrt(v.vx * v.vx + v.vy * v.vy);
+          if (speed > 24) {
+            v.vx = (v.vx / speed) * 24;
+            v.vy = (v.vy / speed) * 24;
+          }
+
+          pos.x += v.vx;
+          pos.y += v.vy;
+        });
+      }
+
+      allNodeIds.forEach(id => {
+        const p = currentPos.get(id);
+        positions[id] = { x: Math.round(p.x), y: Math.round(p.y) };
+      });
+
+      return positions;
+    }
+
+    // Alias for compatibility
+    const computeCelestialStarPositions = computeConstellationLayout;
+
+    function getGraphLayout(layoutName = 'concentric') {
+      if (layoutName === 'concentric') {
+        return {
+          name: 'concentric',
+          fit: true,
+          padding: 40,
+          startAngle: 3/2 * Math.PI,
+          clockwise: true,
+          equidistant: false,
+          minNodeSpacing: 45,
+          avoidOverlap: true,
+          nodeDimensionsIncludeLabels: true,
+          concentric: function(node) {
+            return node.data('weight') || 1;
+          },
+          levelWidth: function(nodes) {
+            return 2.5;
+          },
+          animate: true,
+          animationDuration: 400
+        };
+      } else if (layoutName === 'star') {
+        const starPositions = computeConstellationLayout();
+        return {
+          name: 'preset',
+          positions: function(node) {
+            return starPositions[node.id()] || node.position() || { x: 0, y: 0 };
+          },
+          fit: true,
+          padding: 50,
+          animate: true,
+          animationDuration: 600,
+          animationEasing: 'ease-out-cubic'
+        };
+      } else if (layoutName === 'cose') {
+        return {
+          name: 'cose',
+          idealEdgeLength: function(edge) {
+            const w = edge.data('weight') || 5;
+            return Math.max(40, 160 - w * 12);
+          },
+          nodeOverlap: 20,
+          refresh: 20,
+          fit: true,
+          padding: 30,
+          randomize: false,
+          componentSpacing: 100,
+          nodeRepulsion: function(node) {
+            return (node.data('weight') || 5) * 40000;
+          },
+          edgeElasticity: function(edge) {
+            return (edge.data('weight') || 5) * 30;
+          },
+          gravity: 80,
+          numIter: 1000,
+          animate: true,
+          animationDuration: 400
+        };
+      }
+      return { name: layoutName, fit: true, padding: 30, animate: true, animationDuration: 400 };
+    }
+
+    // Initialize Cytoscape container with weight-driven hierarchical styling
     function initCytoscape() {
       cyInstance = cytoscape({
         container: document.getElementById('cy'),
@@ -674,101 +2014,169 @@
             selector: 'node',
             style: {
               'label': 'data(label)',
-              'color': '#f8fafc',
-              'font-size': '11px',
-              'text-valign': 'bottom',
-              'text-margin-y': 5,
+              'color': '#ffffff',
+              'font-size': 'data(fontSize)',
+              'font-weight': 'data(fontWeight)',
+              'text-valign': 'center',
+              'text-halign': 'center',
+              'text-wrap': 'wrap',
+              'text-max-width': 'data(textMaxWidth)',
+              'shape': 'data(shape)',
               'background-color': 'data(color)',
-              'width': 'mapData(weight, 1, 10, 24, 46)',
-              'height': 'mapData(weight, 1, 10, 24, 46)',
-              'border-width': 2,
-              'border-color': '#0f172a',
-              'text-outline-color': '#0f172a',
-              'text-outline-width': 2,
-              'transition-property': 'background-color, border-color, width, height',
+              'width': 'data(width)',
+              'height': 'data(height)',
+              'border-width': 'data(borderWidth)',
+              'border-color': 'data(borderColor)',
+              'text-outline-color': 'data(color)',
+              'text-outline-width': 1.5,
+              'transition-property': 'background-color, border-color, width, height, opacity',
               'transition-duration': '0.2s'
             }
           },
+          // 1. Core / Primary Seed Ideas (Glowing Gold Sun / Star, center hub)
+          {
+            selector: 'node[node_type = "seed"], node[?is_seed]',
+            style: {
+              'shape': 'ellipse',
+              'background-color': '#f59e0b',
+              'border-width': 4.5,
+              'border-color': '#fde68a',
+              'border-style': 'solid',
+              'color': '#ffffff',
+              'font-weight': 'bold',
+              'text-outline-width': 2,
+              'text-outline-color': '#b45309',
+              'z-index': 100
+            }
+          },
+          // 2. Connected Ideas / Concepts (Vivid Violet Circle)
+          {
+            selector: 'node[node_type = "concept"], node[category = "Concept"], node[category = "Idea"]',
+            style: {
+              'shape': 'ellipse',
+              'background-color': '#8b5cf6',
+              'border-width': 2.5,
+              'border-color': '#c4b5fd',
+              'border-style': 'solid',
+              'color': '#ffffff',
+              'text-outline-width': 1.5,
+              'text-outline-color': '#6d28d9',
+              'z-index': 50
+            }
+          },
+          // 3. Source Books (Ocean Blue Rounded Capsule / Pill)
+          {
+            selector: 'node[node_type = "book"], node[category = "Book"]',
+            style: {
+              'shape': 'round-rectangle',
+              'background-color': '#2563eb',
+              'border-width': 2.5,
+              'border-color': '#60a5fa',
+              'border-style': 'solid',
+              'color': '#ffffff',
+              'text-outline-width': 1.5,
+              'text-outline-color': '#1d4ed8',
+              'z-index': 45
+            }
+          },
+          // 4. Section / Chapter Headings (Emerald Teal Rounded Capsule / Pill)
+          {
+            selector: 'node[node_type = "section"], node[category = "Section"]',
+            style: {
+              'shape': 'round-rectangle',
+              'background-color': '#0d9488',
+              'border-width': 2,
+              'border-color': '#34d399',
+              'border-style': 'solid',
+              'color': '#ffffff',
+              'text-outline-width': 1.5,
+              'text-outline-color': '#0f766e',
+              'z-index': 20
+            }
+          },
+          // 5. Evidence Chunks (Charcoal Slate Smooth Ellipse, NO square notes)
+          {
+            selector: 'node[node_type = "chunk"], node[category = "Chunk"]',
+            style: {
+              'shape': 'ellipse',
+              'background-color': '#334155',
+              'border-width': 1.5,
+              'border-color': '#64748b',
+              'border-style': 'solid',
+              'color': '#f1f5f9',
+              'text-outline-width': 1.2,
+              'text-outline-color': '#1e293b',
+              'opacity': 0.85,
+              'z-index': 10
+            }
+          },
+          // Node Selection Glow
           {
             selector: 'node:selected',
             style: {
               'border-color': '#ffffff',
-              'border-width': 4,
-              'box-shadow': '0 0 15px rgba(255,255,255,0.8)'
+              'border-width': 4.5,
+              'box-shadow': '0 0 20px rgba(255,255,255,0.95)',
+              'z-index': 999
             }
           },
           {
             selector: 'edge',
             style: {
-              'width': 1.8,
-              'line-color': '#475569',
-              'target-arrow-color': '#475569',
+              'width': 'mapData(weight, 1, 10, 1.2, 4.0)',
+              'line-color': 'data(lineColor)',
+              'target-arrow-color': 'data(lineColor)',
               'target-arrow-shape': 'triangle',
+              'arrow-scale': 0.8,
               'curve-style': 'bezier',
               'label': 'data(label)',
               'font-size': '8px',
               'color': '#94a3b8',
               'text-rotation': 'autorotate',
               'text-background-color': '#090d16',
-              'text-background-opacity': 0.8,
+              'text-background-opacity': 0.85,
               'text-background-padding': 2,
-              'opacity': 0.8
+              'opacity': 'data(opacity)'
+            }
+          },
+          {
+            selector: 'edge[weight >= 7]',
+            style: {
+              'z-index': 40
+            }
+          },
+          {
+            selector: 'edge[weight < 4]',
+            style: {
+              'line-style': 'dashed',
+              'z-index': 10
             }
           }
         ],
-        layout: { name: 'cose', animate: false }
+        layout: getGraphLayout('concentric')
       });
 
       // Node Click handler
       cyInstance.on('tap', 'node', function(evt) {
         const node = evt.target;
         loadNodeDetails(node.data('id'));
+        hideNodeContextMenu();
       });
-    }
 
-    let lightragServerInfo = null;
+      // Node Right-Click Context Menu handler (Neo4j Browser style)
+      cyInstance.on('cxttap', 'node', function(evt) {
+        showNodeContextMenu(evt);
+      });
 
-    async function checkLightRAGStatus() {
-      try {
-        const resp = await fetch('/api/health');
-        const data = await resp.json();
-        if (data.lightrag_server) {
-          lightragServerInfo = data.lightrag_server;
-          const badge = document.getElementById('lightrag-status-badge');
-          const label = document.getElementById('lightrag-endpoint-label');
-          const btnWeb = document.getElementById('lightrag-open-webui');
-          const btnWork = document.getElementById('lightrag-open-workspace');
-          const iframe = document.getElementById('lightrag-iframe');
-          const offlineNotice = document.getElementById('lightrag-offline-notice');
-
-          if (lightragServerInfo.embedded_running && lightragServerInfo.webui_url) {
-            badge.style.display = 'inline-block';
-            badge.textContent = 'Online';
-            badge.className = 'debug-tag success';
-            label.textContent = lightragServerInfo.webui_url;
-            btnWeb.href = lightragServerInfo.webui_url;
-            btnWeb.style.display = 'inline-block';
-            if (lightragServerInfo.workspace_url) {
-              btnWork.href = lightragServerInfo.workspace_url;
-              btnWork.style.display = 'inline-block';
-            }
-            if (!iframe.src || iframe.src === 'about:blank') {
-              iframe.src = lightragServerInfo.webui_url;
-            }
-            offlineNotice.style.display = 'none';
-            iframe.style.display = 'block';
-          } else {
-            badge.style.display = 'inline-block';
-            badge.textContent = 'Offline';
-            badge.className = 'debug-tag error';
-            label.textContent = 'Offline (Launch with --lightrag-server)';
-            offlineNotice.style.display = 'flex';
-            iframe.style.display = 'none';
-          }
+      // Hide context menu on background click or pan/zoom
+      cyInstance.on('tap', function(evt) {
+        if (evt.target === cyInstance) {
+          hideNodeContextMenu();
         }
-      } catch (err) {
-        console.warn('Health check failed:', err);
-      }
+      });
+      cyInstance.on('pan zoom', function() {
+        hideNodeContextMenu();
+      });
     }
 
     function switchTab(tab) {
@@ -779,13 +2187,10 @@
         document.getElementById('tab-btn-graph').classList.add('active');
         document.getElementById('pane-graph').classList.add('active');
         if (cyInstance) cyInstance.resize();
-      } else if (tab === 'lightrag') {
-        document.getElementById('tab-btn-lightrag').classList.add('active');
-        document.getElementById('pane-lightrag').classList.add('active');
-        checkLightRAGStatus();
       } else if (tab === 'debug') {
         document.getElementById('tab-btn-debug').classList.add('active');
         document.getElementById('pane-debug').classList.add('active');
+        renderDebugTab();
       }
     }
 
@@ -794,6 +2199,8 @@
       if (!query) return;
 
       const mode = document.getElementById('search-mode').value;
+      const similarity_threshold = parseFloat(document.getElementById('similarity-threshold') ? document.getElementById('similarity-threshold').value : 0.70);
+      const top_k_seeds = parseInt(document.getElementById('top-k-seeds') ? document.getElementById('top-k-seeds').value : 6);
       const denoise_level = document.getElementById('search-denoise') ? document.getElementById('search-denoise').value : 'standard';
       const overlay = document.getElementById('loading-overlay');
       const searchBtn = document.getElementById('search-btn');
@@ -805,7 +2212,7 @@
         const resp = await fetch('/api/search', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query, mode, denoise_level, top_k: 40, graph_limit: 60 })
+          body: JSON.stringify({ query, mode, denoise_level, top_k: 40, graph_limit: 60, similarity_threshold, top_k_seeds })
         });
         const data = await resp.json();
         
@@ -836,6 +2243,198 @@
       }
     }
 
+    function setSearchMode(mode) {
+      document.getElementById('search-mode').value = mode;
+      document.querySelectorAll('#search-mode-segmented .seg-btn').forEach(btn => {
+        if (btn.getAttribute('data-mode') === mode) {
+          btn.classList.add('active');
+        } else {
+          btn.classList.remove('active');
+        }
+      });
+    }
+
+    function clearSearchInput() {
+      const input = document.getElementById('search-input');
+      if (input) {
+        input.value = '';
+        input.focus();
+        const clearBtn = document.getElementById('search-clear-btn');
+        if (clearBtn) clearBtn.style.display = 'none';
+      }
+    }
+
+    let evidenceVisible = false; // Default: Clean ideas view without chunk/section clutter
+
+    function toggleEvidenceFilter() {
+      evidenceVisible = !evidenceVisible;
+      updateEvidenceButtonState();
+      applyEvidenceVisibility();
+    }
+
+    function updateEvidenceButtonState() {
+      const btn = document.getElementById('btn-toggle-evidence');
+      const textEl = document.getElementById('evidence-btn-text');
+      const badgeEl = document.getElementById('evidence-badge');
+      if (!cyInstance) return;
+
+      const evidenceNodes = cyInstance.nodes('[category = "Chunk"], [category = "Section"]');
+      const count = evidenceNodes.length;
+      if (badgeEl) {
+        badgeEl.textContent = count;
+      }
+      if (btn && textEl) {
+        if (evidenceVisible) {
+          textEl.textContent = 'Evidence Chunks: Visible';
+          btn.classList.add('active');
+        } else {
+          textEl.textContent = 'Evidence Chunks: Hidden';
+          btn.classList.remove('active');
+        }
+      }
+    }
+
+    function applyEvidenceVisibility() {
+      if (!cyInstance) return;
+      const evidenceNodes = cyInstance.nodes('[category = "Chunk"], [category = "Section"]');
+      const evidenceEdges = cyInstance.edges().filter(e => {
+        const s = e.source().data('category');
+        const t = e.target().data('category');
+        return s === 'Chunk' || s === 'Section' || t === 'Chunk' || t === 'Section';
+      });
+
+      if (evidenceVisible) {
+        evidenceNodes.show();
+        evidenceEdges.show();
+      } else {
+        evidenceNodes.hide();
+        evidenceEdges.hide();
+      }
+
+      updateEvidenceButtonState();
+
+      // Relayout only visible nodes so hidden nodes do not create awkward gaps!
+      const visibleNodes = cyInstance.nodes(':visible');
+      if (visibleNodes.length > 0) {
+        visibleNodes.layout(getGraphLayout(currentGraphLayout || 'concentric')).run();
+      }
+    }
+
+    function focusEvidenceNode(nodeId) {
+      if (!cyInstance) return;
+      if (!evidenceVisible) {
+        toggleEvidenceFilter();
+      }
+      const targetNode = cyInstance.getElementById(nodeId);
+      if (targetNode && targetNode.nonempty()) {
+        cyInstance.nodes().unselect();
+        targetNode.select();
+        cyInstance.animate({
+          center: { eles: targetNode },
+          zoom: Math.max(cyInstance.zoom(), 1.2)
+        }, { duration: 400 });
+      }
+      loadNodeDetails(nodeId);
+    }
+
+    function getNodeVisualData(n) {
+      const isSeed = !!(n.is_seed || n.tier === 'primary' || n.node_type === 'seed');
+      const category = n.category || (n.labels && n.labels.includes('Book') ? 'Book' : (n.labels && n.labels.includes('Chunk') ? 'Chunk' : (n.labels && n.labels.includes('Section') ? 'Section' : 'Concept')));
+      
+      let nodeType = n.node_type || (isSeed ? 'seed' : (category === 'Book' ? 'book' : (category === 'Section' ? 'section' : (category === 'Chunk' ? 'chunk' : 'concept'))));
+      let color = n.color;
+      let borderColor = n.border_color;
+      let borderWidth = n.border_width || 2;
+      let icon = n.icon;
+      const weight = n.weight !== undefined ? n.weight : 5;
+
+      // Clean title text WITHOUT emoji icons for graph canvas nodes
+      const rawName = (n.name || n.title || '').trim();
+      const label = rawName.length > 34 ? rawName.substring(0, 32) + '…' : rawName;
+
+      let shape, width, height, fontSize, fontWeight, textMaxWidth;
+
+      if (nodeType === 'seed') {
+        shape = 'ellipse';
+        color = '#f59e0b';
+        borderColor = '#fde68a';
+        borderWidth = 4.5;
+        icon = '🧠';
+        width = Math.max(90, Math.min(120, 80 + label.length * 1.5));
+        height = width;
+        fontSize = '12px';
+        fontWeight = 'bold';
+        textMaxWidth = (width - 18) + 'px';
+      } else if (nodeType === 'book') {
+        shape = 'round-rectangle';
+        color = '#2563eb';
+        borderColor = '#60a5fa';
+        borderWidth = 2.5;
+        icon = '📚';
+        width = Math.max(82, Math.min(115, 72 + label.length * 1.5));
+        height = Math.max(52, Math.min(68, 46 + Math.floor(label.length / 15) * 8));
+        fontSize = '10px';
+        fontWeight = '600';
+        textMaxWidth = (width - 16) + 'px';
+      } else if (nodeType === 'section') {
+        shape = 'round-rectangle';
+        color = '#0d9488';
+        borderColor = '#34d399';
+        borderWidth = 2;
+        icon = '📑';
+        width = Math.max(70, Math.min(98, 62 + label.length * 1.3));
+        height = Math.max(44, Math.min(56, 40 + Math.floor(label.length / 14) * 6));
+        fontSize = '9px';
+        fontWeight = '500';
+        textMaxWidth = (width - 14) + 'px';
+      } else if (nodeType === 'chunk') {
+        shape = 'ellipse';
+        color = '#334155';
+        borderColor = '#64748b';
+        borderWidth = 1.5;
+        icon = '📄';
+        width = Math.max(64, Math.min(88, 54 + label.length * 1.2));
+        height = Math.max(42, Math.min(54, 36 + Math.floor(label.length / 13) * 6));
+        fontSize = '8.5px';
+        fontWeight = '500';
+        textMaxWidth = (width - 14) + 'px';
+      } else {
+        nodeType = 'concept';
+        shape = 'ellipse';
+        color = '#8b5cf6';
+        borderColor = '#c4b5fd';
+        borderWidth = 2.5;
+        icon = '💡';
+        width = Math.max(74, Math.min(102, 66 + label.length * 1.4));
+        height = width;
+        fontSize = '10.5px';
+        fontWeight = '600';
+        textMaxWidth = (width - 16) + 'px';
+      }
+
+      return {
+        id: n.id,
+        label: label, // Clean title inside node, NO emoji prefix!
+        fullName: n.name,
+        color: color,
+        borderColor: borderColor,
+        borderWidth: borderWidth,
+        shape: shape,
+        weight: weight,
+        size: width, // for compatibility
+        width: width,
+        height: height,
+        fontSize: fontSize,
+        fontWeight: fontWeight,
+        textMaxWidth: textMaxWidth,
+        node_type: nodeType,
+        tier: isSeed ? 'primary' : (nodeType === 'chunk' || nodeType === 'section' ? 'context' : 'secondary'),
+        is_seed: isSeed,
+        category: category,
+        icon: icon
+      };
+    }
+
     function renderSearchResults(data) {
       if (!cyInstance) initCytoscape();
 
@@ -846,52 +2445,36 @@
       nodes.forEach(n => {
         elements.push({
           group: 'nodes',
-          data: {
-            id: n.id,
-            label: n.name.length > 25 ? n.name.substring(0, 23) + '...' : n.name,
-            fullName: n.name,
-            color: n.color || '#8b5cf6',
-            weight: n.weight || 5,
-            category: n.category
-          }
+          data: getNodeVisualData(n)
         });
       });
 
       edges.forEach(e => {
+        const edgeWeight = e.weight || (e.properties && e.properties.weight) || 5;
         elements.push({
           group: 'edges',
           data: {
             id: e.id,
             source: e.source,
             target: e.target,
-            label: e.type.replace(/_/g, ' ').toLowerCase()
+            label: e.type ? e.type.replace(/_/g, ' ').toLowerCase() : '',
+            weight: edgeWeight,
+            lineColor: e.line_color || (edgeWeight >= 7 ? '#818cf8' : (edgeWeight < 4 ? '#334155' : '#475569')),
+            opacity: e.opacity || (edgeWeight >= 7 ? 0.9 : 0.5)
           }
         });
       });
 
       cyInstance.elements().remove();
       cyInstance.add(elements);
-      cyInstance.layout({
-        name: 'cose',
-        idealEdgeLength: 100,
-        nodeOverlap: 20,
-        refresh: 20,
-        fit: true,
-        padding: 30,
-        randomize: false,
-        componentSpacing: 100,
-        nodeRepulsion: 400000,
-        edgeElasticity: 100,
-        nestingFactor: 5,
-        gravity: 80,
-        numIter: 1000,
-        initialTemp: 200,
-        coolingFactor: 0.95,
-        minTemp: 1.0
-      }).run();
+      updateEvidenceButtonState();
+      applyEvidenceVisibility();
     }
 
     async function loadNodeDetails(nodeId, optionalSynthesis = null) {
+      if (isDetailPanelCollapsed()) {
+        setDetailPanelCollapsed(false, false);
+      }
       const container = document.getElementById('node-detail-content');
       const titleEl = document.getElementById('node-detail-title');
       const catEl = document.getElementById('node-detail-category');
@@ -906,19 +2489,21 @@
 
         const node = data.node;
         const props = node.properties || {};
+        const isEvidenceNode = (node.category === 'Chunk' || node.category === 'Section' || (node.labels && (node.labels.includes('Chunk') || node.labels.includes('Section'))));
+        const isBookNode = (node.category === 'Book' || (node.labels && node.labels.includes('Book')));
 
-        titleEl.innerHTML = `<span>${node.icon || '💡'}</span> ${node.name}`;
-        catEl.textContent = node.category || 'Idea';
+        titleEl.innerHTML = `<span>${node.icon || (isEvidenceNode ? '📄' : isBookNode ? '📚' : '💡')}</span> ${escapeHtml(node.name)}`;
+        catEl.textContent = node.category || (isEvidenceNode ? 'Evidence' : isBookNode ? 'Book' : 'Idea');
         catEl.style.backgroundColor = node.color ? node.color + '33' : 'var(--bg-card)';
         catEl.style.color = node.color || '#fff';
 
         let html = '';
 
-        // 1. Dual-Level Synthesis Box if available
+        // 1. Idea Synthesis Summary Box if available
         if (optionalSynthesis) {
           html += `
             <div class="synthesis-card">
-              <h3>🤖 LightRAG Synthesis Answer</h3>
+              <h3>💡 Idea Search Synthesis</h3>
               <div style="font-size:0.9rem; line-height:1.5;">${marked.parse(optionalSynthesis)}</div>
             </div>
           `;
@@ -927,18 +2512,67 @@
         // 2. Obsidian YAML Frontmatter Box
         html += `
           <div class="frontmatter-card">
-            <div class="fm-row"><span class="fm-label">title:</span><span class="fm-value">"${node.name}"</span></div>
+            <div class="fm-row"><span class="fm-label">title:</span><span class="fm-value">"${escapeHtml(node.name)}"</span></div>
             <div class="fm-row"><span class="fm-label">type:</span><span class="fm-value">${node.labels.join(', ')}</span></div>
-            <div class="fm-row"><span class="fm-label">category:</span><span class="fm-value">"${node.category}"</span></div>
+            <div class="fm-row"><span class="fm-label">category:</span><span class="fm-value">"${escapeHtml(node.category)}"</span></div>
             <div class="fm-row"><span class="fm-label">weight:</span><span class="fm-value">${node.weight}/10</span></div>
             <div class="fm-row"><span class="fm-label">occurrences:</span><span class="fm-value">${node.occurrences}</span></div>
           </div>
         `;
 
-        // 3. Summary & Detailed Explanation
+        // Direct Book Source Document Banner (if inspecting a Book node)
+        if (isBookNode && node.book_file && node.book_file.found) {
+          const bf = node.book_file;
+          html += `
+            <div class="book-source-banner">
+              <div style="display:flex; align-items:center; gap:10px;">
+                <span style="font-size:1.6rem;">📚</span>
+                <div>
+                  <div style="font-weight:700; font-size:0.95rem; color:#f8fafc;">Source Document</div>
+                  <div style="font-size:0.8rem; color:#94a3b8; word-break:break-all;">
+                    ${escapeHtml(bf.filename)} <span style="color:#64748b;">(${formatBytes(bf.file_size)})</span>
+                  </div>
+                </div>
+              </div>
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <a href="${bf.view_url}" target="_blank" rel="noopener noreferrer" class="btn-download-primary" title="Open book document in new tab">📖 Open Book</a>
+                <a href="${bf.download_url}" download class="btn-download-secondary" title="Direct download book file">📥 Download</a>
+                ${bf.external_url ? `<a href="${bf.external_url}" target="_blank" rel="noopener noreferrer" class="btn-book-action btn-book-external" title="View external source (arXiv)">🌐 arXiv</a>` : ''}
+              </div>
+            </div>
+          `;
+        }
+
+        // If this is a Chunk/Section note, display its raw excerpt card directly
+        if (isEvidenceNode) {
+          const chunkBody = props.text || props.content || props.quote || props.description || '';
+          const bookTitle = props.book_title || props.source || '';
+          const bf = node.book_file;
+          html += `
+            <div style="background: rgba(15, 23, 42, 0.7); border: 1px solid #475569; border-radius: 8px; padding: 14px; margin-bottom: 16px;">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:6px;">
+                <span style="font-size:0.8rem; color:#94a3b8; font-weight:700;">📄 SUPPORTING EXCERPT</span>
+                <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+                  ${bf && bf.found ? `
+                    <a href="${bf.view_url}" target="_blank" rel="noopener noreferrer" class="evidence-book-btn" title="Open ${escapeHtml(bf.filename)}">📖 Open Book</a>
+                    <a href="${bf.download_url}" download class="evidence-download-btn" title="Download book file">📥 Download</a>
+                  ` : ''}
+                  ${bookTitle ? `<span class="evidence-tag">📚 ${escapeHtml(bookTitle)}</span>` : ''}
+                </div>
+              </div>
+              <div class="evidence-text-content" style="margin-bottom:10px;">${escapeHtml(chunkBody) || '<span style="color:var(--text-muted);">No excerpt body available.</span>'}</div>
+              <div style="display:flex; justify-content:flex-end; gap:6px; align-items:center;">
+                ${bf && bf.external_url ? `<a href="${bf.external_url}" target="_blank" rel="noopener noreferrer" class="btn-book-action btn-book-external" style="font-size:0.75rem;" title="View external source (arXiv)">🌐 arXiv</a>` : ''}
+                <button class="debug-action-btn" onclick="copyToClipboard(${JSON.stringify(chunkBody)}, this)">📋 Copy Excerpt</button>
+              </div>
+            </div>
+          `;
+        }
+
+        // 3. Summary & Detailed Explanation (for Ideas/Concepts/Books)
         if (props.summary || props.brief_description) {
           html += `<div class="note-heading">📝 Summary</div>`;
-          html += `<blockquote class="quote-box">${props.summary || props.brief_description}</blockquote>`;
+          html += `<blockquote class="quote-box">${escapeHtml(props.summary || props.brief_description)}</blockquote>`;
         }
 
         if (props.detailed_explanation && props.detailed_explanation !== props.brief_description) {
@@ -948,9 +2582,20 @@
 
         // 4. Books Featuring this Idea
         if (data.books && data.books.length > 0) {
-          html += `<div class="note-heading">📚 Featured in Books</div><div style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:15px;">`;
+          html += `<div class="note-heading">📚 Featured in Books</div><div style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:15px;">`;
           data.books.forEach(b => {
-            html += `<span class="wikilink" onclick="loadNodeDetails('${b.target_id}')">[[${b.target_name}]]</span>`;
+            const bf = b.book_file;
+            html += `
+              <div class="book-pill-card">
+                <span class="wikilink" onclick="loadNodeDetails('${escapeHtml(b.target_id)}')">[[${escapeHtml(b.target_name)}]]</span>
+                ${bf && bf.found ? `
+                  <div style="display:inline-flex; gap:4px; margin-left:6px;">
+                    <a href="${bf.view_url}" target="_blank" rel="noopener noreferrer" class="book-mini-btn" title="Open book document: ${escapeHtml(bf.filename)}">📖 Open</a>
+                    <a href="${bf.download_url}" download class="book-mini-btn" title="Download book file: ${escapeHtml(bf.filename)}">📥</a>
+                  </div>
+                ` : ''}
+              </div>
+            `;
           });
           html += `</div>`;
         }
@@ -962,8 +2607,8 @@
             html += `
               <div class="relation-item">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
-                  <span class="wikilink" onclick="loadNodeDetails('${c.target_id}')">[[${c.target_name}]]</span>
-                  <span class="rel-badge">${c.rel_type}</span>
+                  <span class="wikilink" onclick="loadNodeDetails('${escapeHtml(c.target_id)}')">[[${escapeHtml(c.target_name)}]]</span>
+                  <span class="rel-badge">${escapeHtml(c.rel_type)}</span>
                 </div>
               </div>
             `;
@@ -971,18 +2616,60 @@
           html += `</div>`;
         }
 
-        // 6. Evidence & Supporting Sections
+        // 6. Evidence & Supporting Sections (1-Click Expandable Reader with Direct Book Links)
         if (data.evidence && data.evidence.length > 0) {
-          html += `<div class="note-heading">📑 Supporting Evidence & Chunks</div>`;
-          data.evidence.forEach(ev => {
+          html += `
+            <div class="note-heading">
+              <span>📑</span> Supporting Evidence & Chunks
+              <span style="font-size:0.75rem; color:var(--text-muted); font-weight:normal; margin-left:auto;">(${data.evidence.length} items)</span>
+            </div>
+          `;
+          data.evidence.forEach((ev, idx) => {
+            const rawContent = ev.text || ev.quote || (ev.other_properties && (ev.other_properties.text || ev.other_properties.content)) || '';
+            const breadcrumb = ev.breadcrumb || ev.target_name || `Evidence #${idx+1}`;
+            const bookSource = ev.book_title || (ev.other_properties && (ev.other_properties.book_title || ev.other_properties.source)) || '';
+            const pageNum = ev.page || (ev.other_properties && ev.other_properties.page);
+            const bf = ev.book_file;
+
             html += `
-              <div class="relation-item" style="margin-bottom:8px;">
-                <div style="display:flex; justify-content:space-between;">
-                  <span style="font-size:0.8rem; color:#94a3b8;">${ev.breadcrumb || ev.target_name}</span>
-                  <span class="rel-badge">${ev.rel_type}</span>
+              <details class="evidence-accordion" id="ev-acc-${idx}">
+                <summary class="evidence-summary">
+                  <div class="evidence-header-left">
+                    <span class="evidence-icon">📄</span>
+                    <span class="evidence-breadcrumb" title="${escapeHtml(breadcrumb)}">${escapeHtml(breadcrumb)}</span>
+                  </div>
+                  <div class="evidence-meta-badges">
+                    ${bf && bf.found ? `
+                      <a href="${bf.view_url}" target="_blank" rel="noopener noreferrer" class="evidence-book-btn" title="Open source book: ${escapeHtml(bf.filename)}" onclick="event.stopPropagation();">
+                        📖 Open Book
+                      </a>
+                      <a href="${bf.download_url}" download class="evidence-download-btn" title="Download source book file" onclick="event.stopPropagation();">
+                        📥 Download
+                      </a>
+                    ` : ''}
+                    ${bookSource ? `<span class="evidence-tag">📚 ${escapeHtml(bookSource)}</span>` : ''}
+                    ${pageNum ? `<span class="evidence-tag">p.${escapeHtml(String(pageNum))}</span>` : ''}
+                    <span class="evidence-expand-badge">1-Click View ▾</span>
+                  </div>
+                </summary>
+                <div class="evidence-details-body">
+                  ${rawContent ? `<div class="evidence-text-content">${escapeHtml(rawContent)}</div>` : '<div style="color:var(--text-muted); font-style:italic;">No excerpt text stored for this chunk.</div>'}
+                  <div class="evidence-actions-row">
+                    <span class="wikilink" onclick="loadNodeDetails('${escapeHtml(ev.target_id)}')">[[${escapeHtml(ev.target_name)}]]</span>
+                    <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+                      ${bf && bf.found ? `
+                        <a href="${bf.view_url}" target="_blank" rel="noopener noreferrer" class="btn-book-action" title="Open source book document in new tab">📖 Open Book</a>
+                        <a href="${bf.download_url}" download class="btn-book-action" title="Download book file">📥 Download</a>
+                      ` : ''}
+                      ${bf && bf.external_url ? `
+                        <a href="${bf.external_url}" target="_blank" rel="noopener noreferrer" class="btn-book-action btn-book-external" title="View external source (arXiv)">🌐 arXiv</a>
+                      ` : ''}
+                      ${rawContent ? `<button class="debug-action-btn" onclick="copyToClipboard(${JSON.stringify(rawContent)}, this)">📋 Copy</button>` : ''}
+                      <button class="btn-focus-chunk" onclick="focusEvidenceNode('${escapeHtml(ev.target_id)}')">🎯 Center on Graph</button>
+                    </div>
+                  </div>
                 </div>
-                ${ev.quote ? `<div class="quote-box">"${ev.quote}"</div>` : ''}
-              </div>
+              </details>
             `;
           });
         }
@@ -993,7 +2680,7 @@
         if (cyInstance) {
           cyInstance.nodes().unselect();
           const targetCyNode = cyInstance.getElementById(nodeId);
-          if (targetCyNode) targetCyNode.select();
+          if (targetCyNode && targetCyNode.nonempty()) targetCyNode.select();
         }
 
       } catch (err) {
@@ -1001,45 +2688,362 @@
       }
     }
 
+    function formatBytes(bytes) {
+      if (!bytes || bytes <= 0) return '0 B';
+      const k = 1024;
+      const sizes = ['B', 'KB', 'MB', 'GB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    async function copyToClipboard(text, btn, successLabel = 'Copied!') {
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          const textarea = document.createElement('textarea');
+          textarea.value = text;
+          textarea.style.position = 'fixed';
+          textarea.style.left = '-9999px';
+          document.body.appendChild(textarea);
+          textarea.select();
+          document.execCommand('copy');
+          document.body.removeChild(textarea);
+        }
+        if (btn) {
+          const originalHtml = btn.innerHTML;
+          btn.classList.add('copied');
+          btn.innerHTML = `<span>✓</span> ${successLabel}`;
+          setTimeout(() => {
+            btn.classList.remove('copied');
+            btn.innerHTML = originalHtml;
+          }, 2000);
+        }
+      } catch (err) {
+        console.error('Failed to copy to clipboard:', err);
+        if (btn) {
+          btn.textContent = '❌ Failed';
+          setTimeout(() => { btn.textContent = '📋 Copy'; }, 2000);
+        }
+      }
+    }
+
+    function copyQueryFromHistory(idx, btn) {
+      const item = telemetryHistory[idx];
+      if (item && item.query) {
+        copyToClipboard(item.query, btn, 'Query Copied!');
+      }
+    }
+
+    function pasteQueryFromHistory(idx) {
+      const item = telemetryHistory[idx];
+      if (item && item.query) {
+        const input = document.getElementById('search-input');
+        input.value = item.query;
+        input.focus();
+        switchTab('graph');
+      }
+    }
+
+    let cypherFormatMode = localStorage.getItem('bookeeper_cypher_format') || 'props';
+
+    function serializeMapUnquotedKeys(obj) {
+      if (Array.isArray(obj)) {
+        return '[' + obj.map(serializeMapUnquotedKeys).join(', ') + ']';
+      }
+      if (obj !== null && typeof obj === 'object') {
+        const parts = Object.entries(obj).map(([k, v]) => {
+          const keyPart = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) ? k : JSON.stringify(k);
+          return `${keyPart}: ${serializeMapUnquotedKeys(v)}`;
+        });
+        return '{' + parts.join(', ') + '}';
+      }
+      return JSON.stringify(obj);
+    }
+
+    function formatBrowserCypher(exactCypher, parameters, formatMode) {
+      if (!exactCypher) return 'No query executed';
+      let query = exactCypher.trim();
+      const params = parameters || {};
+      const keys = Object.keys(params);
+
+      if (formatMode === 'props') {
+        for (const k of keys) {
+          const escapedKey = k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const regex = new RegExp('\\$' + escapedKey + '\\b', 'g');
+          query = query.replace(regex, '$obj.props.' + k);
+        }
+      }
+
+      if (keys.length > 0) {
+        const paramStr = serializeMapUnquotedKeys(params);
+        return `:param obj => ({props: ${paramStr}})\n\n${query}`;
+      }
+      return query;
+    }
+
+    function setCypherFormatMode(idx, mode) {
+      cypherFormatMode = mode;
+      localStorage.setItem('bookeeper_cypher_format', mode);
+      const item = telemetryHistory[idx];
+      if (item) {
+        item._cypherFormatMode = mode;
+      }
+      const box = document.getElementById(`cypher-box-${idx}`);
+      if (box && item && item.neo4j) {
+        box.textContent = formatBrowserCypher(item.neo4j.exact_cypher, item.neo4j.parameters, mode);
+      }
+      const card = document.getElementById(`debug-card-${idx}`);
+      if (card) {
+        const btns = card.querySelectorAll('.debug-toggle-btn');
+        btns.forEach(b => {
+          if (b.getAttribute('data-mode') === mode) {
+            b.classList.add('active');
+          } else {
+            b.classList.remove('active');
+          }
+        });
+      }
+    }
+
+    function copyCypherFromHistory(idx, btn) {
+      const item = telemetryHistory[idx];
+      if (item && item.neo4j) {
+        const mode = item._cypherFormatMode || cypherFormatMode || 'props';
+        const text = formatBrowserCypher(item.neo4j.exact_cypher, item.neo4j.parameters, mode);
+        const label = mode === 'props' ? 'Copied ($obj.props)!' : 'Copied ($param)!';
+        copyToClipboard(text, btn, label);
+      }
+    }
+
+    function toggleExpandCode(boxId, btn) {
+      const box = document.getElementById(boxId);
+      if (!box) return;
+      if (box.style.maxHeight === 'none') {
+        box.style.maxHeight = '380px';
+        btn.innerHTML = '<span>↕️</span> Expand';
+      } else {
+        box.style.maxHeight = 'none';
+        btn.innerHTML = '<span>🔼</span> Collapse';
+      }
+    }
+
+    function pasteCandidateTerm(term) {
+      const input = document.getElementById('search-input');
+      input.value = term;
+      input.focus();
+    }
+
+    function clearTelemetryHistory() {
+      telemetryHistory = [];
+      latestTelemetry = null;
+      const badge = document.getElementById('debug-count-badge');
+      if (badge) {
+        badge.textContent = '0';
+        badge.style.display = 'none';
+      }
+      renderDebugTab();
+    }
+
     function renderDebugTab() {
       const container = document.getElementById('debug-log-list');
       const badge = document.getElementById('debug-count-badge');
-      if (!latestTelemetry) return;
+      if (!container) return;
 
-      badge.style.display = 'inline-block';
-      badge.textContent = telemetryHistory.length;
+      if (!telemetryHistory || telemetryHistory.length === 0) {
+        if (badge) badge.style.display = 'none';
+        container.innerHTML = `
+          <div style="color: var(--text-muted); text-align: center; padding-top: 40px; font-size: 0.95rem;">
+            <div style="font-size: 2rem; margin-bottom: 12px;">🔍</div>
+            No telemetry logged yet. Execute a search query above to inspect exact Cypher statements, candidate terms, and graph retrieval metrics.
+          </div>
+        `;
+        return;
+      }
 
-      let html = '';
+      if (badge) {
+        badge.style.display = 'inline-block';
+        badge.textContent = telemetryHistory.length;
+      }
+
+      let html = `
+        <div class="debug-toolbar">
+          <div class="debug-toolbar-title">
+            Logged Telemetry & Cypher Queries (${telemetryHistory.length})
+          </div>
+          <button class="debug-action-btn" onclick="clearTelemetryHistory()" title="Clear telemetry history">
+            <span>🗑️</span> Clear History
+          </button>
+        </div>
+      `;
+
       telemetryHistory.forEach((t, idx) => {
         const timeStr = new Date(t.timestamp * 1000).toLocaleTimeString();
-        const rag = t.lightrag || {};
         const neo = t.neo4j || {};
+        const queryNum = telemetryHistory.length - idx;
+        const cypherBoxId = `cypher-box-${idx}`;
+        const currentMode = t._cypherFormatMode || cypherFormatMode || 'props';
+        const formattedCypher = formatBrowserCypher(neo.exact_cypher, neo.parameters, currentMode);
+
+        const emb = t.embedding_debug || {};
+        const pairwise = emb.pairwise_similarity || {};
+        const coreIdeas = t.core_ideas || [];
+
+        const coreIdeasHtml = coreIdeas.map((c, i) => {
+          const rank = c.rank || (i + 1);
+          return `
+          <div style="display:flex; justify-content:space-between; align-items:center; background:rgba(15,23,42,0.6); padding:8px 12px; border-radius:6px; margin-bottom:6px; font-size:0.83rem; border:1px solid rgba(255,255,255,0.06);">
+            <div style="display:flex; align-items:center; gap:8px;">
+              <span style="background:#312e81; color:#c7d2fe; font-size:0.75rem; font-weight:bold; padding:2px 6px; border-radius:4px; font-family:monospace;">#${rank}</span>
+              <strong style="color:#fbbf24; cursor:pointer;" onclick="pasteCandidateTerm('${escapeHtml(c.name)}')" title="Click to search idea">${escapeHtml(c.name)}</strong> 
+              <span style="color:var(--text-muted); font-size:0.75rem;">${escapeHtml(c.id)}</span>
+            </div>
+            <div style="font-family:monospace; font-size:0.8rem; display:flex; gap:12px; align-items:center;">
+              <span style="color:#60a5fa;" title="Embedding Cosine Similarity with User Query">cos: <strong>${c.cosine_similarity}</strong></span>
+              <span style="color:#c084fc;" title="Knowledge Graph Significance Weight">wt: <strong>${c.weight}</strong></span>
+              <span style="color:#34d399; font-weight:700; background:rgba(52,211,153,0.1); padding:2px 6px; border-radius:4px; border:1px solid rgba(52,211,153,0.25);" title="Final Priority Rate = Cosine × Weight">rate: ${c.priority_score}</span>
+              <span class="debug-tag ${c.threshold_met ? 'success' : 'info'}" style="font-size:0.7rem;">${c.threshold_met ? '≥ Threshold' : 'Relaxed'}</span>
+            </div>
+          </div>`;
+        }).join('') || '<span style="color:var(--text-muted);">No core ideas retrieved</span>';
+
+        let pairwiseHtml = '';
+        if (pairwise.matrix && pairwise.matrix.length > 1) {
+          const names = pairwise.names || [];
+          const mat = pairwise.matrix;
+          const ths = names.map((n, i) => `<th style="padding:6px; font-size:0.75rem; color:#a5b4fc;" title="${escapeHtml(n)}">#${i+1}</th>`).join('');
+          const rows = mat.map((row, i) => {
+            const rowCells = row.map((val, j) => {
+              const isDiag = (i === j);
+              let color = '#94a3b8';
+              let weight = 'normal';
+              if (isDiag) {
+                color = '#f59e0b';
+                weight = 'bold';
+              } else if (val >= 0.75) {
+                color = '#34d399';
+                weight = 'bold';
+              } else if (val >= 0.60) {
+                color = '#60a5fa';
+              }
+              return `<td style="padding:6px; color:${color}; font-weight:${weight}; background:${isDiag ? 'rgba(245,158,11,0.08)' : 'transparent'}; border:1px solid rgba(255,255,255,0.04);">${val.toFixed(3)}</td>`;
+            }).join('');
+            return `
+            <tr>
+              <td style="text-align:left; padding:6px 10px; color:#e2e8f0; font-size:0.75rem; white-space:nowrap; border:1px solid rgba(255,255,255,0.04);">
+                <span style="color:#a5b4fc; margin-right:4px;">#${i+1}</span> ${escapeHtml(names[i])}
+              </td>
+              ${rowCells}
+            </tr>`;
+          }).join('');
+
+          pairwiseHtml = `
+            <div style="margin-top:12px; background:rgba(15,23,42,0.55); border:1px solid rgba(255,255,255,0.06); border-radius:8px; padding:10px 12px;">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:4px;">
+                <span style="font-size:0.78rem; font-weight:700; color:#38bdf8; text-transform:uppercase; letter-spacing:0.5px;">
+                  Inter-Idea Pairwise Cosine Similarity Matrix (Cluster Affinity)
+                </span>
+                <span style="font-size:0.72rem; color:var(--text-muted);">
+                  Values indicate semantic cosine affinity between retrieved core ideas
+                </span>
+              </div>
+              <div style="overflow-x:auto;">
+                <table style="width:100%; border-collapse:collapse; font-size:0.76rem; font-family:monospace; text-align:center;">
+                  <thead>
+                    <tr style="background:rgba(30,41,59,0.5);">
+                      <th style="text-align:left; padding:6px 10px; color:var(--text-muted);">Core Idea</th>
+                      ${ths}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${rows}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          `;
+        }
 
         html += `
-          <div class="debug-card">
+          <div class="debug-card" id="debug-card-${idx}">
             <div class="debug-card-header">
-              <span>Query #${telemetryHistory.length - idx}: "${t.query}"</span>
-              <div style="display:flex; gap:8px;">
-                <span class="debug-tag ${rag.status === 'success' ? 'success' : 'error'}">LightRAG: ${rag.status || 'N/A'} (${rag.duration_seconds || 0}s)</span>
+              <div class="debug-query-title-row">
+                <span class="debug-query-badge">#${queryNum}</span>
+                <span class="debug-query-text" title="${escapeHtml(t.query)}">${escapeHtml(t.query)}</span>
+                <div class="debug-btn-group">
+                  <button class="debug-action-btn primary" onclick="copyQueryFromHistory(${idx}, this)" title="Copy natural language query to clipboard">
+                    <span>📋</span> Copy Query
+                  </button>
+                  <button class="debug-action-btn" onclick="pasteQueryFromHistory(${idx})" title="Load query into search bar and switch to graph">
+                    <span>🔍</span> Paste into Search
+                  </button>
+                </div>
+              </div>
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
                 <span class="debug-tag ${neo.status === 'success' ? 'success' : 'error'}">Neo4j: ${neo.status || 'N/A'} (${neo.duration_seconds || 0}s)</span>
+                <span class="debug-tag info">Nodes: ${neo.nodes_count || 0} | Edges: ${neo.edges_count || 0}</span>
                 <span class="debug-tag info">${timeStr}</span>
+              </div>
+            </div>
+
+            <!-- Denoise & Density Subgraph Breakdown -->
+            <div style="padding:10px 14px; border-bottom:1px solid var(--border); background:rgba(15, 23, 42, 0.45); font-size:0.82rem; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+              <div>
+                <strong style="color:#38bdf8;">Graph Detail & Denoise:</strong> 
+                <span style="color:#e2e8f0; margin-left:4px;">${t.denoise_summary ? t.denoise_summary.description : (t.denoise_level || 'standard')}</span>
+                <span style="color:var(--text-muted); font-size:0.75rem; margin-left:6px;">(Filters noisy raw text chunks to prioritize conceptual idea connections)</span>
+              </div>
+              <div style="display:flex; gap:6px; font-family:monospace; font-size:0.75rem;">
+                <span class="debug-tag info">Ideas: ${t.denoise_summary ? t.denoise_summary.ideas_count : 'N/A'}</span>
+                <span class="debug-tag info">Books: ${t.denoise_summary ? t.denoise_summary.books_count : 'N/A'}</span>
+                <span class="debug-tag info">Sections: ${t.denoise_summary ? t.denoise_summary.sections_count : 'N/A'}</span>
+                <span class="debug-tag info">Chunks: ${t.denoise_summary ? t.denoise_summary.chunks_count : 'N/A'}</span>
               </div>
             </div>
             
             <div style="padding:14px; border-bottom:1px solid var(--border); background:rgba(30, 41, 59, 0.4);">
-              <h4 style="font-size:0.85rem; color:#818cf8; margin-bottom:6px;">1. Exact Prompt sent to LightRAG:</h4>
-              <div class="debug-code-box">${rag.exact_query || t.query} (mode: ${rag.mode || 'hybrid'}, top_k: ${rag.top_k})</div>
-            </div>
-
-            <div style="padding:14px; border-bottom:1px solid var(--border); background:rgba(30, 41, 59, 0.2);">
-              <h4 style="font-size:0.85rem; color:#34d399; margin-bottom:6px;">2. Raw Response & Identified Concepts from LightRAG:</h4>
-              <div style="margin-bottom:8px; font-size:0.85rem;"><strong>Identified Concepts:</strong> ${(rag.identified_concepts || []).map(c => `<code>${c}</code>`).join(', ') || 'None'}</div>
-              <div class="debug-code-box">${rag.raw_response || rag.note || rag.error || 'No response.'}</div>
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:6px;">
+                <h4 style="font-size:0.85rem; color:#818cf8; margin:0;">1. Core Ideas via Embeddings (Priority Rate = Cosine × Node Weight):</h4>
+                <div style="display:flex; gap:6px; font-family:monospace; font-size:0.75rem;">
+                  <span class="debug-tag info">Model: ${emb.model_name || 'bge-m3:latest'} (${emb.dimensions || 1024}d)</span>
+                  <span class="debug-tag info">Threshold: ≥ ${t.similarity_threshold !== undefined ? t.similarity_threshold : 0.7}</span>
+                  <span class="debug-tag success">Candidates Met: ${emb.candidates_above_threshold_count !== undefined ? emb.candidates_above_threshold_count : coreIdeas.length}</span>
+                  <span class="debug-tag info">Retrieved: ${coreIdeas.length} / ${emb.top_k_requested || t.top_k_seeds || 6}</span>
+                </div>
+              </div>
+              <div style="margin-bottom:6px;">${coreIdeasHtml}</div>
+              ${pairwiseHtml}
             </div>
 
             <div style="padding:14px; background:rgba(30, 41, 59, 0.4);">
-              <h4 style="font-size:0.85rem; color:#f59e0b; margin-bottom:6px;">3. Exact Cypher Executed in Neo4j:</h4>
-              <div class="debug-code-box">${neo.exact_cypher || 'No query executed'}\n\n// Parameters: ${JSON.stringify(neo.parameters || {}, null, 2)}</div>
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:8px;">
+                <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                  <h4 style="font-size:0.85rem; color:#f59e0b; margin:0;">2. Cypher & Browser Parameters:</h4>
+                  <div class="debug-toggle-group" title="Switch parameter interpolation format ($obj.props vs $param)">
+                    <button class="debug-toggle-btn ${currentMode === 'props' ? 'active' : ''}" data-mode="props" onclick="setCypherFormatMode(${idx}, 'props')">$obj.props</button>
+                    <button class="debug-toggle-btn ${currentMode === 'param' ? 'active' : ''}" data-mode="param" onclick="setCypherFormatMode(${idx}, 'param')">$param</button>
+                  </div>
+                </div>
+                <div class="debug-btn-group">
+                  <button class="debug-action-btn" onclick="toggleExpandCode('${cypherBoxId}', this)" title="Toggle full height">
+                    <span>↕️</span> Expand
+                  </button>
+                  <button class="debug-action-btn primary" onclick="copyCypherFromHistory(${idx}, this)" title="Copy Cypher query formatted for browser to clipboard">
+                    <span>📋</span> Copy Cypher
+                  </button>
+                </div>
+              </div>
+              <div class="debug-code-box" id="${cypherBoxId}">${escapeHtml(formattedCypher)}</div>
             </div>
           </div>
         `;
@@ -1048,18 +3052,348 @@
       container.innerHTML = html;
     }
 
+    let activeContextMenuNodeId = null;
+
+    function showNodeContextMenu(evt) {
+      const node = evt.target;
+      activeContextMenuNodeId = node.data('id');
+      const fullName = node.data('fullName') || node.data('label') || activeContextMenuNodeId;
+      const category = node.data('category') || (node.data('is_seed') ? 'Core Idea' : 'Node');
+
+      const titleEl = document.getElementById('ctx-node-title');
+      const badgeEl = document.getElementById('ctx-node-badge');
+      const iconEl = document.getElementById('ctx-node-icon');
+
+      if (titleEl) {
+        titleEl.textContent = fullName;
+        titleEl.title = fullName;
+      }
+      if (badgeEl) {
+        badgeEl.textContent = category;
+      }
+      if (iconEl) {
+        let icon = '💡';
+        if (category === 'Book') icon = '📚';
+        else if (category === 'Chunk') icon = '📄';
+        else if (category === 'Section') icon = '📑';
+        else if (node.data('is_seed')) icon = '🧠';
+        iconEl.textContent = icon;
+      }
+
+      const menu = document.getElementById('node-context-menu');
+      if (!menu) return;
+
+      menu.style.display = 'block';
+
+      const col = document.querySelector('.graph-column');
+      const colRect = col.getBoundingClientRect();
+
+      const clientX = evt.originalEvent ? evt.originalEvent.clientX : (evt.renderedPosition.x + colRect.left);
+      const clientY = evt.originalEvent ? evt.originalEvent.clientY : (evt.renderedPosition.y + colRect.top);
+
+      let left = clientX - colRect.left;
+      let top = clientY - colRect.top;
+
+      const menuWidth = 280;
+      const menuHeight = 310;
+      if (left + menuWidth > colRect.width) {
+        left = Math.max(10, colRect.width - menuWidth - 10);
+      }
+      if (top + menuHeight > colRect.height) {
+        top = Math.max(10, colRect.height - menuHeight - 10);
+      }
+
+      menu.style.left = `${left}px`;
+      menu.style.top = `${top}px`;
+    }
+
+    function hideNodeContextMenu() {
+      const menu = document.getElementById('node-context-menu');
+      if (menu) menu.style.display = 'none';
+    }
+
+    async function expandTargetNode(typeFilter) {
+      const nodeId = activeContextMenuNodeId;
+      hideNodeContextMenu();
+      if (!nodeId || !cyInstance) return;
+
+      showToast(`Expanding neighborhood (${typeFilter})...`);
+
+      try {
+        const resp = await fetch('/api/node/expand', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: nodeId, type_filter: typeFilter, limit: 50 })
+        });
+        const data = await resp.json();
+        if (data.error) {
+          showToast('Expansion error: ' + data.error);
+          return;
+        }
+
+        const newElements = [];
+        let addedNodes = 0;
+        let addedEdges = 0;
+
+        (data.nodes || []).forEach(n => {
+          if (cyInstance.getElementById(n.id).length === 0) {
+            newElements.push({
+              group: 'nodes',
+              data: getNodeVisualData(n)
+            });
+            addedNodes++;
+          }
+        });
+
+        (data.edges || []).forEach(e => {
+          if (cyInstance.getElementById(e.id).length === 0) {
+            const edgeWeight = e.weight || (e.properties && e.properties.weight) || 5;
+            newElements.push({
+              group: 'edges',
+              data: {
+                id: e.id,
+                source: e.source,
+                target: e.target,
+                label: e.type ? e.type.replace(/_/g, ' ').toLowerCase() : '',
+                weight: edgeWeight,
+                lineColor: e.line_color || (edgeWeight >= 7 ? '#818cf8' : (edgeWeight < 4 ? '#334155' : '#475569')),
+                opacity: e.opacity || (edgeWeight >= 7 ? 0.9 : 0.5)
+              }
+            });
+            addedEdges++;
+          }
+        });
+
+        if (newElements.length > 0) {
+          cyInstance.add(newElements);
+
+          // If chunks or sections were expanded, make sure evidence visibility is active
+          if ((typeFilter === 'Chunk' || typeFilter === 'Section') && !evidenceVisible) {
+            evidenceVisible = true;
+          }
+
+          updateEvidenceButtonState();
+          applyEvidenceVisibility();
+
+          // Smoothly animate & layout visible nodes
+          const visibleNodes = cyInstance.nodes(':visible');
+          if (visibleNodes.length > 0) {
+            visibleNodes.layout(getGraphLayout(currentGraphLayout || 'concentric')).run();
+          }
+
+          showToast(`Expanded +${addedNodes} node(s), +${addedEdges} edge(s)`);
+        } else {
+          showToast('All connected neighbors of this type are already on canvas');
+        }
+
+      } catch (err) {
+        showToast('Expansion request failed: ' + err.message);
+      }
+    }
+
+    function openDetailsFromContextMenu() {
+      const nodeId = activeContextMenuNodeId;
+      hideNodeContextMenu();
+      if (nodeId) {
+        loadNodeDetails(nodeId);
+        if (cyInstance) {
+          const target = cyInstance.getElementById(nodeId);
+          if (target && target.nonempty()) {
+            cyInstance.nodes().unselect();
+            target.select();
+          }
+        }
+      }
+    }
+
+    function showToast(msg) {
+      let toast = document.getElementById('app-toast');
+      if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'app-toast';
+        toast.className = 'app-toast';
+        document.body.appendChild(toast);
+      }
+      toast.textContent = msg;
+      toast.classList.add('show');
+      clearTimeout(toast._timeout);
+      toast._timeout = setTimeout(() => {
+        toast.classList.remove('show');
+      }, 3000);
+    }
+
+    // Proportional Splitter Dragging & Panel Persistence
+    function initSplitter() {
+      const resizer = document.getElementById('pane-resizer');
+      const container = document.querySelector('.results-container');
+      const detailPanel = document.getElementById('detail-panel');
+      if (!resizer || !container || !detailPanel) return;
+
+      // Restore saved width from localStorage
+      const savedWidth = localStorage.getItem('bookeeper_panel_width');
+      if (savedWidth) {
+        const parsed = parseInt(savedWidth, 10);
+        if (!isNaN(parsed) && parsed >= 260) {
+          detailPanel.style.width = `${parsed}px`;
+        }
+      }
+
+      // Restore collapsed state
+      const isCollapsed = localStorage.getItem('bookeeper_panel_collapsed') === 'true';
+      if (isCollapsed) {
+        setDetailPanelCollapsed(true, false);
+      }
+
+      let isDragging = false;
+
+      resizer.addEventListener('mousedown', function(e) {
+        e.preventDefault();
+        isDragging = true;
+        resizer.classList.add('dragging');
+        detailPanel.classList.add('resizing');
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+
+        const onMouseMove = function(e) {
+          if (!isDragging) return;
+          const containerRect = container.getBoundingClientRect();
+          let newWidth = containerRect.right - e.clientX;
+          const minWidth = 260;
+          const maxWidth = Math.max(minWidth, containerRect.width - 320);
+
+          if (newWidth < minWidth) newWidth = minWidth;
+          if (newWidth > maxWidth) newWidth = maxWidth;
+
+          detailPanel.style.width = `${newWidth}px`;
+          if (cyInstance) cyInstance.resize();
+        };
+
+        const onMouseUp = function() {
+          if (!isDragging) return;
+          isDragging = false;
+          resizer.classList.remove('dragging');
+          detailPanel.classList.remove('resizing');
+          document.body.style.cursor = '';
+          document.body.style.userSelect = '';
+          window.removeEventListener('mousemove', onMouseMove);
+          window.removeEventListener('mouseup', onMouseUp);
+
+          const finalWidth = parseInt(detailPanel.style.width, 10);
+          if (!isNaN(finalWidth)) {
+            localStorage.setItem('bookeeper_panel_width', finalWidth);
+          }
+          if (cyInstance) {
+            cyInstance.resize();
+          }
+        };
+
+        window.addEventListener('mousemove', onMouseMove);
+        window.addEventListener('mouseup', onMouseUp);
+      });
+
+      // Double-click resizer to reset to 40%
+      resizer.addEventListener('dblclick', function() {
+        const containerRect = container.getBoundingClientRect();
+        const defaultWidth = Math.round(containerRect.width * 0.4);
+        detailPanel.style.width = `${defaultWidth}px`;
+        localStorage.setItem('bookeeper_panel_width', defaultWidth);
+        if (cyInstance) cyInstance.resize();
+        showToast(`Reset description width to 40% (${defaultWidth}px)`);
+      });
+    }
+
+    function isDetailPanelCollapsed() {
+      const panel = document.getElementById('detail-panel');
+      return panel && panel.classList.contains('collapsed');
+    }
+
+    function toggleDetailPanel(forceState = null) {
+      const panel = document.getElementById('detail-panel');
+      if (!panel) return;
+
+      const shouldCollapse = forceState !== null ? forceState : !panel.classList.contains('collapsed');
+      setDetailPanelCollapsed(shouldCollapse, true);
+    }
+
+    function setDetailPanelCollapsed(collapse, savePreference = true) {
+      const panel = document.getElementById('detail-panel');
+      const resizer = document.getElementById('pane-resizer');
+      const unfoldBtn = document.getElementById('btn-unfold-panel');
+      if (!panel) return;
+
+      if (collapse) {
+        panel.classList.add('collapsed');
+        if (resizer) resizer.style.display = 'none';
+        if (unfoldBtn) unfoldBtn.style.display = 'flex';
+        if (savePreference) localStorage.setItem('bookeeper_panel_collapsed', 'true');
+        showToast('Description panel folded (100% Graph view)');
+      } else {
+        panel.classList.remove('collapsed');
+        if (resizer) resizer.style.display = '';
+        if (unfoldBtn) unfoldBtn.style.display = 'none';
+        if (savePreference) localStorage.setItem('bookeeper_panel_collapsed', 'false');
+      }
+
+      if (cyInstance) {
+        setTimeout(() => {
+          cyInstance.resize();
+          cyInstance.fit(30);
+        }, 50);
+      }
+    }
+
     function cyResetZoom() {
       if (cyInstance) cyInstance.fit(30);
     }
 
     function cyReLayout(layoutName) {
-      if (cyInstance) cyInstance.layout({ name: layoutName, animate: true, animationDuration: 400 }).run();
+      if (!cyInstance) return;
+      currentGraphLayout = layoutName;
+      document.querySelectorAll('.graph-controls .ctrl-btn[data-layout]').forEach(b => {
+        if (b.getAttribute('data-layout') === layoutName) {
+          b.classList.add('active');
+        } else {
+          b.classList.remove('active');
+        }
+      });
+      const visibleNodes = cyInstance.nodes(':visible');
+      if (visibleNodes.length > 0) {
+        visibleNodes.layout(getGraphLayout(layoutName)).run();
+      } else {
+        cyInstance.layout(getGraphLayout(layoutName)).run();
+      }
     }
 
-    // Auto-initialize Cytoscape and check LightRAG server status on page load
+    // Auto-initialize Cytoscape and input event handlers on page load
     window.addEventListener('DOMContentLoaded', () => {
       initCytoscape();
-      checkLightRAGStatus();
+      initSplitter();
+      const input = document.getElementById('search-input');
+      if (input) {
+        input.addEventListener('input', function() {
+          const clearBtn = document.getElementById('search-clear-btn');
+          if (clearBtn) clearBtn.style.display = this.value.trim().length > 0 ? 'block' : 'none';
+        });
+      }
+
+      // Prevent native browser context menu on canvas area
+      const graphCol = document.querySelector('.graph-column');
+      if (graphCol) {
+        graphCol.addEventListener('contextmenu', function(e) {
+          e.preventDefault();
+        });
+      }
+
+      // Hide context menu on outside click or Escape key
+      document.addEventListener('click', function(e) {
+        const menu = document.getElementById('node-context-menu');
+        if (menu && menu.style.display === 'block' && !menu.contains(e.target)) {
+          hideNodeContextMenu();
+        }
+      });
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') hideNodeContextMenu();
+      });
     });
   </script>
 </body>

@@ -73,6 +73,55 @@ If you already have a completed verification run for Branch A, you can compare a
 ./scripts/ab_test.sh vs ./ab_test_runs/run_20261010_120000/branch_A/verification_report.json feature-dual-pass 5
 ```
 
+#### Mode 4: Bookkeeper Knowledge Graph vs. LightRAG Benchmark
+
+Directly benchmarks Bookkeeper's structured Knowledge Graph against LightRAG's native raw text chunking engine on the exact same $N$ books. The benchmark is split into **3 distinct phases** with **safe points** between runs:
+
+1. **Phase 1: Bookkeeper Analysis & Knowledge Graph Generation (Safe Point 1)**:
+   - Indexes $N$ books into Bookkeeper (hierarchical chunking, idea extraction, dual-pass post-processing from `config.yaml`).
+   - Generates `output/knowledge_graph.json` and updates Neo4j.
+   - **Safe Point 1** is recorded in `benchmark_checkpoint.json`. If a pre-computed knowledge graph already exists, Phase 1 can be skipped automatically without re-indexing.
+2. **Phase 2: LightRAG Data Ingestion & Native Chunking (Safe Point 2)**:
+   - Ingests the exact same $N$ books into LightRAG directly (`LightRAGRawIndexer`), using raw full-text input and LightRAG's native token-based chunker.
+   - Operates on a dedicated, persistent event loop thread to prevent `PriorityQueue is bound to a different event loop` worker issues.
+   - Persists per-book progress in `indexed_books.json` and records **Safe Point 2** in `benchmark_checkpoint.json`. If indexing is interrupted or if Phase 2 was already completed, it resumes without re-processing.
+3. **Phase 3: Dual Retrieval & Objective Verification Queries (Safe Point 3)**:
+   - **Subject-Matter Queries**: Queries name concrete mechanisms, algorithms, models, and failure modes directly. Meta-references (*"in this book"*, *"the author"*, *"in chapter X"*, *"according to the paper"*) are strictly sanitized because queries run against a global aggregated knowledge base.
+   - **Binary Invariant Verification Checklist**: Each query is paired with 3–4 boolean criteria ([`ChecklistItem`](file:///Users/serg/repos/bookeeper/src/bookeeper/evaluation/question_generator.py)) including positive mechanisms (`expected: true`) and negative anti-hallucination distractor checks (`expected: false`).
+   - **Dual Retrieval & Objective LLM Judge**: Submits queries to Bookkeeper (`SearchEngineBackend` with Neo4j or local graph fallback) and LightRAG (`LightRAGService`). The LLM Judge verifies retrieved context against the invariant checklist.
+   - **Reporting**: Generates `ab_test_summary.md` with pass rates and deltas, and saves `benchmark_report.json`.
+
+```bash
+# 1. Run complete end-to-end benchmark (Phases 1-3):
+bookeeper ab-benchmark 3
+
+# 2. Continue from Phase 2 (reuse pre-computed Bookkeeper graph, index LightRAG, and run queries):
+bookeeper ab-benchmark 3 --from-phase 2
+
+# 3. Continue from Phase 3 (run queries across pre-computed Bookkeeper & LightRAG storages):
+bookeeper ab-benchmark 3 --from-phase 3
+
+# 4. Execute ONLY a specific phase:
+bookeeper ab-benchmark 3 --phase bookkeeper  # Run only Phase 1
+bookeeper ab-benchmark 3 --phase lightrag    # Run only Phase 2
+bookeeper ab-benchmark 3 --phase benchmark   # Run only Phase 3
+
+# 5. Using the ab_test.py automation runner:
+./scripts/ab_test.py --vs-lightrag --books 3 --from-phase 2
+./scripts/ab_test.py --vs-lightrag --books 3 --phase lightrag
+
+# 6. Discard previous safe points and rebuild completely from scratch:
+bookeeper ab-benchmark 3 --clean
+
+# 7. Use an existing or curated question library:
+bookeeper ab-benchmark 3 --questions questions.json
+
+# 8. Launch the interactive LightRAG WebUI & Graph Visualizer on test results:
+bookeeper lightrag-ui
+# Or point directly to a specific A/B benchmark run directory:
+bookeeper lightrag-ui --lightrag-dir ab_test_runs/run_20261014_144807
+```
+
 ---
 
 ## 3. Configuration Overlays (`config-a.yaml` & `config-b.yaml`)
@@ -165,12 +214,40 @@ At the conclusion of the verification phase, the A/B test harness automatically 
 
 ---
 
-## 6. Full CLI Reference
+## 6. Phase 3 Dual-Level Query Execution & Keyword Extraction
 
+During Phase 3, both Bookkeeper (hierarchical ideas/deep/exact search) and LightRAG (hybrid/local/global search) execute against identical evaluation questions:
+- **LightRAG Dual Retrieval**: LightRAG combines local subgraphs (entity-level) and global summaries (relationship-level).
+- **Keyword Extraction Resilience**: LightRAG automatically extracts `high_level_keywords` and `low_level_keywords` using the configured LLM. Bookkeeper ensures structured JSON enforcement with Ollama, normalizes `keep_alive` values (numeric `-1` duration vs string duration), and applies an automated fallback extractor directly from the query terms if either keyword tier is missing or unparseable.
+- **Fail-Safe Retrieval**: If keyword extraction produces an empty list, terms are balanced between tiers so graph traversal and vector chunk extraction never abort or trigger default empty responses.
+
+---
+
+## 7. Knowledge Graph Structural Topology Comparison
+
+Both engines maintain an underlying graph structure that is compared directly in `ab_test_summary.md` and `benchmark_report.json`:
+- **Nodes Count**: Total distinct entities, concepts, sections, and ideas extracted into the graph.
+- **Edges Count**: Total cross-link relationships, structural links, and thematic edges.
+- **Relational Density**: Edge-to-node connectivity ratio ($|E| / |V|$), measuring relational cross-referencing depth.
+- **Chunk Breakdown**: Number of hierarchical source chunks vs. flat token chunks.
+
+| Graph Structural Metric | Bookkeeper (A) | LightRAG (B) | Comparison / Delta |
+| :--- | :---: | :---: | :---: |
+| **Total Graph Nodes** | Extracted ideas, concepts, sections | Named entities and concepts | Node density ratio |
+| **Total Graph Edges** | Multi-hop thematic & semantic links | Relationship co-occurrences | Relational link ratio |
+| **Connectivity Density** | Edges per node | Edges per node | Graph density delta |
+| **Indexed Chunks** | Hierarchical chunks | Flat token chunks | Context granularity |
+
+---
+
+## 8. Full CLI Reference
+
+### 8.1 `scripts/ab_test.py`
 ```text
 usage: ab_test.py [-h] [--books N] [--percent P] [--timeout SEC]
                   [--config PATH] [--config-a PATH] [--config-b PATH]
                   [--blocks N] [--output-dir DIR]
+                  [--vs-lightrag] [--questions PATH] [--questions-per-book N]
                   [branch_a] [branch_b]
 
 positional arguments:
@@ -186,11 +263,71 @@ options:
   --config-b PATH      Optional overlay configuration for Case B
   --blocks N           Number of chunk blocks to evaluate in cross-check (default: 10)
   --output-dir DIR     Custom root destination for test runs
+  --vs-lightrag        Run A/B benchmark against LightRAG engine
+  --questions PATH     Path to pre-generated QuestionLibrary JSON
+  --questions-per-book Questions to generate per book if synthesizing library (default: 5)
+```
+
+### 8.2 `bookeeper ab-benchmark`
+```text
+Usage: bookeeper ab-benchmark [OPTIONS] [NUM_BOOKS]
+
+  Run an end-to-end comparative A/B benchmark between Bookkeeper and LightRAG.
+
+Arguments:
+  [NUM_BOOKS]            Number of books to benchmark [default: 3]
+
+Options:
+  -q, --questions PATH   Path to existing question library JSON
+  -k, --questions-per-book INTEGER
+                         Number of questions per book if generating [default: 5]
+  -m, --lightrag-mode TEXT
+                         LightRAG query mode (hybrid/local/global/naive) [default: hybrid]
+  -b, --bookkeeper-mode TEXT
+                         Bookkeeper search mode (ideas/deep/exact) [default: ideas]
+  -j, --judge-model TEXT Judge / verification model name
+  -o, --output-dir PATH  Custom output directory for benchmark reports
+  -s, --skip-lightrag-indexing
+                         Skip LightRAG ingestion and reuse existing storage
+```
+
+### 8.3 `bookeeper generate-questions`
+```text
+Usage: bookeeper generate-questions [OPTIONS] [NUM_BOOKS]
+
+  Generate an evaluation question library for N books using the verification
+  model pool with subject-matter queries and binary invariant checklists.
+
+Arguments:
+  [NUM_BOOKS]            Number of books to include [default: 3]
+
+Options:
+  -k, --questions-per-book INTEGER
+                         Questions to generate per book [default: 5]
+  -o, --output PATH      Destination path for generated question library JSON
+  -m, --model TEXT       LLM model to use (defaults to verification model)
+  -t, --timeout INTEGER  Ollama request timeout in seconds [default: 180]
+```
+
+### 8.4 `bookeeper lightrag-index`
+```text
+Usage: bookeeper lightrag-index [OPTIONS] [NUM_BOOKS]
+
+  Index N books into LightRAG directly using raw book text (natural chunking)
+  for direct A/B baseline comparison.
+
+Arguments:
+  [NUM_BOOKS]            Number of books to index [default: 3]
+
+Options:
+  -w, --working-dir PATH Custom LightRAG storage directory
+  -c, --clean            Clear existing LightRAG working directory before indexing
+  -f, --file PATH        Index a specific book file directly
 ```
 
 ---
 
-## 7. Next Steps
+## 9. Next Steps
 
 - 🛡️ **[Factual Verification & Auditing](verification.md)** — Detailed breakdown of verification modes and NLI cross-checking.
 - 🏗️ **[Building the Knowledge Graph](building-graph.md)** — Core graph extraction options and rebuilds.

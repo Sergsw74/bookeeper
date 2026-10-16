@@ -5621,35 +5621,20 @@ def ui_command(
     host: str = typer.Option("127.0.0.1", "--host", "-h", help="Host interface to bind the web server (default: 127.0.0.1)."),
     port: int = typer.Option(8000, "--port", "-p", help="HTTP port to listen on (default: 8000)."),
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml configuration file."),
-    lightrag_dir: Optional[str] = typer.Option(None, "--lightrag-dir", help="Path to LightRAG storage directory."),
-    start_lightrag_server: bool = typer.Option(False, "--lightrag-server", help="Also start embedded LightRAG FastAPI server with official WebUI/Workspace on port 9621."),
-    lightrag_port: int = typer.Option(9621, "--lightrag-port", help="Port for the embedded LightRAG server (default: 9621)."),
 ):
     """
-    Launch the interactive Bookeeper Idea-Based Search Engine Web UI.
-    Provides a central natural language search bar, an interactive 2-column results pane
+    Launch the interactive Bookeeper Idea-Based Search Engine Web UI and REST API.
+    Provides a central idea search bar, interactive 2-column results pane
     (Cytoscape Neo4j graph on the left, Obsidian-style detail note on the right),
-    an embedded LightRAG WebUI tab, and an observability Debug Tab displaying exact LightRAG and Neo4j telemetry.
+    an observability Debug Tab, and a LightRAG-compatible query API (/query).
     """
     from bookeeper.ui.backend import SearchEngineBackend
-    from bookeeper.ui.lightrag_server import LightRAGServerManager
     from bookeeper.ui.server import run_server
 
     cfg = _get_effective_settings(config_path)
-    target_lightrag = Path(lightrag_dir).expanduser().resolve() if lightrag_dir else cfg.resolved_lightrag_dir
+    backend = SearchEngineBackend(config=cfg, neo4j_config=cfg.neo4j)
 
-    backend = SearchEngineBackend(config=cfg, lightrag_dir=target_lightrag, neo4j_config=cfg.neo4j)
-
-    lightrag_mgr = None
-    if start_lightrag_server:
-        console.print(f"[cyan]Initializing embedded LightRAG FastAPI server on {host}:{lightrag_port}...[/cyan]")
-        lightrag_mgr = LightRAGServerManager(config=cfg, working_dir=target_lightrag, host=host, port=lightrag_port)
-        if lightrag_mgr.start():
-            console.print(f"[bold green]✓ Embedded LightRAG WebUI active at:[/bold green] [bold cyan]{lightrag_mgr.webui_url}[/bold cyan]")
-        else:
-            console.print(f"[yellow]Warning: Could not start embedded LightRAG server on port {lightrag_port}.[/yellow]")
-
-    server = run_server(host=host, port=port, backend=backend, lightrag_mgr=lightrag_mgr, auto_port=True)
+    server = run_server(host=host, port=port, backend=backend, auto_port=True)
     actual_port = server.server_port
 
     if actual_port != port:
@@ -5657,11 +5642,8 @@ def ui_command(
 
     console.print(f"\n[bold cyan]Starting Bookeeper Idea-Based Search Engine UI...[/bold cyan]")
     console.print(f"  • [bold white]Web Interface:[/bold white] [bold green]http://{host}:{actual_port}/[/bold green]")
-    if lightrag_mgr and lightrag_mgr.is_alive():
-        console.print(f"  • [bold white]LightRAG WebUI:[/bold white] [bold cyan]{lightrag_mgr.webui_url}[/bold cyan]")
-        console.print(f"  • [bold white]LightRAG Workspace:[/bold white] [bold cyan]{lightrag_mgr.workspace_url}[/bold cyan]")
+    console.print(f"  • [bold white]Query API:[/bold white] [bold cyan]http://{host}:{actual_port}/query[/bold cyan] [dim](LightRAG compatible)[/dim]")
     console.print(f"  • [bold white]Neo4j URI:[/bold white] {cfg.neo4j.uri} (database: '{cfg.neo4j.database}')")
-    console.print(f"  • [bold white]LightRAG Storage:[/bold white] {target_lightrag}")
     console.print("[dim]Press Ctrl+C to terminate the web server.[/dim]\n")
 
     try:
@@ -5671,8 +5653,28 @@ def ui_command(
     finally:
         server.server_close()
         backend.close()
-        if lightrag_mgr:
-            lightrag_mgr.stop()
+
+
+@app.command("search")
+def search_command(
+    query_text: str = typer.Argument(..., help="Idea name or concept query string to search."),
+    mode: str = typer.Option("ideas", "--mode", "-m", help="Search mode: 'ideas', 'deep' (2-hop), or 'exact'."),
+    top_k: int = typer.Option(10, "--top-k", "-k", help="Maximum ideas to retrieve."),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+):
+    """
+    Search ideas directly in the Bookkeeper Knowledge Graph.
+    Retrieves matching ideas and their surrounding neighborhood notes (connected ideas, books, evidence).
+    """
+    from bookeeper.ui.backend import SearchEngineBackend
+    cfg = _get_effective_settings(config_path)
+    backend = SearchEngineBackend(config=cfg, neo4j_config=cfg.neo4j)
+    try:
+        with console.status(f"[bold cyan]Searching ideas for '{query_text}'...[/bold cyan]"):
+            result = backend.query_ideas(query=query_text, mode=mode, top_k=top_k)
+        console.print(Panel(result["answer"], title=f"[bold green]Bookkeeper Idea Search Results[/bold green]", border_style="green"))
+    finally:
+        backend.close()
 
 
 @app.command("lightrag-ui")
@@ -5689,11 +5691,26 @@ def lightrag_ui_command(
     from bookeeper.ui.lightrag_server import LightRAGServerManager
 
     cfg = _get_effective_settings(config_path)
-    target_lightrag = Path(lightrag_dir).expanduser().resolve() if lightrag_dir else cfg.resolved_lightrag_dir
+    if lightrag_dir:
+        target_lightrag = Path(lightrag_dir).expanduser().resolve()
+        if (target_lightrag / "lightrag_storage").is_dir():
+            target_lightrag = target_lightrag / "lightrag_storage"
+        elif (target_lightrag / "output" / "lightrag_storage").is_dir():
+            target_lightrag = target_lightrag / "output" / "lightrag_storage"
+    else:
+        target_lightrag = cfg.resolved_lightrag_dir
+        if not (target_lightrag / "graph_chunk_entity_relation.graphml").is_file():
+            # Check for most recent A/B test run storage
+            for candidate_root in [Path("ab_test_runs"), Path("output/ab_test_runs")]:
+                if candidate_root.is_dir():
+                    runs = sorted(candidate_root.glob("run_*/lightrag_storage"), key=lambda p: p.stat().st_mtime, reverse=True)
+                    if runs and (runs[0] / "graph_chunk_entity_relation.graphml").is_file():
+                        target_lightrag = runs[0].resolve()
+                        break
 
     if not target_lightrag.exists():
         console.print(f"[bold red]LightRAG storage directory not found:[/bold red] {target_lightrag}")
-        console.print("[yellow]Please run 'bookeeper build-graph --lightrag' first to populate the storage.[/yellow]")
+        console.print("[yellow]Please run 'bookeeper ab-benchmark' or 'bookeeper build-graph --lightrag' first to populate the storage.[/yellow]")
         raise typer.Exit(1)
 
     console.print(f"\n[bold cyan]Starting Official LightRAG Server & WebUI...[/bold cyan]")
@@ -5718,6 +5735,278 @@ def lightrag_ui_command(
         console.print("\n[yellow]Shutting down LightRAG server...[/yellow]")
     finally:
         mgr.stop()
+
+
+@app.command("lightrag-index")
+def lightrag_index_command(
+    book_cnt: int = typer.Argument(1, metavar="BOOK-CNT", help="Number of books to index with LightRAG native chunking."),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    calibre_path: Optional[str] = typer.Option(None, "--calibre-path", help="Calibre library path or SMB mount."),
+    books_dir: Optional[str] = typer.Option(None, "--books-dir", help="Path to folder containing books/articles."),
+    lightrag_dir: Optional[str] = typer.Option(None, "--lightrag-dir", help="Working directory for LightRAG database."),
+    clean: bool = typer.Option(False, "--clean", help="Wipe existing LightRAG database before indexing."),
+):
+    """
+    Index N books into LightRAG directly using raw book text and LightRAG's native chunking.
+    Decoupled from Bookkeeper's core concept graph extraction for clean standalone indexing.
+    """
+    from bookeeper.calibre import get_book_client
+    from bookeeper.rag.lightrag_service import LightRAGRawIndexer
+
+    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir)
+    client = get_book_client(cfg, calibre_path=calibre_path, books_dir=books_dir)
+    all_books = client.list_books()
+
+    if not all_books:
+        console.print("[bold red]No books found in the specified book source.[/bold red]")
+        raise typer.Exit(1)
+
+    target_books_meta = all_books[:book_cnt]
+    export_dir = cfg.resolved_output_dir / "cache" / "books"
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    books_to_index = []
+    for b in target_books_meta:
+        bid = b.get("id")
+        bpath = b.get("path")
+        if not bpath or not Path(bpath).is_file():
+            try:
+                bpath = client.export_book(bid, target_dir=export_dir)
+            except Exception as e:
+                console.print(f"[yellow]Could not export book #{bid}: {e}[/yellow]")
+                continue
+        if bpath and Path(bpath).is_file():
+            books_to_index.append({"id": bid, "title": b.get("title", f"Book #{bid}"), "path": str(bpath)})
+
+    if not books_to_index:
+        console.print("[bold red]No valid book files could be prepared for LightRAG indexing.[/bold red]")
+        raise typer.Exit(1)
+
+    target_dir = Path(lightrag_dir).expanduser().resolve() if lightrag_dir else cfg.resolved_lightrag_dir
+    indexer = LightRAGRawIndexer(settings=cfg, working_dir=target_dir, console=console)
+    indexer.index_books(books=books_to_index, clean=clean, show_progress=True)
+
+
+@app.command("generate-questions")
+def generate_questions_command(
+    book_cnt: int = typer.Argument(1, metavar="BOOK-CNT", help="Number of books to generate evaluation questions for."),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Destination path for question library JSON (default: output/question_library.json)."),
+    questions_per_book: int = typer.Option(5, "--questions-per-book", "-q", help="Number of questions to generate per book."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Verification LLM model for question synthesis (default: from config)."),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    calibre_path: Optional[str] = typer.Option(None, "--calibre-path", help="Calibre library path or SMB mount."),
+    books_dir: Optional[str] = typer.Option(None, "--books-dir", help="Path to folder containing books/articles."),
+    timeout: int = typer.Option(180, "--timeout", "-t", help="Timeout in seconds per LLM request for question synthesis (default: 180s)."),
+):
+    """
+    Generate an evaluation question library for N books using the capable verification model.
+    Questions span concept definitions, relational trade-offs, factual mechanics, and thematic synthesis.
+    Saved to JSON for human review and revision prior to benchmarking.
+    """
+    from bookeeper.calibre import get_book_client
+    from bookeeper.evaluation.question_generator import QuestionGenerator
+
+    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir)
+    client = get_book_client(cfg, calibre_path=calibre_path, books_dir=books_dir)
+    all_books = client.list_books()
+
+    if not all_books:
+        console.print("[bold red]No books found in the specified book source.[/bold red]")
+        raise typer.Exit(1)
+
+    target_books_meta = all_books[:book_cnt]
+    export_dir = cfg.resolved_output_dir / "cache" / "books"
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    books_to_eval = []
+    for b in target_books_meta:
+        bid = b.get("id")
+        bpath = b.get("path")
+        if not bpath or not Path(bpath).is_file():
+            try:
+                bpath = client.export_book(bid, target_dir=export_dir)
+            except Exception:
+                pass
+        books_to_eval.append({
+            "id": bid,
+            "title": b.get("title", f"Book #{bid}"),
+            "path": str(bpath) if bpath and Path(bpath).is_file() else None,
+        })
+
+    out_file = Path(output).expanduser().resolve() if output else (cfg.resolved_output_dir / "question_library.json")
+    generator = QuestionGenerator(settings=cfg, model_name=model, timeout=timeout, console=console)
+
+    library = generator.generate_library(
+        books=books_to_eval,
+        questions_per_book=questions_per_book,
+        output_file=out_file,
+        show_progress=True,
+    )
+
+    console.print(
+        f"\n[bold green]✓ Question library successfully created:[/bold green] "
+        f"[bold white]{len(library.questions)}[/bold white] questions saved to [bold cyan]{out_file}[/bold cyan]\n"
+    )
+
+
+@app.command("ab-benchmark")
+def ab_benchmark_command(
+    book_cnt: int = typer.Argument(1, metavar="BOOK-CNT", help="Number of books to benchmark across Bookkeeper and LightRAG."),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    calibre_path: Optional[str] = typer.Option(None, "--calibre-path", help="Calibre library path or SMB mount."),
+    books_dir: Optional[str] = typer.Option(None, "--books-dir", help="Path to folder containing books/articles."),
+    questions_file: Optional[str] = typer.Option(None, "--questions", "-q", help="Path to existing question library JSON file (if omitted, questions are generated)."),
+    questions_per_book: int = typer.Option(5, "--questions-per-book", help="Questions to generate per book if --questions is not provided."),
+    output_dir: Optional[str] = typer.Option(None, "--output-dir", "-o", help="Target output session folder for benchmark artifacts and reports."),
+    from_phase: int = typer.Option(1, "--from-phase", help="Starting benchmark phase: 1 (Bookkeeper Analysis), 2 (LightRAG Analysis), 3 (Benchmark Queries). Default: 1."),
+    phase: Optional[str] = typer.Option(None, "--phase", help="Execute ONLY a single specific phase: '1'|'bookkeeper', '2'|'lightrag', '3'|'benchmark'."),
+    resume: bool = typer.Option(True, "--resume/--no-resume", "--continue/--no-continue", help="Resume from detected safe points (default: true)."),
+    clean: bool = typer.Option(False, "--clean", help="Discard previous safe points and rebuild from scratch."),
+    lightrag_mode: str = typer.Option("hybrid", "--lightrag-mode", help="Query mode for LightRAG ('hybrid', 'local', 'global')."),
+    bookkeeper_mode: str = typer.Option("ideas", "--bookkeeper-mode", help="Query mode for Bookkeeper ('ideas', 'deep')."),
+    judge_model: Optional[str] = typer.Option(None, "--judge-model", help="Dedicated LLM model for judging (default: verification model from config)."),
+    dual_pass: Optional[bool] = typer.Option(None, "--dual-pass/--no-dual-pass", "--postprocess-ideas/--no-postprocess-ideas", help="Execute two-pass idea postprocessing for Bookkeeper (default: from config.yaml)."),
+    skip_lightrag_indexing: bool = typer.Option(False, "--skip-lightrag-indexing", help="Skip re-indexing LightRAG if storage already exists."),
+    skip_bookkeeper_build: bool = typer.Option(False, "--skip-bookkeeper-build", help="Skip rebuilding Bookkeeper graph if already built."),
+):
+    """
+    Run an end-to-end comparative A/B benchmark between Bookkeeper and LightRAG:
+    - Phase 1: Bookkeeper indexes N books with post-processing (Safe Point 1).
+    - Phase 2: LightRAG indexes the exact same N books using raw text and native chunking (Safe Point 2).
+    - Phase 3: Synthesizes / loads question library, executes dual queries, and judges responses (Safe Point 3).
+    Supports resuming or starting from any phase with safe-point checkpoints.
+    """
+    from bookeeper.calibre import get_book_client
+    from bookeeper.evaluation.benchmark import ABBenchmarkRunner
+    from bookeeper.evaluation.question_generator import QuestionLibrary
+
+    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir)
+    client = get_book_client(cfg, calibre_path=calibre_path, books_dir=books_dir)
+    all_books = client.list_books()
+
+    if not all_books:
+        console.print("[bold red]No books found in the specified book source.[/bold red]")
+        raise typer.Exit(1)
+
+    target_books_meta = all_books[:book_cnt]
+    export_dir = cfg.resolved_output_dir / "cache" / "books"
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    books_to_process = []
+    for b in target_books_meta:
+        bid = b.get("id")
+        bpath = b.get("path")
+        if not bpath or not Path(bpath).is_file():
+            try:
+                bpath = client.export_book(bid, target_dir=export_dir)
+            except Exception:
+                pass
+        if bpath and Path(bpath).is_file():
+            books_to_process.append({"id": bid, "title": b.get("title", f"Book #{bid}"), "path": str(bpath)})
+
+    if not books_to_process:
+        console.print("[bold red]No valid book files available for benchmarking.[/bold red]")
+        raise typer.Exit(1)
+
+    # Resolve target output directory
+    if output_dir:
+        target_output_dir = Path(output_dir).expanduser().resolve()
+    elif not clean and (resume or from_phase >= 2):
+        latest_session = ABBenchmarkRunner.find_latest_session_dir()
+        if latest_session:
+            target_output_dir = latest_session
+            console.print(f"[bold cyan]Resuming existing benchmark session:[/bold cyan] [dim]{target_output_dir}[/dim]")
+        else:
+            target_output_dir = cfg.resolved_output_dir / "ab_test_runs" / f"run_{time.strftime('%Y%m%d_%H%M%S')}"
+    else:
+        target_output_dir = cfg.resolved_output_dir / "ab_test_runs" / f"run_{time.strftime('%Y%m%d_%H%M%S')}"
+
+    runner = ABBenchmarkRunner(settings=cfg, output_dir=target_output_dir, console=console)
+
+    # 1. Bookkeeper Graph Build (Phase 1)
+    should_run_phase1 = (from_phase <= 1) and (phase in (None, "all", "1", "bookkeeper")) and not skip_bookkeeper_build
+
+    if not should_run_phase1:
+        if runner.is_phase1_complete():
+            console.print(
+                f"[bold green]✓ Phase 1 (Bookkeeper Analysis) Safe Point detected:[/bold green] Reusing existing Knowledge Graph. Skipping Phase 1."
+            )
+        else:
+            console.print(f"[dim]Phase 1 skipped (starting from phase {from_phase}).[/dim]")
+    else:
+        # Check if pre-computed graph already exists and resume is enabled
+        existing_kg = cfg.resolved_output_dir / "knowledge_graph.json"
+        can_reuse_existing = resume and not clean and (runner.is_phase1_complete() or existing_kg.is_file())
+
+        if can_reuse_existing:
+            console.print(
+                f"[bold green]✓ Phase 1 (Bookkeeper Analysis) Safe Point detected:[/bold green] "
+                f"Found existing Knowledge Graph at [dim]{existing_kg}[/dim]. Skipping rebuild. (Pass --clean to rebuild from scratch)."
+            )
+            runner.record_safe_point_1(existing_kg, len(books_to_process), books=books_to_process)
+        else:
+            console.print(
+                f"\n[bold yellow]═══ Phase 1/3: Building Bookkeeper Knowledge Graph for {len(books_to_process)} books ═══[/bold yellow]\n"
+            )
+            try:
+                build_graph(
+                    calibre_path=calibre_path,
+                    books_dir=books_dir,
+                    config_path=config_path,
+                    from_scratch=True,
+                    enable_lightrag=False,
+                    clean_export=True,
+                    limit=book_cnt,
+                    dual_pass=dual_pass,
+                )
+            except typer.Exit as e:
+                if e.exit_code != 0:
+                    console.print(f"[bold red]Bookkeeper build-graph failed with code {e.exit_code}. Aborting benchmark.[/bold red]")
+                    raise
+            runner.record_safe_point_1(existing_kg, len(books_to_process), books=books_to_process)
+
+        if phase in ("1", "bookkeeper"):
+            console.print(f"\n[bold green]✓ Phase 1 (Bookkeeper Analysis) complete. Exiting as requested by --phase {phase}.[/bold green]\n")
+            return
+
+    # 2. Load Question Library if provided
+    ql = None
+    if questions_file:
+        qp = Path(questions_file).expanduser().resolve()
+        if qp.is_file():
+            ql = QuestionLibrary.load(qp)
+
+    # 3. Execute Benchmark Pipeline (Phase 2 & Phase 3)
+    report = runner.run_benchmark(
+        books=books_to_process,
+        question_library=ql,
+        questions_per_book=questions_per_book,
+        lightrag_mode=lightrag_mode,
+        bookkeeper_mode=bookkeeper_mode,
+        judge_model=judge_model,
+        from_phase=from_phase,
+        phase=phase,
+        clean=clean,
+        resume=resume,
+        skip_lightrag_indexing=skip_lightrag_indexing,
+    )
+
+    if report.total_questions > 0:
+        console.print(
+            Panel.fit(
+                f"[bold green]✓ A/B Benchmark Complete[/bold green]\n"
+                f"• Bookkeeper Wins: [bold cyan]{report.bookkeeper_wins}[/bold cyan] | "
+                f"LightRAG Wins: [bold yellow]{report.lightrag_wins}[/bold yellow] | "
+                f"Ties: [bold white]{report.ties}[/bold white]\n"
+                f"• Bookkeeper Pass Rate: [bold green]{report.bookkeeper_overall_pass_rate}%[/bold green] "
+                f"({report.bookkeeper_avg_latency:.4f}s avg latency)\n"
+                f"• LightRAG Pass Rate: [bold yellow]{report.lightrag_overall_pass_rate}%[/bold yellow] "
+                f"({report.lightrag_avg_latency:.4f}s avg latency)\n"
+                f"• Summary Report: [bold cyan]{runner.output_dir / 'ab_test_summary.md'}[/bold cyan]",
+                title="Benchmark Results",
+                border_style="green",
+            )
+        )
 
 
 if __name__ == "__main__":

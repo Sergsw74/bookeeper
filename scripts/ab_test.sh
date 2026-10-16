@@ -44,6 +44,12 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     exec "$PYTHON_EXEC" "${SCRIPT_DIR}/ab_test.py" --help
 fi
 
+# Check for vs-lightrag mode keyword or flag
+if [ "${1:-}" = "vs-lightrag" ] || [ "${1:-}" = "--vs-lightrag" ] || [ "${1:-}" = "lightrag" ]; then
+    shift
+    exec "$PYTHON_EXEC" "${SCRIPT_DIR}/ab_test.py" --vs-lightrag "$@"
+fi
+
 # Check for cross-check mode keyword or flag
 if [ "${1:-}" = "cross-check" ] || [ "${1:-}" = "--cross-check" ]; then
     if [ $# -lt 2 ]; then

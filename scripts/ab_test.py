@@ -13,6 +13,7 @@ Performs automated end-to-end A/B testing:
    re-runs `bookeeper verify` on both branches with a specified sample percentage,
    and compares results.
 5. Cross-Check Mode: Audits contiguous chunk blocks across two runs using NLI assertions.
+6. VS LightRAG Benchmark Mode: Compares Bookkeeper Knowledge Graph against LightRAG on N books.
 
 Usage:
     # 1. Same-Branch Mode (No branches specified -> active branch, or single branch)
@@ -33,6 +34,10 @@ Usage:
 
     # 5. Cross-Check Mode (Contiguous Chunk Seam & Recall Comparative Audit)
     ./ab_test.py cross-check <path_to_abtest_result> [blocks]
+
+    # 6. VS LightRAG Benchmark Mode
+    ./ab_test.py vs-lightrag [books] [--questions <path>]
+    ./ab_test.py --vs-lightrag [--books 5] [--questions <path>]
 """
 
 import argparse
@@ -53,22 +58,24 @@ from typing import Any, Dict, List, Optional, Tuple
 def _ensure_venv() -> None:
     if os.environ.get("BOOKEEPER_VENV_AUTO_EXEC"):
         return
+
+    repo_venv_py = Path(__file__).resolve().parent.parent / ".venv" / "bin" / "python"
+    cwd_venv_py = Path.cwd() / ".venv" / "bin" / "python"
+    target_venv = repo_venv_py if repo_venv_py.is_file() else cwd_venv_py
+
+    # If current executable is not the repo venv, switch immediately
+    if target_venv.is_file() and os.access(target_venv, os.X_OK):
+        if target_venv.resolve() != Path(sys.executable).resolve():
+            env = dict(os.environ)
+            env["BOOKEEPER_VENV_AUTO_EXEC"] = "1"
+            os.execve(str(target_venv), [str(target_venv)] + sys.argv, env)
+
     try:
         import yaml  # noqa: F401
+        import bookeeper  # noqa: F401
         return
     except ImportError:
         pass
-
-    candidates = [
-        Path(__file__).resolve().parent.parent / ".venv" / "bin" / "python",
-        Path.cwd() / ".venv" / "bin" / "python",
-    ]
-    for cand in candidates:
-        if cand.is_file() and os.access(cand, os.X_OK):
-            if cand.resolve() != Path(sys.executable).resolve():
-                env = dict(os.environ)
-                env["BOOKEEPER_VENV_AUTO_EXEC"] = "1"
-                os.execve(str(cand), [str(cand)] + sys.argv, env)
 
 
 _ensure_venv()
@@ -2388,6 +2395,54 @@ Examples:
         help="Path to pre-existing A/B test run directory to run cross-check comparative audit.",
     )
     parser.add_argument(
+        "--vs-lightrag",
+        dest="vs_lightrag",
+        action="store_true",
+        default=False,
+        help="Run comparative benchmark between Bookkeeper and LightRAG on N books.",
+    )
+    parser.add_argument(
+        "--questions",
+        dest="questions_file",
+        type=str,
+        default=None,
+        help="Path to existing question library JSON file for --vs-lightrag benchmark.",
+    )
+    parser.add_argument(
+        "--questions-per-book",
+        dest="questions_per_book",
+        type=int,
+        default=None,
+        help="Questions to generate per book if synthesizing library (default: 5).",
+    )
+    parser.add_argument(
+        "--from-phase",
+        dest="from_phase",
+        type=int,
+        default=None,
+        help="Starting benchmark phase: 1 (Bookkeeper), 2 (LightRAG), 3 (Queries/Judging).",
+    )
+    parser.add_argument(
+        "--phase",
+        dest="phase",
+        type=str,
+        default=None,
+        help="Execute only a specific phase: '1'|'bookkeeper', '2'|'lightrag', '3'|'benchmark'.",
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        default=False,
+        help="Discard previous safe points and rebuild from scratch.",
+    )
+    parser.add_argument(
+        "--no-resume",
+        dest="no_resume",
+        action="store_true",
+        default=False,
+        help="Do not resume from safe points (force rerun of all phases).",
+    )
+    parser.add_argument(
         "--blocks",
         type=int,
         default=20,
@@ -2501,6 +2556,68 @@ Examples:
             return True
         except (ValueError, TypeError):
             return False
+
+    if args.vs_lightrag or (args.arg1 and args.arg1.lower() in ("vs-lightrag", "--vs-lightrag", "lightrag")):
+        target_books = args.books
+        if args.arg1 and args.arg1.lower() in ("vs-lightrag", "--vs-lightrag", "lightrag"):
+            if args.arg2 and _is_number(args.arg2):
+                try:
+                    target_books = int(args.arg2)
+                except ValueError:
+                    pass
+        elif args.arg1 and _is_number(args.arg1):
+            try:
+                target_books = int(args.arg1)
+            except ValueError:
+                pass
+
+        log_header(f"A/B Benchmark: Bookkeeper vs LightRAG ({target_books} books)")
+        repo_dir = Path(__file__).resolve().parent.parent
+        venv_bin = repo_dir / ".venv" / "bin" / "bookeeper"
+        venv_py = repo_dir / ".venv" / "bin" / "python"
+
+        if venv_bin.is_file() and os.access(venv_bin, os.X_OK):
+            cmd = [str(venv_bin), "ab-benchmark", str(target_books)]
+        elif venv_py.is_file() and os.access(venv_py, os.X_OK):
+            cmd = [str(venv_py), "-m", "bookeeper.cli", "ab-benchmark", str(target_books)]
+        else:
+            cmd = [sys.executable, "-m", "bookeeper.cli", "ab-benchmark", str(target_books)]
+
+        if args.base_config:
+            cmd.extend(["--config", str(args.base_config)])
+        if args.output_dir:
+            cmd.extend(["--output-dir", str(args.output_dir)])
+        if args.questions_file:
+            cmd.extend(["--questions", str(args.questions_file)])
+        if getattr(args, "questions_per_book", None) is not None:
+            cmd.extend(["--questions-per-book", str(args.questions_per_book)])
+        if getattr(args, "from_phase", None) is not None:
+            cmd.extend(["--from-phase", str(args.from_phase)])
+        if getattr(args, "phase", None) is not None:
+            cmd.extend(["--phase", str(args.phase)])
+        if getattr(args, "clean", False):
+            cmd.append("--clean")
+        if getattr(args, "no_resume", False):
+            cmd.append("--no-resume")
+        if args.extra_args:
+            for extra in args.extra_args.split():
+                if extra:
+                    cmd.append(extra)
+
+        if args.dry_run:
+            log_warning("Dry-run requested: simulating invocation.")
+            print(f"Command: {' '.join(cmd)}")
+            return
+
+        try:
+            res = subprocess.run(cmd, check=False)
+            sys.exit(res.returncode)
+        except KeyboardInterrupt:
+            log_warning("\nExecution aborted by user.")
+            sys.exit(130)
+        except Exception as exc:
+            log_error(f"Benchmark execution failed: {exc}")
+            sys.exit(1)
 
     if args.cross_check_path:
         cross_check_path = args.cross_check_path

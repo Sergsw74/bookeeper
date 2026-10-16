@@ -644,6 +644,14 @@ class OllamaPool:
             logger.debug(f"Reset request to {url} completed with: {e}")
             return False
 
+    def execute(
+        self,
+        operation: Callable[[Any], Any],
+        **kwargs,
+    ) -> Any:
+        """Convenience alias for execute_with_failover."""
+        return self.execute_with_failover(operation, **kwargs)
+
     def execute_with_failover(
         self,
         operation: Callable[[str], Any],

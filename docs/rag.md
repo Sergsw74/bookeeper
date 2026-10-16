@@ -116,6 +116,54 @@ bookeeper query "Explain the two-phase commit protocol." --mode naive
 
 ---
 
+## 4.1 Standalone Raw Text Indexing (`lightrag-index`)
+
+For direct comparison benchmarks against Bookkeeper without pre-chunking, Bookkeeper provides `lightrag-index`. This extracts full raw book content (combining chapter headers) and feeds the full raw text directly into LightRAG's natural sliding-window chunker:
+
+```bash
+# Index 3 books directly from the book source using LightRAG's native chunking:
+bookeeper lightrag-index 3
+
+# Specify a custom working directory:
+bookeeper lightrag-index 3 --working-dir output/lightrag_benchmark
+
+# Index specific book files:
+bookeeper lightrag-index 1 --file path/to/book.epub
+```
+
+---
+
+## 4.2 LightRAG-Compatible HTTP API
+
+Bookkeeper's Web UI server (`bookeeper ui`) exposes a LightRAG-compatible query API. External applications, evaluations, and scripts can query the knowledge graph using standard LightRAG payload formats:
+
+- **Endpoint**: `POST /query` or `POST /api/query`
+- **Request Schema**:
+  ```json
+  {
+    "query": "What is Paxos consensus?",
+    "mode": "hybrid",
+    "stream": false
+  }
+  ```
+- **Response Schema**:
+  ```json
+  {
+    "response": "Detailed synthesized answer from knowledge graph..."
+  }
+  ```
+
+---
+
+## 4.3 A/B Benchmarking: Bookkeeper vs. LightRAG
+
+To objectively evaluate retrieval precision, latency, and factual recall between Bookkeeper's Knowledge Graph and LightRAG:
+- Use `bookeeper ab-benchmark` or `scripts/ab_test.py --vs-lightrag`.
+- Evaluates systems against pure subject-matter queries and binary invariant checklists (`expected: bool`).
+- See **[Automated A/B Testing & Benchmarking](ab-tests.md#mode-4-bookkeeper-knowledge-graph-vs-lightrag-benchmark)** for full configuration and workflow details.
+
+---
+
 ## 5. Configuration & Performance Tuning
 
 Configure LightRAG settings and throughput concurrency in `config.yaml`:

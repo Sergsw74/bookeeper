@@ -1,8 +1,9 @@
 """
-Tests for Bookeeper UI Web Server, REST API, and Search Engine Backend.
+Tests for Bookeeper UI Web Server, REST API, LightRAG-Compatible Query API, and Search Engine Backend.
 """
 
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -35,14 +36,17 @@ def test_ui_backend_candidate_terms_extraction(mock_backend):
     assert "Time Horizon" in candidates
     assert "Complexity Classes" in candidates
 
+    # Test extract_query_terms on natural language questions
+    query_terms = mock_backend.extract_query_terms("What is a time horizon?")
+    assert "time horizon" in query_terms
+    assert "time" in query_terms or "horizon" in query_terms
+
 
 def test_ui_backend_query_ideas_with_mocks(mock_backend):
-    # Mock Neo4j session and record returns
     mock_driver = MagicMock()
     mock_session = MagicMock()
     mock_driver.session.return_value.__enter__.return_value = mock_session
 
-    # Mock Neo4j node
     mock_node = MagicMock()
     mock_node.labels = ["Concept", "Idea"]
     mock_node.get.side_effect = lambda k, d=None: {
@@ -50,14 +54,16 @@ def test_ui_backend_query_ideas_with_mocks(mock_backend):
         "name": "Time Horizon",
         "category": "Evaluation",
         "weight": 8,
+        "brief_description": "Measures task time",
     }.get(k, d)
-    mock_node.keys.return_value = ["id", "name", "category", "weight"]
-    mock_node.__iter__.return_value = ["id", "name", "category", "weight"]
+    mock_node.keys.return_value = ["id", "name", "category", "weight", "brief_description"]
+    mock_node.__iter__.return_value = ["id", "name", "category", "weight", "brief_description"]
     mock_node.__getitem__.side_effect = lambda k: {
         "id": "concept:TimeHorizon",
         "name": "Time Horizon",
         "category": "Evaluation",
         "weight": 8,
+        "brief_description": "Measures task time",
     }[k]
 
     mock_record = {
@@ -68,14 +74,45 @@ def test_ui_backend_query_ideas_with_mocks(mock_backend):
     mock_session.run.return_value = [mock_record]
 
     with patch.object(mock_backend, "get_neo4j_driver", return_value=mock_driver):
-        with patch.object(mock_backend, "get_lightrag_engine", return_value=None):
-            res = mock_backend.query_ideas("What is a time horizon?")
-            assert "graph" in res
-            assert len(res["graph"]["nodes"]) == 1
-            assert res["graph"]["nodes"][0]["name"] == "Time Horizon"
-            assert "telemetry" in res
-            assert res["telemetry"]["neo4j"]["status"] == "success"
-            assert "exact_cypher" in res["telemetry"]["neo4j"]
+        res = mock_backend.query_ideas("What is a time horizon?")
+        assert "graph" in res
+        assert len(res["graph"]["nodes"]) == 1
+        assert res["graph"]["nodes"][0]["name"] == "Time Horizon"
+        assert "Time Horizon" in res["answer"]
+        assert "telemetry" in res
+        assert res["telemetry"]["neo4j"]["status"] == "success"
+        assert "exact_cypher" in res["telemetry"]["neo4j"]
+
+
+def test_ui_backend_query_api_mimic(mock_backend):
+    """Verify backend.query_api outputs LightRAG-compatible response schema."""
+    with patch.object(mock_backend, "query_ideas", return_value={
+        "query": "kv-cache",
+        "answer": "KV Cache stores attention key-value pairs.",
+        "identified_concepts": ["KV Cache"],
+        "graph": {
+            "nodes": [
+                {
+                    "id": "book:1",
+                    "name": "Transformer Architecture",
+                    "labels": ["Book"],
+                    "properties": {"title": "Transformer Architecture", "description": "LLM foundations"}
+                }
+            ],
+            "edges": []
+        },
+        "selected_node_id": "concept:KVCache",
+        "telemetry": {"query": "kv-cache", "neo4j": {}}
+    }):
+        api_res = mock_backend.query_api("kv-cache", include_references=True)
+        assert "response" in api_res
+        assert api_res["response"] == "KV Cache stores attention key-value pairs."
+        assert "references" in api_res
+        assert len(api_res["references"]) == 1
+        assert api_res["references"][0]["reference_id"] == "book:1"
+        assert api_res["references"][0]["file_path"] == "Transformer Architecture"
+        assert api_res["llm_generated"] is False
+        assert "response_time" in api_res
 
 
 def test_ui_backend_node_details_with_mocks(mock_backend):
@@ -137,10 +174,15 @@ def test_ui_http_server_endpoints(mock_backend, tmp_path):
     base_url = f"http://127.0.0.1:{port}"
 
     try:
-        # 1. Health check
-        with urllib.request.urlopen(f"{base_url}/api/health", timeout=3) as resp:
+        # 1. Health check (/health and /api/health)
+        with urllib.request.urlopen(f"{base_url}/health", timeout=3) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             assert data["status"] == "ok"
+            assert data["service"] == "bookkeeper-search"
+
+        with urllib.request.urlopen(f"{base_url}/api/health", timeout=3) as resp:
+            data2 = json.loads(resp.read().decode("utf-8"))
+            assert data2["status"] == "ok"
 
         # 2. Index HTML
         with urllib.request.urlopen(f"{base_url}/", timeout=3) as resp:
@@ -148,9 +190,13 @@ def test_ui_http_server_endpoints(mock_backend, tmp_path):
             assert "Bookeeper | Idea-Based Search Engine" in html
             assert "Cytoscape" in html
             assert "Debug & Observability" in html
+            assert "pane-resizer" in html
+            assert "btn-unfold-panel" in html
+            assert "btn-fold-panel" in html
+            assert "Star Layout" in html
 
-        # 3. Search POST API
-        post_data = json.dumps({"query": "time horizon", "mode": "hybrid"}).encode("utf-8")
+        # 3. Search POST API (/api/search)
+        post_data = json.dumps({"query": "time horizon", "mode": "ideas"}).encode("utf-8")
         req = urllib.request.Request(
             f"{base_url}/api/search",
             data=post_data,
@@ -160,12 +206,32 @@ def test_ui_http_server_endpoints(mock_backend, tmp_path):
             "query": "time horizon",
             "answer": "Synthesized test answer",
             "graph": {"nodes": [], "edges": []},
-            "telemetry": {"lightrag": {}, "neo4j": {}}
+            "telemetry": {"candidate_terms": ["time horizon"], "neo4j": {}}
         }):
             with urllib.request.urlopen(req, timeout=3) as resp:
                 search_res = json.loads(resp.read().decode("utf-8"))
                 assert search_res["query"] == "time horizon"
                 assert "Synthesized test answer" in search_res["answer"]
+
+        # 4. LightRAG-Compatible Query API (/query and /api/query)
+        query_data = json.dumps({"query": "time horizon", "mode": "hybrid"}).encode("utf-8")
+        req_query = urllib.request.Request(
+            f"{base_url}/query",
+            data=query_data,
+            headers={"Content-Type": "application/json"},
+        )
+        with patch.object(mock_backend, "query_api", return_value={
+            "response": "LightRAG compatible synthesized answer",
+            "references": [{"reference_id": "book:1", "file_path": "Book A", "content": []}],
+            "response_time": 0.05,
+            "llm_generated": False,
+        }):
+            with urllib.request.urlopen(req_query, timeout=3) as resp:
+                query_res = json.loads(resp.read().decode("utf-8"))
+                assert "response" in query_res
+                assert query_res["response"] == "LightRAG compatible synthesized answer"
+                assert len(query_res["references"]) == 1
+
     finally:
         server.shutdown()
         server.server_close()
@@ -177,7 +243,12 @@ def test_ui_cli_help():
     assert "Launch the interactive Bookeeper Idea-Based Search Engine Web UI" in res.stdout
     assert "--host" in res.stdout
     assert "--port" in res.stdout
-    assert "--lightrag-server" in res.stdout
+
+
+def test_search_cli_help():
+    res = runner.invoke(app, ["search", "--help"])
+    assert res.exit_code == 0
+    assert "Search ideas directly in the Bookkeeper Knowledge Graph" in res.stdout
 
 
 def test_lightrag_ui_cli_help():
@@ -198,4 +269,816 @@ def test_lightrag_server_manager_initialization(tmp_path):
     assert "http://127.0.0.1:9655/webui/" == mgr.webui_url
     assert "http://127.0.0.1:9655/workspace/" == mgr.workspace_url
     assert not mgr.is_alive()
+
+
+def test_format_browser_cypher():
+    from bookeeper.ui.backend import SearchEngineBackend
+
+    query = """
+    UNWIND $candidate_terms AS term
+    MATCH (c)
+    WHERE degree <= $max_hub_degree
+    LIMIT $max_seeds
+    """
+    params = {
+        "candidate_terms": ["kv cache", "cache"],
+        "max_seeds": 8,
+        "max_hub_degree": 120,
+    }
+
+    # Format with nested props ($obj.props.<param>)
+    formatted_props = SearchEngineBackend.format_browser_cypher(query, params, use_nested_props=True)
+    assert formatted_props.startswith(":param obj => ({props: {")
+    assert 'candidate_terms: ["kv cache", "cache"]' in formatted_props
+    assert '"candidate_terms":' not in formatted_props
+    assert 'max_seeds: 8' in formatted_props
+    assert '"max_seeds":' not in formatted_props
+    assert 'max_hub_degree: 120' in formatted_props
+    assert "UNWIND $obj.props.candidate_terms AS term" in formatted_props
+    assert "WHERE degree <= $obj.props.max_hub_degree" in formatted_props
+    assert "LIMIT $obj.props.max_seeds" in formatted_props
+
+    # Format keeping original param ($param)
+    formatted_param = SearchEngineBackend.format_browser_cypher(query, params, use_nested_props=False)
+    assert formatted_param.startswith(":param obj => ({props: {")
+    assert 'candidate_terms: ["kv cache", "cache"]' in formatted_param
+    assert '"candidate_terms":' not in formatted_param
+    assert "UNWIND $candidate_terms AS term" in formatted_param
+    assert "WHERE degree <= $max_hub_degree" in formatted_param
+    assert "LIMIT $max_seeds" in formatted_param
+
+    # Empty params
+    assert SearchEngineBackend.format_browser_cypher("RETURN 1", {}) == "RETURN 1"
+    assert SearchEngineBackend.format_browser_cypher("", params) == ""
+
+
+def test_ui_index_html_has_browser_param_toggle():
+    backend_path = Path(__file__).resolve().parent.parent / "src" / "bookeeper" / "ui" / "static" / "index.html"
+    content = backend_path.read_text(encoding="utf-8")
+
+    assert ":param obj => ({props: " in content
+    assert "serializeMapUnquotedKeys" in content
+    assert "formatBrowserCypher" in content
+    assert "setCypherFormatMode" in content
+    assert "$obj.props" in content
+    assert "$param" in content
+    assert "debug-toggle-group" in content
+    assert "getGraphLayout" in content
+    assert "Centered Rings" in content
+    assert "Force Layout" in content
+
+
+def test_post_process_and_filter_subgraph(mock_backend):
+    """Test that secondary chunks/sections are capped, and nodes/edges receive weights."""
+    seed_nodes = {
+        "idea:1": {
+            "id": "idea:1",
+            "name": "Attention Mechanism",
+            "category": "Idea",
+            "labels": ["Idea", "Concept"],
+            "weight": 5,
+        }
+    }
+    nodes_map = dict(seed_nodes)
+
+    # Add 1 connected concept, 1 book, 5 chunks, and 5 sections
+    nodes_map["concept:2"] = {"id": "concept:2", "name": "Transformer", "category": "Concept", "labels": ["Concept"], "weight": 7}
+    nodes_map["book:1"] = {"id": "book:1", "name": "Deep Learning Book", "category": "Book", "labels": ["Book"]}
+
+    edges = [
+        {"source": "idea:1", "target": "concept:2", "type": "RELATES_TO"},
+        {"source": "idea:1", "target": "book:1", "type": "APPEARS_IN"},
+    ]
+
+    for i in range(1, 6):
+        cid = f"chunk:{i}"
+        sec_id = f"section:{i}"
+        nodes_map[cid] = {"id": cid, "name": f"Chunk {i}", "category": "Chunk", "labels": ["Chunk"]}
+        nodes_map[sec_id] = {"id": sec_id, "name": f"Section {i}", "category": "Section", "labels": ["Section"]}
+        edges.append({"source": "idea:1", "target": cid, "type": "MENTIONS"})
+        edges.append({"source": "idea:1", "target": sec_id, "type": "IN_SECTION"})
+
+    seed_neighbors = {"idea:1": []}
+
+    filtered_nodes, filtered_edges, _ = mock_backend._post_process_and_filter_subgraph(
+        seed_nodes=seed_nodes,
+        nodes_map=nodes_map,
+        edges_list=edges,
+        seed_neighbors=seed_neighbors,
+        denoise_level="standard",
+    )
+
+    # Core concept and book are preserved
+    assert "idea:1" in filtered_nodes
+    assert "concept:2" in filtered_nodes
+    assert "book:1" in filtered_nodes
+
+    # Weights and styling:
+    # Seed node: weight 10, amber, size 60
+    assert filtered_nodes["idea:1"]["tier"] == "primary"
+    assert filtered_nodes["idea:1"]["is_seed"] is True
+    assert filtered_nodes["idea:1"]["weight"] == 10.0
+    assert filtered_nodes["idea:1"]["color"] == "#f59e0b"
+    assert filtered_nodes["idea:1"]["size"] == 60
+
+    # Connected concept: secondary, weight 6-8.5, purple, size 42
+    assert filtered_nodes["concept:2"]["tier"] == "secondary"
+    assert filtered_nodes["concept:2"]["weight"] >= 6.0
+    assert filtered_nodes["concept:2"]["color"] == "#8b5cf6"
+    assert filtered_nodes["concept:2"]["size"] == 42
+
+    # Book: secondary, blue, size 38
+    assert filtered_nodes["book:1"]["tier"] == "secondary"
+    assert filtered_nodes["book:1"]["color"] == "#3b82f6"
+    assert filtered_nodes["book:1"]["size"] == 38
+
+    # Secondary container nodes (Chunks and Sections) are capped to 2 per seed
+    chunk_nodes = [nid for nid, n in filtered_nodes.items() if n.get("category") == "Chunk"]
+    section_nodes = [nid for nid, n in filtered_nodes.items() if n.get("category") == "Section"]
+    assert len(chunk_nodes) <= 2
+    assert len(section_nodes) <= 2
+
+    # Verify secondary nodes are gray/grayish with small size and low weight
+    for cid in chunk_nodes:
+        assert filtered_nodes[cid]["tier"] == "context"
+        assert filtered_nodes[cid]["color"] == "#475569"
+        assert filtered_nodes[cid]["weight"] == 1.5
+        assert filtered_nodes[cid]["size"] == 16
+
+    for sec_id in section_nodes:
+        assert filtered_nodes[sec_id]["tier"] == "context"
+        assert filtered_nodes[sec_id]["color"] == "#64748b"
+        assert filtered_nodes[sec_id]["weight"] == 2.8
+        assert filtered_nodes[sec_id]["size"] == 22
+
+    # Verify relationship weights
+    concept_rel = next(e for e in filtered_edges if e["source"] == "idea:1" and e["target"] == "concept:2")
+    assert concept_rel["weight"] == 9.0
+    assert concept_rel["line_color"] == "#818cf8"
+
+    book_rel = next(e for e in filtered_edges if e["source"] == "idea:1" and e["target"] == "book:1")
+    assert book_rel["weight"] == 6.5
+    assert book_rel["line_color"] == "#3b82f6"
+
+    chunk_rel = next(e for e in filtered_edges if "chunk" in e["target"])
+    assert chunk_rel["weight"] == 1.8
+    assert chunk_rel["line_color"] == "#334155"
+
+
+def test_ui_primary_selected_id_never_selects_chunk_or_section(mock_backend):
+    """Verify primary_selected_id strictly picks Concept/Idea, then Book, and never Chunk or Section."""
+    # 1. When seed nodes has a Concept and a Chunk, it must select the Concept
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    concept_node = MagicMock()
+    concept_node.labels = ["Concept"]
+    concept_node.get.side_effect = lambda k, d=None: {
+        "id": "concept:Attention",
+        "name": "Attention",
+        "category": "Concept",
+        "weight": 8,
+        "brief_description": "Attention mechanism",
+    }.get(k, d)
+    concept_node.keys.return_value = ["id", "name", "category", "weight", "brief_description"]
+    concept_node.__iter__.return_value = ["id", "name", "category", "weight", "brief_description"]
+    concept_node.__getitem__.side_effect = lambda k: {
+        "id": "concept:Attention",
+        "name": "Attention",
+        "category": "Concept",
+        "weight": 8,
+        "brief_description": "Attention mechanism",
+    }[k]
+
+    chunk_node = MagicMock()
+    chunk_node.labels = ["Chunk"]
+    chunk_node.get.side_effect = lambda k, d=None: {
+        "id": "chunk:99",
+        "name": "Chunk 99",
+        "category": "Chunk",
+        "weight": 1,
+        "text": "Some raw page chunk content",
+    }.get(k, d)
+    chunk_node.keys.return_value = ["id", "name", "category", "weight", "text"]
+    chunk_node.__iter__.return_value = ["id", "name", "category", "weight", "text"]
+    chunk_node.__getitem__.side_effect = lambda k: {
+        "id": "chunk:99",
+        "name": "Chunk 99",
+        "category": "Chunk",
+        "weight": 1,
+        "text": "Some raw page chunk content",
+    }[k]
+
+    mock_rel = MagicMock()
+    mock_rel.type = "MENTIONS"
+    mock_rel.start_node = concept_node
+    mock_rel.end_node = chunk_node
+    mock_rel.__iter__.return_value = []
+
+    mock_session.run.return_value = [
+        {"c": concept_node, "rel": mock_rel, "neighbor": chunk_node}
+    ]
+
+    with patch.object(mock_backend, "get_neo4j_driver", return_value=mock_driver):
+        res = mock_backend.query_ideas("attention")
+        assert res["selected_node_id"] == "concept:Attention"
+        assert res["selected_node_id"] != "chunk:99"
+
+
+def test_ui_index_html_has_evidence_deprioritization_and_one_click_accordion():
+    """Verify index.html contains the 1-click evidence filter button and Obsidian accordion elements."""
+    html_path = Path(__file__).resolve().parent.parent / "src" / "bookeeper" / "ui" / "static" / "index.html"
+    content = html_path.read_text(encoding="utf-8")
+
+    # 1-Click Evidence Toggle
+    assert 'id="btn-toggle-evidence"' in content
+    assert "toggleEvidenceFilter()" in content
+    assert "applyEvidenceVisibility()" in content
+    assert "focusEvidenceNode(" in content
+    assert "evidenceVisible = false" in content
+
+    # 1-Click Accordions & Excerpt reader
+    assert "evidence-accordion" in content
+    assert "evidence-summary" in content
+    assert "evidence-text-content" in content
+    assert "btn-focus-chunk" in content
+    assert "1-Click View" in content
+    assert "Supporting Evidence & Chunks" in content
+
+
+def test_ui_get_node_details_evidence_extraction(mock_backend):
+    """Verify get_node_details retrieves full chunk text and properties."""
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    idea_node = MagicMock()
+    idea_node.labels = ["Idea"]
+    idea_node.get.side_effect = lambda k, d=None: {
+        "id": "idea:FlashAttention",
+        "name": "Flash Attention",
+        "category": "Idea",
+    }.get(k, d)
+    idea_node.keys.return_value = ["id", "name", "category"]
+    idea_node.__iter__.return_value = ["id", "name", "category"]
+    idea_node.__getitem__.side_effect = lambda k: {
+        "id": "idea:FlashAttention",
+        "name": "Flash Attention",
+        "category": "Idea",
+    }[k]
+
+    mock_rec = MagicMock()
+    mock_rec.__getitem__.side_effect = lambda k: {
+        "n": idea_node,
+        "relations": [
+            {
+                "type": "MENTIONS",
+                "direction": "outgoing",
+                "other_id": "chunk:12",
+                "other_name": "Chunk 12 Excerpt",
+                "other_labels": ["Chunk"],
+                "other_category": "Chunk",
+                "properties": {"breadcrumb": "Chapter 3 > Flash Attention"},
+                "other_properties": {
+                    "text": "FlashAttention tiles the softmax computation across SRAM blocks.",
+                    "book_title": "Fast Inference",
+                    "page": 42,
+                },
+            }
+        ],
+    }[k]
+    mock_session.run.return_value.single.return_value = mock_rec
+
+    with patch.object(mock_backend, "get_neo4j_driver", return_value=mock_driver):
+        details = mock_backend.get_node_details("idea:FlashAttention")
+        assert len(details["evidence"]) == 1
+        ev = details["evidence"][0]
+        assert ev["target_id"] == "chunk:12"
+        assert ev["breadcrumb"] == "Chapter 3 > Flash Attention"
+        assert ev["book_title"] == "Fast Inference"
+        assert ev["page"] == 42
+        assert "FlashAttention tiles the softmax computation" in ev["text"]
+
+
+def test_ui_backend_hierarchical_term_extraction(mock_backend):
+    """Verify multi-word phrases and single words are properly separated and prioritized."""
+    h = mock_backend.extract_query_terms_hierarchical("What is a kv cache size?")
+    assert h["full_query"] == "kv cache size"
+    assert "kv cache size" in h["phrase_terms"]
+    assert "kv cache" in h["phrase_terms"] or "cache size" in h["phrase_terms"]
+    assert "size" in h["word_terms"]
+    assert "cache" in h["word_terms"]
+
+    h2 = mock_backend.extract_query_terms_hierarchical("time horizon")
+    assert h2["full_query"] == "time horizon"
+    assert h2["phrase_terms"] == ["time horizon"]
+    assert "time" in h2["word_terms"]
+    assert "horizon" in h2["word_terms"]
+
+
+def test_ui_backend_fast_concept_vectorizer():
+    """Verify FastConceptVectorizer cosine similarity, morphological matching, and sub-ms latency."""
+    from bookeeper.ui.backend import FastConceptVectorizer
+
+    corpus = {
+        "concept:TimeHorizon": "Time Horizon metric for task completion time",
+        "concept:TaskDifficulty": "Task Difficulty and difficulty estimation in AI tasks",
+        "concept:KVCache": "KV Cache storage and attention keys",
+        "concept:Parameters": "Parameters saved to storage disks",
+    }
+    vec = FastConceptVectorizer(corpus)
+
+    # Exact or near-exact match
+    matches = vec.query("time horizon", top_k=3, min_threshold=0.45)
+    assert len(matches) > 0
+    assert matches[0][0] == "concept:TimeHorizon"
+    assert matches[0][1] >= 0.50
+
+    # Multi-word phrase matching morphological variations
+    diff_matches = vec.query("difficulty estimation", top_k=3, min_threshold=0.45)
+    assert len(diff_matches) > 0
+    assert diff_matches[0][0] == "concept:TaskDifficulty"
+
+    # Query with kv cache should find KVCache, NOT Parameters
+    cache_matches = vec.query("kv cache", top_k=3, min_threshold=0.45)
+    match_ids = [m[0] for m in cache_matches]
+    assert "concept:KVCache" in match_ids
+    assert "concept:Parameters" not in match_ids
+
+
+def test_ui_backend_browser_cypher_unquoted_and_direct_seeds(mock_backend):
+    """Verify browser Cypher format has unquoted keys and direct seed IDs."""
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    mock_node = MagicMock()
+    mock_node.labels = ["Concept", "Idea"]
+    mock_node.get.side_effect = lambda k, d=None: {
+        "id": "concept:TimeHorizon",
+        "name": "Time Horizon",
+        "category": "Evaluation",
+        "weight": 8,
+    }.get(k, d)
+    mock_node.keys.return_value = ["id", "name", "category", "weight"]
+    mock_node.__iter__.return_value = ["id", "name", "category", "weight"]
+    mock_node.__getitem__.side_effect = lambda k: {
+        "id": "concept:TimeHorizon",
+        "name": "Time Horizon",
+        "category": "Evaluation",
+        "weight": 8,
+    }[k]
+
+    mock_session.run.return_value = [{"c": mock_node, "rel": None, "neighbor": None, "relevance": 100, "degree": 5}]
+
+    with patch.object(mock_backend, "get_neo4j_driver", return_value=mock_driver):
+        res = mock_backend.query_ideas("time horizon")
+        telemetry = res["telemetry"]
+        assert "seed_ids" in telemetry
+        assert "core_ideas" in telemetry
+
+        neo = telemetry["neo4j"]
+        browser_cypher = neo["browser_cypher_props"]
+        assert ":param obj => ({props:" in browser_cypher
+        # Verify unquoted parameter keys
+        assert "seed_ids:" in browser_cypher
+        assert "max_seeds:" in browser_cypher
+        assert "similarity_threshold:" in browser_cypher
+        assert '"seed_ids":' not in browser_cypher
+        assert '"max_seeds":' not in browser_cypher
+        # Verify $obj.props rewriting
+        assert "$obj.props.seed_ids" in browser_cypher
+        assert "$obj.props.max_seeds" in browser_cypher
+
+
+def test_concept_embedding_index_priority_product(tmp_path):
+    """Verify embedding priority ranking = cosine_similarity * node_weight."""
+    from bookeeper.ui.embeddings import ConceptEmbeddingIndex
+    import numpy as np
+
+    cache_file = tmp_path / "test_embeddings.npz"
+
+    # Create synthetic normalized embeddings: 3 concepts of dim 4
+    # Query vector will align perfectly with concept 1, partially with concept 2, zero with concept 3
+    # Concept 1: vector [1, 0, 0, 0], weight 5.0 -> cosine 1.0, priority = 5.0
+    # Concept 2: vector [0.9, 0.435, 0, 0] (norm=1), weight 8.0 -> cosine 0.9, priority = 7.2 (WINS despite lower cosine!)
+    # Concept 3: vector [0, 1, 0, 0], weight 10.0 -> cosine 0.0, priority = 0.0 (filtered by threshold)
+    c2_v = np.array([0.9, np.sqrt(1 - 0.9**2), 0, 0], dtype=np.float32)
+
+    np.savez_compressed(
+        cache_file,
+        ids=np.array(["concept:1", "concept:2", "concept:3"], dtype=object),
+        names=np.array(["Idea One", "Idea Two High Weight", "Idea Three"], dtype=object),
+        weights=np.array([5.0, 8.0, 10.0], dtype=np.float32),
+        vectors=np.array([
+            [1.0, 0.0, 0.0, 0.0],
+            c2_v,
+            [0.0, 1.0, 0.0, 0.0],
+        ], dtype=np.float32),
+    )
+
+    index = ConceptEmbeddingIndex(cache_path=cache_file)
+    assert index.load() is True
+
+    # Mock embed_text to return [1, 0, 0, 0]
+    index.embed_text = lambda q: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+    core_ideas = index.query_core_ideas("query", similarity_threshold=0.70, top_k=5)
+
+    assert len(core_ideas) == 2  # Concept 3 is cosine 0.0 < 0.70, so filtered out
+    # Concept 2 wins the top spot because priority (7.2) > Concept 1 priority (5.0)!
+    assert core_ideas[0]["id"] == "concept:2"
+    assert core_ideas[0]["priority_score"] == 7.2
+    assert core_ideas[0]["weight"] == 8.0
+    assert core_ideas[0]["cosine_similarity"] == 0.9
+
+    assert core_ideas[1]["id"] == "concept:1"
+    assert core_ideas[1]["priority_score"] == 5.0
+    assert core_ideas[1]["cosine_similarity"] == 1.0
+
+    # Also test query_core_ideas_with_telemetry and pairwise similarity matrix
+    ideas, meta = index.query_core_ideas_with_telemetry("query", similarity_threshold=0.70, top_k=5)
+    assert len(ideas) == 2
+    assert meta["candidates_above_threshold_count"] == 2
+    assert meta["top_k_retrieved"] == 2
+    assert "pairwise_similarity" in meta
+    pairwise = meta["pairwise_similarity"]
+    assert len(pairwise["names"]) == 2
+    assert pairwise["matrix"][0][0] == 1.0  # Diagonal
+    assert pairwise["matrix"][1][1] == 1.0  # Diagonal
+    assert round(pairwise["matrix"][0][1], 3) == 0.9  # Inter-idea cosine similarity
+    assert round(pairwise["matrix"][1][0], 3) == 0.9  # Symmetric
+
+
+def test_ui_backend_expand_node_neighborhood(mock_backend):
+    """Verify backend.expand_node_neighborhood returns undirected neighbors and relationships."""
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    mock_center = MagicMock()
+    mock_center.labels = ["Concept", "Idea"]
+    mock_center.get.side_effect = lambda k, d=None: {
+        "id": "concept:Center",
+        "name": "Center Concept",
+        "weight": 8,
+    }.get(k, d)
+
+    mock_neighbor = MagicMock()
+    mock_neighbor.labels = ["Book"]
+    mock_neighbor.get.side_effect = lambda k, d=None: {
+        "id": "book:1",
+        "title": "Reference Book",
+        "weight": 6,
+    }.get(k, d)
+
+    mock_rel = MagicMock()
+    mock_rel.type = "FEATURED_IN"
+    mock_rel.start_node = mock_center
+    mock_rel.end_node = mock_neighbor
+    mock_rel.__iter__.return_value = []
+    mock_rel.items.return_value = []
+
+    mock_record = {
+        "n": mock_center,
+        "rel": mock_rel,
+        "neighbor": mock_neighbor,
+    }
+    mock_session.run.return_value = [mock_record]
+
+    with patch.object(mock_backend, "get_neo4j_driver", return_value=mock_driver):
+        res = mock_backend.expand_node_neighborhood(node_id="concept:Center", type_filter="all")
+        assert res["node_id"] == "concept:Center"
+        assert res["type_filter"] == "all"
+        assert res["total_nodes"] == 2
+        assert res["total_edges"] == 1
+        assert res["edges"][0]["type"] == "FEATURED_IN"
+        assert res["edges"][0]["source"] == "concept:Center"
+        assert res["edges"][0]["target"] == "book:1"
+        assert "telemetry" in res
+        assert "exact_cypher" in res["telemetry"]
+        assert "browser_cypher_props" in res["telemetry"]
+
+
+def test_ui_backend_expand_node_neighborhood_local_fallback(tmp_path):
+    """Verify expand_node_neighborhood falls back to local knowledge_graph.json when Neo4j is offline."""
+    kg_file = tmp_path / "knowledge_graph.json"
+    kg_data = {
+        "nodes": [
+            {"id": "concept:A", "name": "Concept A", "type": "Concept"},
+            {"id": "concept:B", "name": "Concept B", "type": "Concept"},
+            {"id": "book:1", "title": "Book 1", "type": "Book", "category": "Book"},
+        ],
+        "edges": [
+            {"source": "concept:A", "target": "concept:B", "relation": "RELATES_TO"},
+            {"source": "concept:A", "target": "book:1", "relation": "FEATURED_IN"},
+        ],
+    }
+    kg_file.write_text(json.dumps(kg_data), encoding="utf-8")
+
+    cfg = Settings(output_dir=str(tmp_path))
+    backend = SearchEngineBackend(config=cfg)
+
+    # Neo4j offline
+    with patch.object(backend, "get_neo4j_driver", side_effect=Exception("Connection refused")):
+        # Expand all
+        res_all = backend.expand_node_neighborhood("concept:A", type_filter="all")
+        assert res_all["total_nodes"] == 3
+        assert res_all["total_edges"] == 2
+
+        # Expand only Book
+        res_book = backend.expand_node_neighborhood("concept:A", type_filter="Book")
+        assert res_book["total_nodes"] == 2  # Center + Book
+        assert res_book["total_edges"] == 1
+        assert res_book["edges"][0]["target"] == "book:1"
+
+
+def test_ui_server_expand_endpoint(mock_backend):
+    """Verify HTTP POST and GET /api/node/expand endpoints."""
+    import urllib.request
+    from threading import Thread
+
+    with patch.object(mock_backend, "expand_node_neighborhood", return_value={
+        "node_id": "concept:Test",
+        "type_filter": "all",
+        "nodes": [{"id": "concept:Test", "name": "Test"}],
+        "edges": [],
+        "total_nodes": 1,
+        "total_edges": 0,
+    }):
+        server = run_server(host="127.0.0.1", port=0, backend=mock_backend)
+        port = server.server_port
+        server_thread = Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+
+        base_url = f"http://127.0.0.1:{port}"
+
+        # Test POST /api/node/expand
+        post_req = urllib.request.Request(
+            f"{base_url}/api/node/expand",
+            data=json.dumps({"id": "concept:Test", "type_filter": "all"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(post_req) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            assert data["node_id"] == "concept:Test"
+            assert data["total_nodes"] == 1
+
+        # Test GET /api/node/expand
+        with urllib.request.urlopen(f"{base_url}/api/node/expand?id=concept:Test&type_filter=Concept") as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            assert data["node_id"] == "concept:Test"
+
+        server.shutdown()
+
+
+def test_node_types_distinct_styling_and_shapes(mock_backend):
+    """Verify each node type has constant, distinct visual styling (shapes, colors, borders, icons)."""
+    # 1. Seed Concept
+    seed_mock = MagicMock()
+    seed_mock.labels = ["Concept", "Idea"]
+    seed_mock.get.side_effect = lambda k, d=None: {"id": "c:seed", "name": "Core Seed", "weight": 9}.get(k, d)
+    seed = mock_backend._serialize_node(seed_mock, is_seed=True, relevance=95.0)
+    assert seed["node_type"] == "seed"
+    assert seed["shape"] == "ellipse"
+    assert seed["color"] == "#f59e0b"
+    assert seed["border_color"] == "#fde68a"
+    assert seed["icon"] == "🧠"
+
+    # 2. Connected Concept
+    concept_mock = MagicMock()
+    concept_mock.labels = ["Concept", "Idea"]
+    concept_mock.get.side_effect = lambda k, d=None: {"id": "c:other", "name": "Linked Concept", "weight": 7}.get(k, d)
+    concept = mock_backend._serialize_node(concept_mock, is_seed=False)
+    assert concept["node_type"] == "concept"
+    assert concept["shape"] == "ellipse"
+    assert concept["color"] == "#8b5cf6"
+    assert concept["border_color"] == "#c4b5fd"
+    assert concept["icon"] == "💡"
+
+    # 3. Book
+    book_mock = MagicMock()
+    book_mock.labels = ["Book"]
+    book_mock.get.side_effect = lambda k, d=None: {"id": "book:1", "title": "AI Foundations", "weight": 6}.get(k, d)
+    book = mock_backend._serialize_node(book_mock, is_seed=False)
+    assert book["node_type"] == "book"
+    assert book["shape"] == "round-rectangle"
+    assert book["color"] == "#2563eb"
+    assert book["border_color"] == "#60a5fa"
+    assert book["icon"] == "📚"
+
+    # 4. Section
+    sec_mock = MagicMock()
+    sec_mock.labels = ["Section"]
+    sec_mock.get.side_effect = lambda k, d=None: {"id": "sec:1", "title": "Chapter 1", "weight": 3}.get(k, d)
+    sec = mock_backend._serialize_node(sec_mock, is_seed=False)
+    assert sec["node_type"] == "section"
+    assert sec["shape"] == "round-rectangle"
+    assert sec["color"] == "#0d9488"
+    assert sec["border_color"] == "#34d399"
+    assert sec["icon"] == "📑"
+
+    # 5. Chunk
+    chunk_mock = MagicMock()
+    chunk_mock.labels = ["Chunk"]
+    chunk_mock.get.side_effect = lambda k, d=None: {"id": "chk:1", "text": "Excerpt", "weight": 1.5}.get(k, d)
+    chunk = mock_backend._serialize_node(chunk_mock, is_seed=False)
+    assert chunk["node_type"] == "chunk"
+    assert chunk["shape"] == "ellipse"
+    assert chunk["color"] == "#334155"
+    assert chunk["border_color"] == "#64748b"
+    assert chunk["icon"] == "📄"
+
+
+def test_constellation_gravitational_layout_ui():
+    """Verify index.html contains the constellation gravitational layout with multi-hub centers, organic phyllotaxis, and inside-node scaled titles."""
+    index_path = Path(__file__).parent.parent / "src" / "bookeeper" / "ui" / "static" / "index.html"
+    assert index_path.exists()
+    content = index_path.read_text(encoding="utf-8")
+
+    # Star layout button with data-layout="star"
+    assert 'data-layout="star"' in content
+    assert 'cyReLayout(\'star\')' in content
+    assert 'Constellation Gravitational Layout' in content
+
+    # Constellation positioning function & physics engine
+    assert 'computeConstellationLayout()' in content
+    assert 'prominenceScores' in content
+    assert 'constellationCenters' in content
+    assert 'centerCoords' in content
+    assert 'goldenAngle' in content
+
+    # Scaled title within node formatting (no square notes, text centered inside)
+    assert "'text-valign': 'center'" in content
+    assert "'text-halign': 'center'" in content
+    assert "'text-wrap': 'wrap'" in content
+    assert "'text-max-width': 'data(textMaxWidth)'" in content
+
+    # Clean titles inside nodes without emoji prefixes on graph canvas
+    assert "Clean title text WITHOUT emoji icons" in content
+
+
+def test_celestial_star_system_layout_ui():
+    """Compatibility alias test for constellation layout."""
+    test_constellation_gravitational_layout_ui()
+
+
+def test_expand_and_query_smart_id_and_canonical_idea_resolution(mock_backend):
+    """Verify backend supports numeric Neo4j IDs (id(n) = 1335) and upgrades subordinate concepts to canonical Ideas."""
+    backend_path = Path(__file__).parent.parent / "src" / "bookeeper" / "ui" / "backend.py"
+    backend_code = backend_path.read_text(encoding="utf-8")
+
+    # expand_node_neighborhood supports numeric ID and elementId suffix
+    assert "toString(id(target)) = $node_id" in backend_code
+    assert "elementId(target) ENDS WITH (':' + $node_id)" in backend_code
+    assert "OPTIONAL MATCH (better:Idea)" in backend_code
+
+    # get_node_details supports numeric ID and elementId suffix
+    assert "MATCH (target)" in backend_code
+    assert "WITH coalesce(better, target) AS n" in backend_code
+
+    # query_ideas includes exact Neo4j Idea name matching and canonical Idea upgrade
+    assert "MATCH (c_seed)" in backend_code
+    assert "WITH coalesce(better, c_seed) AS c" in backend_code
+
+
+def test_book_file_resolver(tmp_path):
+    """Verify resolve_book_file correctly resolves documents by title, filename, breadcrumb, and ID."""
+    books_dir = tmp_path / "downloads"
+    books_dir.mkdir()
+    pdf_file = books_dir / "sample_paper.pdf"
+    pdf_file.write_bytes(b"%PDF-1.4 sample content")
+
+    index_data = {
+        "2610.99999": {
+            "title": "Quantum Attention Mechanisms in Large Language Models",
+            "file_path": "sample_paper.pdf",
+            "url": "https://arxiv.org/pdf/2610.99999",
+            "format": "pdf",
+        }
+    }
+    (books_dir / "index.json").write_text(json.dumps(index_data), encoding="utf-8")
+
+    cfg = Settings()
+    cfg.books_dir = str(books_dir)
+    backend = SearchEngineBackend(config=cfg)
+
+    # 1. Match by exact title
+    res_title = backend.resolve_book_file(title="Quantum Attention Mechanisms in Large Language Models")
+    assert res_title is not None
+    assert res_title["found"] is True
+    assert res_title["filename"] == "sample_paper.pdf"
+    assert "/api/book/download?filename=" in res_title["download_url"]
+    assert "/api/book/file?filename=" in res_title["view_url"]
+    assert res_title["external_url"] == "https://arxiv.org/pdf/2610.99999"
+
+    # 2. Match by breadcrumb
+    res_bc = backend.resolve_book_file(breadcrumb="Quantum Attention Mechanisms in Large Language Models > Chapter 3 [part 1]")
+    assert res_bc is not None
+    assert res_bc["found"] is True
+    assert res_bc["filename"] == "sample_paper.pdf"
+
+    # 3. Match by direct filename
+    res_fn = backend.resolve_book_file(filename="sample_paper.pdf")
+    assert res_fn is not None
+    assert res_fn["found"] is True
+    assert res_fn["file_size"] == len(b"%PDF-1.4 sample content")
+
+    # 4. Match by arxiv/book ID
+    res_id = backend.resolve_book_file(book_id="2610.99999")
+    assert res_id is not None
+    assert res_id["found"] is True
+
+    # 5. Non-existent book
+    res_none = backend.resolve_book_file(title="NonExistent Paper Never Written")
+    assert res_none is None
+
+
+def test_server_book_endpoints(tmp_path):
+    """Test HTTP API endpoints for /api/book/file, /api/book/download, and /api/book/info."""
+    books_dir = tmp_path / "downloads"
+    books_dir.mkdir()
+    pdf_file = books_dir / "ai_horizons.pdf"
+    pdf_file.write_bytes(b"%PDF-1.4 test stream content")
+
+    index_data = {
+        "2610.12466": {
+            "title": "On the estimation and validity of AI time horizons",
+            "file_path": "ai_horizons.pdf",
+            "url": "https://arxiv.org/pdf/2610.12466",
+        }
+    }
+    (books_dir / "index.json").write_text(json.dumps(index_data), encoding="utf-8")
+
+    cfg = Settings()
+    cfg.books_dir = str(books_dir)
+    backend = SearchEngineBackend(config=cfg)
+
+    server = run_server(host="127.0.0.1", port=8991, backend=backend, auto_port=True)
+    import threading
+    import urllib.request
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+    actual_port = server.server_address[1]
+    base_url = f"http://127.0.0.1:{actual_port}"
+
+    try:
+        # 1. Info endpoint
+        req = urllib.request.urlopen(f"{base_url}/api/book/info?title=AI%20time%20horizons")
+        assert req.status == 200
+        info_data = json.loads(req.read().decode("utf-8"))
+        assert info_data["found"] is True
+        assert info_data["filename"] == "ai_horizons.pdf"
+        assert "absolute_path" not in info_data  # Should not expose local server paths
+
+        # 2. View file endpoint (inline)
+        req_view = urllib.request.urlopen(f"{base_url}/api/book/file?title=AI%20time%20horizons")
+        assert req_view.status == 200
+        assert req_view.headers.get("Content-Type") == "application/pdf"
+        assert "inline" in req_view.headers.get("Content-Disposition", "")
+        assert req_view.read() == b"%PDF-1.4 test stream content"
+
+        # 3. Download file endpoint (attachment)
+        req_dl = urllib.request.urlopen(f"{base_url}/api/book/download?filename=ai_horizons.pdf")
+        assert req_dl.status == 200
+        assert "attachment" in req_dl.headers.get("Content-Disposition", "")
+        assert req_dl.read() == b"%PDF-1.4 test stream content"
+
+        # 4. Path traversal attempt rejected
+        with pytest.raises(Exception):
+            urllib.request.urlopen(f"{base_url}/api/book/file?filename=../../config.yaml")
+
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_ui_book_file_links_in_html():
+    """Verify frontend HTML renders book open and download links in evidence and book cards."""
+    html_file = Path(__file__).parent.parent / "src" / "bookeeper" / "ui" / "static" / "index.html"
+    content = html_file.read_text(encoding="utf-8")
+
+    # CSS classes for book buttons
+    assert ".evidence-book-btn" in content
+    assert ".evidence-download-btn" in content
+    assert ".btn-book-action" in content
+    assert ".book-pill-card" in content
+    assert ".book-source-banner" in content
+
+    # JavaScript rendering of book files
+    assert "formatBytes(bytes)" in content
+    assert "bf.view_url" in content
+    assert "bf.download_url" in content
+    assert "📖 Open Book" in content
+    assert "📥 Download" in content
+
+
+
+
+
+
+
+
 

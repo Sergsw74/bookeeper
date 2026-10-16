@@ -72,12 +72,22 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
 
         # 1. API: Health Check & System Status
         if path in ("/health", "/api/health"):
+            consistency = self.backend.validate_database_consistency()
             self._send_json({
                 "status": "ok",
                 "service": "bookkeeper-search",
                 "neo4j_uri": self.backend.neo4j_cfg.uri,
                 "neo4j_db": self.backend.neo4j_cfg.database,
+                "consistency": consistency,
             })
+            return
+
+        # 1b. API: Consistency & Database Sync Validation
+        if path in ("/api/sync/status", "/api/consistency"):
+            qs = parse_qs(parsed.query)
+            force_refresh = qs.get("refresh", ["false"])[0].lower() in ("true", "1")
+            consistency = self.backend.validate_database_consistency(force_refresh=force_refresh)
+            self._send_json(consistency)
             return
 
         # 2. API: Node Details (Obsidian Note View)

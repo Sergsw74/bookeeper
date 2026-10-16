@@ -131,6 +131,8 @@ class SearchEngineBackend:
         self._concept_embedding_index: Optional[ConceptEmbeddingIndex] = None
         self._books_index_cache: Optional[Dict[str, Any]] = None
         self._books_index_mtime: float = 0.0
+        self._local_kg_stats_cache: Optional[Dict[str, int]] = None
+        self._local_kg_mtime: float = 0.0
 
     def _get_all_books_dirs(self) -> List[Path]:
         """
@@ -599,6 +601,162 @@ class SearchEngineBackend:
             except Exception:
                 pass
             self._neo4j_driver = None
+
+    def get_local_graph_stats(self, force_refresh: bool = False) -> Dict[str, int]:
+        """
+        Return high-level counts for the local knowledge base:
+        books, chunks, ideas/concepts, total_nodes, total_edges.
+        Caches results based on file modification time.
+        """
+        kg_path = getattr(self.config, "resolved_output_dir", None) or Path("output")
+        kg_file = Path(kg_path).expanduser().resolve() / "knowledge_graph.json"
+
+        if not kg_file.is_file():
+            out_p = Path(kg_path).expanduser().resolve()
+            book_states = list((out_p / ".book_states").glob("book_*_state.json")) if (out_p / ".book_states").is_dir() else []
+            chunk_files = list((out_p / "chunks").glob("book_*_chunks.json")) if (out_p / "chunks").is_dir() else []
+            return {
+                "books": len(book_states),
+                "chunks": len(chunk_files),
+                "ideas": 0,
+                "total_nodes": len(book_states) + len(chunk_files),
+                "total_edges": 0,
+            }
+
+        try:
+            mtime = kg_file.stat().st_mtime
+            if not force_refresh and self._local_kg_stats_cache is not None and self._local_kg_mtime == mtime:
+                return self._local_kg_stats_cache
+
+            with open(kg_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            nodes = data.get("nodes", [])
+            edges = data.get("edges", [])
+
+            books = 0
+            chunks = 0
+            ideas = 0
+
+            for n in nodes:
+                ntype = n.get("type") or n.get("category") or ""
+                if ntype == "Book" or n.get("tag") == "book":
+                    books += 1
+                elif ntype == "Chunk" or n.get("tag") == "chunk":
+                    chunks += 1
+                elif ntype in ("Concept", "Idea") or n.get("is_idea") or n.get("tag") == "idea":
+                    ideas += 1
+
+            stats = {
+                "books": books,
+                "chunks": chunks,
+                "ideas": ideas,
+                "total_nodes": len(nodes),
+                "total_edges": len(edges),
+            }
+            self._local_kg_stats_cache = stats
+            self._local_kg_mtime = mtime
+            return stats
+        except Exception as e:
+            logger.warning(f"Error computing local knowledge graph stats from {kg_file}: {e}")
+            return {"books": 0, "chunks": 0, "ideas": 0, "total_nodes": 0, "total_edges": 0}
+
+    def get_neo4j_stats(self) -> Tuple[bool, Optional[Dict[str, int]], Optional[str]]:
+        """
+        Return (connected, stats_dict, error_message).
+        Queries high-level node and relationship counts from Neo4j.
+        """
+        try:
+            driver = self.get_neo4j_driver()
+            with driver.session(database=self.neo4j_cfg.database) as session:
+                q_nodes = """
+                MATCH (n)
+                RETURN
+                    count(n) AS total_nodes,
+                    count(CASE WHEN n:Book THEN 1 END) AS books,
+                    count(CASE WHEN n:Chunk THEN 1 END) AS chunks,
+                    count(CASE WHEN n:Idea OR n:Concept THEN 1 END) AS ideas
+                """
+                rec_nodes = session.run(q_nodes).single()
+                if not rec_nodes:
+                    return True, {"books": 0, "chunks": 0, "ideas": 0, "total_nodes": 0, "total_edges": 0}, None
+
+                q_edges = "MATCH ()-[r]->() RETURN count(r) AS total_edges"
+                rec_edges = session.run(q_edges).single()
+                total_edges = rec_edges["total_edges"] if rec_edges else 0
+
+                stats = {
+                    "books": int(rec_nodes["books"] or 0),
+                    "chunks": int(rec_nodes["chunks"] or 0),
+                    "ideas": int(rec_nodes["ideas"] or 0),
+                    "total_nodes": int(rec_nodes["total_nodes"] or 0),
+                    "total_edges": int(total_edges or 0),
+                }
+                return True, stats, None
+        except Exception as e:
+            return False, None, str(e)
+
+    def validate_database_consistency(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """
+        Compare high-level statistics between local knowledge base and connected Neo4j database.
+        Returns consistency evaluation, discrepancies, and warnings.
+        """
+        local_stats = self.get_local_graph_stats(force_refresh=force_refresh)
+        connected, neo4j_stats, error_msg = self.get_neo4j_stats()
+
+        if not connected:
+            return {
+                "neo4j_connected": False,
+                "is_consistent": True,  # Consistent in standalone offline mode
+                "standalone_mode": True,
+                "local_stats": local_stats,
+                "neo4j_stats": None,
+                "discrepancies": [],
+                "warning": None,
+                "error": error_msg,
+            }
+
+        discrepancies: List[str] = []
+
+        # Check books
+        if local_stats["books"] != neo4j_stats["books"]:
+            diff = neo4j_stats["books"] - local_stats["books"]
+            discrepancies.append(f"Books: local={local_stats['books']}, neo4j={neo4j_stats['books']} (diff: {diff:+d})")
+
+        # Check chunks
+        if local_stats["chunks"] != neo4j_stats["chunks"]:
+            diff = neo4j_stats["chunks"] - local_stats["chunks"]
+            discrepancies.append(f"Chunks: local={local_stats['chunks']:,}, neo4j={neo4j_stats['chunks']:,} (diff: {diff:+d})")
+
+        # Check ideas / concepts
+        if local_stats["ideas"] != neo4j_stats["ideas"]:
+            diff = neo4j_stats["ideas"] - local_stats["ideas"]
+            discrepancies.append(f"Ideas: local={local_stats['ideas']:,}, neo4j={neo4j_stats['ideas']:,} (diff: {diff:+d})")
+
+        # Check total nodes if not already flagged
+        if not discrepancies and local_stats["total_nodes"] != neo4j_stats["total_nodes"]:
+            diff = neo4j_stats["total_nodes"] - local_stats["total_nodes"]
+            discrepancies.append(f"Total Nodes: local={local_stats['total_nodes']:,}, neo4j={neo4j_stats['total_nodes']:,} (diff: {diff:+d})")
+
+        is_consistent = len(discrepancies) == 0
+        warning = None
+        if not is_consistent:
+            warning = (
+                f"Neo4j database is out of sync with local knowledge base. "
+                + "; ".join(discrepancies)
+                + ". Run 'bookeeper build-graph --export-neo4j' or 'bookeeper rebuild-graph --export-neo4j' to synchronize."
+            )
+
+        return {
+            "neo4j_connected": True,
+            "is_consistent": is_consistent,
+            "standalone_mode": False,
+            "local_stats": local_stats,
+            "neo4j_stats": neo4j_stats,
+            "discrepancies": discrepancies,
+            "warning": warning,
+            "error": None,
+        }
 
     def _get_concept_vectorizer(self) -> Optional[FastConceptVectorizer]:
         """Lazy-load and cache the FastConceptVectorizer using Neo4j or local knowledge_graph.json."""

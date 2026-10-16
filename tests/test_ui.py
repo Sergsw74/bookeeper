@@ -1075,6 +1075,118 @@ def test_ui_book_file_links_in_html():
     assert "📥 Download" in content
 
 
+def test_ui_database_consistency_offline(mock_backend):
+    """Verify consistency status reports standalone offline mode when Neo4j is offline."""
+    mock_backend.get_neo4j_stats = MagicMock(return_value=(False, None, "Connection refused"))
+    mock_backend.get_local_graph_stats = MagicMock(return_value={
+        "books": 20,
+        "chunks": 5000,
+        "ideas": 12000,
+        "total_nodes": 17020,
+        "total_edges": 50000,
+    })
+
+    val = mock_backend.validate_database_consistency()
+    assert val["neo4j_connected"] is False
+    assert val["standalone_mode"] is True
+    assert val["is_consistent"] is True
+    assert val["warning"] is None
+    assert val["local_stats"]["books"] == 20
+
+
+def test_ui_database_consistency_inconsistent(mock_backend):
+    """Verify consistency status detects when Neo4j database is outdated compared to local KB."""
+    mock_backend.get_local_graph_stats = MagicMock(return_value={
+        "books": 22,
+        "chunks": 6000,
+        "ideas": 14000,
+        "total_nodes": 20022,
+        "total_edges": 60000,
+    })
+    # Neo4j has only 10 books, 2000 chunks, 4000 ideas
+    mock_backend.get_neo4j_stats = MagicMock(return_value=(True, {
+        "books": 10,
+        "chunks": 2000,
+        "ideas": 4000,
+        "total_nodes": 6010,
+        "total_edges": 15000,
+    }, None))
+
+    val = mock_backend.validate_database_consistency()
+    assert val["neo4j_connected"] is True
+    assert val["standalone_mode"] is False
+    assert val["is_consistent"] is False
+    assert len(val["discrepancies"]) == 3
+    assert any("Books:" in d for d in val["discrepancies"])
+    assert any("Chunks:" in d for d in val["discrepancies"])
+    assert any("Ideas:" in d for d in val["discrepancies"])
+    assert val["warning"] is not None
+    assert "out of sync" in val["warning"].lower()
+
+
+def test_ui_database_consistency_endpoints(tmp_path):
+    """Verify /api/sync/status and /health endpoints return database consistency payload."""
+    import urllib.request
+    import json
+    import threading
+
+    cfg = Settings()
+    backend = SearchEngineBackend(config=cfg)
+    backend.get_local_graph_stats = MagicMock(return_value={
+        "books": 15,
+        "chunks": 3000,
+        "ideas": 8000,
+        "total_nodes": 11015,
+        "total_edges": 30000,
+    })
+    backend.get_neo4j_stats = MagicMock(return_value=(True, {
+        "books": 5,
+        "chunks": 1000,
+        "ideas": 2000,
+        "total_nodes": 3005,
+        "total_edges": 6000,
+    }, None))
+
+    server = run_server(host="127.0.0.1", port=0, backend=backend)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        # 1. /api/sync/status
+        req_sync = urllib.request.urlopen(f"{base_url}/api/sync/status")
+        assert req_sync.status == 200
+        sync_data = json.loads(req_sync.read().decode())
+        assert sync_data["neo4j_connected"] is True
+        assert sync_data["is_consistent"] is False
+        assert len(sync_data["discrepancies"]) == 3
+
+        # 2. /health includes consistency
+        req_health = urllib.request.urlopen(f"{base_url}/health")
+        assert req_health.status == 200
+        health_data = json.loads(req_health.read().decode())
+        assert "consistency" in health_data
+        assert health_data["consistency"]["is_consistent"] is False
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_ui_consistency_banner_in_html():
+    """Verify HTML template includes warning banner and JS sync validation."""
+    html_file = Path(__file__).parent.parent / "src" / "bookeeper" / "ui" / "static" / "index.html"
+    content = html_file.read_text(encoding="utf-8")
+
+    assert ".consistency-banner" in content
+    assert "id=\"consistency-banner\"" in content
+    assert "Database Inconsistency Detected" in content
+    assert "checkDatabaseConsistency()" in content
+    assert "showConsistencyBanner" in content
+    assert "dismissConsistencyBanner" in content
+    assert "/api/sync/status" in content
+    assert "id=\"debug-sync-panel\"" in content
+
+
 
 
 

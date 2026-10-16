@@ -5729,6 +5729,30 @@ def ui_command(
     console.print(f"  • [bold white]Web Interface:[/bold white] [bold green]http://{host}:{actual_port}/[/bold green]")
     console.print(f"  • [bold white]Query API:[/bold white] [bold cyan]http://{host}:{actual_port}/query[/bold cyan] [dim](LightRAG compatible)[/dim]")
     console.print(f"  • [bold white]Neo4j URI:[/bold white] {cfg.neo4j.uri} (database: '{cfg.neo4j.database}')")
+
+    # Pre-flight Database Consistency Verification
+    try:
+        consistency = backend.validate_database_consistency()
+        if consistency.get("neo4j_connected"):
+            if not consistency.get("is_consistent"):
+                discrepancy_lines = "\n".join(f"  • [yellow]{d}[/yellow]" for d in consistency.get("discrepancies", []))
+                console.print(Panel(
+                    f"[bold yellow]⚠️  DATABASE INCONSISTENCY DETECTED[/bold yellow]\n\n"
+                    f"The connected Neo4j database is outdated or out of sync with your local knowledge base:\n"
+                    f"{discrepancy_lines}\n\n"
+                    f"[bold white]Impact:[/bold white] Search results and graph exploration may return incomplete data.\n"
+                    f"[bold white]Resolution:[/bold white] Run [bold cyan]bookeeper rebuild-graph --export-neo4j[/bold cyan] or [bold cyan]bookeeper build-graph --export-neo4j[/bold cyan] to synchronize.",
+                    title="[bold yellow]Consistency Warning[/bold yellow]",
+                    border_style="yellow",
+                ))
+            else:
+                ls = consistency.get("local_stats", {})
+                console.print(f"  • [bold green]Neo4j Status:[/bold green] [green]Synchronized with local KB[/green] ({ls.get('books', 0)} books, {ls.get('chunks', 0):,} chunks, {ls.get('ideas', 0):,} ideas)")
+        else:
+            console.print(f"  • [bold dim]Neo4j Status:[/bold dim] [dim]Offline / Standalone mode (serving from local knowledge_graph.json)[/dim]")
+    except Exception as e:
+        console.print(f"  • [dim]Consistency check skipped: {e}[/dim]")
+
     console.print("[dim]Press Ctrl+C to terminate the web server.[/dim]\n")
 
     try:

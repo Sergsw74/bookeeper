@@ -1369,9 +1369,104 @@
       transform: translateX(-50%) translateY(0);
       opacity: 1;
     }
+
+    /* Consistency Warning Banner */
+    .consistency-banner {
+      background: linear-gradient(90deg, #78350f, #92400e);
+      border-bottom: 1px solid #b45309;
+      color: #fef3c7;
+      padding: 10px 24px;
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 15px;
+      font-size: 0.88rem;
+      z-index: 100;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+      flex-shrink: 0;
+    }
+    .consistency-banner .banner-content {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex: 1;
+      flex-wrap: wrap;
+    }
+    .consistency-banner .banner-icon {
+      font-size: 1.25rem;
+      flex-shrink: 0;
+    }
+    .consistency-banner .banner-text {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .consistency-banner .banner-title {
+      font-weight: 700;
+      color: #fff;
+    }
+    .consistency-banner .banner-stats {
+      background: rgba(0, 0, 0, 0.3);
+      padding: 3px 8px;
+      border-radius: 5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.8rem;
+      color: #fde68a;
+      border: 1px solid rgba(253, 230, 138, 0.2);
+    }
+    .consistency-banner .banner-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+    .consistency-banner .banner-hint {
+      font-size: 0.8rem;
+      color: #fcd34d;
+    }
+    .consistency-banner .banner-hint code {
+      background: rgba(0,0,0,0.35);
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: #fff;
+      font-weight: 600;
+      font-family: ui-monospace, monospace;
+    }
+    .consistency-banner .banner-close {
+      background: transparent;
+      border: none;
+      color: #fde68a;
+      cursor: pointer;
+      font-size: 1.15rem;
+      line-height: 1;
+      padding: 4px 8px;
+      border-radius: 4px;
+      transition: background 0.15s, color 0.15s;
+    }
+    .consistency-banner .banner-close:hover {
+      background: rgba(0,0,0,0.25);
+      color: #fff;
+    }
   </style>
 </head>
 <body>
+
+  <!-- Consistency Warning Banner -->
+  <div id="consistency-banner" class="consistency-banner">
+    <div class="banner-content">
+      <span class="banner-icon">⚠️</span>
+      <div class="banner-text">
+        <span class="banner-title">Database Inconsistency Detected:</span>
+        <span id="banner-message">The connected Neo4j database is out of sync with your local knowledge base.</span>
+        <span id="banner-stats" class="banner-stats"></span>
+      </div>
+    </div>
+    <div class="banner-actions">
+      <span class="banner-hint">Resolution: <code>bookeeper rebuild-graph --export-neo4j</code></span>
+      <button class="banner-close" onclick="dismissConsistencyBanner()" title="Dismiss warning for this session">✕</button>
+    </div>
+  </div>
 
   <!-- Header & Central Search -->
   <header>
@@ -1574,9 +1669,28 @@
 
     <!-- View 2: Dedicated Debug & Telemetry Tab -->
     <div class="view-pane" id="pane-debug">
-      <div class="debug-container" id="debug-log-list">
-        <div style="color: var(--text-muted); text-align: center; padding-top: 40px;">
-          No telemetry logged yet. Execute a search to inspect candidate terms and Neo4j Cypher queries.
+      <div class="debug-container" style="max-width:1100px; margin:0 auto; padding:20px; overflow-y:auto; height:100%;">
+        <!-- Database Consistency & Sync Panel -->
+        <div id="debug-sync-panel" class="debug-card" style="margin-bottom: 20px; background:var(--bg-panel); border:1px solid var(--border); border-radius:10px; padding:16px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+            <div style="display:flex; align-items:center; gap:10px;">
+              <span style="font-size:1.3rem;">🔄</span>
+              <strong style="color:var(--text-main); font-size:1rem;">Database Consistency & Sync Status</strong>
+              <span id="debug-sync-badge" class="debug-tag info">Checking...</span>
+            </div>
+            <button class="debug-action-btn" onclick="checkDatabaseConsistency(true)" title="Force re-check database sync status">
+              <span>🔄</span> Refresh Status
+            </button>
+          </div>
+          <div id="debug-sync-details" style="font-size:0.88rem; color:var(--text-muted); line-height:1.6;">
+            Checking local knowledge base and Neo4j database sync...
+          </div>
+        </div>
+
+        <div id="debug-log-list">
+          <div style="color: var(--text-muted); text-align: center; padding-top: 40px;">
+            No telemetry logged yet. Execute a search to inspect candidate terms and Neo4j Cypher queries.
+          </div>
         </div>
       </div>
     </div>
@@ -3364,10 +3478,155 @@
       }
     }
 
+    // Database Consistency & Sync Verification
+    async function checkDatabaseConsistency(forceRefresh = false) {
+      const badge = document.getElementById('debug-sync-badge');
+      if (badge && forceRefresh) {
+        badge.className = 'debug-tag info';
+        badge.textContent = 'Checking...';
+      }
+      try {
+        const url = forceRefresh ? '/api/sync/status?refresh=true' : '/api/sync/status';
+        const res = await fetch(url);
+        if (!res.ok) return;
+        const data = await res.json();
+        
+        updateDebugSyncStatus(data);
+
+        // Show banner if connected and inconsistent
+        if (data.neo4j_connected && data.is_consistent === false) {
+          showConsistencyBanner(data);
+        } else if (data.is_consistent) {
+          const banner = document.getElementById('consistency-banner');
+          if (banner) banner.style.display = 'none';
+        }
+      } catch (err) {
+        console.debug('Failed to check database consistency:', err);
+      }
+    }
+
+    function showConsistencyBanner(data) {
+      if (sessionStorage.getItem('dismiss_consistency_banner') === 'true') {
+        return;
+      }
+      const banner = document.getElementById('consistency-banner');
+      if (!banner) return;
+
+      const loc = data.local_stats || {};
+      const neo = data.neo4j_stats || {};
+      
+      const statsText = `Local KB: ${loc.books || 0} books, ${(loc.chunks || 0).toLocaleString()} chunks, ${(loc.ideas || 0).toLocaleString()} ideas | Neo4j: ${neo.books || 0} books, ${(neo.chunks || 0).toLocaleString()} chunks, ${(neo.ideas || 0).toLocaleString()} ideas`;
+      
+      const statsEl = document.getElementById('banner-stats');
+      if (statsEl) {
+        statsEl.textContent = statsText;
+        if (data.discrepancies && data.discrepancies.length > 0) {
+          statsEl.title = data.discrepancies.join('\n');
+        }
+      }
+
+      banner.style.display = 'flex';
+    }
+
+    function dismissConsistencyBanner() {
+      const banner = document.getElementById('consistency-banner');
+      if (banner) banner.style.display = 'none';
+      sessionStorage.setItem('dismiss_consistency_banner', 'true');
+    }
+
+    function updateDebugSyncStatus(data) {
+      const badge = document.getElementById('debug-sync-badge');
+      const details = document.getElementById('debug-sync-details');
+      if (!details) return;
+
+      if (!data.neo4j_connected) {
+        if (badge) {
+          badge.className = 'debug-tag info';
+          badge.textContent = 'Offline / Standalone';
+        }
+        const loc = data.local_stats || {};
+        details.innerHTML = `
+          <div style="margin-bottom:8px;">
+            <strong style="color:#94a3b8;">Neo4j Database:</strong> <span style="color:#e2e8f0;">Offline / Unreachable</span>
+            <span style="color:#64748b; font-size:0.8rem; margin-left:8px;">(Operating in standalone mode from local knowledge_graph.json)</span>
+          </div>
+          <div style="display:flex; gap:16px; flex-wrap:wrap; background:rgba(15,23,42,0.6); padding:10px 14px; border-radius:6px;">
+            <div><strong>Books:</strong> ${loc.books || 0}</div>
+            <div><strong>Chunks:</strong> ${(loc.chunks || 0).toLocaleString()}</div>
+            <div><strong>Ideas:</strong> ${(loc.ideas || 0).toLocaleString()}</div>
+            <div><strong>Total Nodes:</strong> ${(loc.total_nodes || 0).toLocaleString()}</div>
+            <div><strong>Total Edges:</strong> ${(loc.total_edges || 0).toLocaleString()}</div>
+          </div>
+        `;
+        return;
+      }
+
+      if (data.is_consistent) {
+        if (badge) {
+          badge.className = 'debug-tag success';
+          badge.textContent = '✓ Synchronized';
+        }
+        const loc = data.local_stats || {};
+        details.innerHTML = `
+          <div style="margin-bottom:8px;">
+            <strong style="color:#34d399;">✓ Status:</strong> Neo4j database is fully consistent with your local knowledge base.
+          </div>
+          <div style="display:flex; gap:16px; flex-wrap:wrap; background:rgba(15,23,42,0.6); padding:10px 14px; border-radius:6px;">
+            <div><strong>Books:</strong> ${loc.books || 0}</div>
+            <div><strong>Chunks:</strong> ${(loc.chunks || 0).toLocaleString()}</div>
+            <div><strong>Ideas:</strong> ${(loc.ideas || 0).toLocaleString()}</div>
+            <div><strong>Total Nodes:</strong> ${(loc.total_nodes || 0).toLocaleString()}</div>
+            <div><strong>Total Edges:</strong> ${(loc.total_edges || 0).toLocaleString()}</div>
+          </div>
+        `;
+      } else {
+        if (badge) {
+          badge.className = 'debug-tag warn';
+          badge.textContent = '⚠️ Inconsistent';
+        }
+        const loc = data.local_stats || {};
+        const neo = data.neo4j_stats || {};
+        const discrepanciesHtml = (data.discrepancies || []).map(d => `<li style="color:#fcd34d;">${escapeHtml(d)}</li>`).join('');
+
+        details.innerHTML = `
+          <div style="margin-bottom:8px; color:#fde68a;">
+            <strong>⚠️ Inconsistency Detected:</strong> Neo4j database is outdated or out of sync with your local knowledge base.
+          </div>
+          <ul style="margin:0 0 12px 20px; font-size:0.85rem;">
+            ${discrepanciesHtml}
+          </ul>
+          <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:10px; margin-bottom:12px;">
+            <div style="background:rgba(15,23,42,0.6); padding:10px; border-radius:6px; border:1px solid rgba(255,255,255,0.08);">
+              <div style="font-size:0.75rem; color:#94a3b8; text-transform:uppercase; font-weight:700;">Local Knowledge Base</div>
+              <div style="font-size:0.85rem; margin-top:4px; line-height:1.5;">
+                Books: <strong>${loc.books || 0}</strong><br>
+                Chunks: <strong>${(loc.chunks || 0).toLocaleString()}</strong><br>
+                Ideas: <strong>${(loc.ideas || 0).toLocaleString()}</strong><br>
+                Nodes: <strong>${(loc.total_nodes || 0).toLocaleString()}</strong>
+              </div>
+            </div>
+            <div style="background:rgba(15,23,42,0.6); padding:10px; border-radius:6px; border:1px solid #b45309;">
+              <div style="font-size:0.75rem; color:#f59e0b; text-transform:uppercase; font-weight:700;">Connected Neo4j Database</div>
+              <div style="font-size:0.85rem; margin-top:4px; line-height:1.5;">
+                Books: <strong>${neo.books || 0}</strong><br>
+                Chunks: <strong>${(neo.chunks || 0).toLocaleString()}</strong><br>
+                Ideas: <strong>${(neo.ideas || 0).toLocaleString()}</strong><br>
+                Nodes: <strong>${(neo.total_nodes || 0).toLocaleString()}</strong>
+              </div>
+            </div>
+          </div>
+          <div style="font-size:0.82rem; color:#94a3b8;">
+            💡 Fix: Run <code style="background:rgba(0,0,0,0.4); padding:2px 6px; border-radius:4px; color:#fff;">bookeeper rebuild-graph --export-neo4j</code> or <code style="background:rgba(0,0,0,0.4); padding:2px 6px; border-radius:4px; color:#fff;">bookeeper build-graph --export-neo4j</code> to upsert latest data to Neo4j.
+          </div>
+        `;
+      }
+    }
+
     // Auto-initialize Cytoscape and input event handlers on page load
     window.addEventListener('DOMContentLoaded', () => {
       initCytoscape();
       initSplitter();
+      checkDatabaseConsistency();
       const input = document.getElementById('search-input');
       if (input) {
         input.addEventListener('input', function() {

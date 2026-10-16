@@ -5694,9 +5694,9 @@ def restore_command(
 
 @app.command("ui")
 def ui_command(
-    host: str = typer.Option("127.0.0.1", "--host", "-h", help="Host interface to bind the web server (default: 127.0.0.1)."),
-    port: int = typer.Option(8000, "--port", "-p", help="HTTP port to listen on (default: 8000)."),
-    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml configuration file."),
+    host: str = typer.Option("127.0.0.1", "--host", "-h", envvar=["BOOKEEPER_HOST", "HOST"], help="Host interface to bind the web server (default: 127.0.0.1)."),
+    port: int = typer.Option(8000, "--port", "-p", envvar=["BOOKEEPER_PORT", "PORT"], help="HTTP port to listen on (default: 8000)."),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", envvar=["BOOKEEPER_CONFIG"], help="Path to config.yaml configuration file."),
 ):
     """
     Launch the interactive Bookeeper Idea-Based Search Engine Web UI and REST API.

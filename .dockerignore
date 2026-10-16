@@ -1,0 +1,33 @@
+# Version control & cache
+.git
+.github
+.gitignore
+.DS_Store
+
+# Python virtual environment & cache
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.coverage
+htmlcov
+.ruff_cache
+.mypy_cache
+
+# Large archives and backups
+*.zip
+*.7z
+*.tar.gz
+*.bak
+
+# Temporary / Staging artifacts
+.staged_metadata.db
+scratch
+
+# Local volume mounts (mounted at runtime)
+output
+archive_downloader/downloads

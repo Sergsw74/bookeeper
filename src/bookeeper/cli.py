@@ -5326,6 +5326,28 @@ def backup_command(
         "-f",
         help="Archive compression format: 'zip' or '7z'. Default: auto-detected from filename or 'zip'.",
     ),
+    backup_type: Optional[str] = typer.Option(
+        None,
+        "--type",
+        "-t",
+        help="Backup type: 'knowledge' (default) or 'full' (includes original indexed source books).",
+    ),
+    full: bool = typer.Option(
+        False,
+        "--full",
+        help="Create a full backup containing knowledge artifacts and original indexed source books.",
+    ),
+    books_dir: Optional[Path] = typer.Option(
+        None,
+        "--books-dir",
+        "-b",
+        help="Source directory containing books/papers (default: books_dir in config or archive_downloader/downloads).",
+    ),
+    all_books: bool = typer.Option(
+        False,
+        "--all-books",
+        help="For full backup: include all books in books-dir rather than only indexed books.",
+    ),
     output_dir: Optional[Path] = typer.Option(
         None,
         "--output-dir",
@@ -5365,11 +5387,15 @@ def backup_command(
 ):
     """
     Create a compressed backup archive (.zip or .7z) of the current knowledge graph,
-    Obsidian vault, book states, chunks, and progress checkpoints.
+    Obsidian vault, book states, chunks, checkpoints, and optionally source books (full backup).
     """
     destination = _resolve_opt(destination)
     output = _resolve_opt(output)
     format_type = _resolve_opt(format_type)
+    backup_type = _resolve_opt(backup_type)
+    full = _resolve_opt(full, False)
+    books_dir = _resolve_opt(books_dir)
+    all_books = _resolve_opt(all_books, False)
     output_dir = _resolve_opt(output_dir)
     config_path = _resolve_opt(config_path)
     calibre_path = _resolve_opt(calibre_path)
@@ -5387,13 +5413,31 @@ def backup_command(
         console.print(f"[bold red]Source output directory not found:[/bold red] {source_dir}")
         raise typer.Exit(1)
 
+    effective_type = "full" if (full or (backup_type and backup_type.lower() == "full")) else "knowledge"
+    effective_books_dir = None
+    if effective_type == "full":
+        if books_dir:
+            effective_books_dir = Path(books_dir).expanduser().resolve()
+        elif cfg.resolved_books_dir:
+            effective_books_dir = cfg.resolved_books_dir
+        else:
+            default_books = Path("archive_downloader/downloads").resolve()
+            effective_books_dir = default_books
+
+        if not effective_books_dir.is_dir():
+            console.print(f"[bold red]Source books directory not found:[/bold red] {effective_books_dir}")
+            raise typer.Exit(1)
+
     custom_dirs = {
         "chunks_dir": cfg.resolved_chunks_dir,
         "state_file": cfg.resolved_state_file,
     }
 
     t0 = time.perf_counter()
-    console.print(f"[bold cyan]Creating knowledge backup from [bold white]{source_dir}[/bold white]...[/bold cyan]")
+    type_desc = "full backup (knowledge + source books)" if effective_type == "full" else "knowledge backup"
+    console.print(f"[bold cyan]Creating {type_desc} from [bold white]{source_dir}[/bold white]...[/bold cyan]")
+    if effective_type == "full" and effective_books_dir:
+        console.print(f"[bold cyan]Source books directory: [bold white]{effective_books_dir}[/bold white][/bold cyan]")
 
     with Progress(
         SpinnerColumn(),
@@ -5404,7 +5448,7 @@ def backup_command(
         TimeElapsedColumn(),
         console=console,
     ) as progress:
-        backup_task = progress.add_task("Archiving knowledge files...", total=1)
+        backup_task = progress.add_task("Archiving files...", total=1)
 
         def _on_progress(completed: int, total: int, fname: str):
             short_name = (fname[:32] + "...") if len(fname) > 35 else fname
@@ -5420,6 +5464,9 @@ def backup_command(
                 source_dir=source_dir,
                 destination=Path(target_dest) if target_dest else None,
                 format_type=format_type,
+                backup_type=effective_type,
+                books_dir=effective_books_dir,
+                indexed_only=not all_books,
                 include_chunks=not no_chunks,
                 include_obsidian=not no_obsidian,
                 include_states=not no_states,
@@ -5437,19 +5484,25 @@ def backup_command(
     uncomp_bytes = result["uncompressed_bytes"]
     comp_ratio = ((1.0 - (comp_bytes / uncomp_bytes)) * 100) if uncomp_bytes > 0 else 0.0
 
-    table = Table(title="Knowledge Backup Summary", border_style="green")
+    table_title = "Full Backup Summary" if effective_type == "full" else "Knowledge Backup Summary"
+    table = Table(title=table_title, border_style="green")
     table.add_column("Property", style="bold")
     table.add_column("Details", style="cyan")
 
     table.add_row("Backup Archive", str(dest_path))
+    table.add_row("Backup Type", result.get("backup_type", effective_type).upper())
     table.add_row("Format", result["format"].upper())
+    if effective_type == "full" and effective_books_dir:
+        table.add_row("Books Source", str(effective_books_dir))
+        table.add_row("Indexed Only", "Yes" if not all_books else "No (All Books)")
+        table.add_row("Book Files Archived", f"{result.get('books_count', 0):,}")
     table.add_row("Total Files Archived", f"{result['total_files']:,}")
     table.add_row("Uncompressed Data Size", f"{uncomp_bytes / (1024 * 1024):.2f} MB ({uncomp_bytes:,} bytes)")
     table.add_row("Compressed Archive Size", f"{comp_bytes / (1024 * 1024):.2f} MB ({comp_bytes:,} bytes)")
     table.add_row("Compression Space Saved", f"{comp_ratio:.1f}%")
     table.add_row("Duration", f"{elapsed:.2f}s")
     console.print("\n", table)
-    console.print(f"[bold green]✓ Successfully created knowledge backup at:[/bold green] [bold cyan]{dest_path}[/bold cyan]\n")
+    console.print(f"[bold green]✓ Successfully created {type_desc} at:[/bold green] [bold cyan]{dest_path}[/bold cyan]\n")
 
 
 @app.command("restore")
@@ -5471,6 +5524,12 @@ def restore_command(
         "--output-dir",
         "-o",
         help="Target directory to restore knowledge artifacts into (default: configured output_dir).",
+    ),
+    books_dir: Optional[Path] = typer.Option(
+        None,
+        "--books-dir",
+        "-b",
+        help="Target directory to restore source books into for full backups (default: configured books_dir or archive_downloader/downloads).",
     ),
     config_path: Optional[Path] = typer.Option(
         None,
@@ -5495,12 +5554,13 @@ def restore_command(
     ),
 ):
     """
-    Restore knowledge graph, Obsidian vault, book states, chunks, and checkpoints
-    from a backup archive (.zip or .7z).
+    Restore knowledge graph, Obsidian vault, book states, chunks, checkpoints,
+    and original source books (for full backups) from a backup archive (.zip or .7z).
     """
     archive_path = _resolve_opt(archive_path)
     from_archive = _resolve_opt(from_archive)
     output_dir = _resolve_opt(output_dir)
+    books_dir = _resolve_opt(books_dir)
     config_path = _resolve_opt(config_path)
     calibre_path = _resolve_opt(calibre_path)
     clean = _resolve_opt(clean, False)
@@ -5509,7 +5569,7 @@ def restore_command(
     target_archive = archive_path or from_archive
     if not target_archive:
         console.print("[bold red]Please specify the archive file path to restore from.[/bold red]")
-        console.print("[dim]Usage: bookeeper restore <path_to_backup.zip|.7z> [--output-dir <path>] [--clean][/dim]")
+        console.print("[dim]Usage: bookeeper restore <path_to_backup.zip|.7z> [--output-dir <path>] [--books-dir <path>] [--clean][/dim]")
         raise typer.Exit(1)
 
     archive_file = Path(target_archive).expanduser().resolve()
@@ -5519,6 +5579,11 @@ def restore_command(
 
     cfg = _get_effective_settings(config_path, calibre_path)
     target_dir = Path(output_dir).expanduser().resolve() if output_dir else cfg.resolved_output_dir
+    target_books_dir = (
+        Path(books_dir).expanduser().resolve()
+        if books_dir
+        else (cfg.resolved_books_dir or Path("archive_downloader/downloads").resolve())
+    )
 
     if dry_run:
         console.print(f"[bold cyan]Inspecting archive [bold white]{archive_file}[/bold white] (Dry Run)...[/bold cyan]")
@@ -5531,6 +5596,7 @@ def restore_command(
         table = Table(title=f"Archive Inspection: {archive_file.name}", border_style="cyan")
         table.add_column("Category", style="bold")
         table.add_column("Count", justify="right", style="cyan")
+        table.add_row("Backup Type", info.get("backup_type", "knowledge").upper(), style="bold magenta")
         for cat, cnt in info["categories"].items():
             table.add_row(cat.replace("_", " ").title(), str(cnt))
         table.add_row("Total Files", f"{info['total_files']:,}", style="bold green")
@@ -5541,9 +5607,9 @@ def restore_command(
 
     t0 = time.perf_counter()
     if clean:
-        console.print(f"[bold yellow]Wiping existing knowledge artifacts in {target_dir} before restore...[/bold yellow]")
+        console.print(f"[bold yellow]Wiping existing artifacts before restore...[/bold yellow]")
 
-    console.print(f"[bold cyan]Restoring knowledge artifacts into [bold white]{target_dir}[/bold white]...[/bold cyan]")
+    console.print(f"[bold cyan]Restoring backup into [bold white]{target_dir}[/bold white]...[/bold cyan]")
 
     with Progress(
         SpinnerColumn(),
@@ -5554,7 +5620,7 @@ def restore_command(
         TimeElapsedColumn(),
         console=console,
     ) as progress:
-        restore_task = progress.add_task("Restoring knowledge files...", total=1)
+        restore_task = progress.add_task("Restoring files...", total=1)
 
         def _on_progress(completed: int, total: int, fname: str):
             short_name = (fname[:32] + "...") if len(fname) > 35 else fname
@@ -5569,6 +5635,7 @@ def restore_command(
             result = restore_backup(
                 archive_path=archive_file,
                 target_dir=target_dir,
+                books_dir=target_books_dir,
                 clean=clean,
                 dry_run=False,
                 progress_callback=_on_progress,
@@ -5580,13 +5647,18 @@ def restore_command(
     elapsed = time.perf_counter() - t0
     res_bytes = result["bytes_restored"]
     res_files = result["files_restored"]
+    is_full = result.get("backup_type") == "full"
 
-    table = Table(title="Knowledge Restoration Summary", border_style="green")
+    table_title = "Full Restoration Summary" if is_full else "Knowledge Restoration Summary"
+    table = Table(title=table_title, border_style="green")
     table.add_column("Property", style="bold")
     table.add_column("Details", style="cyan")
 
     table.add_row("Source Archive", str(archive_file))
-    table.add_row("Target Directory", str(target_dir))
+    table.add_row("Backup Type", result.get("backup_type", "knowledge").upper())
+    table.add_row("Target Directory (Knowledge)", str(target_dir))
+    if is_full:
+        table.add_row("Target Directory (Books)", str(result.get("target_books_dir") or target_books_dir))
     table.add_row("Format", result["format"].upper())
     if clean:
         cl = result.get("cleaned", {})
@@ -5594,7 +5666,10 @@ def restore_command(
             "Clean Mode",
             f"✓ Purged {cl.get('files_removed', 0)} old file(s), {cl.get('dirs_removed', 0)} old folder(s)",
         )
-    table.add_row("Files Restored", f"{res_files:,}")
+    table.add_row("Knowledge Files Restored", f"{result.get('knowledge_files_restored', res_files):,}")
+    if is_full:
+        table.add_row("Book Files Restored", f"{result.get('book_files_restored', 0):,}")
+    table.add_row("Total Files Restored", f"{res_files:,}")
     table.add_row("Data Restored", f"{res_bytes / (1024 * 1024):.2f} MB ({res_bytes:,} bytes)")
     table.add_row("Duration", f"{elapsed:.2f}s")
 
@@ -5613,7 +5688,8 @@ def restore_command(
             table.add_row("Knowledge Graph Verification", f"[yellow]Could not parse graph ({e})[/yellow]")
 
     console.print("\n", table)
-    console.print(f"[bold green]✓ Knowledge successfully restored to:[/bold green] [bold cyan]{target_dir}[/bold cyan]\n")
+    restored_label = "Full backup (knowledge + source books)" if is_full else "Knowledge"
+    console.print(f"[bold green]✓ {restored_label} successfully restored to:[/bold green] [bold cyan]{target_dir}[/bold cyan]\n")
 
 
 @app.command("ui")

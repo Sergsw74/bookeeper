@@ -316,3 +316,189 @@ def test_sanitize_filename_windows_compatibility():
     assert sanitize_filename("\tTabs and \r\n multiple   spaces\t") == "Tabs and multiple spaces"
 
 
+@pytest.fixture
+def mock_books_dir(tmp_path: Path) -> Path:
+    """Populate a temporary source books directory with indexed and unindexed books."""
+    bdir = tmp_path / "downloads"
+    bdir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Indexed book matching "Test Book" from mock_output_dir
+    book1 = bdir / "Test Book.pdf"
+    book1.write_bytes(b"%PDF-1.4 test indexed book pdf contents")
+    opf1 = bdir / "Test Book.opf"
+    opf1.write_text("<package><metadata><title>Test Book</title></metadata></package>", encoding="utf-8")
+
+    # 2. Unindexed book
+    book2 = bdir / "Unrelated Other Book.epub"
+    book2.write_bytes(b"PK\x03\x04test epub contents")
+
+    # 3. index.json
+    index_data = {
+        "1": {
+            "title": "Test Book",
+            "file_path": "Test Book.pdf",
+            "authors": ["Author One"],
+        },
+        "2": {
+            "title": "Unrelated Other Book",
+            "file_path": "Unrelated Other Book.epub",
+            "authors": ["Author Two"],
+        },
+    }
+    (bdir / "index.json").write_text(json.dumps(index_data), encoding="utf-8")
+
+    return bdir
+
+
+def test_full_backup_creation_and_restore(mock_output_dir: Path, mock_books_dir: Path, tmp_path: Path):
+    """Verify creating a full backup packages both knowledge artifacts and indexed source books."""
+    archive_dest = tmp_path / "test_full_backup.zip"
+
+    res_backup = create_backup(
+        source_dir=mock_output_dir,
+        destination=archive_dest,
+        format_type="zip",
+        backup_type="full",
+        books_dir=mock_books_dir,
+        indexed_only=True,
+    )
+
+    assert res_backup["backup_type"] == "full"
+    assert archive_dest.is_file()
+    assert res_backup["books_count"] >= 2  # Test Book.pdf, Test Book.opf, index.json
+
+    # Inspect backup
+    info = inspect_backup(archive_dest)
+    assert info["backup_type"] == "full"
+    assert info["categories"]["books"] >= 2
+    assert info["categories"]["graph"] >= 1
+
+    # Restore to clean targets
+    restore_out = tmp_path / "restored_output"
+    restore_books = tmp_path / "restored_books"
+
+    res_restore = restore_backup(
+        archive_path=archive_dest,
+        target_dir=restore_out,
+        books_dir=restore_books,
+        clean=True,
+    )
+
+    assert res_restore["backup_type"] == "full"
+    assert res_restore["knowledge_files_restored"] >= 5
+    assert res_restore["book_files_restored"] >= 2
+
+    # Verify knowledge files
+    assert (restore_out / "knowledge_graph.json").is_file()
+    assert (restore_out / "obsidian_vault" / "00_Index.md").is_file()
+
+    # Verify books
+    assert (restore_books / "Test Book.pdf").is_file()
+    assert (restore_books / "Test Book.opf").is_file()
+    assert (restore_books / "index.json").is_file()
+    # Unindexed book should NOT be restored when indexed_only=True
+    assert not (restore_books / "Unrelated Other Book.epub").exists()
+
+
+def test_full_backup_all_books(mock_output_dir: Path, mock_books_dir: Path, tmp_path: Path):
+    """Verify indexed_only=False includes all books in books_dir."""
+    archive_dest = tmp_path / "test_full_all.zip"
+
+    res = create_backup(
+        source_dir=mock_output_dir,
+        destination=archive_dest,
+        format_type="zip",
+        backup_type="full",
+        books_dir=mock_books_dir,
+        indexed_only=False,
+    )
+
+    info = inspect_backup(archive_dest)
+    paths = [e["path"] for e in info["entries"]]
+    assert "books/Test Book.pdf" in paths
+    assert "books/Unrelated Other Book.epub" in paths
+
+    restore_books = tmp_path / "restored_all_books"
+    restore_out = tmp_path / "restored_all_out"
+    restore_backup(archive_dest, target_dir=restore_out, books_dir=restore_books)
+
+    assert (restore_books / "Test Book.pdf").is_file()
+    assert (restore_books / "Unrelated Other Book.epub").is_file()
+
+
+def test_full_backup_cli(mock_output_dir: Path, mock_books_dir: Path, tmp_path: Path):
+    """Verify CLI backup and restore commands with --full and --books-dir."""
+    archive_dest = tmp_path / "cli_full.zip"
+    restore_out = tmp_path / "cli_full_out"
+    restore_books = tmp_path / "cli_full_books"
+
+    # 1. Run CLI backup --full
+    res_backup = runner.invoke(
+        app,
+        [
+            "backup",
+            str(archive_dest),
+            "--output-dir",
+            str(mock_output_dir),
+            "--full",
+            "--books-dir",
+            str(mock_books_dir),
+        ],
+    )
+    assert res_backup.exit_code == 0
+    assert "Full Backup Summary" in res_backup.stdout
+    assert "Books Source" in res_backup.stdout
+    assert archive_dest.is_file()
+
+    # 2. Run CLI restore
+    res_restore = runner.invoke(
+        app,
+        [
+            "restore",
+            str(archive_dest),
+            "--output-dir",
+            str(restore_out),
+            "--books-dir",
+            str(restore_books),
+        ],
+    )
+    assert res_restore.exit_code == 0
+    assert "Full Restoration Summary" in res_restore.stdout
+    assert "Book Files Restored" in res_restore.stdout
+    assert (restore_out / "knowledge_graph.json").is_file()
+    assert (restore_books / "Test Book.pdf").is_file()
+
+
+def test_full_backup_7z(mock_output_dir: Path, mock_books_dir: Path, tmp_path: Path):
+    """Verify creating and restoring a full backup with 7z format."""
+    archive_dest = tmp_path / "test_full_7z.7z"
+
+    res_backup = create_backup(
+        source_dir=mock_output_dir,
+        destination=archive_dest,
+        format_type="7z",
+        backup_type="full",
+        books_dir=mock_books_dir,
+        indexed_only=True,
+    )
+    assert res_backup["backup_type"] == "full"
+    assert archive_dest.is_file()
+
+    restore_out = tmp_path / "restored_7z_out"
+    restore_books = tmp_path / "restored_7z_books"
+
+    res_restore = restore_backup(
+        archive_path=archive_dest,
+        target_dir=restore_out,
+        books_dir=restore_books,
+        clean=True,
+    )
+    assert res_restore["backup_type"] == "full"
+    assert (restore_out / "knowledge_graph.json").is_file()
+    assert (restore_books / "Test Book.pdf").is_file()
+    assert (restore_books / "Test Book.opf").is_file()
+    assert (restore_books / "index.json").is_file()
+
+
+
+

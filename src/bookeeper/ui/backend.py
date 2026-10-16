@@ -11,6 +11,7 @@ Coordinates:
 
 import json
 import logging
+import os
 import re
 import time
 from collections import Counter
@@ -131,102 +132,269 @@ class SearchEngineBackend:
         self._books_index_cache: Optional[Dict[str, Any]] = None
         self._books_index_mtime: float = 0.0
 
-    def _get_books_dir(self) -> Optional[Path]:
-        """Resolve the directory containing book files from configuration or standard locations."""
-        # 1. Config resolved_books_dir
-        b_dir = getattr(self.config, "resolved_books_dir", None)
-        if b_dir and Path(b_dir).is_dir():
-            return Path(b_dir).resolve()
+    def _get_all_books_dirs(self) -> List[Path]:
+        """
+        Discover and return all candidate directories containing book files or index.json.
+        Preserves precedence while eliminating duplicates and empty folders.
+        """
+        raw_candidates: List[Any] = []
 
-        # 2. String config books_dir
-        raw_b_dir = getattr(self.config, "books_dir", None)
-        if raw_b_dir:
-            p = Path(raw_b_dir).expanduser().resolve()
-            if p.is_dir():
-                return p
+        # 1. Environment variables
+        raw_candidates.append(os.environ.get("BOOKEEPER_BOOKS_DIR"))
+        raw_candidates.append(os.environ.get("BOOKS_DIR"))
 
-        # 3. Locations relative to resolved output_dir
-        out_dir = getattr(self.config, "resolved_output_dir", None)
+        # 2. Configured resolved_books_dir / books_dir
+        raw_candidates.append(getattr(self.config, "resolved_books_dir", None))
+        raw_candidates.append(getattr(self.config, "books_dir", None))
+
+        # 3. Locations relative to output directory (where full backups extract books)
+        out_dir = getattr(self.config, "resolved_output_dir", None) or getattr(self.config, "output_dir", None)
         if out_dir:
-            out_p = Path(out_dir).expanduser().resolve()
-            for candidate in (
-                out_p / "archive_downloader" / "downloads",
-                out_p / "downloads",
-                out_p / "books",
-                out_p.parent / "archive_downloader" / "downloads",
-                out_p.parent / "downloads",
-                out_p.parent / "books",
-            ):
-                if candidate.is_dir():
-                    return candidate
+            try:
+                out_p = Path(out_dir).expanduser().resolve()
+                raw_candidates.extend([
+                    out_p / "archive_downloader" / "downloads",
+                    out_p / "downloads",
+                    out_p / "books",
+                    out_p.parent / "archive_downloader" / "downloads",
+                    out_p.parent / "downloads",
+                    out_p.parent / "books",
+                ])
+            except Exception:
+                pass
 
-        # 4. Standard fallback locations
-        for candidate in (
+        # 4. Standard container mount locations
+        raw_candidates.extend([
+            Path("/app/output/archive_downloader/downloads"),
+            Path("/app/output/downloads"),
+            Path("/app/output/books"),
+            Path("/app/archive_downloader/downloads"),
+            Path("/app/downloads"),
+            Path("/app/books"),
+        ])
+
+        # 5. Common server filesystem paths (e.g., Ubuntu server restore targets)
+        raw_candidates.extend([
+            Path("/srv/dev-disk-by-uuid-1d5527f6-4c4f-419b-aee6-896ae783c213/bookeeper/archive_downloader/downloads"),
+            Path("/srv/dev-disk-by-uuid-1d5527f6-4c4f-419b-aee6-896ae783c213/bookeeper/downloads"),
+            Path("/srv/dev-disk-by-uuid-1d5527f6-4c4f-419b-aee6-896ae783c213/bookeeper/books"),
+            Path("/srv/dev-disk-by-uuid-1d5527f6-4c4f-419b-aee6-896ae783c213/bookeeper"),
+            Path("/home/ubuntu/repos/bookeeper/archive_downloader/downloads"),
+            Path("/home/ubuntu/repos/bookeeper/downloads"),
+            Path("/home/ubuntu/repos/bookeeper/books"),
+        ])
+
+        # 6. Current working directory relatives
+        raw_candidates.extend([
             Path("archive_downloader/downloads").resolve(),
             Path("./downloads").resolve(),
             Path("./books").resolve(),
-        ):
-            if candidate.is_dir():
-                return candidate
+            Path("../archive_downloader/downloads").resolve(),
+        ])
+
+        def _dir_has_books(p: Path) -> bool:
+            try:
+                if not p.is_dir():
+                    return False
+                idx = p / "index.json"
+                if idx.is_file() and idx.stat().st_size > 2:
+                    return True
+                for ext in ("*.pdf", "*.epub", "*.mobi", "*.azw3", "*.djvu", "*.txt", "*.opf"):
+                    if next(p.glob(ext), None) is not None:
+                        return True
+            except Exception:
+                pass
+            return False
+
+        valid_dirs: List[Path] = []
+        seen = set()
+
+        # First pass: only return directories that actually contain books or index.json
+        for c in raw_candidates:
+            if not c:
+                continue
+            try:
+                p = Path(c).expanduser().resolve()
+                if p not in seen:
+                    seen.add(p)
+                    if _dir_has_books(p):
+                        valid_dirs.append(p)
+            except Exception:
+                continue
+
+        # Second pass fallback: if no directory had books, pick any candidate that exists on disk
+        if not valid_dirs:
+            for c in raw_candidates:
+                if not c:
+                    continue
+                try:
+                    p = Path(c).expanduser().resolve()
+                    if p.is_dir() and p not in valid_dirs:
+                        valid_dirs.append(p)
+                except Exception:
+                    continue
+
+        return valid_dirs
+
+    def _get_books_dir(self) -> Optional[Path]:
+        """Resolve the primary directory containing book files."""
+        dirs = self._get_all_books_dirs()
+        return dirs[0] if dirs else None
+
+    def _get_book_title_by_id(self, book_id: Any) -> Optional[str]:
+        """
+        Resolve real book title from numeric/string book_id using offline artifacts:
+        .book_states, chunks, knowledge_graph.json, or Neo4j if available.
+        """
+        if book_id is None:
+            return None
+        bid_str = str(book_id).replace("book:", "").strip()
+        if not bid_str or bid_str.lower() in ("sample", "unknown", "untitled", "none"):
+            return None
+
+        if not hasattr(self, "_book_id_title_map") or self._book_id_title_map is None:
+            self._book_id_title_map = {}
+
+        if bid_str in self._book_id_title_map:
+            return self._book_id_title_map[bid_str]
+
+        out_dir = getattr(self.config, "resolved_output_dir", None) or Path("output")
+        try:
+            out_p = Path(out_dir).expanduser().resolve()
+        except Exception:
+            out_p = Path("output").resolve()
+
+        # 1. Check .book_states/
+        try:
+            state_file = out_p / ".book_states" / f"book_{bid_str}_state.json"
+            if state_file.is_file():
+                with open(state_file, "r", encoding="utf-8") as f:
+                    sdata = json.load(f)
+                    bt = sdata.get("book_title")
+                    if bt and bt.strip() and bt.lower() != "sample":
+                        self._book_id_title_map[bid_str] = bt.strip()
+                        return bt.strip()
+        except Exception:
+            pass
+
+        # 2. Check chunks/
+        try:
+            chunk_file = out_p / "chunks" / f"book_{bid_str}_chunks.json"
+            if chunk_file.is_file():
+                with open(chunk_file, "r", encoding="utf-8") as f:
+                    cdata = json.load(f)
+                    bt = cdata.get("book_title") if isinstance(cdata, dict) else None
+                    if bt and bt.strip() and bt.lower() != "sample":
+                        self._book_id_title_map[bid_str] = bt.strip()
+                        return bt.strip()
+        except Exception:
+            pass
+
+        # 3. Check knowledge_graph.json
+        try:
+            kg_path = out_p / "knowledge_graph.json"
+            if kg_path.is_file():
+                with open(kg_path, "r", encoding="utf-8") as f:
+                    kg_data = json.load(f)
+                for node in kg_data.get("nodes", []):
+                    n_bid = str(node.get("book_id", "")).replace("book:", "").strip()
+                    n_bt = node.get("book_title")
+                    if n_bid and n_bt and n_bt.strip() and n_bt.lower() != "sample":
+                        self._book_id_title_map[n_bid] = n_bt.strip()
+                if bid_str in self._book_id_title_map:
+                    return self._book_id_title_map[bid_str]
+        except Exception:
+            pass
+
+        # 4. Check Neo4j if available
+        try:
+            bid_num = int(bid_str)
+            driver = self.get_neo4j_driver()
+            with driver.session(database=self.neo4j_cfg.database) as s:
+                rec = s.run(
+                    "MATCH (c:Chunk) WHERE c.book_id = $bid AND c.book_title IS NOT NULL AND toLower(c.book_title) <> 'sample' RETURN c.book_title AS bt LIMIT 1",
+                    {"bid": bid_num},
+                ).single()
+                if rec and rec["bt"]:
+                    res_bt = rec["bt"].strip()
+                    self._book_id_title_map[bid_str] = res_bt
+                    return res_bt
+        except Exception:
+            pass
 
         return None
 
     def _load_books_index(self) -> Dict[str, Any]:
         """
-        Load index.json mapping from books_dir, caching it in memory.
+        Load index.json mapping from all available books directories, caching it in memory.
         Returns a dict containing:
         - 'by_key': raw dict from index.json
         - 'by_norm_title': normalized_title -> entry
         - 'by_file_name': lowercase filename -> entry
         - 'entries': list of entries
         """
-        books_dir = self._get_books_dir()
-        if not books_dir:
-            return {"by_key": {}, "by_norm_title": {}, "by_file_name": {}, "entries": []}
+        books_dirs = self._get_all_books_dirs()
+        if not books_dirs:
+            b_dir = self._get_books_dir()
+            if b_dir:
+                books_dirs = [b_dir]
+            else:
+                return {"by_key": {}, "by_norm_title": {}, "by_file_name": {}, "entries": []}
 
-        index_path = books_dir / "index.json"
-        if not index_path.is_file():
-            return {"by_key": {}, "by_norm_title": {}, "by_file_name": {}, "entries": []}
+        mtimes: List[Tuple[str, float]] = []
+        for b in books_dirs:
+            idx_file = b / "index.json"
+            if idx_file.is_file():
+                try:
+                    mtimes.append((str(idx_file), idx_file.stat().st_mtime))
+                except Exception:
+                    pass
+        current_mtimes = tuple(mtimes)
+        if self._books_index_cache is not None and getattr(self, "_books_index_mtimes", None) == current_mtimes:
+            return self._books_index_cache
 
-        try:
-            mtime = index_path.stat().st_mtime
-            if self._books_index_cache is not None and self._books_index_mtime == mtime:
-                return self._books_index_cache
+        by_key: Dict[str, Any] = {}
+        by_norm_title: Dict[str, Any] = {}
+        by_file_name: Dict[str, Any] = {}
+        entries: List[Dict[str, Any]] = []
 
-            with open(index_path, "r", encoding="utf-8") as f:
-                raw_data = json.load(f)
-
-            by_norm_title: Dict[str, Any] = {}
-            by_file_name: Dict[str, Any] = {}
-            entries: List[Dict[str, Any]] = []
-
-            for key, val in raw_data.items():
-                if not isinstance(val, dict):
+        for b in books_dirs:
+            idx_path = b / "index.json"
+            if not idx_path.is_file():
+                continue
+            try:
+                with open(idx_path, "r", encoding="utf-8") as f:
+                    raw_data = json.load(f)
+                if not isinstance(raw_data, dict):
                     continue
-                entry = dict(val)
-                entry.setdefault("key", key)
-                title = entry.get("title", "")
-                if title:
-                    norm_t = re.sub(r"[^a-z0-9]", "", title.lower())
-                    if norm_t:
-                        by_norm_title[norm_t] = entry
-                fpath = entry.get("file_path", "")
-                if fpath:
-                    by_file_name[Path(fpath).name.lower()] = entry
-                entries.append(entry)
+                for key, val in raw_data.items():
+                    if not isinstance(val, dict):
+                        continue
+                    entry = dict(val)
+                    entry.setdefault("key", key)
+                    entry["_dir"] = str(b)
+                    by_key[key] = entry
+                    title = entry.get("title", "")
+                    if title:
+                        norm_t = re.sub(r"[^a-z0-9]", "", title.lower())
+                        if norm_t:
+                            by_norm_title[norm_t] = entry
+                    fpath = entry.get("file_path", "")
+                    if fpath:
+                        by_file_name[Path(fpath).name.lower()] = entry
+                    entries.append(entry)
+            except Exception as e:
+                logger.warning(f"Failed to load books index.json from {idx_path}: {e}")
 
-            cache = {
-                "by_key": raw_data,
-                "by_norm_title": by_norm_title,
-                "by_file_name": by_file_name,
-                "entries": entries,
-            }
-            self._books_index_cache = cache
-            self._books_index_mtime = mtime
-            return cache
-        except Exception as e:
-            logger.warning(f"Failed to load books index.json from {index_path}: {e}")
-            return {"by_key": {}, "by_norm_title": {}, "by_file_name": {}, "entries": []}
+        cache = {
+            "by_key": by_key,
+            "by_norm_title": by_norm_title,
+            "by_file_name": by_file_name,
+            "entries": entries,
+        }
+        self._books_index_cache = cache
+        self._books_index_mtimes = current_mtimes
+        return cache
 
     def resolve_book_file(
         self,
@@ -240,9 +408,13 @@ class SearchEngineBackend:
         Matches by filename, exact/fuzzy book title, breadcrumb header, or book ID.
         Returns a dict with metadata, download/view URLs, or None if not found.
         """
-        books_dir = self._get_books_dir()
-        if not books_dir or not books_dir.is_dir():
-            return None
+        books_dirs = self._get_all_books_dirs()
+        if not books_dirs:
+            primary = self._get_books_dir()
+            if primary:
+                books_dirs = [primary]
+            else:
+                return None
 
         def _norm(s: str) -> str:
             return re.sub(r"[^a-z0-9]", "", s.lower()) if s else ""
@@ -256,43 +428,61 @@ class SearchEngineBackend:
         target_file: Optional[Path] = None
         matched_entry: Optional[Dict[str, Any]] = None
 
-        # 1. Direct filename match
+        # 1. Direct filename match across any discovered books directory
         if filename:
             clean_name = Path(filename).name
-            cand = (books_dir / clean_name).resolve()
-            if cand.is_relative_to(books_dir) and cand.is_file():
-                target_file = cand
-                matched_entry = by_file_name.get(cand.name.lower())
+            for b_dir in books_dirs:
+                cand = (b_dir / clean_name).resolve()
+                if cand.is_file():
+                    target_file = cand
+                    matched_entry = by_file_name.get(cand.name.lower())
+                    break
 
-        # 2. Match by key / arxiv_id / book_id if provided
+        # 2. Match by key / arxiv_id / book_id if provided in index.json
         if not target_file and book_id is not None:
             bid_str = str(book_id).strip()
-            if bid_str.startswith("book:"):
-                bid_clean = bid_str.split(":", 1)[1]
-            else:
-                bid_clean = bid_str
+            bid_clean = bid_str.replace("book:", "").strip()
             if bid_clean in by_key:
                 matched_entry = by_key[bid_clean]
                 fp = matched_entry.get("file_path")
-                if fp and (books_dir / fp).is_file():
-                    target_file = (books_dir / fp).resolve()
+                if fp:
+                    entry_dir = matched_entry.get("_dir")
+                    dirs_to_check = [Path(entry_dir)] if entry_dir else books_dirs
+                    for b_dir in dirs_to_check:
+                        cand = (b_dir / fp).resolve()
+                        if cand.is_file():
+                            target_file = cand
+                            break
 
-        # 3. Match by candidate title extracted from breadcrumb if title is empty or generic
+        # 3. Determine effective title (substituting real title if 'sample' or empty)
         effective_title = (title or "").strip()
-        if (not effective_title or effective_title.lower() in ("sample", "unknown", "untitled")) and breadcrumb:
+        if not effective_title or effective_title.lower() in ("sample", "unknown", "untitled", "none"):
+            if book_id is not None:
+                real_title = self._get_book_title_by_id(book_id)
+                if real_title:
+                    effective_title = real_title
+
+        # Check breadcrumb if still empty or sample
+        if (not effective_title or effective_title.lower() in ("sample", "unknown", "untitled", "none")) and breadcrumb:
             parts = breadcrumb.split(" > ")
-            if parts and parts[0].strip():
+            if parts and parts[0].strip() and parts[0].strip().lower() not in ("sample", "unknown", "untitled", "none"):
                 effective_title = parts[0].strip()
 
-        # 4. Match by Title
-        if not target_file and effective_title:
+        # 4. Match by Title (only if effective_title is non-empty and not generic)
+        if not target_file and effective_title and effective_title.lower() not in ("sample", "unknown", "untitled", "none"):
             norm_q = _norm(effective_title)
             # 4a. Exact normalized match in index.json
             if norm_q in by_norm_title:
                 matched_entry = by_norm_title[norm_q]
                 fp = matched_entry.get("file_path")
-                if fp and (books_dir / fp).is_file():
-                    target_file = (books_dir / fp).resolve()
+                if fp:
+                    entry_dir = matched_entry.get("_dir")
+                    dirs_to_check = [Path(entry_dir)] if entry_dir else books_dirs
+                    for b_dir in dirs_to_check:
+                        cand = (b_dir / fp).resolve()
+                        if cand.is_file():
+                            target_file = cand
+                            break
 
             # 4b. Containment/substring match in index.json
             if not target_file and len(norm_q) >= 4:
@@ -300,34 +490,44 @@ class SearchEngineBackend:
                     ent_norm = _norm(entry.get("title", ""))
                     if ent_norm and (norm_q in ent_norm or ent_norm in norm_q):
                         fp = entry.get("file_path")
-                        if fp and (books_dir / fp).is_file():
-                            target_file = (books_dir / fp).resolve()
-                            matched_entry = entry
+                        if fp:
+                            entry_dir = entry.get("_dir")
+                            dirs_to_check = [Path(entry_dir)] if entry_dir else books_dirs
+                            for b_dir in dirs_to_check:
+                                cand = (b_dir / fp).resolve()
+                                if cand.is_file():
+                                    target_file = cand
+                                    matched_entry = entry
+                                    break
+                        if target_file:
                             break
 
-            # 4c. Direct file scan in books_dir if not found in index.json
+            # 4c. Direct file scan across all books_dirs if not found in index.json
             if not target_file and len(norm_q) >= 4:
-                for ext in ("*.pdf", "*.epub", "*.mobi", "*.azw3", "*.djvu", "*.txt"):
-                    for f in books_dir.glob(ext):
-                        norm_f = _norm(f.stem)
-                        if norm_f and (norm_q in norm_f or norm_f in norm_q):
-                            target_file = f.resolve()
-                            matched_entry = by_file_name.get(f.name.lower())
+                for b_dir in books_dirs:
+                    for ext in ("*.pdf", "*.epub", "*.mobi", "*.azw3", "*.djvu", "*.txt"):
+                        for f in b_dir.glob(ext):
+                            norm_f = _norm(f.stem)
+                            if norm_f and (norm_q in norm_f or norm_f in norm_q):
+                                target_file = f.resolve()
+                                matched_entry = by_file_name.get(f.name.lower())
+                                break
+                        if target_file:
                             break
                     if target_file:
                         break
 
-        # 5. Fallback for numeric book_id via Neo4j chunk lookup
+        # 5. Online Neo4j fallback if still not found
         if not target_file and book_id is not None:
             try:
                 bid_num = int(str(book_id).replace("book:", ""))
                 driver = self.get_neo4j_driver()
                 with driver.session(database=self.neo4j_cfg.database) as s:
                     rec = s.run(
-                        "MATCH (c:Chunk) WHERE c.book_id = $bid AND c.book_title IS NOT NULL RETURN c.book_title AS bt LIMIT 1",
+                        "MATCH (c:Chunk) WHERE c.book_id = $bid AND c.book_title IS NOT NULL AND toLower(c.book_title) <> 'sample' RETURN c.book_title AS bt LIMIT 1",
                         {"bid": bid_num},
                     ).single()
-                    if rec and rec["bt"]:
+                    if rec and rec["bt"] and rec["bt"] != effective_title:
                         return self.resolve_book_file(title=rec["bt"], filename=filename)
             except Exception:
                 pass

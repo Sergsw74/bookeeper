@@ -21,11 +21,11 @@ services:
       # - BOOKEEPER_NEO4J_PASSWORD=password
     volumes:
       # Mount configuration file
-      - ./config.yaml:/app/config.yaml:ro
+      - ${BOOKEEPER_CONFIG_FILE:-./config.yaml}:/app/config.yaml:ro
       # Knowledge artifacts (graph, embeddings, obsidian vault, chunks, checkpoints)
-      - ./output:/app/output
-      # Source books and papers
-      - ./archive_downloader/downloads:/app/archive_downloader/downloads
+      - ${BOOKEEPER_DATA_DIR:-./output}:/app/output
+      # Source books and papers (can point to host download folder or disk mount)
+      - ${BOOKEEPER_BOOKS_DIR:-./archive_downloader/downloads}:/app/archive_downloader/downloads
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/"]
       interval: 30s

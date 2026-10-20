@@ -1448,6 +1448,265 @@
       background: rgba(0,0,0,0.25);
       color: #fff;
     }
+
+    /* Books View Pane & Table Styling */
+    .books-container {
+      max-width: 1200px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 24px;
+      overflow-y: auto;
+      height: 100%;
+    }
+
+    .books-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    .books-header-left {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+    }
+
+    .books-title {
+      font-size: 1.4rem;
+      font-weight: 700;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .books-subtitle {
+      font-size: 0.88rem;
+      color: var(--text-muted);
+    }
+
+    .books-controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .books-filter-input {
+      background: var(--bg-dark);
+      border: 1px solid var(--border);
+      color: var(--text-main);
+      padding: 7px 12px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      outline: none;
+      width: 240px;
+      transition: border-color 0.15s;
+    }
+
+    .books-filter-input:focus {
+      border-color: var(--accent);
+    }
+
+    .books-table-card {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+    }
+
+    .books-table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 0.88rem;
+    }
+
+    .books-table th {
+      background: rgba(15, 23, 42, 0.75);
+      padding: 12px 16px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      font-size: 0.75rem;
+      letter-spacing: 0.5px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    .books-table td {
+      padding: 14px 16px;
+      border-bottom: 1px solid rgba(51, 65, 85, 0.5);
+      vertical-align: top;
+    }
+
+    .books-table tr:hover {
+      background: rgba(51, 65, 85, 0.35);
+    }
+
+    .book-title-cell {
+      font-weight: 600;
+      color: var(--text-main);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .book-author-sub {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      font-weight: 400;
+    }
+
+    .book-meta-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid var(--border);
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+
+    .book-ideas-cell {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      max-width: 580px;
+    }
+
+    .idea-pill-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      background: rgba(99, 102, 241, 0.12);
+      border: 1px solid rgba(99, 102, 241, 0.35);
+      color: #c7d2fe;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      font-weight: 500;
+      cursor: pointer;
+      text-decoration: none;
+      transition: all 0.15s ease;
+    }
+
+    .idea-pill-tag:hover {
+      background: rgba(99, 102, 241, 0.3);
+      border-color: var(--accent);
+      color: #ffffff;
+      transform: translateY(-1px);
+      box-shadow: 0 2px 6px rgba(99, 102, 241, 0.25);
+    }
+
+    .idea-score-sub {
+      background: rgba(99, 102, 241, 0.35);
+      color: #e0e7ff;
+      border-radius: 4px;
+      padding: 0 4px;
+      font-size: 0.7rem;
+      font-weight: 700;
+    }
+
+    .book-action-btn {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 0.78rem;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      transition: all 0.15s ease;
+      text-decoration: none;
+    }
+
+    .book-action-btn:hover {
+      color: var(--text-main);
+      border-color: var(--accent);
+      background: var(--bg-card);
+    }
+
+    /* Modal dialog styling for backup */
+    .modal-backdrop {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background: rgba(15, 23, 42, 0.75);
+      backdrop-filter: blur(4px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 99999;
+    }
+
+    .modal-card {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      max-width: 520px;
+      width: 90%;
+      box-shadow: 0 16px 36px rgba(0, 0, 0, 0.6);
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .modal-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .modal-close-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 1.2rem;
+      cursor: pointer;
+      padding: 4px;
+      border-radius: 4px;
+    }
+    .modal-close-btn:hover {
+      color: #fff;
+      background: var(--bg-card);
+    }
+
+    .modal-body {
+      font-size: 0.88rem;
+      color: var(--text-muted);
+      line-height: 1.5;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .modal-footer {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 8px;
+    }
   </style>
 </head>
 <body>
@@ -1478,6 +1737,10 @@
       <div class="nav-tabs">
         <button class="nav-tab-btn active" id="tab-btn-graph" onclick="switchTab('graph')">
           🌐 Graph & Explorer
+        </button>
+        <button class="nav-tab-btn" id="tab-btn-books" onclick="switchTab('books')">
+          📚 Indexed Books
+          <span id="books-count-badge" class="debug-tag info" style="display:none; margin-left:4px;">0</span>
         </button>
         <button class="nav-tab-btn" id="tab-btn-debug" onclick="switchTab('debug')">
           🔬 Debug & Observability
@@ -1667,7 +1930,57 @@
       </div>
     </div>
 
-    <!-- View 2: Dedicated Debug & Telemetry Tab -->
+    <!-- View 2: Dedicated Indexed Books List Page -->
+    <div class="view-pane" id="pane-books">
+      <div class="books-container">
+        <div class="books-header">
+          <div class="books-header-left">
+            <h2 class="books-title"><span>📚</span> Indexed Books & Literature</h2>
+            <span class="books-subtitle" id="books-subtitle-count">Showing indexed books in descending chronological order</span>
+          </div>
+          <div class="books-controls">
+            <input 
+              type="text" 
+              id="books-search-filter" 
+              class="books-filter-input" 
+              placeholder="Filter by title, author, or idea..." 
+              oninput="filterBooksTable()"
+            />
+            <button class="debug-action-btn" onclick="openBackupModal()" title="Create and download full backup archive">
+              <span>💾</span> Full Backup
+            </button>
+            <button class="debug-action-btn" onclick="openRestoreModal()" title="Upload and restore backup archive into database">
+              <span>📥</span> Restore Backup
+            </button>
+            <button class="debug-action-btn" onclick="loadIndexedBooks(true)" title="Refresh indexed books list">
+              <span>🔄</span> Refresh Books
+            </button>
+          </div>
+        </div>
+
+        <div class="books-table-card">
+          <table class="books-table" id="books-table">
+            <thead>
+              <tr>
+                <th style="width: 28%;">Book Title & Author</th>
+                <th style="width: 48%;">Highlighted Ideas (occurrences × weight)</th>
+                <th style="width: 12%;">Indexed Date</th>
+                <th style="width: 12%; text-align: right;">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="books-table-body">
+              <tr>
+                <td colspan="4" style="text-align:center; padding: 40px; color: var(--text-muted);">
+                  Loading indexed books from knowledge base...
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- View 3: Dedicated Debug & Telemetry Tab -->
     <div class="view-pane" id="pane-debug">
       <div class="debug-container" style="max-width:1100px; margin:0 auto; padding:20px; overflow-y:auto; height:100%;">
         <!-- Database Consistency & Sync Panel -->
@@ -1699,6 +2012,120 @@
     <div class="loading-overlay" id="loading-overlay">
       <div class="spinner"></div>
       <div id="loading-status-text" style="font-weight: 600; color: #e2e8f0;">Searching Knowledge Graph for ideas & neighborhood...</div>
+    </div>
+
+    <!-- Full Backup Modal Dialog -->
+    <div class="modal-backdrop" id="backup-modal">
+      <div class="modal-card">
+        <div class="modal-header">
+          <div class="modal-title">
+            <span>💾</span> Create & Download Backup
+          </div>
+          <button class="modal-close-btn" onclick="closeBackupModal()">✕</button>
+        </div>
+        <div class="modal-body">
+          <p>Package your entire knowledge graph, checkpoints, concept notes, evidence chunks, and original source books into a compressed archive.</p>
+          
+          <div style="display:flex; flex-direction:column; gap:6px;">
+            <label style="font-size:0.8rem; font-weight:600; color:var(--text-muted); text-transform:uppercase;">Backup Type:</label>
+            <select id="backup-type-select" class="toolbar-select" style="width:100%; padding:8px 10px;">
+              <option value="full" selected>Full Backup (Knowledge Graph + Indexed Source Books)</option>
+              <option value="knowledge">Knowledge Only (Graph, Chunks, Notes, State Checkpoints)</option>
+            </select>
+          </div>
+
+          <div style="display:flex; flex-direction:column; gap:6px;">
+            <label style="font-size:0.8rem; font-weight:600; color:var(--text-muted); text-transform:uppercase;">Archive Format:</label>
+            <select id="backup-format-select" class="toolbar-select" style="width:100%; padding:8px 10px;">
+              <option value="zip" selected>ZIP (.zip) - Universal Compatibility</option>
+              <option value="7z">7-Zip (.7z) - Maximum Compression</option>
+            </select>
+          </div>
+
+          <div id="backup-progress-area" style="display:none; background:rgba(15,23,42,0.6); padding:12px; border-radius:6px; border:1px solid var(--border);">
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+              <div class="spinner" style="width:16px; height:16px; border-width:2px; margin:0;"></div>
+              <span id="backup-progress-text" style="font-size:0.85rem; color:var(--text-main);">Preparing backup archive...</span>
+            </div>
+            <div style="font-size:0.75rem; color:var(--text-muted);">This may take a few moments depending on the size of your library.</div>
+          </div>
+
+          <div id="backup-result-area" style="display:none; background:rgba(16,185,129,0.12); padding:12px; border-radius:6px; border:1px solid #10b981;">
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px; color:#34d399; font-weight:600;">
+              <span>✓</span> Backup Prepared Successfully!
+            </div>
+            <div id="backup-result-details" style="font-size:0.82rem; color:var(--text-main); line-height:1.5;"></div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="book-action-btn" onclick="closeBackupModal()" id="btn-backup-cancel">Cancel</button>
+          <button class="search-btn" id="btn-backup-start" onclick="startBackupCreation()" style="padding:8px 18px; font-size:0.9rem;">
+            <span>🚀 Prepare & Download</span>
+          </button>
+          <a id="btn-backup-download" class="search-btn" href="#" target="_blank" style="display:none; padding:8px 18px; font-size:0.9rem; text-decoration:none; background:#10b981;">
+            <span>📥 Download File</span>
+          </a>
+        </div>
+      </div>
+    </div>
+
+    <!-- Restore Backup Modal Dialog -->
+    <div class="modal-backdrop" id="restore-modal">
+      <div class="modal-card">
+        <div class="modal-header">
+          <div class="modal-title">
+            <span>📥</span> Restore Backup Archive
+          </div>
+          <button class="modal-close-btn" onclick="closeRestoreModal()">✕</button>
+        </div>
+        <div class="modal-body">
+          <p>Upload a Bookkeeper backup archive (<code style="color:#a5b4fc;">.zip</code> or <code style="color:#a5b4fc;">.7z</code>). The server will unpack the archive, update the local knowledge base, synchronize the connected Neo4j database, and validate database consistency.</p>
+
+          <div style="background:rgba(245,158,11,0.12); border:1px solid #f59e0b; padding:10px 14px; border-radius:6px; font-size:0.82rem; color:#fde68a;">
+            <strong>⚠️ Maintenance Notice:</strong> Idea search and graph queries are locked during the restore process to prevent partial read errors.
+          </div>
+
+          <div style="display:flex; flex-direction:column; gap:6px;">
+            <label style="font-size:0.8rem; font-weight:600; color:var(--text-muted); text-transform:uppercase;">Select Backup File:</label>
+            <input 
+              type="file" 
+              id="restore-file-input" 
+              accept=".zip,.7z,application/zip,application/x-7z-compressed" 
+              style="background:var(--bg-dark); border:1px solid var(--border); padding:8px; border-radius:6px; color:var(--text-main); font-size:0.85rem;" 
+              onchange="onRestoreFileSelected()"
+            />
+            <div id="restore-file-info" style="font-size:0.75rem; color:var(--text-muted);">Supported formats: .zip, .7z</div>
+          </div>
+
+          <div style="display:flex; align-items:center; gap:8px;">
+            <input type="checkbox" id="restore-clean-chk" checked style="accent-color:var(--accent); width:16px; height:16px; cursor:pointer;" />
+            <label for="restore-clean-chk" style="font-size:0.85rem; color:var(--text-main); cursor:pointer;">
+              Clean restore (purge existing artifacts and wipe Neo4j before importing)
+            </label>
+          </div>
+
+          <div id="restore-progress-area" style="display:none; background:rgba(15,23,42,0.6); padding:12px; border-radius:6px; border:1px solid var(--border);">
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+              <div class="spinner" style="width:16px; height:16px; border-width:2px; margin:0;"></div>
+              <span id="restore-progress-text" style="font-size:0.85rem; color:var(--text-main);">Uploading and unpacking archive...</span>
+            </div>
+            <div id="restore-progress-sub" style="font-size:0.75rem; color:var(--text-muted);">Please keep this window open while files are being restored and Neo4j is updated.</div>
+          </div>
+
+          <div id="restore-result-area" style="display:none; background:rgba(16,185,129,0.12); padding:12px; border-radius:6px; border:1px solid #10b981;">
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px; color:#34d399; font-weight:600;">
+              <span>✓</span> Restore & Synchronization Complete!
+            </div>
+            <div id="restore-result-details" style="font-size:0.82rem; color:var(--text-main); line-height:1.5;"></div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="book-action-btn" onclick="closeRestoreModal()" id="btn-restore-cancel">Close</button>
+          <button class="search-btn" id="btn-restore-start" onclick="startBackupRestore()" style="padding:8px 18px; font-size:0.9rem;" disabled>
+            <span>📥 Upload & Restore</span>
+          </button>
+        </div>
+      </div>
     </div>
   </main>
 
@@ -2293,6 +2720,8 @@
       });
     }
 
+    let indexedBooksCache = [];
+
     function switchTab(tab) {
       document.querySelectorAll('.nav-tab-btn').forEach(b => b.classList.remove('active'));
       document.querySelectorAll('.view-pane').forEach(p => p.classList.remove('active'));
@@ -2301,6 +2730,12 @@
         document.getElementById('tab-btn-graph').classList.add('active');
         document.getElementById('pane-graph').classList.add('active');
         if (cyInstance) cyInstance.resize();
+      } else if (tab === 'books') {
+        const btnBooks = document.getElementById('tab-btn-books');
+        if (btnBooks) btnBooks.classList.add('active');
+        const paneBooks = document.getElementById('pane-books');
+        if (paneBooks) paneBooks.classList.add('active');
+        loadIndexedBooks();
       } else if (tab === 'debug') {
         document.getElementById('tab-btn-debug').classList.add('active');
         document.getElementById('pane-debug').classList.add('active');
@@ -2308,7 +2743,425 @@
       }
     }
 
+    async function loadIndexedBooks(forceRefresh = false) {
+      if (indexedBooksCache.length > 0 && !forceRefresh) {
+        renderBooksTable(indexedBooksCache);
+        return;
+      }
+
+      const tbody = document.getElementById('books-table-body');
+      if (tbody && indexedBooksCache.length === 0) {
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="4" style="text-align:center; padding: 40px; color: var(--text-muted);">
+              <div class="spinner" style="width:24px; height:24px; margin:0 auto 10px auto; border-width:2px;"></div>
+              Loading indexed books...
+            </td>
+          </tr>
+        `;
+      }
+
+      try {
+        const resp = await fetch('/api/books');
+        const data = await resp.json();
+        const books = data.books || [];
+        indexedBooksCache = books;
+
+        // Update badge
+        const badge = document.getElementById('books-count-badge');
+        if (badge) {
+          badge.textContent = books.length;
+          badge.style.display = books.length > 0 ? 'inline-block' : 'none';
+        }
+
+        renderBooksTable(books);
+      } catch (err) {
+        console.error('Failed to load indexed books:', err);
+        if (tbody) {
+          tbody.innerHTML = `
+            <tr>
+              <td colspan="4" style="text-align:center; padding: 30px; color: #f87171;">
+                Failed to load indexed books: ${escapeHtml(err.message)}
+              </td>
+            </tr>
+          `;
+        }
+      }
+    }
+
+    function renderBooksTable(books) {
+      const tbody = document.getElementById('books-table-body');
+      const subtitle = document.getElementById('books-subtitle-count');
+      if (!tbody) return;
+
+      if (!books || books.length === 0) {
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="4" style="text-align:center; padding: 40px; color: var(--text-muted);">
+              No indexed books found in knowledge graph. Run <code>bookeeper build-graph</code> to index literature.
+            </td>
+          </tr>
+        `;
+        if (subtitle) subtitle.textContent = '0 indexed books';
+        return;
+      }
+
+      if (subtitle) {
+        subtitle.textContent = `Showing ${books.length} indexed book${books.length === 1 ? '' : 's'} (ordered from most recent)`;
+      }
+
+      let html = '';
+      books.forEach(b => {
+        // Date formatting
+        let dateStr = 'Unknown';
+        if (b.timestamp) {
+          const d = new Date(b.timestamp * 1000);
+          dateStr = d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) + '<br><span style="font-size:0.75rem; color:var(--text-muted);">' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) + '</span>';
+        }
+
+        // Ideas tags
+        let ideasHtml = '';
+        if (b.top_ideas && b.top_ideas.length > 0) {
+          ideasHtml = b.top_ideas.map(idea => {
+            const ideaName = idea.name || idea.id || '';
+            const occ = idea.occurrences || 1;
+            const wt = idea.weight || 5;
+            const score = idea.score !== undefined ? idea.score : (occ * wt);
+            const titleTooltip = `Idea: ${escapeHtml(ideaName)}\nOccurrences: ${occ}\nWeight: ${wt}\nSignificance (occ × wt): ${score}`;
+            return `<a href="javascript:void(0)" class="idea-pill-tag" onclick="searchIdeaFromBooks('${escapeHtml(ideaName).replace(/'/g, "\\'")}')" title="${titleTooltip}">
+              <span>💡 ${escapeHtml(ideaName)}</span>
+              <span class="idea-score-sub" title="Occurrences in book × weight">${score}</span>
+            </a>`;
+          }).join('');
+        } else {
+          ideasHtml = '<span style="color:var(--text-muted); font-size:0.8rem; font-style:italic;">No core ideas extracted yet</span>';
+        }
+
+        // Book actions (view book note in explorer, download file if exists)
+        let actionsHtml = `<button class="book-action-btn" onclick="openBookInGraph('${escapeHtml(b.id || b.book_id || b.title).replace(/'/g, "\\'")}', '${escapeHtml(b.title).replace(/'/g, "\\'")}')" title="Explore concept subgraph & note details for this book">
+          <span>🔍 Explore</span>
+        </button>`;
+
+        if (b.book_file && b.book_file.download_url) {
+          actionsHtml += ` <a href="${b.book_file.download_url}" class="book-action-btn" target="_blank" title="Download book source file">
+            <span>📥 PDF/EPUB</span>
+          </a>`;
+        }
+
+        html += `
+          <tr>
+            <td>
+              <div class="book-title-cell">
+                <div>
+                  <a href="javascript:void(0)" onclick="openBookInGraph('${escapeHtml(b.id || b.book_id || b.title).replace(/'/g, "\\'")}', '${escapeHtml(b.title).replace(/'/g, "\\'")}')" style="color:var(--text-main); text-decoration:none; font-weight:600;" onmouseover="this.style.color='#818cf8'" onmouseout="this.style.color='var(--text-main)'">
+                    📖 ${escapeHtml(b.title)}
+                  </a>
+                </div>
+                <div class="book-author-sub">by ${escapeHtml(b.author || 'Unknown')}</div>
+                <div style="display:flex; gap:6px; margin-top:4px;">
+                  <span class="book-meta-badge">ID: ${escapeHtml(b.book_id)}</span>
+                  ${b.total_chunks ? `<span class="book-meta-badge">${b.total_chunks} chunks</span>` : ''}
+                  ${b.ideas_count !== undefined ? `<span class="book-meta-badge" style="color:#c7d2fe;">${b.ideas_count} ideas</span>` : ''}
+                </div>
+              </div>
+            </td>
+            <td>
+              <div class="book-ideas-cell">
+                ${ideasHtml}
+              </div>
+            </td>
+            <td style="white-space:nowrap; font-size:0.82rem;">
+              ${dateStr}
+            </td>
+            <td style="text-align: right; white-space: nowrap;">
+              ${actionsHtml}
+            </td>
+          </tr>
+        `;
+      });
+
+      tbody.innerHTML = html;
+    }
+
+    function filterBooksTable() {
+      const q = (document.getElementById('books-search-filter').value || '').toLowerCase().trim();
+      if (!q) {
+        renderBooksTable(indexedBooksCache);
+        return;
+      }
+
+      const filtered = indexedBooksCache.filter(b => {
+        const titleMatch = (b.title || '').toLowerCase().includes(q);
+        const authorMatch = (b.author || '').toLowerCase().includes(q);
+        const ideaMatch = (b.top_ideas || []).some(i => (i.name || '').toLowerCase().includes(q));
+        return titleMatch || authorMatch || ideaMatch;
+      });
+      renderBooksTable(filtered);
+    }
+
+    function searchIdeaFromBooks(ideaName) {
+      if (!ideaName) return;
+      const input = document.getElementById('search-input');
+      if (input) {
+        input.value = ideaName;
+        const clearBtn = document.getElementById('search-clear-btn');
+        if (clearBtn) clearBtn.style.display = 'block';
+      }
+      switchTab('graph');
+      executeSearch();
+    }
+
+    function openBookInGraph(bookNodeId, bookTitle) {
+      const input = document.getElementById('search-input');
+      if (input) {
+        input.value = bookTitle || bookNodeId;
+        const clearBtn = document.getElementById('search-clear-btn');
+        if (clearBtn) clearBtn.style.display = 'block';
+      }
+      switchTab('graph');
+      executeSearch();
+    }
+
+    function openBackupModal() {
+      const modal = document.getElementById('backup-modal');
+      const progressArea = document.getElementById('backup-progress-area');
+      const resultArea = document.getElementById('backup-result-area');
+      const startBtn = document.getElementById('btn-backup-start');
+      const downloadBtn = document.getElementById('btn-backup-download');
+
+      if (progressArea) progressArea.style.display = 'none';
+      if (resultArea) resultArea.style.display = 'none';
+      if (startBtn) {
+        startBtn.style.display = 'inline-flex';
+        startBtn.disabled = false;
+      }
+      if (downloadBtn) downloadBtn.style.display = 'none';
+
+      if (modal) modal.style.display = 'flex';
+    }
+
+    function closeBackupModal() {
+      const modal = document.getElementById('backup-modal');
+      if (modal) modal.style.display = 'none';
+    }
+
+    async function startBackupCreation() {
+      const typeSelect = document.getElementById('backup-type-select');
+      const formatSelect = document.getElementById('backup-format-select');
+      const progressArea = document.getElementById('backup-progress-area');
+      const progressText = document.getElementById('backup-progress-text');
+      const resultArea = document.getElementById('backup-result-area');
+      const resultDetails = document.getElementById('backup-result-details');
+      const startBtn = document.getElementById('btn-backup-start');
+      const downloadBtn = document.getElementById('btn-backup-download');
+      const cancelBtn = document.getElementById('btn-backup-cancel');
+
+      const backupType = typeSelect ? typeSelect.value : 'full';
+      const backupFormat = formatSelect ? formatSelect.value : 'zip';
+
+      if (progressArea) progressArea.style.display = 'block';
+      if (resultArea) resultArea.style.display = 'none';
+      if (startBtn) startBtn.disabled = true;
+      if (cancelBtn) cancelBtn.disabled = true;
+      if (progressText) {
+        progressText.textContent = `Packaging ${backupType === 'full' ? 'full backup (with source books)' : 'knowledge backup'} as .${backupFormat}...`;
+      }
+
+      try {
+        const resp = await fetch('/api/backup/prepare', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: backupType, format: backupFormat, indexed_only: true })
+        });
+        const data = await resp.json();
+
+        if (data.error) {
+          throw new Error(data.error);
+        }
+
+        if (progressArea) progressArea.style.display = 'none';
+        if (resultArea) resultArea.style.display = 'block';
+
+        const sizeMb = (data.file_size / (1024 * 1024)).toFixed(2);
+        if (resultDetails) {
+          resultDetails.innerHTML = `
+            <strong>File:</strong> <code>${escapeHtml(data.filename)}</code><br>
+            <strong>Size:</strong> ${sizeMb} MB (${data.file_size.toLocaleString()} bytes)<br>
+            <strong>Archived Files:</strong> ${data.total_files.toLocaleString()} entries<br>
+            <span style="color:#6ee7b7; font-size:0.75rem;">Your download is starting automatically, or click below.</span>
+          `;
+        }
+
+        if (startBtn) startBtn.style.display = 'none';
+        if (downloadBtn) {
+          downloadBtn.href = data.download_url;
+          downloadBtn.setAttribute('download', data.filename);
+          downloadBtn.style.display = 'inline-flex';
+        }
+
+        // Trigger browser download automatically
+        const a = document.createElement('a');
+        a.href = data.download_url;
+        a.download = data.filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+
+      } catch (err) {
+        alert('Failed to prepare backup: ' + err.message);
+        if (progressArea) progressArea.style.display = 'none';
+      } finally {
+        if (startBtn) startBtn.disabled = false;
+        if (cancelBtn) cancelBtn.disabled = false;
+      }
+    }
+
+    let isRestoreInProgress = false;
+
+    function openRestoreModal() {
+      const modal = document.getElementById('restore-modal');
+      const fileInput = document.getElementById('restore-file-input');
+      const fileInfo = document.getElementById('restore-file-info');
+      const progressArea = document.getElementById('restore-progress-area');
+      const resultArea = document.getElementById('restore-result-area');
+      const startBtn = document.getElementById('btn-restore-start');
+      const cancelBtn = document.getElementById('btn-restore-cancel');
+
+      if (fileInput) fileInput.value = '';
+      if (fileInfo) fileInfo.textContent = 'Supported formats: .zip, .7z';
+      if (progressArea) progressArea.style.display = 'none';
+      if (resultArea) resultArea.style.display = 'none';
+      if (startBtn) startBtn.disabled = true;
+      if (cancelBtn) cancelBtn.disabled = false;
+
+      if (modal) modal.style.display = 'flex';
+    }
+
+    function closeRestoreModal() {
+      if (isRestoreInProgress) {
+        if (!confirm('A restore operation is currently in progress. Closing this window will not abort the background server task. Are you sure?')) {
+          return;
+        }
+      }
+      const modal = document.getElementById('restore-modal');
+      if (modal) modal.style.display = 'none';
+    }
+
+    function onRestoreFileSelected() {
+      const fileInput = document.getElementById('restore-file-input');
+      const fileInfo = document.getElementById('restore-file-info');
+      const startBtn = document.getElementById('btn-restore-start');
+
+      if (fileInput && fileInput.files && fileInput.files[0]) {
+        const file = fileInput.files[0];
+        const sizeMb = (file.size / (1024 * 1024)).toFixed(2);
+        if (fileInfo) {
+          fileInfo.textContent = `Selected: ${file.name} (${sizeMb} MB)`;
+        }
+        if (startBtn) startBtn.disabled = false;
+      } else {
+        if (fileInfo) fileInfo.textContent = 'Supported formats: .zip, .7z';
+        if (startBtn) startBtn.disabled = true;
+      }
+    }
+
+    async function startBackupRestore() {
+      const fileInput = document.getElementById('restore-file-input');
+      if (!fileInput || !fileInput.files || !fileInput.files[0]) {
+        alert('Please choose a backup file to restore.');
+        return;
+      }
+
+      const file = fileInput.files[0];
+      const cleanChk = document.getElementById('restore-clean-chk');
+      const isClean = cleanChk ? cleanChk.checked : true;
+
+      const progressArea = document.getElementById('restore-progress-area');
+      const progressText = document.getElementById('restore-progress-text');
+      const progressSub = document.getElementById('restore-progress-sub');
+      const resultArea = document.getElementById('restore-result-area');
+      const resultDetails = document.getElementById('restore-result-details');
+      const startBtn = document.getElementById('btn-restore-start');
+      const cancelBtn = document.getElementById('btn-restore-cancel');
+
+      if (progressArea) progressArea.style.display = 'block';
+      if (resultArea) resultArea.style.display = 'none';
+      if (startBtn) startBtn.disabled = true;
+      if (cancelBtn) cancelBtn.disabled = true;
+      isRestoreInProgress = true;
+
+      // Lock search UI while restore is running
+      const searchBtn = document.getElementById('search-btn');
+      if (searchBtn) searchBtn.disabled = true;
+
+      if (progressText) progressText.textContent = `Uploading "${file.name}" and extracting files...`;
+
+      try {
+        const formData = new FormData();
+        formData.append('file', file, file.name);
+        formData.append('clean', isClean ? 'true' : 'false');
+
+        const resp = await fetch('/api/backup/restore', {
+          method: 'POST',
+          body: formData,
+        });
+
+        const data = await resp.json();
+        if (!resp.ok || data.error) {
+          throw new Error(data.error || 'Server returned error ' + resp.status);
+        }
+
+        if (progressArea) progressArea.style.display = 'none';
+        if (resultArea) resultArea.style.display = 'block';
+
+        let neo4jMsg = '<span style="color:#94a3b8;">Neo4j export skipped (offline / not configured)</span>';
+        if (data.neo4j_export) {
+          if (data.neo4j_export.error) {
+            neo4jMsg = `<span style="color:#f87171;">Neo4j export warning: ${escapeHtml(data.neo4j_export.error)}</span>`;
+          } else {
+            const upNodes = data.neo4j_export.nodes_upserted || 0;
+            const upEdges = data.neo4j_export.edges_upserted || 0;
+            neo4jMsg = `<span style="color:#34d399;">✓ Neo4j database updated: ${upNodes.toLocaleString()} nodes, ${upEdges.toLocaleString()} relationships.</span>`;
+          }
+        }
+
+        const consistency = data.consistency || {};
+        let consistencyMsg = '';
+        if (consistency.is_consistent) {
+          consistencyMsg = '<span style="color:#34d399;">✓ Local files and Neo4j database are fully synchronized.</span>';
+        } else if (consistency.discrepancies && consistency.discrepancies.length > 0) {
+          consistencyMsg = `<span style="color:#fcd34d;">⚠️ Consistency Discrepancies: ${escapeHtml(consistency.discrepancies.join(', '))}</span>`;
+        }
+
+        if (resultDetails) {
+          resultDetails.innerHTML = `
+            <strong>Files Restored:</strong> ${data.restored_files.toLocaleString()} files (${(data.restored_bytes / (1024*1024)).toFixed(2)} MB)<br>
+            <strong>Neo4j Status:</strong> ${neo4jMsg}<br>
+            <strong>Validation:</strong> ${consistencyMsg}
+          `;
+        }
+
+        // Re-run consistency checks in main application
+        checkDatabaseConsistency(true);
+        // Refresh indexed books table
+        loadIndexedBooks(true);
+
+      } catch (err) {
+        alert('Restore failed: ' + err.message);
+        if (progressArea) progressArea.style.display = 'none';
+      } finally {
+        isRestoreInProgress = false;
+        if (startBtn) startBtn.disabled = false;
+        if (cancelBtn) cancelBtn.disabled = false;
+        if (searchBtn) searchBtn.disabled = false;
+      }
+    }
+
     async function executeSearch() {
+      if (isRestoreInProgress) {
+        alert('Search is temporarily locked while a backup restore is running.');
+        return;
+      }
       const query = document.getElementById('search-input').value.trim();
       if (!query) return;
 
@@ -3627,6 +4480,29 @@
       initCytoscape();
       initSplitter();
       checkDatabaseConsistency();
+      loadIndexedBooks();
+
+      // Check URL parameters for direct navigation/search (e.g. ?search=idea or ?tab=books)
+      const urlParams = new URLSearchParams(window.location.search);
+      const tabParam = urlParams.get('tab');
+      const searchParam = urlParams.get('search') || urlParams.get('q');
+
+      if (tabParam === 'books') {
+        switchTab('books');
+      } else if (tabParam === 'debug') {
+        switchTab('debug');
+      }
+
+      if (searchParam) {
+        const input = document.getElementById('search-input');
+        if (input) {
+          input.value = searchParam;
+          const clearBtn = document.getElementById('search-clear-btn');
+          if (clearBtn) clearBtn.style.display = 'block';
+        }
+        switchTab('graph');
+        executeSearch();
+      }
       const input = document.getElementById('search-input');
       if (input) {
         input.addEventListener('input', function() {

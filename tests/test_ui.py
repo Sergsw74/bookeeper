@@ -1187,6 +1187,311 @@ def test_ui_consistency_banner_in_html():
     assert "id=\"debug-sync-panel\"" in content
 
 
+def test_ui_backend_get_indexed_books(mock_backend, tmp_path):
+    """Test get_indexed_books logic with descending order and occurrences*weight scoring."""
+    # Create mock knowledge_graph.json
+    kg_data = {
+        "nodes": [
+            {
+                "id": "book:10",
+                "type": "Book",
+                "title": "Older Book",
+                "author": "Author A",
+                "timestamp": 1000.0,
+            },
+            {
+                "id": "book:20",
+                "type": "Book",
+                "title": "Newer Book",
+                "author": "Author B",
+                "timestamp": 2000.0,
+            },
+            {
+                "id": "concept:Alpha",
+                "type": "Concept",
+                "name": "Alpha",
+                "weight": 8,
+            },
+            {
+                "id": "concept:Beta",
+                "type": "Concept",
+                "name": "Beta",
+                "weight": 5,
+            },
+        ],
+        "edges": [
+            {
+                "source": "book:20",
+                "target": "concept:Alpha",
+                "relation": "EXPLORES_IDEA",
+                "occurrences": 3,
+            },
+            {
+                "source": "book:20",
+                "target": "concept:Beta",
+                "relation": "EXPLORES_IDEA",
+                "occurrences": 10,
+            },
+        ],
+    }
+    kg_path = tmp_path / "knowledge_graph.json"
+    kg_path.write_text(json.dumps(kg_data), encoding="utf-8")
+
+    with patch.object(mock_backend, "get_neo4j_driver", side_effect=Exception("Neo4j offline")), \
+         patch.object(mock_backend.config, "output_dir", str(tmp_path)):
+        books = mock_backend.get_indexed_books()
+
+        assert len(books) == 2
+        # Verify descending order by timestamp (most recent first)
+        assert books[0]["title"] == "Newer Book"
+        assert books[0]["timestamp"] == 2000.0
+        assert books[1]["title"] == "Older Book"
+        assert books[1]["timestamp"] == 1000.0
+
+        # Verify highlighted ideas calculation: occurrences * weight
+        top_ideas = books[0]["top_ideas"]
+        assert len(top_ideas) == 2
+        # Beta: occ=10, wt=5 => score=50
+        # Alpha: occ=3, wt=8 => score=24
+        assert top_ideas[0]["name"] == "Beta"
+        assert top_ideas[0]["score"] == 50.0
+        assert top_ideas[0]["occurrences"] == 10
+        assert top_ideas[0]["weight"] == 5.0
+
+        assert top_ideas[1]["name"] == "Alpha"
+        assert top_ideas[1]["score"] == 24.0
+
+
+def test_ui_indexed_books_endpoints(mock_backend, tmp_path):
+    """Test /api/books and /api/books/indexed endpoints."""
+    import urllib.request
+    import threading
+
+    mock_books = [
+        {
+            "book_id": "2",
+            "id": "book:2",
+            "title": "Recent Book",
+            "author": "Alice",
+            "timestamp": 2000.0,
+            "status": "completed",
+            "total_chunks": 40,
+            "ideas_count": 2,
+            "top_ideas": [{"name": "Super Intelligence", "occurrences": 5, "weight": 9, "score": 45.0}],
+            "book_file": None,
+        },
+        {
+            "book_id": "1",
+            "id": "book:1",
+            "title": "Old Book",
+            "author": "Bob",
+            "timestamp": 1000.0,
+            "status": "completed",
+            "total_chunks": 25,
+            "ideas_count": 1,
+            "top_ideas": [{"name": "Neural Nets", "occurrences": 2, "weight": 6, "score": 12.0}],
+            "book_file": None,
+        },
+    ]
+
+    with patch.object(mock_backend, "get_indexed_books", return_value=mock_books):
+        server = run_server(host="127.0.0.1", port=0, backend=mock_backend)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        base_url = f"http://127.0.0.1:{server.server_port}"
+
+        try:
+            with urllib.request.urlopen(f"{base_url}/api/books") as resp:
+                assert resp.status == 200
+                data = json.loads(resp.read().decode("utf-8"))
+                assert "books" in data
+                assert data["count"] == 2
+                assert data["books"][0]["title"] == "Recent Book"
+                assert data["books"][0]["top_ideas"][0]["name"] == "Super Intelligence"
+                assert data["books"][0]["top_ideas"][0]["score"] == 45.0
+
+            with urllib.request.urlopen(f"{base_url}/api/books/indexed") as resp2:
+                assert resp2.status == 200
+                data2 = json.loads(resp2.read().decode("utf-8"))
+                assert data2["count"] == 2
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+def test_ui_index_html_has_indexed_books_page():
+    """Verify HTML template contains indexed books tab, table, idea search redirect, and URL search handler."""
+    html_file = Path(__file__).parent.parent / "src" / "bookeeper" / "ui" / "static" / "index.html"
+    content = html_file.read_text(encoding="utf-8")
+
+    assert "tab-btn-books" in content
+    assert "Indexed Books" in content
+    assert "pane-books" in content
+    assert "books-table" in content
+    assert "books-table-body" in content
+    assert "loadIndexedBooks" in content
+    assert "searchIdeaFromBooks" in content
+    assert "filterBooksTable" in content
+    assert "openBookInGraph" in content
+    assert "occurrences × weight" in content
+    assert "Full Backup" in content
+    assert "backup-modal" in content
+    assert "openBackupModal" in content
+    assert "startBackupCreation" in content
+    assert "Restore Backup" in content
+    assert "restore-modal" in content
+    assert "openRestoreModal" in content
+    assert "startBackupRestore" in content
+    assert "/api/backup/restore" in content
+
+
+def test_ui_backend_restore_from_backup_flow(mock_backend, tmp_path):
+    """Test restore_from_backup restores files, triggers Neo4j export, and runs consistency check."""
+    import zipfile
+
+    # Create dummy archive
+    archive_zip = tmp_path / "restore_test.zip"
+    with zipfile.ZipFile(archive_zip, "w") as zf:
+        zf.writestr("knowledge_graph.json", json.dumps({"nodes": [], "edges": []}))
+
+    with patch("bookeeper.backup.restore_backup", return_value={"files_restored": 1, "bytes_restored": 100, "backup_type": "knowledge"}), \
+         patch.object(mock_backend, "validate_database_consistency", return_value={"neo4j_connected": False, "is_consistent": True, "discrepancies": []}), \
+         patch.object(mock_backend.config, "output_dir", str(tmp_path)):
+
+        res = mock_backend.restore_from_backup(archive_file=archive_zip, clean=True, export_neo4j=False)
+        assert res["success"] is True
+        assert res["restored_files"] == 1
+        assert "consistency" in res
+        assert res["consistency"]["is_consistent"] is True
+
+
+def test_ui_restore_endpoint_flow(mock_backend, tmp_path):
+    """Test /api/backup/restore POST endpoint with multipart upload."""
+    import urllib.request
+    import threading
+
+    mock_restore_res = {
+        "success": True,
+        "restored_files": 42,
+        "restored_bytes": 1024,
+        "backup_type": "full",
+        "consistency": {"is_consistent": True, "discrepancies": []},
+        "neo4j_export": {"nodes_upserted": 10, "edges_upserted": 20},
+    }
+
+    with patch.object(mock_backend, "restore_from_backup", return_value=mock_restore_res):
+        server = run_server(host="127.0.0.1", port=0, backend=mock_backend)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        base_url = f"http://127.0.0.1:{server.server_port}"
+
+        try:
+            # 1. Status endpoint (/api/backup/restore/status)
+            with urllib.request.urlopen(f"{base_url}/api/backup/restore/status") as st_resp:
+                assert st_resp.status == 200
+                st_data = json.loads(st_resp.read().decode())
+                assert "in_progress" in st_data
+
+            # 2. Upload multipart restore request
+            boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
+            body = (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="clean"\r\n\r\n'
+                "true\r\n"
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="file"; filename="test.zip"\r\n'
+                "Content-Type: application/zip\r\n\r\n"
+                "PK0304dummy\r\n"
+                f"--{boundary}--\r\n"
+            ).encode("utf-8")
+
+            req = urllib.request.Request(
+                f"{base_url}/api/backup/restore",
+                data=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            )
+
+            with urllib.request.urlopen(req) as resp:
+                assert resp.status == 200
+                data = json.loads(resp.read().decode("utf-8"))
+                assert data["success"] is True
+                assert data["restored_files"] == 42
+                assert data["neo4j_export"]["nodes_upserted"] == 10
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+
+def test_ui_backend_prepare_full_backup(mock_backend, tmp_path):
+    """Test prepare_full_backup creates valid zip archive with metadata."""
+    kg_path = tmp_path / "knowledge_graph.json"
+    kg_path.write_text(json.dumps({"nodes": [], "edges": []}), encoding="utf-8")
+
+    with patch.object(mock_backend.config, "output_dir", str(tmp_path)):
+        res = mock_backend.prepare_full_backup(backup_type="full", format_type="zip")
+        assert res["success"] is True
+        assert res["filename"].endswith(".zip")
+        assert res["total_files"] >= 1
+        assert "download_url" in res
+        assert Path(res["absolute_path"]).is_file()
+
+
+def test_ui_backup_endpoints(mock_backend, tmp_path):
+    """Test /api/backup/prepare and /api/backup/download endpoints."""
+    import urllib.request
+    import threading
+
+    # Create dummy backup file
+    backups_dir = tmp_path / "backups"
+    backups_dir.mkdir(parents=True, exist_ok=True)
+    test_zip = backups_dir / "test_backup.zip"
+    test_zip.write_bytes(b"PK\x03\x04dummy_zip_content")
+
+    mock_res = {
+        "success": True,
+        "filename": "test_backup.zip",
+        "file_size": len(b"PK\x03\x04dummy_zip_content"),
+        "total_files": 1,
+        "backup_type": "full",
+        "format": "zip",
+        "download_url": "/api/backup/download?filename=test_backup.zip",
+        "absolute_path": str(test_zip),
+    }
+
+    with patch.object(mock_backend, "prepare_full_backup", return_value=mock_res), \
+         patch.object(mock_backend.config, "output_dir", str(tmp_path)):
+        server = run_server(host="127.0.0.1", port=0, backend=mock_backend)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        base_url = f"http://127.0.0.1:{server.server_port}"
+
+        try:
+            # 1. Prepare POST
+            post_data = json.dumps({"type": "full", "format": "zip"}).encode("utf-8")
+            req = urllib.request.Request(
+                f"{base_url}/api/backup/prepare",
+                data=post_data,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req) as resp:
+                assert resp.status == 200
+                data = json.loads(resp.read().decode("utf-8"))
+                assert data["success"] is True
+                assert data["filename"] == "test_backup.zip"
+
+            # 2. Download GET
+            with urllib.request.urlopen(f"{base_url}/api/backup/download?filename=test_backup.zip") as dl_resp:
+                assert dl_resp.status == 200
+                content = dl_resp.read()
+                assert content == b"PK\x03\x04dummy_zip_content"
+                assert "test_backup.zip" in dl_resp.headers.get("Content-Disposition", "")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+
 
 
 

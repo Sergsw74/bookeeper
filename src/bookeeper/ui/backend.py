@@ -9,10 +9,12 @@ Coordinates:
 5. Observability telemetry capturing candidate terms, exact Cypher statements, and execution timing.
 """
 
+import datetime
 import json
 import logging
 import os
 import re
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -133,6 +135,25 @@ class SearchEngineBackend:
         self._books_index_mtime: float = 0.0
         self._local_kg_stats_cache: Optional[Dict[str, int]] = None
         self._local_kg_mtime: float = 0.0
+        self._restore_lock = threading.Lock()
+        self._is_restoring: bool = False
+        self._restore_status: Dict[str, Any] = {
+            "in_progress": False,
+            "stage": "idle",
+            "message": "",
+            "started_at": None,
+            "completed_at": None,
+            "result": None,
+            "error": None,
+        }
+
+    @property
+    def is_restoring(self) -> bool:
+        return self._is_restoring
+
+    def get_restore_status(self) -> Dict[str, Any]:
+        with self._restore_lock:
+            return dict(self._restore_status)
 
     def _get_all_books_dirs(self) -> List[Path]:
         """
@@ -1541,6 +1562,8 @@ class SearchEngineBackend:
         4. Synthesize structured markdown overview and capture complete observability telemetry.
         """
         t0 = time.perf_counter()
+        if self._is_restoring:
+            raise RuntimeError("Search is temporarily disabled while a backup restore operation is in progress.")
         candidate_terms = self.extract_query_terms(query)
 
         # 1. Extract core ideas using embedding cosine similarity * node weight
@@ -2081,6 +2104,496 @@ class SearchEngineBackend:
             "selected_node_id": search_res["selected_node_id"],
             "telemetry": search_res["telemetry"],
         }
+
+    def get_indexed_books(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Retrieve list of indexed books in descending chronological order (most recent first).
+        For each book, highlights its most important ideas based on significance score:
+        score = occurrences in this book * weight.
+        Falls back to local knowledge base / state checkpoints if Neo4j is offline or empty.
+        """
+        books: List[Dict[str, Any]] = []
+
+        # 1. Try querying Neo4j if available
+        try:
+            driver = self.get_neo4j_driver()
+            with driver.session(database=self.neo4j_cfg.database) as session:
+                cypher = """
+                MATCH (b:Book)
+                OPTIONAL MATCH (b)-[r:EXPLORES_IDEA]->(c:Concept)
+                WITH b, c, r,
+                     coalesce(r.occurrences, 1) AS occ,
+                     coalesce(c.weight, 5) AS wt
+                WITH b,
+                     collect(CASE WHEN c IS NOT NULL THEN {
+                         name: coalesce(c.name, c.id),
+                         id: c.id,
+                         occurrences: occ,
+                         weight: wt,
+                         score: occ * wt,
+                         category: coalesce(c.category, 'Idea')
+                     } ELSE null END) AS raw_ideas
+                RETURN b,
+                       [i IN raw_ideas WHERE i IS NOT NULL] AS ideas
+                """
+                results = session.run(cypher)
+                neo4j_records = list(results)
+
+                if neo4j_records:
+                    # Also load local state for timestamps and extra metadata if present
+                    out_p = Path(getattr(self.config, "resolved_output_dir", Path("output"))).expanduser().resolve()
+                    state_books: Dict[str, Dict[str, Any]] = {}
+                    state_file = out_p / ".bookeeper_state.json"
+                    if state_file.is_file():
+                        try:
+                            with open(state_file, "r", encoding="utf-8") as sf:
+                                sdata = json.load(sf)
+                            bg = sdata.get("operations", {}).get("build_graph", {})
+                            for k, v in bg.items():
+                                if isinstance(v, dict):
+                                    state_books[str(k)] = v
+                        except Exception:
+                            pass
+
+                    for record in neo4j_records:
+                        b_node = record["b"]
+                        b_props = dict(b_node.items()) if hasattr(b_node, "items") else {}
+                        bid = str(b_props.get("book_id") or b_props.get("id", "")).replace("book:", "").strip()
+                        title = b_props.get("title") or b_props.get("name") or f"Book {bid}"
+                        author = b_props.get("author") or "Unknown"
+                        summary = b_props.get("summary") or ""
+
+                        # Resolve timestamp
+                        ts = float(b_props.get("timestamp") or b_props.get("indexed_at") or 0.0)
+                        status = "completed"
+                        total_chunks = b_props.get("total_chunks", 0)
+
+                        if bid in state_books:
+                            sb = state_books[bid]
+                            if not ts and sb.get("timestamp"):
+                                ts = float(sb["timestamp"])
+                            status = sb.get("status", status)
+                            if sb.get("metadata", {}).get("total_chunks"):
+                                total_chunks = sb["metadata"]["total_chunks"]
+
+                        # Check per-book state file for exact timestamp if still 0
+                        if not ts:
+                            b_state_file = out_p / ".book_states" / f"book_{bid}_state.json"
+                            if b_state_file.is_file():
+                                try:
+                                    with open(b_state_file, "r", encoding="utf-8") as bsf:
+                                        bs_data = json.load(bsf)
+                                    ts = float(bs_data.get("updated_at") or bs_data.get("created_at") or b_state_file.stat().st_mtime)
+                                    if not total_chunks and bs_data.get("total_chunks"):
+                                        total_chunks = bs_data.get("total_chunks")
+                                except Exception:
+                                    ts = b_state_file.stat().st_mtime
+
+                        raw_ideas = record["ideas"] or []
+                        # Deduplicate ideas by name
+                        ideas_by_name: Dict[str, Dict[str, Any]] = {}
+                        for item in raw_ideas:
+                            name = item.get("name") or ""
+                            if not name:
+                                continue
+                            if name not in ideas_by_name or item.get("score", 0) > ideas_by_name[name].get("score", 0):
+                                ideas_by_name[name] = item
+
+                        sorted_ideas = sorted(ideas_by_name.values(), key=lambda x: x.get("score", 0), reverse=True)
+
+                        # Try resolving book file link
+                        book_file = self.resolve_book_file(title=title, book_id=bid)
+                        safe_book_file = {k: v for k, v in book_file.items() if k != "absolute_path"} if book_file else None
+
+                        books.append({
+                            "book_id": bid,
+                            "id": f"book:{bid}",
+                            "title": title,
+                            "author": author,
+                            "summary": summary,
+                            "timestamp": ts,
+                            "status": status,
+                            "total_chunks": total_chunks,
+                            "ideas_count": len(sorted_ideas),
+                            "top_ideas": sorted_ideas[:10],
+                            "book_file": safe_book_file,
+                        })
+        except Exception as e:
+            logger.info(f"Neo4j get_indexed_books query skipped or failed ({e}). Checking local graph.")
+
+        # 2. Local fallback if Neo4j returned no books or is offline
+        if not books:
+            out_p = Path(getattr(self.config, "resolved_output_dir", Path("output"))).expanduser().resolve()
+            kg_path = out_p / "knowledge_graph.json"
+
+            # Check state file
+            state_books: Dict[str, Dict[str, Any]] = {}
+            state_file = out_p / ".bookeeper_state.json"
+            if state_file.is_file():
+                try:
+                    with open(state_file, "r", encoding="utf-8") as sf:
+                        sdata = json.load(sf)
+                    bg = sdata.get("operations", {}).get("build_graph", {})
+                    for k, v in bg.items():
+                        if isinstance(v, dict):
+                            state_books[str(k)] = v
+                except Exception:
+                    pass
+
+            nodes_by_id: Dict[str, Dict[str, Any]] = {}
+            edges: List[Dict[str, Any]] = []
+            if kg_path.is_file():
+                try:
+                    with open(kg_path, "r", encoding="utf-8") as f:
+                        kg_data = json.load(f)
+                    nodes_by_id = {n.get("id"): n for n in kg_data.get("nodes", []) if n.get("id")}
+                    edges = kg_data.get("edges", [])
+                except Exception as e:
+                    logger.warning(f"Failed to read local knowledge_graph.json: {e}")
+
+            # Identify Book nodes
+            local_book_nodes = [
+                n for n in nodes_by_id.values()
+                if n.get("type") == "Book" or n.get("tag") == "book"
+            ]
+
+            # If no Book nodes in KG, see if we have books from state_books or .book_states
+            book_ids_seen = set()
+            for b_node in local_book_nodes:
+                nid = b_node.get("id", "")
+                bid = str(b_node.get("book_id") or nid).replace("book:", "").strip()
+                book_ids_seen.add(bid)
+
+                title = b_node.get("title") or b_node.get("name") or f"Book {bid}"
+                author = b_node.get("author") or "Unknown"
+                summary = b_node.get("summary") or ""
+
+                # Ideas connected to this book
+                ideas_map: Dict[str, Dict[str, Any]] = {}
+                for edge in edges:
+                    if edge.get("source") == nid and edge.get("relation") == "EXPLORES_IDEA":
+                        cid = edge.get("target")
+                        cnode = nodes_by_id.get(cid, {})
+                        cname = cnode.get("name") or (cid.replace("concept:", "") if cid else "")
+                        if not cname:
+                            continue
+                        occ = int(edge.get("occurrences", 1))
+                        wt = float(cnode.get("weight", 5))
+                        score = occ * wt
+                        ideas_map[cname] = {
+                            "name": cname,
+                            "id": cid,
+                            "occurrences": occ,
+                            "weight": wt,
+                            "score": score,
+                            "category": cnode.get("category", "Idea"),
+                        }
+
+                # Also check chunk evidence linkages if EXPLORES_IDEA is sparse
+                if not ideas_map:
+                    for edge in edges:
+                        if edge.get("relation") in ("SUPPORTED_BY", "SUPPORTS_IDEA"):
+                            cid = edge.get("source") if edge.get("relation") == "SUPPORTED_BY" else edge.get("target")
+                            chid = edge.get("target") if edge.get("relation") == "SUPPORTED_BY" else edge.get("source")
+                            cnode = nodes_by_id.get(cid, {})
+                            chnode = nodes_by_id.get(chid, {})
+                            if str(chnode.get("book_id", "")).replace("book:", "").strip() == bid:
+                                cname = cnode.get("name") or (cid.replace("concept:", "") if cid else "")
+                                if cname:
+                                    cur = ideas_map.get(cname, {
+                                        "name": cname,
+                                        "id": cid,
+                                        "occurrences": 0,
+                                        "weight": float(cnode.get("weight", 5)),
+                                        "category": cnode.get("category", "Idea"),
+                                    })
+                                    cur["occurrences"] += 1
+                                    cur["score"] = cur["occurrences"] * cur["weight"]
+                                    ideas_map[cname] = cur
+
+                sorted_ideas = sorted(ideas_map.values(), key=lambda x: x.get("score", 0), reverse=True)
+
+                # Determine timestamp & status
+                ts = float(b_node.get("timestamp") or 0.0)
+                status = "completed"
+                total_chunks = b_node.get("total_chunks", 0)
+
+                if bid in state_books:
+                    sb = state_books[bid]
+                    if not ts and sb.get("timestamp"):
+                        ts = float(sb["timestamp"])
+                    status = sb.get("status", status)
+                    if sb.get("metadata", {}).get("total_chunks"):
+                        total_chunks = sb["metadata"]["total_chunks"]
+
+                if not ts:
+                    b_state_file = out_p / ".book_states" / f"book_{bid}_state.json"
+                    if b_state_file.is_file():
+                        try:
+                            with open(b_state_file, "r", encoding="utf-8") as bsf:
+                                bs_data = json.load(bsf)
+                            ts = float(bs_data.get("updated_at") or bs_data.get("created_at") or b_state_file.stat().st_mtime)
+                            if not total_chunks and bs_data.get("total_chunks"):
+                                total_chunks = bs_data.get("total_chunks")
+                        except Exception:
+                            ts = b_state_file.stat().st_mtime
+
+                book_file = self.resolve_book_file(title=title, book_id=bid)
+                safe_book_file = {k: v for k, v in book_file.items() if k != "absolute_path"} if book_file else None
+
+                books.append({
+                    "book_id": bid,
+                    "id": nid,
+                    "title": title,
+                    "author": author,
+                    "summary": summary,
+                    "timestamp": ts,
+                    "status": status,
+                    "total_chunks": total_chunks,
+                    "ideas_count": len(sorted_ideas),
+                    "top_ideas": sorted_ideas[:10],
+                    "book_file": safe_book_file,
+                })
+
+            # Check if there are other completed books in state_books not in KG nodes
+            for bid, sb in state_books.items():
+                if bid in book_ids_seen:
+                    continue
+                if sb.get("status") not in ("completed", "partially_indexed"):
+                    continue
+                book_ids_seen.add(bid)
+                title = sb.get("title") or f"Book {bid}"
+                ts = float(sb.get("timestamp") or 0.0)
+                total_chunks = sb.get("metadata", {}).get("total_chunks", 0)
+
+                # Check per-book state for ideas
+                ideas_map = {}
+                b_state_file = out_p / ".book_states" / f"book_{bid}_state.json"
+                if b_state_file.is_file():
+                    try:
+                        with open(b_state_file, "r", encoding="utf-8") as bsf:
+                            bs_data = json.load(bsf)
+                        if not ts:
+                            ts = float(bs_data.get("updated_at") or bs_data.get("created_at") or b_state_file.stat().st_mtime)
+                        if not total_chunks:
+                            total_chunks = bs_data.get("total_chunks", 0)
+
+                        for chunk in bs_data.get("processed_chunks", {}).values():
+                            for c in chunk.get("extraction", {}).get("concepts", []):
+                                cname = c.get("name")
+                                if cname:
+                                    cur = ideas_map.get(cname, {
+                                        "name": cname,
+                                        "id": f"concept:{cname}",
+                                        "occurrences": 0,
+                                        "weight": float(c.get("weight", 5)),
+                                        "category": c.get("category", "Idea"),
+                                    })
+                                    cur["occurrences"] += 1
+                                    cur["score"] = cur["occurrences"] * cur["weight"]
+                                    ideas_map[cname] = cur
+                    except Exception:
+                        pass
+
+                sorted_ideas = sorted(ideas_map.values(), key=lambda x: x.get("score", 0), reverse=True)
+                book_file = self.resolve_book_file(title=title, book_id=bid)
+                safe_book_file = {k: v for k, v in book_file.items() if k != "absolute_path"} if book_file else None
+
+                books.append({
+                    "book_id": bid,
+                    "id": f"book:{bid}",
+                    "title": title,
+                    "author": "Unknown",
+                    "summary": "",
+                    "timestamp": ts,
+                    "status": sb.get("status", "completed"),
+                    "total_chunks": total_chunks,
+                    "ideas_count": len(sorted_ideas),
+                    "top_ideas": sorted_ideas[:10],
+                    "book_file": safe_book_file,
+                })
+
+        # Sort descending by timestamp (most recent first)
+        books.sort(key=lambda b: float(b.get("timestamp") or 0.0), reverse=True)
+
+        if limit is not None and limit > 0:
+            books = books[:limit]
+
+        return books
+
+    def prepare_full_backup(
+        self,
+        format_type: str = "zip",
+        backup_type: str = "full",
+        destination_dir: Optional[Path] = None,
+        indexed_only: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Create and package a full or knowledge backup archive (.zip or .7z)
+        containing graph knowledge artifacts, state files, and indexed source books.
+        Returns backup metadata and download resolution info.
+        """
+        from bookeeper.backup import create_backup
+
+        out_dir = Path(getattr(self.config, "resolved_output_dir", Path("output"))).expanduser().resolve()
+        
+        # Target backup storage folder (e.g. output/backups)
+        if destination_dir is None:
+            dest_dir = out_dir / "backups"
+        else:
+            dest_dir = Path(destination_dir).expanduser().resolve()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        # Source books directory
+        b_dir = self._get_books_dir()
+        if not b_dir:
+            candidate_dirs = self._get_all_books_dirs()
+            b_dir = candidate_dirs[0] if candidate_dirs else None
+
+        result = create_backup(
+            source_dir=out_dir,
+            destination=dest_dir,
+            format_type=format_type,
+            backup_type=backup_type,
+            books_dir=b_dir,
+            indexed_only=indexed_only,
+            include_chunks=True,
+            include_obsidian=True,
+            include_states=True,
+            include_lightrag=True,
+        )
+
+        dest_file = Path(result["destination"])
+        download_url = f"/api/backup/download?filename={dest_file.name}"
+
+        return {
+            "success": True,
+            "filename": dest_file.name,
+            "file_size": result.get("compressed_bytes", dest_file.stat().st_size if dest_file.is_file() else 0),
+            "uncompressed_bytes": result.get("uncompressed_bytes", 0),
+            "total_files": result.get("total_files", 0),
+            "backup_type": result.get("backup_type", backup_type),
+            "format": result.get("format", format_type),
+            "download_url": download_url,
+            "absolute_path": str(dest_file),
+            "created_at": datetime.datetime.now().isoformat(),
+        }
+
+    def restore_from_backup(
+        self,
+        archive_file: Path,
+        clean: bool = False,
+        export_neo4j: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Unpack a backup archive, restore knowledge artifacts and source books,
+        export/update the connected Neo4j database with the restored ConceptGraphStore,
+        and re-run validation between local files and Neo4j.
+        Blocks search queries during execution via self._is_restoring flag.
+        """
+        from bookeeper.backup import restore_backup
+        from bookeeper.graph.neo4j_exporter import Neo4jExporter
+        from bookeeper.graph.store import ConceptGraphStore
+
+        with self._restore_lock:
+            if self._is_restoring:
+                raise RuntimeError("A restore operation is already in progress.")
+            self._is_restoring = True
+            self._restore_status = {
+                "in_progress": True,
+                "stage": "unpacking",
+                "message": "Extracting backup archive...",
+                "started_at": datetime.datetime.now().isoformat(),
+                "completed_at": None,
+                "result": None,
+                "error": None,
+            }
+
+        try:
+            out_dir = Path(getattr(self.config, "resolved_output_dir", Path("output"))).expanduser().resolve()
+            b_dir = self._get_books_dir()
+            if not b_dir:
+                candidate_dirs = self._get_all_books_dirs()
+                b_dir = candidate_dirs[0] if candidate_dirs else (out_dir / "downloads")
+
+            # 1. Unpack backup files
+            restore_result = restore_backup(
+                archive_path=archive_file,
+                target_dir=out_dir,
+                books_dir=b_dir,
+                clean=clean,
+                dry_run=False,
+            )
+
+            # Invalidate all caches
+            self._local_kg_stats_cache = None
+            self._local_kg_mtime = 0.0
+            self._books_index_cache = None
+            self._books_index_mtime = 0.0
+            self._concept_vectorizer = None
+            self._concept_embedding_index = None
+
+            # 2. Export / update Neo4j database with restored graph
+            neo4j_export_result = None
+            kg_path = out_dir / "knowledge_graph.json"
+            if export_neo4j and kg_path.is_file():
+                with self._restore_lock:
+                    self._restore_status["stage"] = "exporting_neo4j"
+                    self._restore_status["message"] = "Updating Neo4j database with restored knowledge graph..."
+
+                try:
+                    store = ConceptGraphStore()
+                    store.load(kg_path)
+
+                    neo_exp = Neo4jExporter.from_config(self.neo4j_cfg)
+                    # Clean previous content if requested so Neo4j mirrors restored snapshot
+                    neo4j_export_result = neo_exp.export(
+                        store,
+                        clean=clean,
+                        show_progress=False,
+                    )
+                except Exception as e:
+                    logger.warning(f"Neo4j export after restore encountered error: {e}")
+                    neo4j_export_result = {"error": str(e), "success": False}
+
+            # 3. Re-run validation: Neo4j vs local files
+            with self._restore_lock:
+                self._restore_status["stage"] = "validating"
+                self._restore_status["message"] = "Validating database consistency (Neo4j vs local files)..."
+
+            consistency_result = self.validate_database_consistency(force_refresh=True)
+
+            final_result = {
+                "success": True,
+                "restored_files": restore_result.get("files_restored", 0),
+                "restored_bytes": restore_result.get("bytes_restored", 0),
+                "backup_type": restore_result.get("backup_type", "knowledge"),
+                "target_dir": str(out_dir),
+                "books_dir": str(b_dir) if b_dir else None,
+                "neo4j_export": neo4j_export_result,
+                "consistency": consistency_result,
+                "completed_at": datetime.datetime.now().isoformat(),
+            }
+
+            with self._restore_lock:
+                self._restore_status["in_progress"] = False
+                self._restore_status["stage"] = "completed"
+                self._restore_status["message"] = "Restore completed successfully."
+                self._restore_status["completed_at"] = final_result["completed_at"]
+                self._restore_status["result"] = final_result
+
+            return final_result
+
+        except Exception as e:
+            logger.error(f"Restore failed: {e}", exc_info=True)
+            with self._restore_lock:
+                self._restore_status["in_progress"] = False
+                self._restore_status["stage"] = "failed"
+                self._restore_status["message"] = f"Restore failed: {e}"
+                self._restore_status["error"] = str(e)
+            raise
+        finally:
+            self._is_restoring = False
 
     def get_node_details(self, node_id: str) -> Dict[str, Any]:
         """

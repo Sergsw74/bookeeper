@@ -177,6 +177,11 @@ The Bookkeeper UI server provides both the native Web UI API and a **LightRAG-co
 | `/health` / `/api/health` | `GET` | Health check returning service status and Neo4j connection details. |
 | `/query` / `/api/query` | `POST` | **LightRAG-compatible Query API**. Accepts `{"query": "...", "mode": "...", "include_references": true}` and returns `{response, references, response_time, llm_generated, graph}`. |
 | `/api/search` | `POST` | Native Web UI Search endpoint returning query synthesis, graph elements, and telemetry. |
+| `/api/books` / `/api/books/indexed` | `GET` | Returns list of indexed books in descending chronological order, including highlighted top ideas scored by `occurrences * weight`. |
+| `/api/backup/prepare` | `POST` | Packages and creates a full or knowledge backup archive (`{"type": "full", "format": "zip"}`). |
+| `/api/backup/download` | `GET` | Downloads generated backup archive directly via attachment streaming (`?filename=...`). |
+| `/api/backup/restore` | `POST` | Uploads and unpacks backup archive (`multipart/form-data`), updates Neo4j database, and reruns validation. Search queries are locked during execution. |
+| `/api/backup/restore/status` | `GET` | Returns active restore progress status and stage. |
 | `/api/node` | `GET` | Returns full properties and categorized relationships for a node (`?id=<node_id>`). |
 | `/api/node/expand` | `POST`, `GET` | **Interactive Undirected Neighborhood Expansion** (Neo4j Browser-style). Pulls undirected 1-hop connected neighbors (`all`, `Concept`, `Book`, `Chunk`, `Section`). |
 

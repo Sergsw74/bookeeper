@@ -6,6 +6,8 @@ and serves the frontend web UI.
 
 import json
 import logging
+import re
+import tempfile
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -188,6 +190,53 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"found": False, "error": "Book file not found."}, HTTPStatus.NOT_FOUND)
             return
 
+        # 2e. API: Indexed Books List
+        if path in ("/api/books", "/api/books/indexed"):
+            qs = parse_qs(parsed.query)
+            limit_str = qs.get("limit", [""])[0]
+            limit = int(limit_str) if limit_str.isdigit() else None
+            books = self.backend.get_indexed_books(limit=limit)
+            self._send_json({"books": books, "count": len(books)})
+            return
+
+        # 2f. API: Backup Streaming & Direct Download
+        if path == "/api/backup/download":
+            qs = parse_qs(parsed.query)
+            filename = qs.get("filename", [""])[0]
+            if not filename or ".." in filename or "/" in filename or "\\" in filename:
+                self._send_json({"error": "Invalid or missing backup filename."}, HTTPStatus.BAD_REQUEST)
+                return
+
+            out_dir = Path(getattr(self.backend.config, "resolved_output_dir", Path("output"))).expanduser().resolve()
+            backup_file = out_dir / "backups" / filename
+            if not backup_file.is_file():
+                self._send_json({"error": f"Backup file '{filename}' not found."}, HTTPStatus.NOT_FOUND)
+                return
+
+            ext = backup_file.suffix.lower()
+            content_type = "application/zip" if ext == ".zip" else "application/x-7z-compressed"
+            safe_filename = backup_file.name.replace('"', '\\"')
+
+            try:
+                data = backup_file.read_bytes()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception as e:
+                logger.error(f"Error streaming backup archive {backup_file}: {e}")
+                self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Error streaming backup: {e}")
+            return
+
+        # 2g. API: Restore Status Check
+        if path == "/api/backup/restore/status":
+            status = self.backend.get_restore_status()
+            self._send_json(status)
+            return
+
         # 3. Serve Frontend HTML / Static files
         if path in ("/", "/index.html"):
             index_html = STATIC_DIR / "index.html"
@@ -224,6 +273,79 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Empty request body."}, HTTPStatus.BAD_REQUEST)
             return
 
+        content_type = self.headers.get("Content-Type", "")
+
+        # Backup Restore API (/api/backup/restore) - Handles both multipart/form-data file upload and raw binary
+        if path in ("/api/backup/restore", "/api/restore"):
+            if self.backend.is_restoring:
+                self._send_json({"error": "A restore operation is already in progress."}, HTTPStatus.CONFLICT)
+                return
+
+            raw_bytes = self.rfile.read(content_length)
+            archive_bytes = None
+            orig_filename = "uploaded_backup.zip"
+            clean_mode = True
+
+            if "multipart/form-data" in content_type:
+                boundary_match = re.search(r'boundary=([^;]+)', content_type)
+                if not boundary_match:
+                    self._send_json({"error": "Missing multipart boundary."}, HTTPStatus.BAD_REQUEST)
+                    return
+                boundary = boundary_match.group(1).strip().strip('"').encode("ascii")
+                parts = raw_bytes.split(b"--" + boundary)
+                for part in parts:
+                    if not part or part in (b"--\r\n", b"--", b"\r\n"):
+                        continue
+                    if b"\r\n\r\n" not in part:
+                        continue
+                    headers_part, body_part = part.split(b"\r\n\r\n", 1)
+                    if body_part.endswith(b"\r\n"):
+                        body_part = body_part[:-2]
+                    headers_text = headers_part.decode("latin1", errors="replace")
+                    
+                    fname_m = re.search(r'filename="([^"]+)"', headers_text)
+                    name_m = re.search(r'name="([^"]+)"', headers_text)
+
+                    if fname_m:
+                        orig_filename = fname_m.group(1)
+                        archive_bytes = body_part
+                    elif name_m and name_m.group(1) == "clean":
+                        clean_mode = body_part.decode("utf-8", errors="replace").strip().lower() in ("true", "1", "yes")
+            else:
+                # Raw binary payload
+                archive_bytes = raw_bytes
+                qs = parse_qs(parsed.query)
+                orig_filename = qs.get("filename", [orig_filename])[0]
+                clean_mode = qs.get("clean", ["true"])[0].lower() in ("true", "1", "yes")
+
+            if not archive_bytes:
+                self._send_json({"error": "No backup file uploaded in request payload."}, HTTPStatus.BAD_REQUEST)
+                return
+
+            ext = Path(orig_filename).suffix.lower() or ".zip"
+            temp_file = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tf:
+                    tf.write(archive_bytes)
+                    temp_file = Path(tf.name)
+
+                res = self.backend.restore_from_backup(
+                    archive_file=temp_file,
+                    clean=clean_mode,
+                    export_neo4j=True,
+                )
+                self._send_json(res)
+            except Exception as e:
+                logger.error(f"Backup restore failed: {e}", exc_info=True)
+                self._send_json({"error": f"Backup restore failed: {e}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            finally:
+                if temp_file and temp_file.is_file():
+                    try:
+                        temp_file.unlink()
+                    except Exception:
+                        pass
+            return
+
         try:
             body_str = self.rfile.read(content_length).decode("utf-8")
             body = json.loads(body_str)
@@ -244,6 +366,23 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(expansion)
             except Exception as e:
                 logger.error(f"Node expansion API error: {e}", exc_info=True)
+                self._send_json({"error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        # Backup Prepare API (/api/backup/prepare)
+        if path in ("/api/backup/prepare", "/api/backup/create"):
+            fmt = body.get("format", "zip")
+            b_type = body.get("type", "full")
+            indexed_only = body.get("indexed_only", True)
+            try:
+                res = self.backend.prepare_full_backup(
+                    format_type=fmt,
+                    backup_type=b_type,
+                    indexed_only=indexed_only,
+                )
+                self._send_json(res)
+            except Exception as e:
+                logger.error(f"Failed to prepare backup: {e}", exc_info=True)
                 self._send_json({"error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 

@@ -8,8 +8,11 @@ Bookkeeper features a native web-based Idea Search Engine and Knowledge Explorer
 
 - [1. Architecture Overview](#1-architecture-overview)
 - [2. UI Layout & Features](#2-ui-layout--features)
+  - [Header Navigation Menu (Search, Books, Backup & Restore, Debug)](#header-navigation-menu)
   - [Central Search Bar & Denoise Controls](#central-search-bar--denoise-controls)
   - [Two-Column Results Pane](#two-column-results-pane)
+  - [Dedicated Indexed Books & Literature Page](#dedicated-indexed-books--literature-page)
+  - [Dedicated Backup & Restore Management Page](#dedicated-backup--restore-management-page)
   - [Debug & Observability Tab](#debug--observability-tab)
 - [3. Smart Denoising & Super-Hub Mitigation](#3-smart-denoising--super-hub-mitigation)
 - [4. CLI Usage & Commands](#4-cli-usage--commands)
@@ -105,6 +108,25 @@ flowchart TD
       - Expanding the item immediately reveals the full raw excerpt and quote inline.
       - Features **[ 📋 Copy Excerpt ]** and **[ 🎯 Center on Graph ]** buttons that immediately focus, unhide (if hidden), and zoom directly to that evidence node on the canvas.
     - Displays linked books, related concepts, and citation quotes with source breadcrumbs.
+
+### Dedicated Indexed Books & Literature Page
+- Access directly via the **📚 Books** navigation menu item or `?tab=books`.
+- **Chronological Overview**: Lists all indexed books and literature sorted in descending order of ingestion/indexing.
+- **Top Ideas Highlighting**: Displays each book's top extracted ideas ranked by `occurrences × weight`, with direct 1-click links to search and explore those ideas on the canvas.
+- **Search & Filter**: Live client-side filtering by book title, author, or conceptual topics.
+- **Direct Book Actions**: Quick actions to locate the book in the graph, open/download original PDFs/EPUBs, or launch backup operations.
+
+### Dedicated Backup & Restore Management Page
+- Access directly via the **💾 Backup & Restore** navigation menu item or `?tab=backup`.
+- **Backup Creation & Download Card**:
+  - Choose backup scope: **Full Backup** (Graph artifacts, state files, and indexed source books) or **Knowledge Only**.
+  - Choose compression format: **ZIP (.zip)** for universal compatibility or **7-Zip (.7z)** for maximum compression.
+  - Generates download URL and triggers automatic browser download upon preparation.
+- **Restore Backup Archive Card**:
+  - File picker for `.zip` or `.7z` archives.
+  - Option to perform a clean wipe before restore.
+  - Real-time upload and unpack progress display with Neo4j synchronization and consistency re-validation.
+  - Prevents race conditions by automatically locking queries while restore runs.
 
 ### Debug & Observability Tab
 Designed for system transparency and troubleshooting:

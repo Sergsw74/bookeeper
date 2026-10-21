@@ -1345,6 +1345,37 @@ def test_ui_index_html_has_indexed_books_page():
     assert "/api/backup/restore" in content
 
 
+def test_ui_index_html_has_backup_restore_page_and_navigation():
+    """Verify HTML template contains the dedicated Backup & Restore page, tabs, and direct menu navigation."""
+    html_file = Path(__file__).parent.parent / "src" / "bookeeper" / "ui" / "static" / "index.html"
+    content = html_file.read_text(encoding="utf-8")
+
+    # Navigation menu tabs
+    assert 'id="tab-btn-graph"' in content
+    assert 'id="tab-btn-books"' in content
+    assert 'id="tab-btn-backup"' in content
+    assert 'id="tab-btn-debug"' in content
+
+    # View panes
+    assert 'id="pane-graph"' in content
+    assert 'id="pane-books"' in content
+    assert 'id="pane-backup"' in content
+    assert 'id="pane-debug"' in content
+
+    # Backup & Restore page contents
+    assert 'id="page-backup-card"' in content
+    assert 'id="page-restore-card"' in content
+    assert 'id="btn-page-backup-start"' in content
+    assert 'id="btn-page-restore-start"' in content
+    assert 'startPageBackupCreation' in content
+    assert 'startPageBackupRestore' in content
+    assert 'onPageRestoreFileSelected' in content
+
+    # switchTab and URL parameter routing
+    assert "tab === 'backup'" in content or "tab === 'restore'" in content
+    assert "tabParam === 'backup'" in content
+
+
 def test_ui_backend_restore_from_backup_flow(mock_backend, tmp_path):
     """Test restore_from_backup restores files, triggers Neo4j export, and runs consistency check."""
     import zipfile

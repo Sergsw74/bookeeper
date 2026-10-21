@@ -1650,6 +1650,92 @@
       z-index: 99999;
     }
 
+    /* Backup & Restore Dedicated Panels */
+    .backup-page-container {
+      max-width: 1100px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 24px;
+      overflow-y: auto;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }
+
+    .br-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(480px, 1fr));
+      gap: 24px;
+    }
+
+    .br-card {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+    }
+
+    .br-card-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .br-card-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: var(--text-main);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .br-card-desc {
+      font-size: 0.88rem;
+      color: var(--text-muted);
+      line-height: 1.5;
+    }
+
+    .br-form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .br-form-label {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .br-info-box {
+      border-radius: 8px;
+      padding: 12px 14px;
+      font-size: 0.84rem;
+      line-height: 1.5;
+    }
+
+    .br-info-box.warning {
+      background: rgba(245, 158, 11, 0.12);
+      border: 1px solid #f59e0b;
+      color: #fde68a;
+    }
+
+    .br-info-box.info {
+      background: rgba(99, 102, 241, 0.1);
+      border: 1px solid rgba(99, 102, 241, 0.3);
+      color: #c7d2fe;
+    }
+
     .modal-card {
       background: var(--bg-panel);
       border: 1px solid var(--border);
@@ -1736,11 +1822,14 @@
       </div>
       <div class="nav-tabs">
         <button class="nav-tab-btn active" id="tab-btn-graph" onclick="switchTab('graph')">
-          🌐 Graph & Explorer
+          🌐 Search & Graph
         </button>
         <button class="nav-tab-btn" id="tab-btn-books" onclick="switchTab('books')">
-          📚 Indexed Books
+          📚 Books
           <span id="books-count-badge" class="debug-tag info" style="display:none; margin-left:4px;">0</span>
+        </button>
+        <button class="nav-tab-btn" id="tab-btn-backup" onclick="switchTab('backup')">
+          💾 Backup & Restore
         </button>
         <button class="nav-tab-btn" id="tab-btn-debug" onclick="switchTab('debug')">
           🔬 Debug & Observability
@@ -1976,6 +2065,139 @@
               </tr>
             </tbody>
           </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- View 3: Dedicated Backup & Restore Page -->
+    <div class="view-pane" id="pane-backup">
+      <div class="backup-page-container">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+          <div>
+            <h2 style="font-size:1.4rem; font-weight:700; color:var(--text-main); margin-bottom:4px; display:flex; align-items:center; gap:8px;">
+              <span>💾</span> Backup & Restore
+            </h2>
+            <span style="font-size:0.85rem; color:var(--text-muted);">
+              Manage full system archives, export knowledge graphs, or restore backups directly into Bookeeper and Neo4j.
+            </span>
+          </div>
+          <div style="display:flex; gap:10px;">
+            <button class="debug-action-btn" onclick="checkDatabaseConsistency(true)" title="Check database consistency and sync state">
+              <span>🔄</span> Verify Database Sync
+            </button>
+          </div>
+        </div>
+
+        <div class="br-grid">
+          <!-- Backup Card -->
+          <div class="br-card" id="page-backup-card">
+            <div class="br-card-header">
+              <span style="font-size:1.4rem;">📦</span>
+              <div>
+                <div class="br-card-title">Create & Download Backup</div>
+                <div class="br-card-desc">Package your knowledge graph, checkpoints, notes, chunks, and source books into a compressed archive.</div>
+              </div>
+            </div>
+
+            <div class="br-form-group">
+              <label class="br-form-label">Backup Scope:</label>
+              <select id="page-backup-type-select" class="toolbar-select" style="width:100%; padding:10px 12px; font-size:0.9rem;">
+                <option value="full" selected>Full Backup (Knowledge Graph + Indexed Source Books)</option>
+                <option value="knowledge">Knowledge Only (Graph, Chunks, Notes, State Checkpoints)</option>
+              </select>
+            </div>
+
+            <div class="br-form-group">
+              <label class="br-form-label">Archive Format:</label>
+              <select id="page-backup-format-select" class="toolbar-select" style="width:100%; padding:10px 12px; font-size:0.9rem;">
+                <option value="zip" selected>ZIP (.zip) - Universal Compatibility</option>
+                <option value="7z">7-Zip (.7z) - Maximum Compression</option>
+              </select>
+            </div>
+
+            <div class="br-info-box info">
+              💡 <strong>Tip:</strong> Full backups include original source PDFs/EPUBs and can be completely restored into a new empty Bookeeper instance.
+            </div>
+
+            <div id="page-backup-progress-area" style="display:none; background:rgba(15,23,42,0.6); padding:14px; border-radius:8px; border:1px solid var(--border);">
+              <div style="display:flex; align-items:center; gap:10px; margin-bottom:6px;">
+                <div class="spinner" style="width:18px; height:18px; border-width:2px; margin:0;"></div>
+                <span id="page-backup-progress-text" style="font-size:0.88rem; color:var(--text-main); font-weight:600;">Packaging backup archive...</span>
+              </div>
+              <div style="font-size:0.78rem; color:var(--text-muted);">Please wait while files and database checkpoints are gathered.</div>
+            </div>
+
+            <div id="page-backup-result-area" style="display:none; background:rgba(16,185,129,0.12); padding:14px; border-radius:8px; border:1px solid #10b981;">
+              <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px; color:#34d399; font-weight:700;">
+                <span>✓</span> Backup Prepared Successfully!
+              </div>
+              <div id="page-backup-result-details" style="font-size:0.84rem; color:var(--text-main); line-height:1.6;"></div>
+            </div>
+
+            <div style="display:flex; gap:12px; margin-top:auto; padding-top:8px;">
+              <button class="search-btn" id="btn-page-backup-start" onclick="startPageBackupCreation()" style="flex:1; padding:10px 18px; font-size:0.95rem; justify-content:center;">
+                <span>🚀 Prepare & Download</span>
+              </button>
+              <a id="btn-page-backup-download" class="search-btn" href="#" target="_blank" style="display:none; flex:1; padding:10px 18px; font-size:0.95rem; text-decoration:none; background:#10b981; justify-content:center;">
+                <span>📥 Download File</span>
+              </a>
+            </div>
+          </div>
+
+          <!-- Restore Card -->
+          <div class="br-card" id="page-restore-card">
+            <div class="br-card-header">
+              <span style="font-size:1.4rem;">📥</span>
+              <div>
+                <div class="br-card-title">Restore Backup Archive</div>
+                <div class="br-card-desc">Upload a Bookkeeper backup archive (<code style="color:#a5b4fc;">.zip</code> or <code style="color:#a5b4fc;">.7z</code>) to unpack files and sync Neo4j.</div>
+              </div>
+            </div>
+
+            <div class="br-info-box warning">
+              <strong>⚠️ Search Locked During Restore:</strong> Queries are temporarily suspended during archive unpacking and Neo4j database rebuild to prevent inconsistencies.
+            </div>
+
+            <div class="br-form-group">
+              <label class="br-form-label">Select Backup File:</label>
+              <input 
+                type="file" 
+                id="page-restore-file-input" 
+                accept=".zip,.7z,application/zip,application/x-7z-compressed" 
+                style="background:var(--bg-dark); border:1px solid var(--border); padding:10px; border-radius:6px; color:var(--text-main); font-size:0.88rem; width:100%; cursor:pointer;" 
+                onchange="onPageRestoreFileSelected()"
+              />
+              <div id="page-restore-file-info" style="font-size:0.75rem; color:var(--text-muted);">Supported formats: .zip, .7z</div>
+            </div>
+
+            <div style="display:flex; align-items:center; gap:8px;">
+              <input type="checkbox" id="page-restore-clean-chk" checked style="accent-color:var(--accent); width:18px; height:18px; cursor:pointer;" />
+              <label for="page-restore-clean-chk" style="font-size:0.86rem; color:var(--text-main); cursor:pointer;">
+                Clean restore (purge existing artifacts and wipe Neo4j before importing)
+              </label>
+            </div>
+
+            <div id="page-restore-progress-area" style="display:none; background:rgba(15,23,42,0.6); padding:14px; border-radius:8px; border:1px solid var(--border);">
+              <div style="display:flex; align-items:center; gap:10px; margin-bottom:6px;">
+                <div class="spinner" style="width:18px; height:18px; border-width:2px; margin:0;"></div>
+                <span id="page-restore-progress-text" style="font-size:0.88rem; color:var(--text-main); font-weight:600;">Uploading and unpacking archive...</span>
+              </div>
+              <div id="page-restore-progress-sub" style="font-size:0.78rem; color:var(--text-muted);">Please keep this window open while files are being restored and Neo4j is updated.</div>
+            </div>
+
+            <div id="page-restore-result-area" style="display:none; background:rgba(16,185,129,0.12); padding:14px; border-radius:8px; border:1px solid #10b981;">
+              <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px; color:#34d399; font-weight:700;">
+                <span>✓</span> Restore & Synchronization Complete!
+              </div>
+              <div id="page-restore-result-details" style="font-size:0.84rem; color:var(--text-main); line-height:1.6;"></div>
+            </div>
+
+            <div style="display:flex; gap:12px; margin-top:auto; padding-top:8px;">
+              <button class="search-btn" id="btn-page-restore-start" onclick="startPageBackupRestore()" style="flex:1; padding:10px 18px; font-size:0.95rem; justify-content:center;" disabled>
+                <span>📥 Upload & Restore</span>
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -2726,9 +2948,11 @@
       document.querySelectorAll('.nav-tab-btn').forEach(b => b.classList.remove('active'));
       document.querySelectorAll('.view-pane').forEach(p => p.classList.remove('active'));
 
-      if (tab === 'graph') {
-        document.getElementById('tab-btn-graph').classList.add('active');
-        document.getElementById('pane-graph').classList.add('active');
+      if (tab === 'graph' || tab === 'search') {
+        const btnGraph = document.getElementById('tab-btn-graph');
+        if (btnGraph) btnGraph.classList.add('active');
+        const paneGraph = document.getElementById('pane-graph');
+        if (paneGraph) paneGraph.classList.add('active');
         if (cyInstance) cyInstance.resize();
       } else if (tab === 'books') {
         const btnBooks = document.getElementById('tab-btn-books');
@@ -2736,9 +2960,16 @@
         const paneBooks = document.getElementById('pane-books');
         if (paneBooks) paneBooks.classList.add('active');
         loadIndexedBooks();
+      } else if (tab === 'backup' || tab === 'restore' || tab === 'backup-restore') {
+        const btnBackup = document.getElementById('tab-btn-backup');
+        if (btnBackup) btnBackup.classList.add('active');
+        const paneBackup = document.getElementById('pane-backup');
+        if (paneBackup) paneBackup.classList.add('active');
       } else if (tab === 'debug') {
-        document.getElementById('tab-btn-debug').classList.add('active');
-        document.getElementById('pane-debug').classList.add('active');
+        const btnDebug = document.getElementById('tab-btn-debug');
+        if (btnDebug) btnDebug.classList.add('active');
+        const paneDebug = document.getElementById('pane-debug');
+        if (paneDebug) paneDebug.classList.add('active');
         renderDebugTab();
       }
     }
@@ -3153,6 +3384,181 @@
         isRestoreInProgress = false;
         if (startBtn) startBtn.disabled = false;
         if (cancelBtn) cancelBtn.disabled = false;
+        if (searchBtn) searchBtn.disabled = false;
+      }
+    }
+
+    // Dedicated Page Handlers for Backup & Restore Tab
+    async function startPageBackupCreation() {
+      const typeSelect = document.getElementById('page-backup-type-select');
+      const formatSelect = document.getElementById('page-backup-format-select');
+      const progressArea = document.getElementById('page-backup-progress-area');
+      const progressText = document.getElementById('page-backup-progress-text');
+      const resultArea = document.getElementById('page-backup-result-area');
+      const resultDetails = document.getElementById('page-backup-result-details');
+      const startBtn = document.getElementById('btn-page-backup-start');
+      const downloadBtn = document.getElementById('btn-page-backup-download');
+
+      const backupType = typeSelect ? typeSelect.value : 'full';
+      const backupFormat = formatSelect ? formatSelect.value : 'zip';
+
+      if (progressArea) progressArea.style.display = 'block';
+      if (resultArea) resultArea.style.display = 'none';
+      if (startBtn) startBtn.disabled = true;
+      if (downloadBtn) downloadBtn.style.display = 'none';
+      if (progressText) {
+        progressText.textContent = `Packaging ${backupType === 'full' ? 'full backup (with source books)' : 'knowledge backup'} as .${backupFormat}...`;
+      }
+
+      try {
+        const resp = await fetch('/api/backup/prepare', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: backupType, format: backupFormat, indexed_only: true })
+        });
+        const data = await resp.json();
+
+        if (data.error) {
+          throw new Error(data.error);
+        }
+
+        if (progressArea) progressArea.style.display = 'none';
+        if (resultArea) resultArea.style.display = 'block';
+
+        const sizeMb = (data.file_size / (1024 * 1024)).toFixed(2);
+        if (resultDetails) {
+          resultDetails.innerHTML = `
+            <strong>Archive:</strong> <code>${escapeHtml(data.filename)}</code><br>
+            <strong>Size:</strong> ${sizeMb} MB (${data.file_size.toLocaleString()} bytes)<br>
+            <strong>Archived Files:</strong> ${data.total_files.toLocaleString()} entries<br>
+            <span style="color:#6ee7b7; font-size:0.78rem;">Your browser download has started automatically, or use the button below.</span>
+          `;
+        }
+
+        if (downloadBtn) {
+          downloadBtn.href = data.download_url;
+          downloadBtn.setAttribute('download', data.filename);
+          downloadBtn.style.display = 'inline-flex';
+        }
+
+        // Trigger browser download automatically
+        const a = document.createElement('a');
+        a.href = data.download_url;
+        a.download = data.filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+
+      } catch (err) {
+        alert('Failed to prepare backup: ' + err.message);
+        if (progressArea) progressArea.style.display = 'none';
+      } finally {
+        if (startBtn) startBtn.disabled = false;
+      }
+    }
+
+    function onPageRestoreFileSelected() {
+      const fileInput = document.getElementById('page-restore-file-input');
+      const fileInfo = document.getElementById('page-restore-file-info');
+      const startBtn = document.getElementById('btn-page-restore-start');
+
+      if (fileInput && fileInput.files && fileInput.files[0]) {
+        const file = fileInput.files[0];
+        const sizeMb = (file.size / (1024 * 1024)).toFixed(2);
+        if (fileInfo) {
+          fileInfo.textContent = `Selected: ${file.name} (${sizeMb} MB)`;
+        }
+        if (startBtn) startBtn.disabled = false;
+      } else {
+        if (fileInfo) fileInfo.textContent = 'Supported formats: .zip, .7z';
+        if (startBtn) startBtn.disabled = true;
+      }
+    }
+
+    async function startPageBackupRestore() {
+      const fileInput = document.getElementById('page-restore-file-input');
+      if (!fileInput || !fileInput.files || !fileInput.files[0]) {
+        alert('Please select a backup archive to restore.');
+        return;
+      }
+
+      const file = fileInput.files[0];
+      const cleanChk = document.getElementById('page-restore-clean-chk');
+      const isClean = cleanChk ? cleanChk.checked : true;
+
+      const progressArea = document.getElementById('page-restore-progress-area');
+      const progressText = document.getElementById('page-restore-progress-text');
+      const resultArea = document.getElementById('page-restore-result-area');
+      const resultDetails = document.getElementById('page-restore-result-details');
+      const startBtn = document.getElementById('btn-page-restore-start');
+
+      if (progressArea) progressArea.style.display = 'block';
+      if (resultArea) resultArea.style.display = 'none';
+      if (startBtn) startBtn.disabled = true;
+      isRestoreInProgress = true;
+
+      // Lock search button
+      const searchBtn = document.getElementById('search-btn');
+      if (searchBtn) searchBtn.disabled = true;
+
+      if (progressText) progressText.textContent = `Uploading "${file.name}" and extracting archive...`;
+
+      try {
+        const formData = new FormData();
+        formData.append('file', file, file.name);
+        formData.append('clean', isClean ? 'true' : 'false');
+
+        const resp = await fetch('/api/backup/restore', {
+          method: 'POST',
+          body: formData,
+        });
+
+        const data = await resp.json();
+        if (!resp.ok || data.error) {
+          throw new Error(data.error || 'Server returned error ' + resp.status);
+        }
+
+        if (progressArea) progressArea.style.display = 'none';
+        if (resultArea) resultArea.style.display = 'block';
+
+        let neo4jMsg = '<span style="color:#94a3b8;">Neo4j export skipped (offline / not configured)</span>';
+        if (data.neo4j_export) {
+          if (data.neo4j_export.error) {
+            neo4jMsg = `<span style="color:#f87171;">Neo4j export warning: ${escapeHtml(data.neo4j_export.error)}</span>`;
+          } else {
+            const upNodes = data.neo4j_export.nodes_upserted || 0;
+            const upEdges = data.neo4j_export.edges_upserted || 0;
+            neo4jMsg = `<span style="color:#34d399;">✓ Neo4j database updated: ${upNodes.toLocaleString()} nodes, ${upEdges.toLocaleString()} relationships.</span>`;
+          }
+        }
+
+        const consistency = data.consistency || {};
+        let consistencyMsg = '';
+        if (consistency.is_consistent) {
+          consistencyMsg = '<span style="color:#34d399;">✓ Local knowledge base and Neo4j database are fully synchronized.</span>';
+        } else if (consistency.discrepancies && consistency.discrepancies.length > 0) {
+          consistencyMsg = `<span style="color:#fcd34d;">⚠️ Discrepancies: ${escapeHtml(consistency.discrepancies.join(', '))}</span>`;
+        }
+
+        if (resultDetails) {
+          resultDetails.innerHTML = `
+            <strong>Restored Files:</strong> ${data.restored_files.toLocaleString()} files (${(data.restored_bytes / (1024*1024)).toFixed(2)} MB)<br>
+            <strong>Neo4j Status:</strong> ${neo4jMsg}<br>
+            <strong>Validation:</strong> ${consistencyMsg}
+          `;
+        }
+
+        // Re-run consistency checks
+        checkDatabaseConsistency(true);
+        // Refresh indexed books
+        loadIndexedBooks(true);
+
+      } catch (err) {
+        alert('Restore failed: ' + err.message);
+        if (progressArea) progressArea.style.display = 'none';
+      } finally {
+        isRestoreInProgress = false;
+        if (startBtn) startBtn.disabled = false;
         if (searchBtn) searchBtn.disabled = false;
       }
     }
@@ -4489,8 +4895,12 @@
 
       if (tabParam === 'books') {
         switchTab('books');
+      } else if (tabParam === 'backup' || tabParam === 'restore' || tabParam === 'backup-restore') {
+        switchTab('backup');
       } else if (tabParam === 'debug') {
         switchTab('debug');
+      } else if (tabParam === 'search' || tabParam === 'graph') {
+        switchTab('graph');
       }
 
       if (searchParam) {

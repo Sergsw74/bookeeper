@@ -225,9 +225,9 @@ def _get_effective_settings(
     cfg = get_settings(config_path)
     overrides = {}
     if calibre_path:
-        overrides["calibre_library_path"] = calibre_path
+        overrides["calibre_library_path"] = str(calibre_path)
     if books_dir:
-        overrides["books_dir"] = books_dir
+        overrides["books_dir"] = str(books_dir)
     if ollama_url:
         overrides["ollama_base_url"] = ollama_url
     if model:
@@ -5699,6 +5699,248 @@ def restore_command(
     console.print("\n", table)
     restored_label = "Full backup (knowledge + source books)" if is_full else "Knowledge"
     console.print(f"[bold green]✓ {restored_label} successfully restored to:[/bold green] [bold cyan]{target_dir}[/bold cyan]\n")
+
+
+@app.command("sync")
+def sync_command(
+    server: str = typer.Argument(
+        ...,
+        help="Remote Bookkeeper server address (e.g. 192.168.50.20:8855 or http://192.168.50.20:8855).",
+    ),
+    clean: bool = typer.Option(
+        False,
+        "--clean",
+        help="Perform clean restore on remote server (wipe remote artifacts and Neo4j before importing).",
+    ),
+    config_path: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to config.yaml configuration file.",
+    ),
+    books_dir: Optional[Path] = typer.Option(
+        None,
+        "--books-dir",
+        "-b",
+        help="Source directory containing books/papers (default: configured books_dir or archive_downloader/downloads).",
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None,
+        "--output-dir",
+        "-o",
+        help="Source directory containing knowledge artifacts to sync (default: configured output_dir).",
+    ),
+    calibre_path: Optional[Path] = typer.Option(
+        None,
+        "--calibre-path",
+        help="Path to Calibre library.",
+    ),
+    format_type: str = typer.Option(
+        "zip",
+        "--format",
+        "-f",
+        help="Archive format to package for transmission: 'zip' or '7z' (default: zip).",
+    ),
+    timeout: int = typer.Option(
+        600,
+        "--timeout",
+        help="HTTP request timeout in seconds for backup transmission and remote restore (default: 600).",
+    ),
+):
+    """
+    Synchronize local knowledge graph and books with a remote Bookkeeper server via REST API:
+      1. Backup local books and knowledge graph into a compressed archive
+      2. Upload archive to remote server REST API (/api/backup/restore) with the --clean flag synchronized,
+         which unpacks artifacts, updates Neo4j database, and validates database consistency.
+    """
+    import tempfile
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+
+    server = _resolve_opt(server)
+    clean = _resolve_opt(clean, False)
+    config_path = _resolve_opt(config_path)
+    books_dir = _resolve_opt(books_dir)
+    output_dir = _resolve_opt(output_dir)
+    calibre_path = _resolve_opt(calibre_path)
+    format_type = _resolve_opt(format_type, "zip")
+    timeout = _resolve_opt(timeout, 600)
+
+    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir)
+
+    # Normalize remote server URL
+    target_server = server.strip()
+    if not target_server.startswith("http://") and not target_server.startswith("https://"):
+        target_server = f"http://{target_server}"
+    target_server = target_server.rstrip("/")
+
+    console.print(
+        Panel.fit(
+            f"[bold]Remote Server:[/bold] [bold cyan]{target_server}[/bold cyan]\n"
+            f"[bold]Step 1: Local Backup:[/bold] Full Backup (knowledge graph + indexed source books, {format_type.upper()})\n"
+            f"[bold]Step 2: Remote Restore:[/bold] POST {target_server}/api/backup/restore (clean={clean})\n"
+            f"[bold]Remote Neo4j Update:[/bold] Automatic (server restores graph and updates Neo4j database)\n",
+            title="Bookkeeper Sync Plan",
+            border_style="cyan",
+        )
+    )
+
+    t_start = time.perf_counter()
+
+    # -------------------------------------------------------------
+    # Step 1: Backup Local Books and Knowledge Graph
+    # -------------------------------------------------------------
+    console.print("[bold cyan][Step 1/2][/bold cyan] Creating full local backup archive (books + knowledge graph)...")
+    src_out_dir = Path(output_dir).expanduser().resolve() if output_dir else cfg.resolved_output_dir
+    src_books_dir = Path(books_dir).expanduser().resolve() if books_dir else (cfg.resolved_books_dir or Path("archive_downloader/downloads").resolve())
+
+    if not src_out_dir.is_dir():
+        console.print(f"[bold red]Knowledge output directory not found:[/bold red] {src_out_dir}")
+        raise typer.Exit(1)
+
+    temp_archive_dir = Path(tempfile.mkdtemp(prefix="bookeeper_sync_"))
+    archive_ext = ".7z" if format_type.lower() == "7z" else ".zip"
+    temp_archive_file = temp_archive_dir / f"sync_backup{archive_ext}"
+
+    custom_dirs = {
+        "chunks_dir": cfg.resolved_chunks_dir,
+        "state_file": cfg.resolved_state_file,
+    }
+
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=30),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            backup_task = progress.add_task("Archiving local books & graph...", total=1)
+
+            def _on_sync_progress(completed: int, total: int, fname: str):
+                short_name = (fname[:32] + "...") if len(fname) > 35 else fname
+                progress.update(
+                    backup_task,
+                    total=total,
+                    completed=completed,
+                    description=f"Packaging: [cyan]{short_name}[/cyan]",
+                )
+
+            backup_res = create_backup(
+                source_dir=src_out_dir,
+                destination=temp_archive_file,
+                format_type=format_type,
+                backup_type="full",
+                books_dir=src_books_dir if src_books_dir.is_dir() else None,
+                indexed_only=True,
+                include_chunks=True,
+                include_obsidian=True,
+                include_states=True,
+                include_lightrag=True,
+                custom_dirs=custom_dirs,
+                progress_callback=_on_sync_progress,
+            )
+
+        arch_size_mb = backup_res["compressed_bytes"] / (1024 * 1024)
+        console.print(
+            f"[bold green]✓ Step 1 Complete: Created local backup archive[/bold green] "
+            f"([bold white]{arch_size_mb:.2f} MB[/bold white], {backup_res['total_files']:,} files)\n"
+        )
+    except Exception as e:
+        console.print(f"[bold red]✗ Step 1 Failed (create_backup):[/bold red] {e}")
+        if temp_archive_dir.exists():
+            import shutil
+            shutil.rmtree(temp_archive_dir, ignore_errors=True)
+        raise typer.Exit(1)
+
+    # -------------------------------------------------------------
+    # Step 2: Transmit and Restore Backup via Remote REST API
+    # -------------------------------------------------------------
+    restore_url = f"{target_server}/api/backup/restore"
+    console.print(f"[bold cyan][Step 2/2][/bold cyan] Uploading backup to remote server and restoring (clean={clean}) at [bold white]{restore_url}[/bold white]...")
+
+    restore_response_data = None
+    try:
+        archive_bytes = temp_archive_file.read_bytes()
+        boundary = f"----BookkeeperSyncBoundary{int(time.time())}"
+        
+        # Build multipart/form-data payload with synchronized clean flag
+        body_parts = []
+        # 'clean' field
+        body_parts.append(f"--{boundary}\r\n".encode("latin1"))
+        body_parts.append(b'Content-Disposition: form-data; name="clean"\r\n\r\n')
+        body_parts.append(b"true\r\n" if clean else b"false\r\n")
+
+        # 'file' field
+        content_type = "application/x-7z-compressed" if archive_ext == ".7z" else "application/zip"
+        body_parts.append(f"--{boundary}\r\n".encode("latin1"))
+        body_parts.append(f'Content-Disposition: form-data; name="file"; filename="{temp_archive_file.name}"\r\n'.encode("latin1"))
+        body_parts.append(f"Content-Type: {content_type}\r\n\r\n".encode("latin1"))
+        body_parts.append(archive_bytes)
+        body_parts.append(b"\r\n")
+        body_parts.append(f"--{boundary}--\r\n".encode("latin1"))
+
+        multipart_payload = b"".join(body_parts)
+
+        req = urllib.request.Request(
+            restore_url,
+            data=multipart_payload,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Content-Length": str(len(multipart_payload)),
+            },
+            method="POST",
+        )
+
+        with console.status(f"[bold cyan]Transmitting {arch_size_mb:.2f} MB and executing remote restore & Neo4j sync...[/bold cyan]"):
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                resp_text = resp.read().decode("utf-8")
+                restore_response_data = json.loads(resp_text)
+
+        if not restore_response_data.get("success"):
+            err_msg = restore_response_data.get("error", "Unknown server error")
+            console.print(f"[bold red]✗ Step 2 Failed: Server returned failure:[/bold red] {err_msg}")
+            raise typer.Exit(1)
+
+        restored_files = restore_response_data.get("restored_files", 0)
+        neo4j_info = restore_response_data.get("neo4j_export") or {}
+        nodes_up = neo4j_info.get("nodes_upserted", 0)
+        edges_up = neo4j_info.get("edges_upserted", 0)
+
+        console.print(
+            f"[bold green]✓ Step 2 Complete: Remote restore and Neo4j synchronization successful![/bold green] "
+            f"({restored_files:,} files restored, Neo4j: {nodes_up:,} nodes, {edges_up:,} relationships)\n"
+        )
+    except urllib.error.HTTPError as e:
+        err_detail = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
+        console.print(f"[bold red]✗ Step 2 Failed (HTTP {e.code}):[/bold red] {err_detail}")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[bold red]✗ Step 2 Failed (REST API):[/bold red] {e}")
+        raise typer.Exit(1)
+    finally:
+        if temp_archive_dir.exists():
+            import shutil
+            shutil.rmtree(temp_archive_dir, ignore_errors=True)
+
+    elapsed_total = time.perf_counter() - t_start
+
+    # Summary table
+    table = Table(title="Bookkeeper Client Sync Summary", border_style="green")
+    table.add_column("Phase", style="bold cyan")
+    table.add_column("Status / Details", style="green")
+
+    clean_step_txt = "Clean restore (remote database wiped + restored)" if clean else "Additive restore (existing preserved)"
+    table.add_row("1. Local Backup Archive", f"{backup_res['total_files']:,} files ({arch_size_mb:.2f} MB)")
+    table.add_row("2. Remote REST Restore", f"Restored into {target_server} ({clean_step_txt})")
+    table.add_row("Remote Neo4j Sync", f"{neo4j_info.get('nodes_upserted', 0):,} nodes, {neo4j_info.get('edges_upserted', 0):,} edges")
+    table.add_row("Total Duration", f"{elapsed_total:.2f}s")
+
+    console.print(table)
+    console.print(f"[bold green]✓ Synchronization completed successfully for {target_server}![/bold green]\n")
 
 
 @app.command("ui")

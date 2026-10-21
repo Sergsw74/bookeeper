@@ -18,7 +18,7 @@ from bookeeper.backup import (
 )
 from bookeeper.cli import app
 
-runner = CliRunner()
+runner = CliRunner(env={"COLUMNS": "200"})
 
 
 @pytest.fixture
@@ -543,6 +543,102 @@ def test_full_restore_without_explicit_books_dir_uses_output_dir(mock_output_dir
     assert (expected_books_dir / "index.json").is_file()
     assert "Book Files Restored" in res.stdout
     assert "Full Restoration Summary" in res.stdout
+
+
+def test_cli_sync_flow(tmp_path):
+    """Test client sync command packages local backup and invokes REST restore with synchronized --clean flag."""
+    from unittest.mock import MagicMock, patch
+    from typer.testing import CliRunner
+    from bookeeper.cli import app
+    import json
+
+    runner = CliRunner(env={"COLUMNS": "200"})
+
+    # 1. Setup local output_dir with knowledge_graph.json
+    out_dir = tmp_path / "output"
+    out_dir.mkdir()
+    kg_file = out_dir / "knowledge_graph.json"
+    kg_file.write_text(json.dumps({
+        "nodes": [{"id": "book:1", "type": "Book", "title": "Quantum Computing"}],
+        "edges": []
+    }), encoding="utf-8")
+
+    books_dir = tmp_path / "books"
+    books_dir.mkdir()
+    (books_dir / "book.pdf").write_bytes(b"%PDF-sample")
+
+    # Mock urllib.request.urlopen for Step 2 (REST restore)
+    mock_restore_response = MagicMock()
+    mock_restore_response.read.return_value = json.dumps({
+        "success": True,
+        "restored_files": 4,
+        "neo4j_export": {"nodes_upserted": 10, "edges_upserted": 20},
+    }).encode("utf-8")
+    mock_restore_response.__enter__.return_value = mock_restore_response
+
+    with patch("urllib.request.urlopen", return_value=mock_restore_response) as mock_urlopen:
+        res = runner.invoke(app, [
+            "sync",
+            "192.168.50.20:8855",
+            "--clean",
+            "--output-dir", str(out_dir),
+            "--books-dir", str(books_dir),
+        ])
+
+        assert res.exit_code == 0, f"Error: {res.stdout}"
+        assert "Bookkeeper Sync Plan" in res.stdout
+        assert "Step 1/2" in res.stdout
+        assert "Step 2/2" in res.stdout
+        assert "Synchronization completed successfully" in res.stdout
+
+        # Verify Step 2: urlopen called with remote server URL and clean=true
+        mock_urlopen.assert_called_once()
+        req_arg = mock_urlopen.call_args[0][0]
+        assert req_arg.full_url == "http://192.168.50.20:8855/api/backup/restore"
+        # Multipart payload contains name="clean"\r\n\r\ntrue
+        assert b'name="clean"\r\n\r\ntrue' in req_arg.data
+        assert b'filename="sync_backup.zip"' in req_arg.data
+
+
+def test_cli_sync_flow_no_clean(tmp_path):
+    """Test client sync command without --clean translates to clean=false in remote restore."""
+    from unittest.mock import MagicMock, patch
+    from typer.testing import CliRunner
+    from bookeeper.cli import app
+    import json
+
+    runner = CliRunner(env={"COLUMNS": "200"})
+
+    out_dir = tmp_path / "output"
+    out_dir.mkdir()
+    kg_file = out_dir / "knowledge_graph.json"
+    kg_file.write_text(json.dumps({
+        "nodes": [{"id": "book:1", "type": "Book", "title": "Classical Computing"}],
+        "edges": []
+    }), encoding="utf-8")
+
+    mock_restore_response = MagicMock()
+    mock_restore_response.read.return_value = json.dumps({
+        "success": True,
+        "restored_files": 2,
+        "neo4j_export": {"nodes_upserted": 8, "edges_upserted": 14},
+    }).encode("utf-8")
+    mock_restore_response.__enter__.return_value = mock_restore_response
+
+    with patch("urllib.request.urlopen", return_value=mock_restore_response) as mock_urlopen:
+        res = runner.invoke(app, [
+            "sync",
+            "http://example.com:8000",
+            "--output-dir", str(out_dir),
+        ])
+
+        assert res.exit_code == 0, f"Error: {res.stdout}"
+        mock_urlopen.assert_called_once()
+        req_arg = mock_urlopen.call_args[0][0]
+        assert req_arg.full_url == "http://example.com:8000/api/backup/restore"
+        # Multipart payload contains name="clean"\r\n\r\nfalse
+        assert b'name="clean"\r\n\r\nfalse' in req_arg.data
+
 
 
 

@@ -418,9 +418,17 @@ class ObsidianExporter:
 _XML_INVALID_RE = re.compile(r"[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]")
 
 
-def _clean_xml_attr(val: Any) -> str:
-    s = json.dumps(val) if isinstance(val, (list, dict)) else str(val)
+def _clean_xml_attr(val: Any) -> Any:
+    if val is None:
+        return ""
+    if isinstance(val, (int, float, bool)):
+        return val
+    s = json.dumps(val, ensure_ascii=False) if isinstance(val, (list, dict)) else str(val)
     return _XML_INVALID_RE.sub("", s)
+
+
+def _clean_str(val: Any) -> str:
+    return _XML_INVALID_RE.sub("", str(val or ""))
 
 
 class GraphMLExporter:
@@ -431,18 +439,21 @@ class GraphMLExporter:
 
     def export(self, store: ConceptGraphStore) -> Path:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        # Ensure all attribute values are primitive strings/ints for GraphML writer
-        g_copy = nx.DiGraph()
-        for n, attrs in store.graph.nodes(data=True):
-            clean_attrs = {k: _clean_xml_attr(v) for k, v in attrs.items()}
-            g_copy.add_node(n, **clean_attrs)
+        try:
+            # Ensure all attribute values are primitive strings/ints for GraphML writer
+            g_copy = nx.DiGraph()
+            for n, attrs in store.graph.nodes(data=True):
+                clean_attrs = {_clean_str(k): _clean_xml_attr(v) for k, v in attrs.items()}
+                g_copy.add_node(_clean_str(n), **clean_attrs)
 
-        for u, v, attrs in store.graph.edges(data=True):
-            clean_attrs = {k: _clean_xml_attr(val) for k, val in attrs.items()}
-            g_copy.add_edge(u, v, **clean_attrs)
+            for u, v, attrs in store.graph.edges(data=True):
+                clean_attrs = {_clean_str(k): _clean_xml_attr(val) for k, val in attrs.items()}
+                g_copy.add_edge(_clean_str(u), _clean_str(v), **clean_attrs)
 
-        nx.write_graphml(g_copy, str(self.output_path))
-        logger.info(f"Exported GraphML to {self.output_path}")
+            nx.write_graphml(g_copy, str(self.output_path))
+            logger.info(f"Exported GraphML to {self.output_path}")
+        except Exception as e:
+            logger.warning(f"Could not export GraphML to {self.output_path}: {e}")
         return self.output_path
 
 
@@ -454,15 +465,18 @@ class GEXFExporter:
 
     def export(self, store: ConceptGraphStore) -> Path:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
-        g_copy = nx.DiGraph()
-        for n, attrs in store.graph.nodes(data=True):
-            clean_attrs = {k: _clean_xml_attr(v) for k, v in attrs.items()}
-            g_copy.add_node(n, **clean_attrs)
+        try:
+            g_copy = nx.DiGraph()
+            for n, attrs in store.graph.nodes(data=True):
+                clean_attrs = {_clean_str(k): _clean_xml_attr(v) for k, v in attrs.items()}
+                g_copy.add_node(_clean_str(n), **clean_attrs)
 
-        for u, v, attrs in store.graph.edges(data=True):
-            clean_attrs = {k: _clean_xml_attr(val) for k, val in attrs.items()}
-            g_copy.add_edge(u, v, **clean_attrs)
+            for u, v, attrs in store.graph.edges(data=True):
+                clean_attrs = {_clean_str(k): _clean_xml_attr(val) for k, val in attrs.items()}
+                g_copy.add_edge(_clean_str(u), _clean_str(v), **clean_attrs)
 
-        nx.write_gexf(g_copy, str(self.output_path))
-        logger.info(f"Exported GEXF to {self.output_path}")
+            nx.write_gexf(g_copy, str(self.output_path))
+            logger.info(f"Exported GEXF to {self.output_path}")
+        except Exception as e:
+            logger.warning(f"Could not export GEXF to {self.output_path}: {e}")
         return self.output_path

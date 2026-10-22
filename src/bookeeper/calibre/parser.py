@@ -25,6 +25,7 @@ MOJIBAKE_CHARS = (
 )
 MOJIBAKE_RE = re.compile(MOJIBAKE_CHARS)
 CP1251_UTF8_RE = re.compile(r"[РрСс][\u0080-\u00FF\u0400-\u04FF]+")
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def _is_plausible_russian_word(word: str) -> bool:
@@ -166,7 +167,7 @@ class BookParser:
         s = MOJIBAKE_RE.sub(lambda m: _repair_segment(m.group(0)), s)
         s = CP1251_UTF8_RE.sub(lambda m: _repair_segment(m.group(0)), s)
 
-        return s
+        return _CONTROL_CHAR_RE.sub("", s)
 
     @classmethod
     def is_archive(cls, path: Path | str) -> bool:

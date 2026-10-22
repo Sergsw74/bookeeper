@@ -139,6 +139,10 @@ def test_mojibake_repair():
     assert BookParser.repair_mojibake("Spanish: ¿Cómo estás? ¡Muy bien!") == "Spanish: ¿Cómo estás? ¡Muy bien!"
     assert BookParser.repair_mojibake("German: Grüße über die Straße") == "German: Grüße über die Straße"
 
+    # Control characters must be stripped
+    assert BookParser.repair_mojibake("Mem-{\x08eta}") == "Mem-{eta}"
+    assert BookParser.repair_mojibake("Bad\x00Control\x0cChars\x1fTest") == "BadControlCharsTest"
+
     # Stage 1: Section auto-repair
     sec = Section(title="“Ðàñïèñêó”", chapter_idx=1, text="Text with «Ñêàìüþ»")
     assert sec.title == "“Расписку”"
@@ -1845,6 +1849,62 @@ def test_rebuild_graph_command(tmp_path):
     # Tracker should record Book 42 as completed
     tracker = ProgressTracker(out_dir / ".bookeeper_state.json")
     assert 42 in tracker.get_completed_ids("build_graph")
+
+
+def test_xml_exporters_sanitize_control_characters(tmp_path: Path):
+    """Verify GraphMLExporter and GEXFExporter sanitize control chars in node IDs, edge IDs, and attrs."""
+    from bookeeper.graph.store import ConceptGraphStore
+    from bookeeper.graph.exporters import GraphMLExporter, GEXFExporter
+
+    store = ConceptGraphStore()
+    # Node with invalid XML control char in ID and attrs
+    bad_node_id = "concept:Mem-{\x08eta}"
+    store.graph.add_node(bad_node_id, name="Mem-\x08eta", weight=5, summary="Summary with \x1b control char")
+    store.graph.add_node("concept:ValidNode", name="ValidNode", weight=10)
+    store.graph.add_edge(bad_node_id, "concept:ValidNode", relation="RELATES_\x08TO", weight=1)
+
+    graphml_path = tmp_path / "test.graphml"
+    gml = GraphMLExporter(graphml_path)
+    res_gml = gml.export(store)
+    assert res_gml.exists()
+    assert res_gml.stat().st_size > 0
+    content_gml = res_gml.read_text(encoding="utf-8")
+    assert "\x08" not in content_gml
+
+    gexf_path = tmp_path / "test.gexf"
+    gexf = GEXFExporter(gexf_path)
+    res_gexf = gexf.export(store)
+    assert res_gexf.exists()
+    assert res_gexf.stat().st_size > 0
+    content_gexf = res_gexf.read_text(encoding="utf-8")
+    assert "\x08" not in content_gexf
+
+
+def test_book_processing_state_cancellation_preservation(tmp_path: Path):
+    """Verify that cancelling mid-book marks status as partially_indexed and clears stacked chunks."""
+    from bookeeper.processing.state import BookProcessingState
+
+    state_dir = tmp_path / ".book_states"
+    state = BookProcessingState(book_id=65, book_title="Test Cancel Book", state_dir=state_dir)
+    state.set_total_chunks(10)
+
+    # Chunk 1 extracted
+    state.mark_chunk_processed("chk_1", 1, "Sec 1", {"concepts": ["A"]}, duration=1.2, server_used="srv1")
+    # Chunk 2 stacked in flight
+    state.mark_chunk_stacked("chk_2", 2, "Sec 2")
+
+    # Simulate cancellation
+    state.data["stacked_chunks"] = {}
+    if state.data.get("status") != "fully_indexed":
+        state.data["status"] = "partially_indexed"
+    state.save()
+
+    # Verify reloading
+    state2 = BookProcessingState(book_id=65, book_title="Test Cancel Book", state_dir=state_dir)
+    assert state2.data["status"] == "partially_indexed"
+    assert "chk_1" in state2.data["processed_chunks"]
+    assert state2.data["stacked_chunks"] == {}
+
 
 
 

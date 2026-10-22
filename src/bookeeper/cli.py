@@ -1732,12 +1732,21 @@ def build_graph(
             return (avg_val, p80_val, p18_val, fastest_val)
 
     total_books = len(books_to_process)
+    book_state = None
     try:
         for book_idx, binfo in enumerate(books_to_process, start=1):
             bid = binfo["id"]
             btitle = BookParser.repair_mojibake(binfo["title"])
             bauthor = BookParser.repair_mojibake(binfo["author"])
             bpath: Optional[Path] = binfo.get("path")
+
+            book_state_dir = output_dir / ".book_states"
+            book_state = BookProcessingState(
+                book_id=bid,
+                book_title=btitle,
+                state_dir=book_state_dir,
+                max_chunk_attempts=6,
+            )
 
             model_banner = f"LLM: [bold green]{cfg.llm_model}[/bold green]"
             if cfg.llm_model_fallback:
@@ -1968,13 +1977,6 @@ def build_graph(
 
                     _update_progress_description()
 
-                    book_state_dir = output_dir / ".book_states"
-                    book_state = BookProcessingState(
-                        book_id=bid,
-                        book_title=btitle,
-                        state_dir=book_state_dir,
-                        max_chunk_attempts=6,
-                    )
                     book_state.set_total_chunks(len(chunks))
 
                     # 1. Restore any already processed or failed chunks from previous run
@@ -2270,6 +2272,11 @@ def build_graph(
                         with concurrent.futures.thread._global_shutdown_lock:
                             for t in list(chunk_executor._threads):
                                 concurrent.futures.thread._threads_queues.pop(t, None)
+                        if book_state is not None:
+                            book_state.data["stacked_chunks"] = {}
+                            if book_state.data.get("status") != "fully_indexed":
+                                book_state.data["status"] = "partially_indexed"
+                            book_state.save()
                         store.remove_book(bid)
                         raise
                     finally:
@@ -2420,6 +2427,11 @@ def build_graph(
                     break
 
             except KeyboardInterrupt:
+                if book_state is not None:
+                    book_state.data["stacked_chunks"] = {}
+                    if book_state.data.get("status") != "fully_indexed":
+                        book_state.data["status"] = "partially_indexed"
+                    book_state.save()
                 store.remove_book(bid)
                 raise
             except Exception as e:
@@ -2429,6 +2441,11 @@ def build_graph(
 
     except KeyboardInterrupt:
         interrupted = True
+        if book_state is not None:
+            book_state.data["stacked_chunks"] = {}
+            if book_state.data.get("status") != "fully_indexed":
+                book_state.data["status"] = "partially_indexed"
+            book_state.save()
         console.print("\n[bold yellow]Cancelled by user. Saving current Knowledge Graph state...[/bold yellow]")
 
     finally:
@@ -2464,10 +2481,17 @@ def build_graph(
 
             store.save(graph_file)
             final_clean = should_clean and not has_cleaned
-            obs = ObsidianExporter(vault_dest)
-            obs.export(store, clean=final_clean)
-            gml = GraphMLExporter(graphml_dest)
-            gml.export(store)
+            try:
+                obs = ObsidianExporter(vault_dest)
+                obs.export(store, clean=final_clean)
+            except Exception as e:
+                console.print(f"[bold yellow]⚠ Obsidian export skipped or incomplete:[/bold yellow] {e}")
+
+            try:
+                gml = GraphMLExporter(graphml_dest)
+                gml.export(store)
+            except Exception as e:
+                console.print(f"[bold yellow]⚠ GraphML export skipped or incomplete:[/bold yellow] {e}")
 
             should_export_neo4j = cfg.neo4j.enabled if export_neo4j is None else export_neo4j
             if should_export_neo4j:
@@ -2507,7 +2531,7 @@ def build_graph(
                 f"Completed in this session: [bold green]{completed_in_session}[/bold green] book(s). "
                 f"Knowledge graph checkpoint and Obsidian vault preserved."
             )
-            raise typer.Exit(code=130)
+            raise typer.Exit(code=0)
 
     # Persist graph to JSON and exports
     console.print(f"\n[bold green]✓ Knowledge Graph persisted to:[/bold green] {graph_file}")

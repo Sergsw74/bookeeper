@@ -566,6 +566,19 @@ class SearchEngineBackend:
         external_url = matched_entry.get("url") if matched_entry else None
         arxiv_id = matched_entry.get("arxiv_id") if matched_entry else None
 
+        from bookeeper.calibre.parser import BookParser
+        pub_date = None
+        if matched_entry:
+            pub_date = BookParser.parse_publication_date(
+                matched_entry.get("publication_date")
+                or matched_entry.get("pubdate")
+                or matched_entry.get("published")
+                or matched_entry.get("published_date")
+                or arxiv_id
+            )
+        if not pub_date and target_file:
+            pub_date = BookParser.extract_publication_date(target_file)
+
         return {
             "found": True,
             "filename": rel_name,
@@ -576,8 +589,59 @@ class SearchEngineBackend:
             "view_url": f"/api/book/file?filename={safe_rel}",
             "external_url": external_url,
             "arxiv_id": arxiv_id,
+            "publication_date": pub_date,
+            "pubdate": pub_date,
             "absolute_path": str(target_file),
         }
+
+    def resolve_publication_date(
+        self,
+        book_id: Optional[Any] = None,
+        title: str = "",
+        book_file: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Resolve publication date from book file, state checkpoints, or metadata."""
+        from bookeeper.calibre.parser import BookParser
+        if book_file and book_file.get("publication_date"):
+            return book_file["publication_date"]
+
+        out_p = Path(getattr(self.config, "resolved_output_dir", Path("output"))).expanduser().resolve()
+        if book_id is not None:
+            bid_clean = str(book_id).replace("book:", "").strip()
+            # 1. Check per-book state file (.book_states)
+            b_state_file = out_p / ".book_states" / f"book_{bid_clean}_state.json"
+            if b_state_file.is_file():
+                try:
+                    with open(b_state_file, "r", encoding="utf-8") as bsf:
+                        bdata = json.load(bsf)
+                    p_date = BookParser.parse_publication_date(bdata.get("publication_date") or bdata.get("pubdate"))
+                    if p_date:
+                        return p_date
+                except Exception:
+                    pass
+
+            # 2. Check general progress tracker (.bookeeper_state.json)
+            state_file = out_p / ".bookeeper_state.json"
+            if state_file.is_file():
+                try:
+                    with open(state_file, "r", encoding="utf-8") as sf:
+                        sdata = json.load(sf)
+                    rec = sdata.get("operations", {}).get("build_graph", {}).get(bid_clean, {})
+                    p_date = BookParser.parse_publication_date(rec.get("metadata", {}).get("publication_date"))
+                    if p_date:
+                        return p_date
+                except Exception:
+                    pass
+
+        # 3. Resolve from physical book file if not yet resolved
+        if not book_file:
+            book_file = self.resolve_book_file(title=title, book_id=book_id)
+        if book_file and book_file.get("publication_date"):
+            return book_file["publication_date"]
+        if book_file and book_file.get("absolute_path"):
+            return BookParser.extract_publication_date(Path(book_file["absolute_path"]))
+
+        return None
 
     def _get_concept_embedding_index(self) -> ConceptEmbeddingIndex:
         """Lazy-load and cache the neural ConceptEmbeddingIndex."""
@@ -2205,6 +2269,14 @@ class SearchEngineBackend:
                         book_file = self.resolve_book_file(title=title, book_id=bid)
                         safe_book_file = {k: v for k, v in book_file.items() if k != "absolute_path"} if book_file else None
 
+                        from bookeeper.calibre.parser import BookParser
+                        pub_date = (
+                            BookParser.parse_publication_date(b_props.get("publication_date") or b_props.get("pubdate"))
+                            or (state_books.get(bid, {}).get("metadata", {}).get("publication_date") if bid in state_books else None)
+                            or (safe_book_file.get("publication_date") if safe_book_file else None)
+                            or self.resolve_publication_date(book_id=bid, title=title, book_file=safe_book_file)
+                        )
+
                         books.append({
                             "book_id": bid,
                             "id": f"book:{bid}",
@@ -2212,6 +2284,8 @@ class SearchEngineBackend:
                             "author": author,
                             "summary": summary,
                             "timestamp": ts,
+                            "pubdate": pub_date,
+                            "publication_date": pub_date,
                             "status": status,
                             "total_chunks": total_chunks,
                             "ideas_count": len(sorted_ideas),
@@ -2341,6 +2415,14 @@ class SearchEngineBackend:
                 book_file = self.resolve_book_file(title=title, book_id=bid)
                 safe_book_file = {k: v for k, v in book_file.items() if k != "absolute_path"} if book_file else None
 
+                from bookeeper.calibre.parser import BookParser
+                pub_date = (
+                    BookParser.parse_publication_date(b_node.get("publication_date") or b_node.get("pubdate"))
+                    or (state_books.get(bid, {}).get("metadata", {}).get("publication_date") if bid in state_books else None)
+                    or (safe_book_file.get("publication_date") if safe_book_file else None)
+                    or self.resolve_publication_date(book_id=bid, title=title, book_file=safe_book_file)
+                )
+
                 books.append({
                     "book_id": bid,
                     "id": nid,
@@ -2348,6 +2430,8 @@ class SearchEngineBackend:
                     "author": author,
                     "summary": summary,
                     "timestamp": ts,
+                    "pubdate": pub_date,
+                    "publication_date": pub_date,
                     "status": status,
                     "total_chunks": total_chunks,
                     "ideas_count": len(sorted_ideas),
@@ -2399,6 +2483,13 @@ class SearchEngineBackend:
                 book_file = self.resolve_book_file(title=title, book_id=bid)
                 safe_book_file = {k: v for k, v in book_file.items() if k != "absolute_path"} if book_file else None
 
+                from bookeeper.calibre.parser import BookParser
+                pub_date = (
+                    BookParser.parse_publication_date(sb.get("metadata", {}).get("publication_date"))
+                    or (safe_book_file.get("publication_date") if safe_book_file else None)
+                    or self.resolve_publication_date(book_id=bid, title=title, book_file=safe_book_file)
+                )
+
                 books.append({
                     "book_id": bid,
                     "id": f"book:{bid}",
@@ -2406,6 +2497,8 @@ class SearchEngineBackend:
                     "author": "Unknown",
                     "summary": "",
                     "timestamp": ts,
+                    "pubdate": pub_date,
+                    "publication_date": pub_date,
                     "status": sb.get("status", "completed"),
                     "total_chunks": total_chunks,
                     "ideas_count": len(sorted_ideas),
@@ -2695,6 +2788,12 @@ class SearchEngineBackend:
                                 book_id=other_bid,
                             )
                             rel_entry["book_file"] = {k: v for k, v in bf.items() if k != "absolute_path"} if bf else None
+                            from bookeeper.calibre.parser import BookParser
+                            rel_entry["publication_date"] = (
+                                BookParser.parse_publication_date(other_props.get("publication_date") or other_props.get("pubdate"))
+                                or (bf.get("publication_date") if bf else None)
+                                or self.resolve_publication_date(book_id=other_bid, title=name or other_props.get("title") or book_title_str, book_file=bf)
+                            )
                             books.append(rel_entry)
                         elif "Concept" in labels or "Idea" in labels:
                             related_concepts.append(rel_entry)
@@ -2719,6 +2818,12 @@ class SearchEngineBackend:
                             book_id=node_props.get("book_id") or node_data.get("id"),
                         )
                         node_data["book_file"] = {k: v for k, v in bf.items() if k != "absolute_path"} if bf else None
+                        from bookeeper.calibre.parser import BookParser
+                        node_data["publication_date"] = (
+                            BookParser.parse_publication_date(node_props.get("publication_date") or node_props.get("pubdate"))
+                            or (bf.get("publication_date") if bf else None)
+                            or self.resolve_publication_date(book_id=node_props.get("book_id") or node_data.get("id"), title=node_data.get("name") or node_props.get("title"), book_file=bf)
+                        )
                     elif "Chunk" in node_labels or node_cat == "Chunk" or "Section" in node_labels:
                         bf = self.resolve_book_file(
                             title=node_props.get("book_title"),
@@ -2788,6 +2893,12 @@ class SearchEngineBackend:
                                     book_id=other_bid,
                                 )
                                 rel_entry["book_file"] = {k: v for k, v in bf.items() if k != "absolute_path"} if bf else None
+                                from bookeeper.calibre.parser import BookParser
+                                rel_entry["publication_date"] = (
+                                    BookParser.parse_publication_date(other_node.get("publication_date") or other_node.get("pubdate"))
+                                    or (bf.get("publication_date") if bf else None)
+                                    or self.resolve_publication_date(book_id=other_bid, title=name or other_node.get("title") or book_title_str, book_file=bf)
+                                )
                                 books.append(rel_entry)
                             elif "Concept" in labels or "Idea" in labels or other_node.get("category") in ("Concept", "Idea"):
                                 related_concepts.append(rel_entry)
@@ -2812,6 +2923,12 @@ class SearchEngineBackend:
                             book_id=l_props.get("book_id") or local_node.get("id"),
                         )
                         local_node["book_file"] = {k: v for k, v in bf.items() if k != "absolute_path"} if bf else None
+                        from bookeeper.calibre.parser import BookParser
+                        local_node["publication_date"] = (
+                            BookParser.parse_publication_date(l_props.get("publication_date") or l_props.get("pubdate"))
+                            or (bf.get("publication_date") if bf else None)
+                            or self.resolve_publication_date(book_id=l_props.get("book_id") or local_node.get("id"), title=local_node.get("name") or l_props.get("title"), book_file=bf)
+                        )
                     elif "Chunk" in l_labels or l_cat == "Chunk" or "Section" in l_labels:
                         bf = self.resolve_book_file(
                             title=l_props.get("book_title"),

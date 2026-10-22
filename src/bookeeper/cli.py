@@ -1739,6 +1739,9 @@ def build_graph(
             btitle = BookParser.repair_mojibake(binfo["title"])
             bauthor = BookParser.repair_mojibake(binfo["author"])
             bpath: Optional[Path] = binfo.get("path")
+            bpubdate = binfo.get("publication_date") or binfo.get("pubdate")
+            if not bpubdate and bpath and bpath.is_file():
+                bpubdate = BookParser.extract_publication_date(bpath)
 
             book_state_dir = output_dir / ".book_states"
             book_state = BookProcessingState(
@@ -1747,6 +1750,8 @@ def build_graph(
                 state_dir=book_state_dir,
                 max_chunk_attempts=6,
             )
+            if bpubdate:
+                book_state.data["publication_date"] = bpubdate
 
             model_banner = f"LLM: [bold green]{cfg.llm_model}[/bold green]"
             if cfg.llm_model_fallback:
@@ -2293,7 +2298,7 @@ def build_graph(
                     failed_poison_results = [r for r in extracted_results if r.get("status") == "failed_chunk"]
 
                     # Atomically integrate successful extractions into knowledge graph
-                    store.add_book(bid, title=btitle, author=bauthor)
+                    store.add_book(bid, title=btitle, author=bauthor, publication_date=bpubdate)
                     for res in successful_results:
                         chk = res["chunk"]
                         extraction = res["extraction"]
@@ -2409,7 +2414,11 @@ def build_graph(
                         "build_graph",
                         bid,
                         title=btitle,
-                        metadata={"indexing_status": "fully_indexed", "total_chunks": len(chunks)},
+                        metadata={
+                            "indexing_status": "fully_indexed",
+                            "total_chunks": len(chunks),
+                            "publication_date": bpubdate,
+                        },
                     )
                     console.print(
                         f"  [dim green]✓ Book #{bid} fully indexed (all {len(chunks)} chunks succeeded). State retained at {book_state.file_path}.[/dim green]"
@@ -5201,7 +5210,8 @@ def rebuild_graph_command(
             extracted_items = [v for v in processed.values() if v.get("status") == "extracted"]
             extracted_items.sort(key=lambda x: x.get("chunk_idx", 0))
 
-            store.add_book(bid, title=btitle, author=bauthor)
+            rebuild_pubdate = s_data.get("publication_date")
+            store.add_book(bid, title=btitle, author=bauthor, publication_date=rebuild_pubdate)
 
             for res in extracted_items:
                 chk_id = res["chunk_id"]

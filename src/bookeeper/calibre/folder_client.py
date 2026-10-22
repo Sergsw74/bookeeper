@@ -59,12 +59,29 @@ def _parse_opf_metadata(opf_path: Path) -> Dict[str, Any]:
             if ident.text and ident.text.strip():
                 identifiers[scheme.lower()] = ident.text.strip()
 
+        date_elem = root.find(".//dc:date", ns) or root.find(".//date")
+        pub_date = (
+            BookParser.parse_publication_date(date_elem.text)
+            if date_elem is not None and date_elem.text
+            else None
+        )
+        if not pub_date:
+            for ident_key, ident_val in identifiers.items():
+                if "arxiv" in ident_key:
+                    pub_date = BookParser.parse_publication_date(ident_val)
+                    if pub_date:
+                        break
+        if not pub_date:
+            pub_date = BookParser.parse_publication_date(opf_path.stem)
+
         return {
             "title": title,
             "authors": authors,
             "description": description,
             "subjects": subjects,
             "identifiers": identifiers,
+            "pubdate": pub_date,
+            "publication_date": pub_date,
         }
     except Exception as e:
         logger.debug(f"Failed to parse OPF file {opf_path}: {e}")
@@ -257,6 +274,17 @@ class FolderBookClient:
                             or "PDF"
                         ).upper()
 
+                        resolved_pubdate = (
+                            opf_meta.get("publication_date")
+                            or BookParser.parse_publication_date(
+                                entry.get("publication_date")
+                                or entry.get("published")
+                                or entry.get("published_date")
+                                or arxiv_id
+                            )
+                            or BookParser.extract_publication_date(cand_path)
+                        )
+
                         key = f"arxiv:{arxiv_id}" if arxiv_id else cand_path.name
                         discovered_items.append(
                             {
@@ -268,6 +296,8 @@ class FolderBookClient:
                                 "formats": [fmt],
                                 "path": str(cand_path.resolve()),
                                 "downloaded_at": entry.get("downloaded_at", ""),
+                                "pubdate": resolved_pubdate,
+                                "publication_date": resolved_pubdate,
                                 "file_size": cand_path.stat().st_size,
                                 "opf_path": str(opf_cand.resolve()) if opf_cand.is_file() else None,
                             }
@@ -306,6 +336,12 @@ class FolderBookClient:
             if m:
                 arxiv_id = m.group(1)
 
+            resolved_pubdate = (
+                opf_meta.get("publication_date")
+                or BookParser.parse_publication_date(arxiv_id)
+                or BookParser.extract_publication_date(item)
+            )
+
             key = f"arxiv:{arxiv_id}" if arxiv_id else item.name
             discovered_items.append(
                 {
@@ -317,6 +353,8 @@ class FolderBookClient:
                     "formats": [fmt],
                     "path": str(item.resolve()),
                     "downloaded_at": "",
+                    "pubdate": resolved_pubdate,
+                    "publication_date": resolved_pubdate,
                     "file_size": item.stat().st_size,
                     "opf_path": str(opf_cand.resolve()) if opf_cand.is_file() else None,
                 }
@@ -413,6 +451,10 @@ class FolderBookClient:
                 entry["arxiv_id"] = b["arxiv_id"]
             if b.get("file_size"):
                 entry["file_size"] = b["file_size"]
+            if b.get("pubdate"):
+                entry["pubdate"] = b["pubdate"]
+            if b.get("publication_date"):
+                entry["publication_date"] = b["publication_date"]
             res.append(entry)
         return res
 

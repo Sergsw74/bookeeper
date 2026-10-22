@@ -2052,9 +2052,9 @@
             <thead>
               <tr>
                 <th style="width: 28%;">Book Title & Author</th>
-                <th style="width: 48%;">Highlighted Ideas (occurrences × weight)</th>
-                <th style="width: 12%;">Indexed Date</th>
-                <th style="width: 12%; text-align: right;">Actions</th>
+                <th style="width: 44%;">Highlighted Ideas (occurrences × weight)</th>
+                <th style="width: 14%;">Dates (Published / Indexed)</th>
+                <th style="width: 14%; text-align: right;">Actions</th>
               </tr>
             </thead>
             <tbody id="books-table-body">
@@ -3043,12 +3043,24 @@
 
       let html = '';
       books.forEach(b => {
-        // Date formatting
-        let dateStr = 'Unknown';
+        // Date formatting: Publication date & Indexed date
+        let pubDateStr = b.publication_date ? escapeHtml(b.publication_date) : '';
+        let indexedDateStr = 'Unknown';
         if (b.timestamp) {
           const d = new Date(b.timestamp * 1000);
-          dateStr = d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) + '<br><span style="font-size:0.75rem; color:var(--text-muted);">' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) + '</span>';
+          indexedDateStr = d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
         }
+
+        let datesHtml = `
+          <div style="display:flex; flex-direction:column; gap:3px;">
+            <div style="font-weight:600; color:#38bdf8; font-size:0.83rem;" title="Publication Date">
+              📅 ${pubDateStr ? pubDateStr : '<span style="color:var(--text-muted); font-weight:normal; font-size:0.78rem;">Unknown pub date</span>'}
+            </div>
+            <div style="font-size:0.75rem; color:var(--text-muted);" title="Indexing Date">
+              ⚡ Indexed: ${indexedDateStr}
+            </div>
+          </div>
+        `;
 
         // Ideas tags
         let ideasHtml = '';
@@ -3102,7 +3114,7 @@
               </div>
             </td>
             <td style="white-space:nowrap; font-size:0.82rem;">
-              ${dateStr}
+              ${datesHtml}
             </td>
             <td style="text-align: right; white-space: nowrap;">
               ${actionsHtml}
@@ -3124,8 +3136,9 @@
       const filtered = indexedBooksCache.filter(b => {
         const titleMatch = (b.title || '').toLowerCase().includes(q);
         const authorMatch = (b.author || '').toLowerCase().includes(q);
+        const pubMatch = (b.publication_date || '').toLowerCase().includes(q);
         const ideaMatch = (b.top_ideas || []).some(i => (i.name || '').toLowerCase().includes(q));
-        return titleMatch || authorMatch || ideaMatch;
+        return titleMatch || authorMatch || pubMatch || ideaMatch;
       });
       renderBooksTable(filtered);
     }
@@ -3883,6 +3896,7 @@
         }
 
         // 2. Obsidian YAML Frontmatter Box
+        const pubDateVal = node.publication_date || props.publication_date || (node.book_file ? node.book_file.publication_date : null);
         html += `
           <div class="frontmatter-card">
             <div class="fm-row"><span class="fm-label">title:</span><span class="fm-value">"${escapeHtml(node.name)}"</span></div>
@@ -3890,18 +3904,20 @@
             <div class="fm-row"><span class="fm-label">category:</span><span class="fm-value">"${escapeHtml(node.category)}"</span></div>
             <div class="fm-row"><span class="fm-label">weight:</span><span class="fm-value">${node.weight}/10</span></div>
             <div class="fm-row"><span class="fm-label">occurrences:</span><span class="fm-value">${node.occurrences}</span></div>
+            ${pubDateVal ? `<div class="fm-row"><span class="fm-label">published:</span><span class="fm-value">"${escapeHtml(pubDateVal)}"</span></div>` : ''}
           </div>
         `;
 
         // Direct Book Source Document Banner (if inspecting a Book node)
         if (isBookNode && node.book_file && node.book_file.found) {
           const bf = node.book_file;
+          const pubBannerStr = pubDateVal ? ` • <span style="color:#38bdf8;">📅 Published: ${escapeHtml(pubDateVal)}</span>` : '';
           html += `
             <div class="book-source-banner">
               <div style="display:flex; align-items:center; gap:10px;">
                 <span style="font-size:1.6rem;">📚</span>
                 <div>
-                  <div style="font-weight:700; font-size:0.95rem; color:#f8fafc;">Source Document</div>
+                  <div style="font-weight:700; font-size:0.95rem; color:#f8fafc;">Source Document${pubBannerStr}</div>
                   <div style="font-size:0.8rem; color:#94a3b8; word-break:break-all;">
                     ${escapeHtml(bf.filename)} <span style="color:#64748b;">(${formatBytes(bf.file_size)})</span>
                   </div>
@@ -3958,9 +3974,11 @@
           html += `<div class="note-heading">📚 Featured in Books</div><div style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:15px;">`;
           data.books.forEach(b => {
             const bf = b.book_file;
+            const bPub = b.publication_date || (bf ? bf.publication_date : '');
+            const pubBadge = bPub ? `<span class="book-meta-badge" style="font-size:0.7rem; color:#38bdf8; margin-left:4px;" title="Publication Date">📅 ${escapeHtml(bPub)}</span>` : '';
             html += `
               <div class="book-pill-card">
-                <span class="wikilink" onclick="loadNodeDetails('${escapeHtml(b.target_id)}')">[[${escapeHtml(b.target_name)}]]</span>
+                <span class="wikilink" onclick="loadNodeDetails('${escapeHtml(b.target_id)}')">[[${escapeHtml(b.target_name)}]]</span>${pubBadge}
                 ${bf && bf.found ? `
                   <div style="display:inline-flex; gap:4px; margin-left:6px;">
                     <a href="${bf.view_url}" target="_blank" rel="noopener noreferrer" class="book-mini-btn" title="Open book document: ${escapeHtml(bf.filename)}">📖 Open</a>

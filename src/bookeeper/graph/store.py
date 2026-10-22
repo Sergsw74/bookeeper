@@ -35,11 +35,13 @@ class ConceptGraphStore:
         author: str = "Unknown",
         summary: str = "",
         tags: Optional[List[str]] = None,
+        publication_date: Optional[str] = None,
     ) -> str:
         """Add or update a Book node enriched with research literature note tags and metadata."""
         title = BookParser.repair_mojibake(title)
         author = BookParser.repair_mojibake(author) if author else "Unknown"
         summary = BookParser.repair_mojibake(summary) if summary else ""
+        pub_date = BookParser.parse_publication_date(publication_date)
 
         node_id = f"book:{book_id}"
         book_tags = ["book", "literature-note", "research-source"]
@@ -49,16 +51,18 @@ class ConceptGraphStore:
                     book_tags.append(t)
 
         if not self.graph.has_node(node_id):
-            self.graph.add_node(
-                node_id,
-                type="Book",
-                tag="book",
-                tags=book_tags,
-                book_id=book_id,
-                title=title,
-                author=author,
-                summary=summary,
-            )
+            node_attrs = {
+                "type": "Book",
+                "tag": "book",
+                "tags": book_tags,
+                "book_id": book_id,
+                "title": title,
+                "author": author,
+                "summary": summary,
+            }
+            if pub_date:
+                node_attrs["publication_date"] = pub_date
+            self.graph.add_node(node_id, **node_attrs)
         else:
             nd = self.graph.nodes[node_id]
             nd["title"] = title
@@ -66,6 +70,8 @@ class ConceptGraphStore:
                 nd["author"] = author
             if summary and len(summary) > len(nd.get("summary", "")):
                 nd["summary"] = summary
+            if pub_date:
+                nd["publication_date"] = pub_date
             if "tags" not in nd:
                 nd["tags"] = book_tags
         return node_id

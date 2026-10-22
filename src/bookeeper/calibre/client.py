@@ -321,7 +321,13 @@ class CalibreClient:
                 logger.debug(f"Running calibredb command: {' '.join(cmd)}")
                 result = subprocess.run(cmd, capture_output=True, text=True, check=False)
                 if result.returncode == 0:
-                    return json.loads(result.stdout)
+                    raw_books = json.loads(result.stdout)
+                    for b in raw_books:
+                        if isinstance(b, dict):
+                            clean_pub = BookParser.parse_publication_date(b.get("pubdate") or b.get("publication_date"))
+                            b["publication_date"] = clean_pub
+                            b["pubdate"] = clean_pub
+                    return raw_books
                 logger.warning(
                     f"calibredb failed (code {result.returncode}), attempting direct SQLite read..."
                 )
@@ -384,6 +390,7 @@ class CalibreClient:
 
             authors = [a.strip() for a in (r["authors"] or "").split("&") if a.strip()]
             formats = book_formats.get(book_id, [])
+            clean_pubdate = BookParser.parse_publication_date(r["pubdate"])
 
             books.append(
                 {
@@ -393,6 +400,8 @@ class CalibreClient:
                     "comments": r["comments"] or "",
                     "formats": formats,
                     "path": str(book_dir),
+                    "pubdate": clean_pubdate,
+                    "publication_date": clean_pubdate,
                 }
             )
 

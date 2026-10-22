@@ -170,6 +170,164 @@ class BookParser:
         return _CONTROL_CHAR_RE.sub("", s)
 
     @classmethod
+    def parse_publication_date(cls, val: Any) -> Optional[str]:
+        """
+        Parse and normalize publication date into ISO string (YYYY-MM-DD, YYYY-MM, or YYYY).
+        Handles Calibre timestamps, OPF <dc:date>, ISO dates, and arXiv patterns.
+        Filters out Calibre default unset timestamp '0101-01-01'.
+        """
+        if not val:
+            return None
+        s = cls.repair_mojibake(str(val)).strip()
+        if not s or s.startswith("0101-01-01"):
+            return None
+
+        # YYYY-MM-DD
+        m_full = re.match(r"^(\d{4})-(\d{2})-(\d{2})", s)
+        if m_full:
+            y, m, d = int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3))
+            if 1000 <= y <= 9999 and 1 <= m <= 12 and 1 <= d <= 31:
+                return f"{y:04d}-{m:02d}-{d:02d}"
+
+        # YYYY-MM
+        m_ym = re.match(r"^(\d{4})-(\d{2})$", s)
+        if m_ym:
+            y, m = int(m_ym.group(1)), int(m_ym.group(2))
+            if 1000 <= y <= 9999 and 1 <= m <= 12:
+                return f"{y:04d}-{m:02d}"
+
+        # YYYY
+        m_year = re.match(r"^(\d{4})$", s)
+        if m_year:
+            y = int(m_year.group(1))
+            if 1000 <= y <= 9999:
+                return str(y)
+
+        # PDF D:YYYYMMDD format
+        m_pdf = re.search(r"D:(\d{4})(\d{2})(\d{2})", s)
+        if m_pdf:
+            y, m, d = int(m_pdf.group(1)), int(m_pdf.group(2)), int(m_pdf.group(3))
+            if 1000 <= y <= 9999 and 1 <= m <= 12 and 1 <= d <= 31:
+                return f"{y:04d}-{m:02d}-{d:02d}"
+
+        # arXiv pattern: YYMM.NNNNN (optional v1/v2 suffix)
+        m_arxiv = re.search(r"(?:^|[^\d])(?:arxiv[:\s]*)?(\d{2})(\d{2})\.\d{4,5}(?:v\d+)?(?=[^\d]|$)", s, re.IGNORECASE)
+        if m_arxiv:
+            yy, mm = int(m_arxiv.group(1)), int(m_arxiv.group(2))
+            year = (1900 + yy) if yy >= 90 else (2000 + yy)
+            if 1 <= mm <= 12:
+                return f"{year}-{mm:02d}"
+
+        # Match standalone 4-digit Year somewhere in string if preceded/followed by non-digit
+        # (avoid matching random numbers, only 1900-2099)
+        m_any_year = re.search(r"(?:^|[^\d])(19\d{2}|20\d{2})(?:[^\d]|$)", s)
+        if m_any_year:
+            return m_any_year.group(1)
+
+        return None
+
+    @classmethod
+    def extract_publication_date(cls, file_path: Path | str) -> Optional[str]:
+        """
+        Extract publication date directly from an ebook file or its sidecar metadata.
+        Inspects sidecar .opf, EPUB metadata, PDF metadata, FB2 XML, or arXiv identifiers.
+        """
+        path = Path(file_path).expanduser().resolve()
+        if not path.is_file():
+            return None
+
+        # 1. Check sidecar .opf
+        opf_cand = path.with_suffix(".opf")
+        if not opf_cand.is_file():
+            calibre_opf = path.parent / "metadata.opf"
+            if calibre_opf.is_file():
+                opf_cand = calibre_opf
+
+        if opf_cand.is_file():
+            try:
+                import xml.etree.ElementTree as ET
+                tree = ET.parse(opf_cand)
+                root = tree.getroot()
+                ns = {
+                    "dc": "http://purl.org/dc/elements/1.1/",
+                    "opf": "http://www.idpf.org/2007/opf",
+                }
+                date_elem = root.find(".//dc:date", ns) or root.find(".//date")
+                if date_elem is not None and date_elem.text:
+                    parsed = cls.parse_publication_date(date_elem.text)
+                    if parsed:
+                        return parsed
+                for ident in root.findall(".//dc:identifier", ns):
+                    scheme = ident.attrib.get("{http://www.idpf.org/2007/opf}scheme", "").lower()
+                    if "arxiv" in scheme and ident.text:
+                        parsed = cls.parse_publication_date(ident.text)
+                        if parsed:
+                            return parsed
+            except Exception as e:
+                logger.debug(f"Could not parse OPF {opf_cand}: {e}")
+
+        ext = path.suffix.lower()
+
+        # 2. EPUB Metadata
+        if ext == ".epub":
+            try:
+                import ebooklib
+                from ebooklib import epub
+                book = epub.read_epub(str(path), options={"ignore_ncx": True})
+                dates = book.get_metadata("DC", "date")
+                if dates and dates[0] and dates[0][0]:
+                    parsed = cls.parse_publication_date(dates[0][0])
+                    if parsed:
+                        return parsed
+            except Exception as e:
+                logger.debug(f"Could not extract EPUB date from {path.name}: {e}")
+
+        # 3. PDF Metadata
+        elif ext == ".pdf":
+            try:
+                import pypdf
+                reader = pypdf.PdfReader(str(path))
+                if reader.metadata:
+                    if getattr(reader.metadata, "creation_date", None):
+                        try:
+                            cd = reader.metadata.creation_date
+                            parsed = cd.strftime("%Y-%m-%d")
+                            if cls.parse_publication_date(parsed):
+                                return parsed
+                        except Exception:
+                            pass
+                    for k in ("/CreationDate", "/ModDate", "CreationDate", "ModDate"):
+                        raw_d = reader.metadata.get(k)
+                        if raw_d:
+                            parsed = cls.parse_publication_date(raw_d)
+                            if parsed:
+                                return parsed
+            except Exception as e:
+                logger.debug(f"Could not extract PDF date from {path.name}: {e}")
+
+        # 4. FB2 Metadata
+        elif ext == ".fb2":
+            try:
+                import xml.etree.ElementTree as ET
+                tree = ET.parse(path)
+                root = tree.getroot()
+                date_elem = root.find(".//{http://www.gribuser.ru/xml/fb2/2.0}date")
+                if date_elem is not None:
+                    raw_val = date_elem.attrib.get("value") or date_elem.text
+                    parsed = cls.parse_publication_date(raw_val)
+                    if parsed:
+                        return parsed
+            except Exception as e:
+                logger.debug(f"Could not extract FB2 date from {path.name}: {e}")
+
+        # 5. Check filename for arXiv pattern (e.g. 2610.12466)
+        parsed_name_date = cls.parse_publication_date(path.name)
+        if parsed_name_date:
+            return parsed_name_date
+
+        return None
+
+    @classmethod
     def is_archive(cls, path: Path | str) -> bool:
         """Check if path or filename represents a supported compressed archive."""
         p = Path(path)

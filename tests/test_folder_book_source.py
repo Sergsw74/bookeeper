@@ -231,3 +231,40 @@ def test_cli_list_books_with_download_dir_alias(sample_download_dir: Path):
     res = runner.invoke(app, ["list-books", "--download-dir", str(sample_download_dir), "--limit", "1"])
     assert res.exit_code == 0
     assert "Showing 1 of 3" in res.output
+
+
+def test_book_parser_parse_publication_date():
+    """Test publication date parsing across diverse formats and edge cases."""
+    from bookeeper.calibre.parser import BookParser
+
+    # ISO formats
+    assert BookParser.parse_publication_date("2024-05-18T10:30:00Z") == "2024-05-18"
+    assert BookParser.parse_publication_date("2023-11-05") == "2023-11-05"
+    assert BookParser.parse_publication_date("2022-07") == "2022-07"
+    assert BookParser.parse_publication_date("1998") == "1998"
+
+    # PDF creation date format D:YYYYMMDD...
+    assert BookParser.parse_publication_date("D:20250314120000Z") == "2025-03-14"
+
+    # arXiv identifiers
+    assert BookParser.parse_publication_date("2610.12466") == "2026-10"
+    assert BookParser.parse_publication_date("arxiv:2305.18290v2") == "2023-05"
+
+    # Calibre unset date and invalid formats
+    assert BookParser.parse_publication_date("0101-01-01") is None
+    assert BookParser.parse_publication_date("0101-01-01T00:00:00+00:00") is None
+    assert BookParser.parse_publication_date(None) is None
+    assert BookParser.parse_publication_date("") is None
+    assert BookParser.parse_publication_date("Quick Start Guide") is None
+
+
+def test_folder_client_publication_date_extraction(sample_download_dir: Path):
+    """Verify FolderBookClient populates publication_date from files / index / opf."""
+    client = FolderBookClient(sample_download_dir)
+    books = client.list_books()
+    assert len(books) == 3
+
+    # Check that each paper got its publication_date inferred (e.g. 2610.00001 -> 2026-10)
+    p1 = next(b for b in books if "Paper One" in b["title"])
+    assert p1.get("publication_date") == "2026-10"
+    assert p1.get("pubdate") == "2026-10"

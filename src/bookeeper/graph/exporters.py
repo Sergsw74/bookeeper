@@ -111,6 +111,8 @@ class ObsidianExporter:
             if author_tag and author_tag not in tag_list:
                 tag_list.append(author_tag)
 
+            pub_date = attrs.get("publication_date")
+
             content = [
                 "---",
                 f"title: \"{title}\"",
@@ -121,12 +123,16 @@ class ObsidianExporter:
                 content.append(f"  - {t}")
             content.extend([
                 f"author: \"{author}\"",
+            ])
+            if pub_date:
+                content.append(f"publication_date: \"{pub_date}\"")
+            content.extend([
                 f"total_sections: {len(child_sections)}",
                 f"total_ideas: {len(explored_ideas)}",
                 "---",
                 "",
                 f"# 📚 {title}",
-                f"*Author: {author}*",
+                f"*Author: {author} | Published: {pub_date}*" if pub_date else f"*Author: {author}*",
                 "",
             ])
             if summary:

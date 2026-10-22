@@ -1188,7 +1188,7 @@ def test_ui_consistency_banner_in_html():
 
 
 def test_ui_backend_get_indexed_books(mock_backend, tmp_path):
-    """Test get_indexed_books logic with descending order and occurrences*weight scoring."""
+    """Test get_indexed_books logic with descending order, occurrences*weight scoring, and publication_date."""
     # Create mock knowledge_graph.json
     kg_data = {
         "nodes": [
@@ -1198,6 +1198,7 @@ def test_ui_backend_get_indexed_books(mock_backend, tmp_path):
                 "title": "Older Book",
                 "author": "Author A",
                 "timestamp": 1000.0,
+                "publication_date": "2023-01-15",
             },
             {
                 "id": "book:20",
@@ -1205,6 +1206,7 @@ def test_ui_backend_get_indexed_books(mock_backend, tmp_path):
                 "title": "Newer Book",
                 "author": "Author B",
                 "timestamp": 2000.0,
+                "publication_date": "2024-06-20",
             },
             {
                 "id": "concept:Alpha",
@@ -1245,8 +1247,10 @@ def test_ui_backend_get_indexed_books(mock_backend, tmp_path):
         # Verify descending order by timestamp (most recent first)
         assert books[0]["title"] == "Newer Book"
         assert books[0]["timestamp"] == 2000.0
+        assert books[0]["publication_date"] == "2024-06-20"
         assert books[1]["title"] == "Older Book"
         assert books[1]["timestamp"] == 1000.0
+        assert books[1]["publication_date"] == "2023-01-15"
 
         # Verify highlighted ideas calculation: occurrences * weight
         top_ideas = books[0]["top_ideas"]
@@ -1458,8 +1462,13 @@ def test_ui_backend_prepare_full_backup(mock_backend, tmp_path):
     """Test prepare_full_backup creates valid zip archive with metadata."""
     kg_path = tmp_path / "knowledge_graph.json"
     kg_path.write_text(json.dumps({"nodes": [], "edges": []}), encoding="utf-8")
+    dummy_books_dir = tmp_path / "sample_books_repo"
+    dummy_books_dir.mkdir(parents=True, exist_ok=True)
+    (dummy_books_dir / "sample.pdf").write_bytes(b"%PDF-1.4 dummy")
 
-    with patch.object(mock_backend.config, "output_dir", str(tmp_path)):
+    with patch.object(mock_backend.config, "output_dir", str(tmp_path)), \
+         patch.object(mock_backend, "_get_books_dir", return_value=dummy_books_dir), \
+         patch.object(mock_backend, "_get_all_books_dirs", return_value=[]):
         res = mock_backend.prepare_full_backup(backup_type="full", format_type="zip")
         assert res["success"] is True
         assert res["filename"].endswith(".zip")

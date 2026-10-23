@@ -5,11 +5,14 @@ Processing pipeline: semantic/TOC chunking, structured LLM extraction, and entit
 from bookeeper.processing.chunker import HierarchicalChunk, HierarchicalChunker
 from bookeeper.processing.deduplicator import EntityDeduplicator
 from bookeeper.processing.extractor import (
+    BatchSectionExtraction,
     BookMetadata,
+    ChunkExtraction,
     Concept,
     ExtractedIdea,
     KnowledgeExtractor,
     SectionExtraction,
+    batch_chunks_by_context_size,
 )
 
 from bookeeper.processing.rolling_semantic_chunker import RollingWindowSemanticChunker
@@ -30,6 +33,9 @@ __all__ = [
     "Concept",
     "ExtractedIdea",
     "SectionExtraction",
+    "ChunkExtraction",
+    "BatchSectionExtraction",
+    "batch_chunks_by_context_size",
     "KnowledgeExtractor",
     "EntityDeduplicator",
     "IdeaPostProcessor",

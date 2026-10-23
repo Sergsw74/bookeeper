@@ -560,6 +560,31 @@ class Settings(BaseSettings):
         default=6,
         description="Maximum total attempts across pool for a stalled/poison chunk before marking as failed (default: 6).",
     )
+    max_context_size: int = Field(
+        default=5120,
+        description="Maximum combined context size in bytes (default: 5120, i.e. 5 KB) to bundle chunks together for simultaneous processing.",
+    )
+
+    @field_validator("max_context_size", mode="before")
+    @classmethod
+    def parse_max_context_size(cls, v: Any) -> int:
+        if v is None:
+            return 5120
+        if isinstance(v, (int, float)):
+            return int(v)
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s.endswith("kb") or s.endswith("k"):
+                val = s.rstrip("kb").rstrip("k").strip()
+                return int(float(val) * 1024)
+            if s.endswith("mb") or s.endswith("m"):
+                val = s.rstrip("mb").rstrip("m").strip()
+                return int(float(val) * 1024 * 1024)
+            if s.endswith("b"):
+                val = s.rstrip("b").strip()
+                return int(val)
+            return int(s)
+        return int(v)
 
     @model_validator(mode="after")
     def validate_retries_alias(self) -> "Settings":

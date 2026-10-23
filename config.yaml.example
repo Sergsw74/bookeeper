@@ -32,6 +32,7 @@ llm_model_fallback: "llama3.1:8b"   # Optional fallback LLM model switched to af
 request_timeout: 30       # HTTP timeout in seconds for LLM calls (prevents stuck workers)
 max_retries: 1           # Retries for an attempt on an Ollama server before failover/skip (default: 1)
 max_chunk_attempts: 6    # Maximum attempts across pool for a stalled chunk before marking failed (default: 6)
+max_context_size: 5120   # Maximum combined chunk context size in bytes (default: 5KB) for simultaneous extraction
 
 # Dedicated local or remote Embeddings endpoint (Recommended for maximum performance)
 # Offloading embeddings to your local machine (e.g. Apple Silicon Mac on http://localhost:11434)

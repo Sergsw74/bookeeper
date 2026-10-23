@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import time
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
@@ -253,6 +253,166 @@ class SectionExtraction(BaseModel):
         return data
 
 
+class ChunkExtraction(BaseModel):
+    """Extraction output for an individual chunk within a combined multi-chunk extraction batch."""
+
+    chunk_id: str = Field(
+        default="",
+        description="The exact identifier or tag of the chunk (matching the <chunk id=\"...\"> tag).",
+    )
+    extracted_ideas: List[ExtractedIdea] = Field(
+        default_factory=list,
+        description="List of core intellectual ideas extracted from this specific chunk.",
+    )
+    concepts: List[Concept] = Field(
+        default_factory=list,
+        description="List of technical concepts and architectural patterns discussed in this chunk.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_chunk_ideas(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if not data.get("chunk_id"):
+                for alt_k in ("id", "chunk", "name", "tag"):
+                    if data.get(alt_k):
+                        data["chunk_id"] = str(data[alt_k])
+                        break
+
+            ideas_raw = data.get("extracted_ideas") or []
+            concepts_raw = data.get("concepts") or []
+
+            if ideas_raw and not concepts_raw:
+                synthesized_concepts = []
+                parsed_ideas = []
+                for item in ideas_raw:
+                    if isinstance(item, dict):
+                        idea_obj = ExtractedIdea(**item)
+                    elif isinstance(item, ExtractedIdea):
+                        idea_obj = item
+                    else:
+                        continue
+                    parsed_ideas.append(idea_obj)
+                    synthesized_concepts.append(idea_obj.to_concept())
+                data["extracted_ideas"] = parsed_ideas
+                data["concepts"] = synthesized_concepts
+            elif concepts_raw and not ideas_raw:
+                synthesized_ideas = []
+                parsed_concepts = []
+                for item in concepts_raw:
+                    if isinstance(item, dict):
+                        concept_obj = Concept(**item)
+                    elif isinstance(item, Concept):
+                        concept_obj = item
+                    else:
+                        continue
+                    parsed_concepts.append(concept_obj)
+                    cat = concept_obj.category.capitalize() if concept_obj.category else "Definition"
+                    idea_type = cat if cat in {"Definition", "Argument", "Mechanism", "Example"} else "Definition"
+                    entities = [concept_obj.name] + [r for r in concept_obj.related_concepts if r != concept_obj.name]
+                    synthesized_ideas.append(
+                        ExtractedIdea(
+                            source_quote=concept_obj.supporting_quote or "",
+                            idea_statement=concept_obj.brief_description or concept_obj.detailed_explanation or concept_obj.name,
+                            key_entities=entities,
+                            idea_type=idea_type,
+                        )
+                    )
+                data["concepts"] = parsed_concepts
+                data["extracted_ideas"] = synthesized_ideas
+        return data
+
+
+class BatchSectionExtraction(BaseModel):
+    """Extraction output containing independent ideas and concepts for multiple combined chunks."""
+
+    chunks: List[ChunkExtraction] = Field(
+        default_factory=list,
+        description="List of extractions, one entry per combined chunk.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def sanitize_batch(cls, data: Any) -> Any:
+        if isinstance(data, list):
+            return {"chunks": data}
+        if isinstance(data, dict):
+            if "chunks" in data:
+                c = data["chunks"]
+                if isinstance(c, dict):
+                    items = []
+                    for cid, cval in c.items():
+                        if isinstance(cval, dict):
+                            cval_copy = dict(cval)
+                            cval_copy.setdefault("chunk_id", str(cid))
+                            items.append(cval_copy)
+                        elif isinstance(cval, list):
+                            items.append({"chunk_id": str(cid), "extracted_ideas": cval})
+                    data["chunks"] = items
+                return data
+            for alt_key in ("chunk_extractions", "extractions", "results", "items"):
+                if alt_key in data and isinstance(data[alt_key], list):
+                    data["chunks"] = data[alt_key]
+                    return data
+            if "extracted_ideas" in data or "concepts" in data:
+                return {"chunks": [data]}
+            # Check if dict keys are chunk_ids
+            items = []
+            for cid, cval in data.items():
+                if isinstance(cval, dict):
+                    cval_copy = dict(cval)
+                    cval_copy.setdefault("chunk_id", str(cid))
+                    items.append(cval_copy)
+                elif isinstance(cval, list):
+                    items.append({"chunk_id": str(cid), "extracted_ideas": cval})
+            if items:
+                return {"chunks": items}
+        return data
+
+
+def batch_chunks_by_context_size(
+    chunks: Sequence[Any],
+    max_context_size: int = 5120,
+    tag_overhead: int = 150,
+) -> List[List[Any]]:
+    """
+    Combine consecutive chunks into batches up to max_context_size bytes (default: 5120 bytes / 5KB).
+    Each chunk's text and its XML chunk tag overhead are accounted for.
+    If a single chunk exceeds max_context_size, it is placed in its own single-item batch.
+    """
+    if max_context_size <= 0:
+        return [[c] for c in chunks]
+
+    batches: List[List[Any]] = []
+    current_batch: List[Any] = []
+    current_size = 0
+
+    def _get_size(c: Any) -> int:
+        if isinstance(c, dict):
+            raw = c.get("text") or ""
+        else:
+            raw = getattr(c, "text", "") or ""
+        return len(raw.encode("utf-8")) + tag_overhead
+
+    for chk in chunks:
+        chk_size = _get_size(chk)
+        if not current_batch:
+            current_batch.append(chk)
+            current_size = chk_size
+        elif current_size + chk_size <= max_context_size:
+            current_batch.append(chk)
+            current_size += chk_size
+        else:
+            batches.append(current_batch)
+            current_batch = [chk]
+            current_size = chk_size
+
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
+
+
 def validate_concept_chunk_grounding(
     concept_name: str,
     supporting_quote: Optional[str],
@@ -274,8 +434,13 @@ def validate_concept_chunk_grounding(
     if not chunk_text:
         return False, ""
 
+    _STOP_WORDS = {
+        "and", "are", "the", "for", "with", "not", "but", "all", "any", "can",
+        "had", "has", "was", "one", "our", "out", "you", "this", "that", "from",
+        "they", "been", "have", "were", "into", "more", "some", "such", "than",
+    }
     t_clean = BookParser.repair_mojibake(chunk_text).lower()
-    t_words = set(re.findall(r"\w{3,}", t_clean))
+    t_words = {w for w in re.findall(r"\w{3,}", t_clean) if w not in _STOP_WORDS}
 
     raw_quote = (supporting_quote or "").strip()
     quote_grounded = False
@@ -290,9 +455,9 @@ def validate_concept_chunk_grounding(
             valid_quote = clean_q
         else:
             # 2. Significant word overlap check (ignoring tiny punctuation differences)
-            q_words = set(re.findall(r"\w{4,}", q_lower))
+            q_words = {w for w in re.findall(r"\w{4,}", q_lower) if w not in _STOP_WORDS}
             if not q_words:
-                q_words = set(re.findall(r"\w{3,}", q_lower))
+                q_words = {w for w in re.findall(r"\w{3,}", q_lower) if w not in _STOP_WORDS}
             if q_words and t_words:
                 overlap = len(q_words & t_words) / len(q_words)
                 if overlap >= 0.5:
@@ -300,10 +465,10 @@ def validate_concept_chunk_grounding(
                     valid_quote = clean_q
 
     name_clean = BookParser.repair_mojibake(concept_name).lower()
-    name_words = set(re.findall(r"\w{3,}", name_clean))
-    name_overlap = bool(name_words & t_words)
+    name_words = {w for w in re.findall(r"\w{3,}", name_clean) if w not in _STOP_WORDS}
+    name_overlap = bool(name_words and (name_words & t_words))
 
-    desc_words = set(re.findall(r"\w{4,}", (brief_description or "").lower()))
+    desc_words = {w for w in re.findall(r"\w{4,}", (brief_description or "").lower()) if w not in _STOP_WORDS}
     desc_overlap = bool(desc_words and len(desc_words & t_words) >= 2)
 
     if quote_grounded:
@@ -345,6 +510,7 @@ class KnowledgeExtractor:
         wol_enabled: bool = True,
         wol_wait_seconds: int = 120,
         wol_probe_interval: float = 5.0,
+        max_context_size: int = 5120,
     ):
         self.model_name = model
         self.fallback_model = fallback_model
@@ -355,6 +521,7 @@ class KnowledgeExtractor:
         self.wol_enabled = wol_enabled
         self.wol_wait_seconds = wol_wait_seconds
         self.wol_probe_interval = wol_probe_interval
+        self.max_context_size = max_context_size
 
         if pool is not None:
             self.pool = pool
@@ -373,6 +540,7 @@ class KnowledgeExtractor:
         base_url: Optional[str] = None,
         model: Optional[str] = None,
         fallback_model: Optional[str] = None,
+        max_context_size: Optional[int] = None,
     ) -> "KnowledgeExtractor":
         cooldown = getattr(settings, "resolved_analysis_cooldown_seconds", getattr(settings, "failover_cooldown_seconds", 600))
         if base_url:
@@ -389,6 +557,7 @@ class KnowledgeExtractor:
                 cooldown_seconds=cooldown,
                 max_tasks_per_server=1,  # Strictly sequential per Ollama server: no mutual execution
             )
+        eff_max_ctx = getattr(settings, "max_context_size", 5120) if max_context_size is None else max_context_size
         return cls(
             pool=pool,
             model=model or settings.llm_model,
@@ -399,6 +568,7 @@ class KnowledgeExtractor:
             wol_enabled=getattr(settings, "wol_enabled", True),
             wol_wait_seconds=getattr(settings, "wol_wait_seconds", 120),
             wol_probe_interval=getattr(settings, "wol_probe_interval", 5.0),
+            max_context_size=eff_max_ctx,
         )
 
     def _execute_structured_invoke(
@@ -782,6 +952,265 @@ class KnowledgeExtractor:
         return result.concepts
 
     extract_concepts_from_section = extract_section
+
+    def batch_chunks(
+        self,
+        chunks: Sequence[Any],
+        max_context_size: Optional[int] = None,
+    ) -> List[List[Any]]:
+        """
+        Combine chunks into batches up to maximum context size (default: self.max_context_size / 5KB).
+        """
+        limit = self.max_context_size if max_context_size is None else max_context_size
+        return batch_chunks_by_context_size(chunks, max_context_size=limit)
+
+    def extract_chunks(
+        self,
+        chunks: List[Any],
+        book_title: str = "",
+        model: Optional[str] = None,
+        retries: Optional[int] = None,
+        quarantine_server: bool = True,
+        exclude_urls: Optional[Set[str]] = None,
+        raise_on_error: bool = False,
+    ) -> Dict[str, SectionExtraction]:
+        """
+        Extract core intellectual ideas simultaneously from multiple chunks combined into
+        a single LLM prompt with XML tags, returning independent SectionExtraction outputs for each chunk.
+        """
+        if not chunks:
+            return {}
+
+        def _get_id(c: Any) -> str:
+            if isinstance(c, dict):
+                return str(c.get("chunk_id") or c.get("id") or "")
+            return str(getattr(c, "chunk_id", getattr(c, "id", "")))
+
+        def _get_text(c: Any) -> str:
+            if isinstance(c, dict):
+                return str(c.get("text") or "")
+            return str(getattr(c, "text", "") or "")
+
+        def _get_section(c: Any) -> str:
+            if isinstance(c, dict):
+                return str(c.get("section_title") or c.get("section") or "")
+            return str(getattr(c, "section_title", getattr(c, "section", "")) or "")
+
+        def _get_subtitle(c: Any) -> str:
+            if isinstance(c, dict):
+                return str(c.get("subtitle") or "")
+            return str(getattr(c, "subtitle", "") or "")
+
+        def _get_idx(c: Any) -> Any:
+            if isinstance(c, dict):
+                return c.get("chunk_idx") or c.get("index") or 0
+            return getattr(c, "chunk_idx", getattr(c, "index", 0))
+
+        # Single chunk fast-path (preserves 100% exact legacy behavior)
+        if len(chunks) == 1:
+            c = chunks[0]
+            cid = _get_id(c)
+            ctext = _get_text(c)
+            csec = _get_section(c)
+            csub = _get_subtitle(c)
+            b_title = book_title or (c.get("book_title") if isinstance(c, dict) else getattr(c, "book_title", ""))
+            parent_ctx = c.get("parent_text") if isinstance(c, dict) else getattr(c, "parent_text", None)
+            res = self.extract_section(
+                text=ctext,
+                book_title=b_title,
+                section_title=csec,
+                subtitle=csub,
+                parent_context=parent_ctx,
+                retries=retries,
+                quarantine_server=quarantine_server,
+                exclude_urls=exclude_urls,
+                raise_on_error=raise_on_error,
+                model=model,
+            )
+            return {cid: res}
+
+        # Multi-chunk simultaneous extraction with appropriate XML chunk tags
+        system_text = (
+            "You are an expert knowledge-graph extractor. Your goal is to extract core intellectual ideas from the provided book chunks.\n"
+            'Multiple chunks are provided simultaneously, each enclosed within <chunk id="..." section="..." index="..."> ... </chunk> tags.\n\n'
+            "Rules:\n"
+            "1. Process each chunk independently and return separate extracted ideas for each chunk id.\n"
+            "2. Every idea must be anchored by an exact verbatim quote from that specific chunk's text.\n"
+            '3. The "idea_statement" must be a concise, self-contained factual claim (1–2 sentences).\n'
+            "4. Do not invent details not present in the chunk. Do not mix quotes or concepts across different chunks.\n"
+            "5. Extract only distinct, meaningful concepts (usually 1 to 3 per chunk). If a chunk contains no standalone ideas, output an empty list of extracted ideas for that chunk id.\n"
+            "6. Return strictly valid JSON matching the schema below.\n\n"
+            "Output Format:\n"
+            "{\n"
+            '  "chunks": [\n'
+            "    {\n"
+            '      "chunk_id": "Exact chunk ID matching the <chunk id=\\"...\\"> tag",\n'
+            '      "extracted_ideas": [\n'
+            "        {\n"
+            '          "source_quote": "Exact verbatim sentence from this specific chunk",\n'
+            '          "idea_statement": "Concise summary of the concept or argument",\n'
+            '          "key_entities": ["Topic A", "Concept B"],\n'
+            '          "idea_type": "Definition" | "Argument" | "Mechanism" | "Example"\n'
+            "        }\n"
+            "      ]\n"
+            "    }\n"
+            "  ]\n"
+            "}\n\n"
+            "Example:\n"
+            "Input:\n"
+            '<chunk id="c1" section="Chapter 1" index="1">\n'
+            "Systems theory demonstrates that complex networks exhibit emergent properties. In ant colonies, no single ant understands the global architecture of the nest, yet through simple local pheromone interactions, highly coordinated structures arise spontaneously.\n"
+            "</chunk>\n\n"
+            '<chunk id="c2" section="Chapter 1" index="2">\n'
+            "In contrast, hierarchical top-down control structures suffer from single points of failure. When a centralized coordinator crashes, the entire distributed cluster halts unless automated leader election protocols intervene.\n"
+            "</chunk>\n\n"
+            "Response:\n"
+            "{\n"
+            '  "chunks": [\n'
+            "    {\n"
+            '      "chunk_id": "c1",\n'
+            '      "extracted_ideas": [\n'
+            "        {\n"
+            '          "source_quote": "In ant colonies, no single ant understands the global architecture of the nest, yet through simple local pheromone interactions, highly coordinated structures arise spontaneously.",\n'
+            '          "idea_statement": "Complex coordination emerges from local rules without central leadership.",\n'
+            '          "key_entities": ["Systems Theory", "Emergence", "Self-organization"],\n'
+            '          "idea_type": "Mechanism"\n'
+            "        }\n"
+            "      ]\n"
+            "    },\n"
+            "    {\n"
+            '      "chunk_id": "c2",\n'
+            '      "extracted_ideas": [\n'
+            "        {\n"
+            '          "source_quote": "When a centralized coordinator crashes, the entire distributed cluster halts unless automated leader election protocols intervene.",\n'
+            '          "idea_statement": "Centralized systems risk catastrophic failure upon coordinator crash without automated leader election.",\n'
+            '          "key_entities": ["Centralized Systems", "Leader Election", "Fault Tolerance"],\n'
+            '          "idea_type": "Argument"\n'
+            "        }\n"
+            "      ]\n"
+            "    }\n"
+            "  ]\n"
+            "}"
+        )
+
+        b_title = BookParser.repair_mojibake(book_title)
+        loc = f"Context: Book: '{b_title}'\n\n" if b_title else ""
+
+        chunk_blocks = []
+        total_input_chars = len(loc)
+        for c in chunks:
+            cid = _get_id(c)
+            csec = BookParser.repair_mojibake(_get_section(c))
+            csub = BookParser.repair_mojibake(_get_subtitle(c))
+            cidx = _get_idx(c)
+            ctext = BookParser.repair_mojibake(_get_text(c))
+            tag_attrs = f'id="{cid}"'
+            if csec:
+                tag_attrs += f' section="{csec}"'
+            if csub and csub != csec:
+                tag_attrs += f' subtitle="{csub}"'
+            if cidx:
+                tag_attrs += f' index="{cidx}"'
+            block = f"<chunk {tag_attrs}>\n{ctext}\n</chunk>"
+            chunk_blocks.append(block)
+            total_input_chars += len(block)
+
+        human_text = (
+            f"{loc}"
+            "Now process the following chunks independently and provide separate output for each chunk:\n\n"
+            + "\n\n".join(chunk_blocks)
+        )
+
+        messages = [
+            SystemMessage(content=system_text),
+            HumanMessage(content=human_text),
+        ]
+
+        try:
+            raw_result = self._execute_structured_invoke(
+                BatchSectionExtraction,
+                messages,
+                retries=retries,
+                quarantine_server=quarantine_server,
+                exclude_urls=exclude_urls,
+                model=model,
+                input_chars=total_input_chars,
+                task_type="llm",
+            )
+            if isinstance(raw_result, BatchSectionExtraction):
+                batch_obj = raw_result
+            elif isinstance(raw_result, dict):
+                batch_obj = BatchSectionExtraction.model_validate(raw_result)
+            else:
+                batch_obj = BatchSectionExtraction.model_validate(dict(raw_result))
+
+            # Build lookup of chunk extractions returned by model
+            model_extractions: Dict[str, ChunkExtraction] = {}
+            for item in batch_obj.chunks:
+                if item.chunk_id:
+                    model_extractions[str(item.chunk_id).strip()] = item
+
+            results: Dict[str, SectionExtraction] = {}
+            for idx, c in enumerate(chunks):
+                cid = _get_id(c)
+                ctext = _get_text(c)
+                matching_item = model_extractions.get(cid)
+                if not matching_item:
+                    # Try partial or index-based matching
+                    for m_id, m_val in model_extractions.items():
+                        if cid in m_id or m_id in cid or m_id == f"chunk_{idx+1}" or m_id == str(idx+1):
+                            matching_item = m_val
+                            break
+
+                if matching_item:
+                    validated_ideas = []
+                    for idea in matching_item.extracted_ideas:
+                        is_grounded, val_quote = validate_concept_chunk_grounding(
+                            concept_name=idea.idea_statement,
+                            supporting_quote=idea.source_quote,
+                            chunk_text=ctext,
+                            brief_description=idea.idea_statement,
+                        )
+                        if is_grounded:
+                            if val_quote:
+                                idea.source_quote = val_quote
+                            validated_ideas.append(idea)
+                    results[cid] = SectionExtraction(
+                        extracted_ideas=validated_ideas,
+                        concepts=[i.to_concept() for i in validated_ideas],
+                    )
+                else:
+                    # Missing from batch output: fallback to single extraction
+                    try:
+                        csec = _get_section(c)
+                        csub = _get_subtitle(c)
+                        parent_ctx = c.get("parent_text") if isinstance(c, dict) else getattr(c, "parent_text", None)
+                        single_res = self.extract_section(
+                            text=ctext,
+                            book_title=book_title,
+                            section_title=csec,
+                            subtitle=csub,
+                            parent_context=parent_ctx,
+                            retries=retries,
+                            quarantine_server=quarantine_server,
+                            exclude_urls=exclude_urls,
+                            raise_on_error=False,
+                            model=model,
+                        )
+                        results[cid] = single_res
+                    except Exception:
+                        results[cid] = SectionExtraction(concepts=[], extracted_ideas=[])
+
+            return results
+
+        except Exception as e:
+            if raise_on_error:
+                raise
+            logger.warning(f"Batch chunk extraction LLM call failed across pool servers: {e}")
+            return {
+                _get_id(c): SectionExtraction(concepts=[], extracted_ideas=[])
+                for c in chunks
+            }
 
     def warmup_and_check_device(
         self,

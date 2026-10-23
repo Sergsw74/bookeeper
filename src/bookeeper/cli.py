@@ -51,6 +51,7 @@ from bookeeper.processing.extractor import (
     Concept,
     KnowledgeExtractor,
     SectionExtraction,
+    batch_chunks_by_context_size,
     validate_concept_chunk_grounding,
 )
 from bookeeper.processing.idea_postprocessor import (
@@ -208,6 +209,7 @@ def _get_effective_settings(
     max_retries: Optional[int] = None,
     max_chunk_attempts: Optional[int] = None,
     books_dir: Optional[str] = None,
+    max_context_size: Optional[int] = None,
 ) -> Settings:
     """Retrieve settings and merge explicit CLI arguments with highest precedence."""
     config_path = _resolve_opt(config_path)
@@ -221,6 +223,7 @@ def _get_effective_settings(
     max_retries = _resolve_opt(max_retries)
     max_chunk_attempts = _resolve_opt(max_chunk_attempts)
     books_dir = _resolve_opt(books_dir)
+    max_context_size = _resolve_opt(max_context_size)
 
     cfg = get_settings(config_path)
     overrides = {}
@@ -249,6 +252,8 @@ def _get_effective_settings(
         overrides["max_retries"] = max_retries
     if max_chunk_attempts is not None:
         overrides["max_chunk_attempts"] = max_chunk_attempts
+    if max_context_size is not None:
+        overrides["max_context_size"] = max_context_size
 
     if overrides:
         data = cfg.model_dump()
@@ -1220,6 +1225,11 @@ def build_graph(
         "--postprocess-ideas/--no-postprocess-ideas",
         help="Perform second-pass idea consolidation and synthesis for multi-occurrence ideas (default: config.yaml dual_pass.enabled).",
     ),
+    max_context_size: Optional[int] = typer.Option(
+        None,
+        "--max-context-size",
+        help="Maximum combined chunk context size in bytes (default: 5120, i.e. 5KB) for simultaneous LLM extraction.",
+    ),
 ):
     """
     Ingest sections, perform semantic chunking, extract concepts via Ollama,
@@ -1252,6 +1262,7 @@ def build_graph(
     limit = _resolve_opt(limit)
     dual_pass = _resolve_opt(dual_pass)
     books_dir = _resolve_opt(books_dir)
+    max_context_size = _resolve_opt(max_context_size)
 
     cfg = _get_effective_settings(
         config_path,
@@ -1265,6 +1276,7 @@ def build_graph(
         max_retries=retries,
         max_chunk_attempts=max_chunk_attempts,
         books_dir=books_dir,
+        max_context_size=max_context_size,
     )
     output_dir = cfg.resolved_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2025,17 +2037,27 @@ def build_graph(
                         )
                         _update_progress_description()
 
-                    fresh_queue: queue.Queue[Tuple[HierarchicalChunk, int, Set[str]]] = queue.Queue()
-                    deferred_retries: List[Tuple[HierarchicalChunk, int, Set[str]]] = []
-                    retry_queue: queue.Queue[Tuple[HierarchicalChunk, int, Set[str]]] = queue.Queue()
+                    fresh_queue: queue.Queue[Tuple[List[HierarchicalChunk], int, Set[str]]] = queue.Queue()
+                    deferred_retries: List[Tuple[List[HierarchicalChunk], int, Set[str]]] = []
+                    retry_queue: queue.Queue[Tuple[List[HierarchicalChunk], int, Set[str]]] = queue.Queue()
+
+                    unprocessed_fresh: List[HierarchicalChunk] = []
+                    unprocessed_retries: List[Tuple[HierarchicalChunk, int]] = []
 
                     for chk in chunks:
                         if not book_state.is_chunk_processed(chk.chunk_id) and not book_state.is_chunk_failed(chk.chunk_id):
                             init_attempt = book_state.get_initial_attempt(chk.chunk_id)
                             if init_attempt == 0:
-                                fresh_queue.put((chk, init_attempt, set()))
+                                unprocessed_fresh.append(chk)
                             else:
-                                deferred_retries.append((chk, init_attempt, set()))
+                                unprocessed_retries.append((chk, init_attempt))
+
+                    fresh_batches = batch_chunks_by_context_size(unprocessed_fresh, max_context_size=cfg.max_context_size)
+                    for f_batch in fresh_batches:
+                        fresh_queue.put((f_batch, 0, set()))
+
+                    for chk, init_att in unprocessed_retries:
+                        deferred_retries.append(([chk], init_att, set()))
 
                     max_chunk_attempts = cfg.max_chunk_attempts
                     phase: str = "fresh"
@@ -2069,19 +2091,23 @@ def build_graph(
 
                             # Fetch next chunk according to current phase
                             task_phase: Optional[str] = None
+                            chunk_batch: List[HierarchicalChunk] = []
+                            attempt: int = 0
+                            tried_urls: Set[str] = set()
+
                             if cur_phase == "fresh":
                                 try:
-                                    chk_item, attempt, tried_urls = fresh_queue.get(timeout=0.2)
+                                    chunk_batch, attempt, tried_urls = fresh_queue.get(timeout=0.2)
                                 except queue.Empty:
                                     continue
                                 task_phase = "fresh"
                                 with stats_lock:
-                                    fresh_in_flight += 1
-                                    active_tasks_count += 1
+                                    fresh_in_flight += len(chunk_batch)
+                                    active_tasks_count += len(chunk_batch)
                                 _update_progress_description()
                             else:  # cur_phase == "retry"
                                 try:
-                                    chk_item, attempt, tried_urls = retry_queue.get(timeout=0.2)
+                                    chunk_batch, attempt, tried_urls = retry_queue.get(timeout=0.2)
                                 except queue.Empty:
                                     with stats_lock:
                                         if len(extracted_results) >= len(chunks):
@@ -2089,18 +2115,19 @@ def build_graph(
                                     continue
                                 task_phase = "retry"
                                 with stats_lock:
-                                    retry_in_flight += 1
-                                    active_tasks_count += 1
+                                    retry_in_flight += len(chunk_batch)
+                                    active_tasks_count += len(chunk_batch)
                                 _update_progress_description()
 
                             t0 = time.time()
                             srv = "ollama"
-                            book_state.mark_chunk_stacked(
-                                chunk_id=chk_item.chunk_id,
-                                chunk_idx=chk_item.chunk_idx,
-                                section_title=chk_item.section_title,
-                                attempt=attempt,
-                            )
+                            for chk_item in chunk_batch:
+                                book_state.mark_chunk_stacked(
+                                    chunk_id=chk_item.chunk_id,
+                                    chunk_idx=chk_item.chunk_idx,
+                                    section_title=chk_item.section_title,
+                                    attempt=attempt,
+                                )
                             is_fallback_attempt = bool(
                                 cfg.llm_model_fallback and attempt >= (max_chunk_attempts / 2.0)
                             )
@@ -2108,19 +2135,17 @@ def build_graph(
 
                             try:
                                 if abort_event.is_set():
-                                    book_state.unstack_chunk(chk_item.chunk_id)
+                                    for chk_item in chunk_batch:
+                                        book_state.unstack_chunk(chk_item.chunk_id)
                                     if task_phase == "fresh":
                                         fresh_queue.task_done()
                                     else:
                                         retry_queue.task_done()
                                     break
 
-                                extraction = extractor.extract_section(
-                                    text=chk_item.text,
+                                extractions = extractor.extract_chunks(
+                                    chunks=chunk_batch,
                                     book_title=btitle,
-                                    section_title=chk_item.section_title,
-                                    subtitle=chk_item.subtitle,
-                                    parent_context=chk_item.parent_text,
                                     model=target_model,
                                     retries=cfg.max_retries,
                                     quarantine_server=False,
@@ -2129,35 +2154,54 @@ def build_graph(
                                 )
                                 dur = time.time() - t0
                                 srv = extractor.pool.get_last_used_server() or "ollama"
-                                with stats_lock:
-                                    durations.append(dur)
-                                    extracted_results.append({
-                                        "status": "extracted",
-                                        "chunk": chk_item,
-                                        "extraction": extraction,
-                                        "duration": dur,
-                                        "server_used": srv,
-                                        "model_used": target_model,
-                                    })
+                                chunk_dur = dur / len(chunk_batch) if chunk_batch else dur
 
-                                book_state.mark_chunk_processed(
-                                    chunk_id=chk_item.chunk_id,
-                                    chunk_idx=chk_item.chunk_idx,
-                                    section_title=chk_item.section_title,
-                                    extraction_dict=extraction.model_dump(),
-                                    duration=dur,
-                                    server_used=srv,
-                                )
+                                with stats_lock:
+                                    for chk_item in chunk_batch:
+                                        durations.append(chunk_dur)
+                                        extraction = extractions.get(chk_item.chunk_id) or SectionExtraction(concepts=[], extracted_ideas=[])
+                                        extracted_results.append({
+                                            "status": "extracted",
+                                            "chunk": chk_item,
+                                            "extraction": extraction,
+                                            "duration": chunk_dur,
+                                            "server_used": srv,
+                                            "model_used": target_model,
+                                        })
+
+                                for chk_item in chunk_batch:
+                                    extraction = extractions.get(chk_item.chunk_id) or SectionExtraction(concepts=[], extracted_ideas=[])
+                                    book_state.mark_chunk_processed(
+                                        chunk_id=chk_item.chunk_id,
+                                        chunk_idx=chk_item.chunk_idx,
+                                        section_title=chk_item.section_title,
+                                        extraction_dict=extraction.model_dump(),
+                                        duration=chunk_dur,
+                                        server_used=srv,
+                                    )
 
                                 model_tag = f" [{target_model}]" if is_fallback_attempt else ""
                                 with display_lock:
-                                    console.print(
-                                        f"  [dim green]✓ [{chk_item.section_title[:24]} p{chk_item.chunk_idx}][/dim green] "
-                                        f"Extracted [bold cyan]{len(extraction.concepts)} concept(s)[/bold cyan] "
-                                        f"[dim]({dur:.1f}s via [bold green]{srv}{model_tag}[/bold green])[/dim]"
-                                    )
+                                    if len(chunk_batch) == 1:
+                                        chk_item = chunk_batch[0]
+                                        ext = extractions.get(chk_item.chunk_id) or SectionExtraction(concepts=[], extracted_ideas=[])
+                                        console.print(
+                                            f"  [dim green]✓ [{chk_item.section_title[:24]} p{chk_item.chunk_idx}][/dim green] "
+                                            f"Extracted [bold cyan]{len(ext.concepts)} concept(s)[/bold cyan] "
+                                            f"[dim]({dur:.1f}s via [bold green]{srv}{model_tag}[/bold green])[/dim]"
+                                        )
+                                    else:
+                                        total_concepts = sum(len(extractions.get(c.chunk_id, SectionExtraction()).concepts) for c in chunk_batch)
+                                        total_bytes = sum(len((c.text or '').encode('utf-8')) for c in chunk_batch)
+                                        total_kb = total_bytes / 1024.0
+                                        console.print(
+                                            f"  [dim green]✓ [{chunk_batch[0].section_title[:18]} p{chunk_batch[0].chunk_idx}-{chunk_batch[-1].chunk_idx} "
+                                            f"({len(chunk_batch)} chunks, {total_kb:.1f}KB)][/dim green] "
+                                            f"Extracted [bold cyan]{total_concepts} concept(s)[/bold cyan] "
+                                            f"[dim]({dur:.1f}s via [bold green]{srv}{model_tag}[/bold green])[/dim]"
+                                        )
 
-                                progress.advance(book_task)
+                                progress.advance(book_task, advance=len(chunk_batch))
                                 _update_progress_description()
                                 if task_phase == "fresh":
                                     fresh_queue.task_done()
@@ -2182,28 +2226,8 @@ def build_graph(
                                 )
 
                                 if task_phase == "fresh":
-                                    # At first failed attempt, skip it and continue with rest of unprocessed chunks.
-                                    # Collect in deferred_retries to be retried only after all fresh chunks finish.
-                                    book_state.mark_chunk_retried(
-                                        chunk_id=chk_item.chunk_id,
-                                        chunk_idx=chk_item.chunk_idx,
-                                        section_title=chk_item.section_title,
-                                        attempt=attempt,
-                                        error=str(exc),
-                                        server_used=srv,
-                                    )
-                                    with display_lock:
-                                        console.print(
-                                            f"  [yellow]⚠ [{chk_item.section_title[:24]} p{chk_item.chunk_idx}] "
-                                            f"Attempt {attempt}/{max_chunk_attempts} failed on {srv} ({exc}). "
-                                            f"Skipping for now; will retry after all unprocessed chunks are completed{fallback_note}.[/yellow]"
-                                        )
-                                    with stats_lock:
-                                        deferred_retries.append((chk_item, attempt, tried_urls))
-                                    fresh_queue.task_done()
-                                else:
-                                    # Retry phase: retry across pool until max_chunk_attempts
-                                    if attempt < max_chunk_attempts and not abort_event.is_set():
+                                    # At first failed attempt, unpack batch into individual chunks to isolate poison chunks
+                                    for chk_item in chunk_batch:
                                         book_state.mark_chunk_retried(
                                             chunk_id=chk_item.chunk_id,
                                             chunk_idx=chk_item.chunk_idx,
@@ -2212,50 +2236,81 @@ def build_graph(
                                             error=str(exc),
                                             server_used=srv,
                                         )
-                                        with display_lock:
+                                        with stats_lock:
+                                            deferred_retries.append(([chk_item], attempt, tried_urls.copy()))
+
+                                    with display_lock:
+                                        if len(chunk_batch) > 1:
+                                            console.print(
+                                                f"  [yellow]⚠ Combined batch ({len(chunk_batch)} chunks: p{chunk_batch[0].chunk_idx}-{chunk_batch[-1].chunk_idx}) "
+                                                f"Attempt {attempt}/{max_chunk_attempts} failed on {srv} ({exc}). "
+                                                f"Splitting into individual chunks for deferred retry{fallback_note}.[/yellow]"
+                                            )
+                                        else:
+                                            chk_item = chunk_batch[0]
                                             console.print(
                                                 f"  [yellow]⚠ [{chk_item.section_title[:24]} p{chk_item.chunk_idx}] "
+                                                f"Attempt {attempt}/{max_chunk_attempts} failed on {srv} ({exc}). "
+                                                f"Skipping for now; will retry after all unprocessed chunks are completed{fallback_note}.[/yellow]"
+                                            )
+                                    fresh_queue.task_done()
+                                else:
+                                    # Retry phase: retry across pool until max_chunk_attempts
+                                    if attempt < max_chunk_attempts and not abort_event.is_set():
+                                        for chk_item in chunk_batch:
+                                            book_state.mark_chunk_retried(
+                                                chunk_id=chk_item.chunk_id,
+                                                chunk_idx=chk_item.chunk_idx,
+                                                section_title=chk_item.section_title,
+                                                attempt=attempt,
+                                                error=str(exc),
+                                                server_used=srv,
+                                            )
+                                            retry_queue.put(([chk_item], attempt, tried_urls.copy()))
+                                        with display_lock:
+                                            console.print(
+                                                f"  [yellow]⚠ [p{chunk_batch[0].chunk_idx}] "
                                                 f"Attempt {attempt}/{max_chunk_attempts} stalled/timed out on {srv} ({exc}). "
                                                 f"Moving to end of retry queue for another server{fallback_note}...[/yellow]"
                                             )
-                                        retry_queue.put((chk_item, attempt, tried_urls))
-                                        retry_queue.task_done()
                                     else:
-                                        book_state.mark_chunk_failed(
-                                            chunk_id=chk_item.chunk_id,
-                                            chunk_idx=chk_item.chunk_idx,
-                                            section_title=chk_item.section_title,
-                                            attempts=attempt,
-                                            error=str(exc),
-                                            server_used=srv,
-                                        )
-                                        with stats_lock:
-                                            extracted_results.append({
-                                                "status": "failed_chunk",
-                                                "chunk": chk_item,
-                                                "extraction": SectionExtraction(concepts=[]),
-                                                "duration": dur,
-                                                "server_used": srv,
-                                                "error": str(exc),
-                                            })
+                                        for chk_item in chunk_batch:
+                                            book_state.mark_chunk_failed(
+                                                chunk_id=chk_item.chunk_id,
+                                                chunk_idx=chk_item.chunk_idx,
+                                                section_title=chk_item.section_title,
+                                                attempts=attempt,
+                                                error=str(exc),
+                                                server_used=srv,
+                                            )
+                                            with stats_lock:
+                                                extracted_results.append({
+                                                    "status": "failed_chunk",
+                                                    "chunk": chk_item,
+                                                    "extraction": SectionExtraction(concepts=[]),
+                                                    "duration": dur / len(chunk_batch),
+                                                    "server_used": srv,
+                                                    "error": str(exc),
+                                                })
                                         with display_lock:
                                             console.print(
-                                                f"  [bold red]✗ [{chk_item.section_title[:24]} p{chk_item.chunk_idx}] "
+                                                f"  [bold red]✗ [{chunk_batch[0].section_title[:24]} p{chunk_batch[0].chunk_idx}] "
                                                 f"Failed after {max_chunk_attempts} attempts across pool ({exc}). "
                                                 f"Marking chunk as poison pill and continuing book processing.[/bold red]"
                                             )
-                                        progress.advance(book_task)
-                                        _update_progress_description()
-                                        retry_queue.task_done()
+                                        progress.advance(book_task, advance=len(chunk_batch))
+                                    _update_progress_description()
+                                    retry_queue.task_done()
                             finally:
+                                batch_count = len(chunk_batch) if chunk_batch else 1
                                 if task_phase == "fresh":
                                     with stats_lock:
-                                        fresh_in_flight = max(0, fresh_in_flight - 1)
-                                        active_tasks_count = max(0, active_tasks_count - 1)
+                                        fresh_in_flight = max(0, fresh_in_flight - batch_count)
+                                        active_tasks_count = max(0, active_tasks_count - batch_count)
                                 elif task_phase == "retry":
                                     with stats_lock:
-                                        retry_in_flight = max(0, retry_in_flight - 1)
-                                        active_tasks_count = max(0, active_tasks_count - 1)
+                                        retry_in_flight = max(0, retry_in_flight - batch_count)
+                                        active_tasks_count = max(0, active_tasks_count - batch_count)
                                 _update_progress_description()
 
                     chunk_executor = DaemonThreadPoolExecutor(max_workers=pool_concurrency)

@@ -373,10 +373,12 @@ class BatchSectionExtraction(BaseModel):
 def batch_chunks_by_context_size(
     chunks: Sequence[Any],
     max_context_size: int = 5120,
+    max_chunk_batch: Optional[int] = 3,
     tag_overhead: int = 150,
 ) -> List[List[Any]]:
     """
-    Combine consecutive chunks into batches up to max_context_size bytes (default: 5120 bytes / 5KB).
+    Combine consecutive chunks into batches up to max_context_size bytes (default: 5120 bytes / 5KB)
+    and up to max_chunk_batch items (default: 3).
     Each chunk's text and its XML chunk tag overhead are accounted for.
     If a single chunk exceeds max_context_size, it is placed in its own single-item batch.
     """
@@ -396,10 +398,13 @@ def batch_chunks_by_context_size(
 
     for chk in chunks:
         chk_size = _get_size(chk)
+        can_fit_size = (current_size + chk_size <= max_context_size)
+        can_fit_count = (max_chunk_batch is None or max_chunk_batch <= 0 or len(current_batch) < max_chunk_batch)
+
         if not current_batch:
             current_batch.append(chk)
             current_size = chk_size
-        elif current_size + chk_size <= max_context_size:
+        elif can_fit_size and can_fit_count:
             current_batch.append(chk)
             current_size += chk_size
         else:
@@ -511,6 +516,7 @@ class KnowledgeExtractor:
         wol_wait_seconds: int = 120,
         wol_probe_interval: float = 5.0,
         max_context_size: int = 5120,
+        max_chunk_batch: int = 3,
     ):
         self.model_name = model
         self.fallback_model = fallback_model
@@ -522,6 +528,7 @@ class KnowledgeExtractor:
         self.wol_wait_seconds = wol_wait_seconds
         self.wol_probe_interval = wol_probe_interval
         self.max_context_size = max_context_size
+        self.max_chunk_batch = max_chunk_batch
 
         if pool is not None:
             self.pool = pool
@@ -541,6 +548,7 @@ class KnowledgeExtractor:
         model: Optional[str] = None,
         fallback_model: Optional[str] = None,
         max_context_size: Optional[int] = None,
+        max_chunk_batch: Optional[int] = None,
     ) -> "KnowledgeExtractor":
         cooldown = getattr(settings, "resolved_analysis_cooldown_seconds", getattr(settings, "failover_cooldown_seconds", 600))
         if base_url:
@@ -558,6 +566,7 @@ class KnowledgeExtractor:
                 max_tasks_per_server=1,  # Strictly sequential per Ollama server: no mutual execution
             )
         eff_max_ctx = getattr(settings, "max_context_size", 5120) if max_context_size is None else max_context_size
+        eff_max_batch = getattr(settings, "max_chunk_batch", 3) if max_chunk_batch is None else max_chunk_batch
         return cls(
             pool=pool,
             model=model or settings.llm_model,
@@ -569,6 +578,7 @@ class KnowledgeExtractor:
             wol_wait_seconds=getattr(settings, "wol_wait_seconds", 120),
             wol_probe_interval=getattr(settings, "wol_probe_interval", 5.0),
             max_context_size=eff_max_ctx,
+            max_chunk_batch=eff_max_batch,
         )
 
     def _execute_structured_invoke(
@@ -957,12 +967,15 @@ class KnowledgeExtractor:
         self,
         chunks: Sequence[Any],
         max_context_size: Optional[int] = None,
+        max_chunk_batch: Optional[int] = None,
     ) -> List[List[Any]]:
         """
-        Combine chunks into batches up to maximum context size (default: self.max_context_size / 5KB).
+        Combine chunks into batches up to maximum context size (default: self.max_context_size / 5KB)
+        and maximum chunk count (default: self.max_chunk_batch / 3).
         """
-        limit = self.max_context_size if max_context_size is None else max_context_size
-        return batch_chunks_by_context_size(chunks, max_context_size=limit)
+        size_limit = self.max_context_size if max_context_size is None else max_context_size
+        count_limit = self.max_chunk_batch if max_chunk_batch is None else max_chunk_batch
+        return batch_chunks_by_context_size(chunks, max_context_size=size_limit, max_chunk_batch=count_limit)
 
     def extract_chunks(
         self,

@@ -210,6 +210,7 @@ def _get_effective_settings(
     max_chunk_attempts: Optional[int] = None,
     books_dir: Optional[str] = None,
     max_context_size: Optional[int] = None,
+    max_chunk_batch: Optional[int] = None,
 ) -> Settings:
     """Retrieve settings and merge explicit CLI arguments with highest precedence."""
     config_path = _resolve_opt(config_path)
@@ -224,6 +225,7 @@ def _get_effective_settings(
     max_chunk_attempts = _resolve_opt(max_chunk_attempts)
     books_dir = _resolve_opt(books_dir)
     max_context_size = _resolve_opt(max_context_size)
+    max_chunk_batch = _resolve_opt(max_chunk_batch)
 
     cfg = get_settings(config_path)
     overrides = {}
@@ -254,6 +256,8 @@ def _get_effective_settings(
         overrides["max_chunk_attempts"] = max_chunk_attempts
     if max_context_size is not None:
         overrides["max_context_size"] = max_context_size
+    if max_chunk_batch is not None:
+        overrides["max_chunk_batch"] = max_chunk_batch
 
     if overrides:
         data = cfg.model_dump()
@@ -1230,6 +1234,11 @@ def build_graph(
         "--max-context-size",
         help="Maximum combined chunk context size in bytes (default: 5120, i.e. 5KB) for simultaneous LLM extraction.",
     ),
+    max_chunk_batch: Optional[int] = typer.Option(
+        None,
+        "--max-chunk-batch",
+        help="Top limit on the number of chunks combined in a single extraction task (default: 3).",
+    ),
 ):
     """
     Ingest sections, perform semantic chunking, extract concepts via Ollama,
@@ -1263,6 +1272,7 @@ def build_graph(
     dual_pass = _resolve_opt(dual_pass)
     books_dir = _resolve_opt(books_dir)
     max_context_size = _resolve_opt(max_context_size)
+    max_chunk_batch = _resolve_opt(max_chunk_batch)
 
     cfg = _get_effective_settings(
         config_path,
@@ -1277,6 +1287,7 @@ def build_graph(
         max_chunk_attempts=max_chunk_attempts,
         books_dir=books_dir,
         max_context_size=max_context_size,
+        max_chunk_batch=max_chunk_batch,
     )
     output_dir = cfg.resolved_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2052,7 +2063,11 @@ def build_graph(
                             else:
                                 unprocessed_retries.append((chk, init_attempt))
 
-                    fresh_batches = batch_chunks_by_context_size(unprocessed_fresh, max_context_size=cfg.max_context_size)
+                    fresh_batches = batch_chunks_by_context_size(
+                        unprocessed_fresh,
+                        max_context_size=cfg.max_context_size,
+                        max_chunk_batch=cfg.max_chunk_batch,
+                    )
                     for f_batch in fresh_batches:
                         fresh_queue.put((f_batch, 0, set()))
 

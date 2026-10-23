@@ -27,10 +27,12 @@ def test_max_context_size_config_defaults_and_parsing():
     # 1. Default value is 5120 bytes (5 KB)
     cfg = Settings()
     assert cfg.max_context_size == 5120
+    assert cfg.max_chunk_batch == 3
 
     # 2. Integer configuration
-    cfg2 = Settings(max_context_size=8192)
+    cfg2 = Settings(max_context_size=8192, max_chunk_batch=5)
     assert cfg2.max_context_size == 8192
+    assert cfg2.max_chunk_batch == 5
 
     # 3. String units (5kb, 5KB, 5k)
     cfg_kb = Settings(max_context_size="5kb")
@@ -47,9 +49,36 @@ def test_max_context_size_config_defaults_and_parsing():
 
 
 def test_get_effective_settings_cli_override():
-    """Verify CLI --max-context-size overrides config file settings."""
-    cfg = _get_effective_settings(max_context_size=10240)
+    """Verify CLI --max-context-size and --max-chunk-batch override config file settings."""
+    cfg = _get_effective_settings(max_context_size=10240, max_chunk_batch=4)
     assert cfg.max_context_size == 10240
+    assert cfg.max_chunk_batch == 4
+
+
+def test_batch_chunks_by_context_size_respects_max_chunk_batch():
+    """
+    Verify chunks are capped by max_chunk_batch even if all chunks fit within max_context_size.
+    """
+    # 5 tiny chunks (~100B each)
+    chunks = [
+        HierarchicalChunk(chunk_id=f"chk_{i}", book_id=1, book_title="Book A", section_title="Sec", chapter_idx=1, chunk_idx=i, text=f"Tiny chunk number {i}")
+        for i in range(5)
+    ]
+
+    # With default max_chunk_batch=3, 5 chunks should split into 3 + 2
+    batches = batch_chunks_by_context_size(chunks, max_context_size=5120, max_chunk_batch=3)
+    assert len(batches) == 2
+    assert len(batches[0]) == 3
+    assert len(batches[1]) == 2
+    assert [c.chunk_id for c in batches[0]] == ["chk_0", "chk_1", "chk_2"]
+    assert [c.chunk_id for c in batches[1]] == ["chk_3", "chk_4"]
+
+    # With max_chunk_batch=2, 5 chunks should split into 2 + 2 + 1
+    batches2 = batch_chunks_by_context_size(chunks, max_context_size=5120, max_chunk_batch=2)
+    assert len(batches2) == 3
+    assert len(batches2[0]) == 2
+    assert len(batches2[1]) == 2
+    assert len(batches2[2]) == 1
 
 
 def test_batch_chunks_by_context_size_combining_three_chunks():
@@ -398,4 +427,56 @@ def test_build_graph_with_chunk_batching(tmp_path):
         # Verify that all 3 chunks were combined into a single batch (total size ~900B < 5120B)
         assert len(captured_batches) >= 1
         assert len(captured_batches[0]) == 3
+
+    # Now run again with --max-chunk-batch 2 on a fresh dir
+    captured_batches_2 = []
+
+    def mock_extract_chunks_2(chunks, **kwargs):
+        captured_batches_2.append(list(chunks))
+        res = {}
+        for c in chunks:
+            res[c.chunk_id] = SectionExtraction(
+                extracted_ideas=[
+                    ExtractedIdea(
+                        source_quote=c.text,
+                        idea_statement=f"Idea for {c.section_title}",
+                        key_entities=[c.section_title],
+                        idea_type="Mechanism",
+                    )
+                ]
+            )
+        return res
+
+    with patch("bookeeper.calibre.parser.BookParser.parse", return_value=mock_sections), \
+         patch("bookeeper.calibre.parser.BookParser.is_graphical_format", return_value=False), \
+         patch.object(KnowledgeExtractor, "extract_chunks", side_effect=mock_extract_chunks_2), \
+         patch.object(KnowledgeExtractor, "from_settings") as mock_from_settings, \
+         patch("bookeeper.processing.deduplicator.EntityDeduplicator.from_settings"):
+
+        mock_ext_instance = MagicMock()
+        mock_ext_instance.extract_chunks.side_effect = mock_extract_chunks_2
+        mock_from_settings.return_value = mock_ext_instance
+
+        res2 = runner.invoke(
+            app,
+            [
+                "build-graph",
+                "--file", str(book_file),
+                "--config", str(cfg_file),
+                "--skip-warmup",
+                "--clean-chunks",
+                "--from-scratch",
+                "--max-context-size", "5120",
+                "--max-chunk-batch", "2",
+                "--max-tasks", "1",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert res2.exit_code == 0
+        # With 3 chunks and max-chunk-batch=2, should be 2 batches: size 2 and size 1
+        assert len(captured_batches_2) == 2
+        assert len(captured_batches_2[0]) == 2
+        assert len(captured_batches_2[1]) == 1
+
 

@@ -564,6 +564,20 @@ class Settings(BaseSettings):
         default=5120,
         description="Maximum combined context size in bytes (default: 5120, i.e. 5 KB) to bundle chunks together for simultaneous processing.",
     )
+    max_chunk_batch: int = Field(
+        default=3,
+        description="Top limit on the number of chunks combined in a single extraction task (default: 3).",
+    )
+
+    @field_validator("max_chunk_batch", mode="before")
+    @classmethod
+    def parse_max_chunk_batch(cls, v: Any) -> int:
+        if v is None:
+            return 3
+        try:
+            return int(v)
+        except (ValueError, TypeError):
+            return 3
 
     @field_validator("max_context_size", mode="before")
     @classmethod

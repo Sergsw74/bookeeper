@@ -234,12 +234,14 @@ class ProgressTracker:
         self.save()
 
     def summary(self, operation: str) -> Dict[str, Any]:
-        """Return counts of completed, partially_indexed, failed, and skipped items for an operation."""
+        """Return counts of completed, partially_indexed, failed, skipped items, and assigned/skipped chunks for an operation."""
         records = self._get_op_records(operation)
         completed = sum(1 for r in records.values() if r.get("status") == "completed")
         partially_indexed = sum(1 for r in records.values() if r.get("status") == "partially_indexed")
         failed = sum(1 for r in records.values() if r.get("status") == "failed")
         skipped = sum(1 for r in records.values() if r.get("status") == "skipped")
+        assigned_chunks = sum(int((r.get("metadata") or {}).get("assigned_chunks", 0)) for r in records.values())
+        skipped_chunks = sum(int((r.get("metadata") or {}).get("skipped_chunks", 0)) for r in records.values())
         return {
             "operation": operation,
             "total_recorded": len(records),
@@ -247,6 +249,8 @@ class ProgressTracker:
             "partially_indexed": partially_indexed,
             "failed": failed,
             "skipped": skipped,
+            "assigned_chunks": assigned_chunks,
+            "skipped_chunks": skipped_chunks,
         }
 
 
@@ -412,6 +416,26 @@ class BookProcessingState:
             stacked = self.data.setdefault("stacked_chunks", {})
             stacked.pop(chunk_id, None)
 
+    @property
+    def assigned_chunks_count(self) -> int:
+        with self._lock:
+            processed = self.data.get("processed_chunks", {})
+            return sum(
+                1
+                for rec in processed.values()
+                if rec.get("server_used") == "semantic_fastpath" or rec.get("status") == "assigned"
+            )
+
+    @property
+    def skipped_chunks_count(self) -> int:
+        with self._lock:
+            processed = self.data.get("processed_chunks", {})
+            return sum(
+                1
+                for rec in processed.values()
+                if rec.get("server_used") == "skipped_limbo" or rec.get("status") == "skipped_limbo"
+            )
+
     def mark_chunk_processed(
         self,
         chunk_id: str,
@@ -426,17 +450,26 @@ class BookProcessingState:
             self.unstack_chunk(chunk_id)
             self.data.setdefault("retried_chunks", {}).pop(chunk_id, None)
 
+            if server_used == "semantic_fastpath":
+                chunk_status = "assigned"
+            elif server_used == "skipped_limbo":
+                chunk_status = "skipped_limbo"
+            else:
+                chunk_status = "extracted"
+
             processed = self.data.setdefault("processed_chunks", {})
             processed[chunk_id] = {
                 "chunk_id": chunk_id,
                 "chunk_idx": chunk_idx,
                 "section_title": section_title,
-                "status": "extracted",
+                "status": chunk_status,
                 "duration": duration,
                 "server_used": server_used,
                 "extraction": extraction_dict,
                 "completed_at": time.time(),
             }
+            self.data["assigned_chunks_count"] = self.assigned_chunks_count
+            self.data["skipped_chunks_count"] = self.skipped_chunks_count
             self.save()
 
     def mark_chunk_retried(

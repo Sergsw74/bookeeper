@@ -620,8 +620,22 @@ def test_build_graph_skip_limbo_chunks_flag(tmp_path: Path):
         assert res.exit_code == 0
         assert "Limbo chunk (0.75) skipped (--skip-limbo-chunks enabled)" in res.stdout
         assert "1 limbo (skipped)" in res.stdout
+        assert "Skipped Chunks (Limbo): 1" in res.stdout
         # Because the chunk was in limbo and --skip-limbo-chunks was enabled, LLM extract_chunks was SKIPPED!
         assert len(mock_extract_calls) == 0
+
+        # Verify `bookeeper status` reports the assigned and skipped chunks
+        status_res = runner.invoke(
+            app,
+            ["status", "--config", str(cfg_file)],
+            catch_exceptions=False,
+        )
+        assert status_res.exit_code == 0
+        assert "Assigned Chunks: 0" in status_res.stdout
+        assert "Skipped Chunks (Limbo): 1" in status_res.stdout
+        assert "assigned=0" in status_res.stdout
+        assert "skipped=1" in status_res.stdout
+
 
 
 

@@ -1823,6 +1823,8 @@ def build_graph(
     )
 
     completed_in_session = 0
+    session_assigned_chunks = 0
+    session_skipped_chunks = 0
     interrupted = False
     pipeline_start_time = time.perf_counter()
 
@@ -2040,12 +2042,18 @@ def build_graph(
                     )
 
                     extracted_results: List[Dict[str, Any]] = []
+                    book_assigned_chunks = 0
+                    book_skipped_chunks = 0
 
                     def _update_progress_description():
                         avg_s, p80_s, p18_s, fastest_s = _calc_stats()
                         with stats_lock:
                             cur_active = active_tasks_count
                             num_extracted = len(extracted_results)
+                            cur_book_assigned = book_assigned_chunks
+                            cur_book_skipped = book_skipped_chunks
+                            cur_session_assigned = session_assigned_chunks
+                            cur_session_skipped = session_skipped_chunks
 
                         # Calculate book analyses ETA formatted as (h, min, sec)
                         rem_chunks = max(0, len(chunks) - num_extracted)
@@ -2066,7 +2074,9 @@ def build_graph(
 
                         desc1 = (
                             f"[bold cyan]Current Book #{bid}[/bold cyan] ('{btitle[:18]}') | "
-                            f"Active: [bold cyan]{cur_active}[/bold cyan] tasks"
+                            f"Active: [bold cyan]{cur_active}[/bold cyan] tasks | "
+                            f"Assigned: [bold green]{cur_book_assigned}[/bold green] | "
+                            f"Skipped: [bold yellow]{cur_book_skipped}[/bold yellow]"
                         )
                         if durations:
                             desc1 += (
@@ -2092,6 +2102,8 @@ def build_graph(
 
                         desc2 = (
                             f"[bold magenta]Overall Progress[/bold magenta] ({book_idx}/{total_books} books) | "
+                            f"Assigned: [bold green]{cur_session_assigned}[/bold green] | "
+                            f"Skipped: [bold yellow]{cur_session_skipped}[/bold yellow] | "
                             f"LLM: [bold green]{cfg.llm_model}[/bold green] | "
                             f"Embeddings: [bold cyan]{cfg.embedding_model}[/bold cyan]"
                         )
@@ -2118,7 +2130,14 @@ def build_graph(
                             srv = cached_rec.get("server_used", "cached")
                             restored_status = "skipped_limbo" if srv == "skipped_limbo" else "extracted"
                             with stats_lock:
-                                durations.append(dur)
+                                if srv not in ("semantic_fastpath", "skipped_limbo"):
+                                    durations.append(dur)
+                                if srv == "semantic_fastpath":
+                                    book_assigned_chunks += 1
+                                    session_assigned_chunks += 1
+                                elif srv == "skipped_limbo":
+                                    book_skipped_chunks += 1
+                                    session_skipped_chunks += 1
                                 extracted_results.append({
                                     "status": restored_status,
                                     "chunk": chk,
@@ -2216,6 +2235,8 @@ def build_graph(
                                         server_used="semantic_fastpath",
                                     )
                                     with stats_lock:
+                                        book_assigned_chunks += 1
+                                        session_assigned_chunks += 1
                                         extracted_results.append({
                                             "status": "extracted",
                                             "chunk": h_chk,
@@ -2246,6 +2267,8 @@ def build_graph(
                                         server_used="skipped_limbo",
                                     )
                                     with stats_lock:
+                                        book_skipped_chunks += 1
+                                        session_skipped_chunks += 1
                                         extracted_results.append({
                                             "status": "skipped_limbo",
                                             "chunk": l_chk,
@@ -2266,6 +2289,7 @@ def build_graph(
 
                             # Order LLM extraction queue: Priority 1 (Unassigned) first, then Priority 3 (Limbo) unless skipped
                             unprocessed_fresh = routing.get_llm_queue_chunks(skip_limbo=should_skip_limbo)
+                            _update_progress_description()
                             if routing.high_confidence_count > 0 or routing.limbo_count > 0:
                                 limbo_desc = "skipped" if should_skip_limbo else "Priority 3 validation"
                                 console.print(
@@ -2701,9 +2725,15 @@ def build_graph(
                         title=btitle,
                         failed_chunks=len(failed_poison_results),
                         total_chunks=len(chunks),
+                        metadata={
+                            "assigned_chunks": book_assigned_chunks,
+                            "skipped_chunks": book_skipped_chunks,
+                            "publication_date": bpubdate,
+                        },
                     )
                     console.print(
-                        f"  [bold yellow]⚠ Book #{bid} partially indexed: {len(successful_results)}/{len(chunks)} chunks succeeded, "
+                        f"  [bold yellow]⚠ Book #{bid} partially indexed: {len(successful_results)}/{len(chunks)} chunks succeeded "
+                        f"(assigned={book_assigned_chunks}, skipped={book_skipped_chunks}), "
                         f"{len(failed_poison_results)} failed poison chunk(s) skipped. State retained at {book_state.file_path}.[/bold yellow]"
                     )
                 else:
@@ -2715,11 +2745,14 @@ def build_graph(
                         metadata={
                             "indexing_status": "fully_indexed",
                             "total_chunks": len(chunks),
+                            "assigned_chunks": book_assigned_chunks,
+                            "skipped_chunks": book_skipped_chunks,
                             "publication_date": bpubdate,
                         },
                     )
                     console.print(
-                        f"  [dim green]✓ Book #{bid} fully indexed (all {len(chunks)} chunks succeeded). State retained at {book_state.file_path}.[/dim green]"
+                        f"  [dim green]✓ Book #{bid} fully indexed (all {len(chunks)} chunks succeeded; "
+                        f"assigned={book_assigned_chunks}, skipped={book_skipped_chunks}). State retained at {book_state.file_path}.[/dim green]"
                     )
 
                 # Incremental persistence: save graph checkpoint after every processed book
@@ -2867,7 +2900,9 @@ def build_graph(
     console.print(
         Panel.fit(
             f"[bold]Total Nodes:[/bold] {st['total_nodes']}\n"
-            f"[bold]Total Edges:[/bold] {st['total_edges']}\n\n"
+            f"[bold]Total Edges:[/bold] {st['total_edges']}\n"
+            f"[bold]Assigned Chunks (Fast-Path):[/bold] {session_assigned_chunks}\n"
+            f"[bold]Skipped Chunks (Limbo):[/bold] {session_skipped_chunks}\n\n"
             f"[bold green]Node Types:[/bold green]\n"
             + "\n".join(f"  • {k}: {v}" for k, v in st["node_types"].items())
             + "\n\n[bold green]Relationship Types:[/bold green]\n"
@@ -2883,11 +2918,58 @@ def show_status(
     state_file: Optional[str] = typer.Option(None, "--state-file", help="Custom path for progress checkpoint JSON file."),
 ):
     """Display progress and checkpoint summary for batch operations."""
+    config_path = _resolve_opt(config_path)
+    state_file = _resolve_opt(state_file)
     cfg = get_settings(config_path)
     tracker_path = Path(state_file) if state_file else cfg.resolved_state_file
     tracker = ProgressTracker(tracker_path)
     clean_summary = tracker.summary("clean_metadata")
     graph_summary = tracker.summary("build_graph")
+
+    # Aggregate assigned and skipped chunks from per-book state files & tracker records
+    book_states_dir = cfg.resolved_output_dir / ".book_states"
+    state_files = sorted(book_states_dir.glob("book_*_state.json")) if book_states_dir.is_dir() else []
+    per_book_chunk_stats: Dict[str, Tuple[int, int]] = {}
+    parsed_state_records: List[Dict[str, Any]] = []
+    for sf in state_files:
+        try:
+            with open(sf, "r", encoding="utf-8") as f:
+                sdata = json.load(f)
+            bid_str = str(sdata.get("book_id", sf.stem))
+            proc_map = sdata.get("processed_chunks", {})
+            b_assigned = sdata.get("assigned_chunks_count")
+            if b_assigned is None:
+                b_assigned = sum(
+                    1
+                    for rec in proc_map.values()
+                    if isinstance(rec, dict) and (rec.get("server_used") == "semantic_fastpath" or rec.get("status") == "assigned")
+                )
+            b_skipped = sdata.get("skipped_chunks_count")
+            if b_skipped is None:
+                b_skipped = sum(
+                    1
+                    for rec in proc_map.values()
+                    if isinstance(rec, dict) and (rec.get("server_used") == "skipped_limbo" or rec.get("status") == "skipped_limbo")
+                )
+            per_book_chunk_stats[bid_str] = (int(b_assigned), int(b_skipped))
+            sdata["_computed_assigned"] = int(b_assigned)
+            sdata["_computed_skipped"] = int(b_skipped)
+            parsed_state_records.append(sdata)
+        except Exception:
+            pass
+
+    # Merge tracker metadata for books whose state files might not be in per_book_chunk_stats
+    graph_records = tracker._get_op_records("build_graph")
+    for bid_str, rec in graph_records.items():
+        if bid_str not in per_book_chunk_stats:
+            meta = rec.get("metadata") or {}
+            per_book_chunk_stats[bid_str] = (
+                int(meta.get("assigned_chunks", 0)),
+                int(meta.get("skipped_chunks", 0)),
+            )
+
+    total_assigned_chunks = sum(v[0] for v in per_book_chunk_stats.values())
+    total_skipped_chunks = sum(v[1] for v in per_book_chunk_stats.values())
 
     table = Table(title=f"Bookeeper Checkpoint State ({tracker_path.name})", show_header=True)
     table.add_column("Operation", style="bold cyan")
@@ -2895,6 +2977,8 @@ def show_status(
     table.add_column("Partially Indexed", style="cyan", justify="right")
     table.add_column("Skipped (Graphical)", style="yellow", justify="right")
     table.add_column("Failed", style="bold red", justify="right")
+    table.add_column("Assigned Chunks", style="bold green", justify="right")
+    table.add_column("Skipped Chunks", style="bold yellow", justify="right")
     table.add_column("Total Recorded", style="white", justify="right")
 
     table.add_row(
@@ -2903,6 +2987,8 @@ def show_status(
         str(clean_summary.get("partially_indexed", 0)),
         str(clean_summary.get("skipped", 0)),
         str(clean_summary["failed"]),
+        "0",
+        "0",
         str(clean_summary["total_recorded"]),
     )
     table.add_row(
@@ -2911,32 +2997,33 @@ def show_status(
         str(graph_summary.get("partially_indexed", 0)),
         str(graph_summary.get("skipped", 0)),
         str(graph_summary["failed"]),
+        str(total_assigned_chunks),
+        str(total_skipped_chunks),
         str(graph_summary["total_recorded"]),
     )
     console.print(table)
+    console.print(
+        f"[bold cyan]Chunk Routing Summary:[/bold cyan] "
+        f"Assigned Chunks: [bold green]{total_assigned_chunks}[/bold green] | "
+        f"Skipped Chunks (Limbo): [bold yellow]{total_skipped_chunks}[/bold yellow]"
+    )
 
-    book_states_dir = cfg.resolved_output_dir / ".book_states"
-    if book_states_dir.is_dir():
-        state_files = list(book_states_dir.glob("book_*_state.json"))
-        if state_files:
-            console.print(f"[dim cyan]Per-book state checkpoints ({len(state_files)} found in {book_states_dir}):[/dim cyan]")
-            for sf in state_files[:5]:
-                try:
-                    with open(sf, "r", encoding="utf-8") as f:
-                        sdata = json.load(f)
-                    b_status = sdata.get("status", "unknown")
-                    b_proc = len(sdata.get("processed_chunks", {}))
-                    b_fail = len(sdata.get("failed_chunks", {}))
-                    b_tot = sdata.get("total_chunks", 0)
-                    b_title = sdata.get("book_title", sf.stem)
-                    console.print(
-                        f"  • [bold]{b_title}[/bold] (ID: {sdata.get('book_id')}): status=[cyan]{b_status}[/cyan], "
-                        f"processed={b_proc}/{b_tot}, failed={b_fail}"
-                    )
-                except Exception:
-                    pass
-            if len(state_files) > 5:
-                console.print(f"  [dim]... and {len(state_files) - 5} more.[/dim]")
+    if parsed_state_records:
+        console.print(f"[dim cyan]Per-book state checkpoints ({len(parsed_state_records)} found in {book_states_dir}):[/dim cyan]")
+        for sdata in parsed_state_records[:5]:
+            b_status = sdata.get("status", "unknown")
+            b_proc = len(sdata.get("processed_chunks", {}))
+            b_fail = len(sdata.get("failed_chunks", {}))
+            b_tot = sdata.get("total_chunks", 0)
+            b_assigned = sdata.get("_computed_assigned", 0)
+            b_skipped = sdata.get("_computed_skipped", 0)
+            b_title = sdata.get("book_title", "Unknown")
+            console.print(
+                f"  • [bold]{b_title}[/bold] (ID: {sdata.get('book_id')}): status=[cyan]{b_status}[/cyan], "
+                f"processed={b_proc}/{b_tot}, assigned={b_assigned}, skipped={b_skipped}, failed={b_fail}"
+            )
+        if len(parsed_state_records) > 5:
+            console.print(f"  [dim]... and {len(parsed_state_records) - 5} more.[/dim]")
 
     console.print(
         f"[dim]Active Models: LLM: [bold green]{cfg.llm_model}[/bold green] | "

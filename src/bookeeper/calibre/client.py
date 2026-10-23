@@ -12,6 +12,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
+from bookeeper.calibre.parser import BookParser
+
 logger = logging.getLogger(__name__)
 
 

@@ -416,6 +416,10 @@ class RecentIdeasConfig(BaseModel):
         default=0.90,
         description="Cosine similarity threshold above which a chunk is directly assigned to an existing idea without LLM extraction (default: 0.90).",
     )
+    skip_limbo_chunks: bool = Field(
+        default=False,
+        description="Whether to skip limbo chunks (similarity between unassigned and high-confidence thresholds) completely from LLM processing (default: False).",
+    )
 
 
 class Settings(BaseSettings):
@@ -604,6 +608,10 @@ class Settings(BaseSettings):
     similarity_high_confidence_threshold: float = Field(
         default=0.90,
         description="Cosine similarity threshold above which a chunk is directly assigned to an existing idea without LLM extraction (default: 0.90).",
+    )
+    skip_limbo_chunks: bool = Field(
+        default=False,
+        description="Whether to skip limbo chunks (similarity between unassigned and high-confidence thresholds) completely from LLM processing (default: False).",
     )
 
     @field_validator("max_chunk_batch", mode="before")

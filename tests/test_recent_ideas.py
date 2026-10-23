@@ -487,3 +487,141 @@ def test_build_graph_high_confidence_chunk_skips_llm(tmp_path: Path):
         assert updated_store.graph.nodes["concept:Paxos Consensus"].get("first_occurrence_month") == "2010-05"
 
 
+def test_get_llm_queue_chunks_skip_limbo():
+    """Verify BatchRoutingResult.get_llm_queue_chunks excludes limbo chunks when skip_limbo=True."""
+    c_unassigned = HierarchicalChunk(chunk_id="c_u", book_id=1, book_title="B", section_title="S1", chapter_idx=1, chunk_idx=1, text="New topic")
+    c_limbo = HierarchicalChunk(chunk_id="c_l", book_id=1, book_title="B", section_title="S2", chapter_idx=1, chunk_idx=2, text="Limbo topic")
+    c_high = HierarchicalChunk(chunk_id="c_h", book_id=1, book_title="B", section_title="S3", chapter_idx=1, chunk_idx=3, text="High topic")
+
+    routing = BatchRoutingResult(
+        unassigned=[RoutedChunk(chunk=c_unassigned, priority=ChunkPriority.UNASSIGNED, similarity=0.2)],
+        limbo=[RoutedChunk(chunk=c_limbo, priority=ChunkPriority.LIMBO, similarity=0.75, matched_idea="Existing")],
+        high_confidence=[RoutedChunk(chunk=c_high, priority=ChunkPriority.HIGH_CONFIDENCE, similarity=0.95, matched_idea="Existing")],
+    )
+
+    assert [c.chunk_id for c in routing.get_llm_queue_chunks(skip_limbo=False)] == ["c_u", "c_l"]
+    assert [c.chunk_id for c in routing.get_llm_queue_chunks(skip_limbo=True)] == ["c_u"]
+
+
+def test_build_graph_skip_limbo_chunks_flag(tmp_path: Path):
+    """
+    Verify that when --skip-limbo-chunks is passed, chunks in limbo (0.65 <= sim < 0.90)
+    are skipped completely and do not invoke LLM extraction.
+    """
+    import sqlite3
+    from unittest.mock import patch
+    from typer.testing import CliRunner
+    from bookeeper.cli import app
+    from bookeeper.processing.extractor import SectionExtraction, KnowledgeExtractor
+    from bookeeper.calibre.client import _register_sqlite_functions
+    from bookeeper.calibre.parser import Section
+    from bookeeper.graph.store import ConceptGraphStore
+
+    runner = CliRunner()
+    lib_dir = tmp_path / "calibre_lib"
+    lib_dir.mkdir()
+    db_path = lib_dir / "metadata.db"
+    conn = sqlite3.connect(str(db_path))
+    _register_sqlite_functions(conn)
+    conn.executescript("""
+        CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT NOT NULL, sort TEXT, author_sort TEXT, pubdate TIMESTAMP, path TEXT NOT NULL DEFAULT 'Author/Book');
+        CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE);
+        CREATE TABLE books_authors_link (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, author INTEGER NOT NULL);
+        CREATE TABLE data (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, format TEXT NOT NULL, name TEXT NOT NULL);
+        CREATE TABLE comments (id INTEGER PRIMARY KEY, book INTEGER NOT NULL UNIQUE, text TEXT NOT NULL);
+    """)
+
+    conn.execute("INSERT INTO books (id, title, sort, author_sort, pubdate, path) VALUES (1, 'Book Beta', 'Book Beta', 'Author', '2021-03-01', 'A/B1')")
+    conn.execute("INSERT INTO authors (id, name) VALUES (1, 'Jane Doe')")
+    conn.execute("INSERT INTO books_authors_link (book, author) VALUES (1, 1)")
+    conn.execute("INSERT INTO data (book, format, name) VALUES (1, 'EPUB', 'Book Beta')")
+    conn.commit()
+    conn.close()
+
+    (lib_dir / "A" / "B1").mkdir(parents=True)
+    (lib_dir / "A" / "B1" / "Book Beta.epub").write_text("dummy", encoding="utf-8")
+
+    out_dir = tmp_path / "output"
+    out_dir.mkdir(parents=True)
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(f"output_dir: {out_dir}\ncalibre_library_path: {lib_dir}\n", encoding="utf-8")
+
+    # Seed the knowledge graph with an existing idea
+    existing_store = ConceptGraphStore()
+    existing_store.add_book(100, title="Preexisting Book", publication_date="2010-05-01")
+    existing_store.add_book_idea_link(100, "Paxos Consensus", publication_date="2010-05-01")
+    kg_path = out_dir / "knowledge_graph.json"
+    existing_store.save(kg_path)
+
+    mock_text = (
+        "Raft consensus provides an understandable alternative to Paxos for replicated state machines. "
+        "Leader election and log replication are decomposed into distinct subproblems. "
+        "Safety properties ensure logs remain consistent across cluster terms. "
+    )
+
+    mock_extract_calls = []
+
+    def mock_extract_chunks(chunks, **kwargs):
+        mock_extract_calls.append(chunks)
+        return {c.chunk_id: SectionExtraction(concepts=[]) for c in chunks}
+
+    mock_parse_sections = [
+        Section(title="Section 1", chapter_idx=1, text=mock_text)
+    ]
+
+    # Idea vector = [1.0, 0.0], Chunk vector = [0.75, sqrt(1 - 0.75^2)] -> cosine similarity = 0.75 (LIMBO: 0.65 <= 0.75 < 0.90)
+    mock_embeddings = MagicMock()
+    mock_embeddings.embedding_stats = {}
+    limbo_vec = [0.75, float(np.sqrt(1.0 - 0.75**2))]
+
+    def _embed_docs(texts):
+        res_vecs = []
+        for t in texts:
+            if t.startswith("Paxos Consensus:"):
+                res_vecs.append([1.0, 0.0])
+            else:
+                res_vecs.append(limbo_vec)
+        return res_vecs
+
+    mock_embeddings.embed_documents.side_effect = _embed_docs
+    mock_embeddings.embed_query.side_effect = lambda text: limbo_vec
+
+    with patch("bookeeper.calibre.parser.BookParser.parse", return_value=mock_parse_sections), \
+         patch("bookeeper.calibre.parser.BookParser.is_graphical_format", return_value=False), \
+         patch("bookeeper.processing.ollama_pool.FailoverOllamaEmbeddings.from_settings", return_value=mock_embeddings), \
+         patch.object(KnowledgeExtractor, "extract_chunks", side_effect=mock_extract_chunks), \
+         patch.object(KnowledgeExtractor, "from_settings") as mock_from_settings, \
+         patch("bookeeper.processing.deduplicator.EntityDeduplicator.from_settings") as mock_dedup_cls:
+
+        mock_ext_instance = MagicMock()
+        mock_ext_instance.extract_chunks.side_effect = mock_extract_chunks
+        mock_from_settings.return_value = mock_ext_instance
+
+        mock_dedup_instance = MagicMock()
+        mock_dedup_instance.resolve_concept.side_effect = lambda c: c
+        mock_dedup_cls.return_value = mock_dedup_instance
+
+        res = runner.invoke(
+            app,
+            [
+                "build-graph",
+                "--all",
+                "--calibre-path", str(lib_dir),
+                "--config", str(cfg_file),
+                "--skip-warmup",
+                "--recent-ideas",
+                "--similarity-unassigned", "0.65",
+                "--similarity-high-confidence", "0.90",
+                "--skip-limbo-chunks",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert res.exit_code == 0
+        assert "Limbo chunk (0.75) skipped (--skip-limbo-chunks enabled)" in res.stdout
+        assert "1 limbo (skipped)" in res.stdout
+        # Because the chunk was in limbo and --skip-limbo-chunks was enabled, LLM extract_chunks was SKIPPED!
+        assert len(mock_extract_calls) == 0
+
+
+

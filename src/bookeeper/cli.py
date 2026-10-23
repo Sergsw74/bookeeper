@@ -225,6 +225,7 @@ def _get_effective_settings(
     recent_ideas: Optional[bool] = None,
     similarity_unassigned: Optional[float] = None,
     similarity_high_confidence: Optional[float] = None,
+    skip_limbo_chunks: Optional[bool] = None,
 ) -> Settings:
     """Retrieve settings and merge explicit CLI arguments with highest precedence."""
     config_path = _resolve_opt(config_path)
@@ -244,6 +245,7 @@ def _get_effective_settings(
     recent_ideas = _resolve_opt(recent_ideas)
     similarity_unassigned = _resolve_opt(similarity_unassigned)
     similarity_high_confidence = _resolve_opt(similarity_high_confidence)
+    skip_limbo_chunks = _resolve_opt(skip_limbo_chunks)
 
     cfg = get_settings(config_path)
     overrides = {}
@@ -282,9 +284,14 @@ def _get_effective_settings(
         overrides["similarity_unassigned_threshold"] = similarity_unassigned
     if similarity_high_confidence is not None:
         overrides["similarity_high_confidence_threshold"] = similarity_high_confidence
-    if recent_ideas is not None:
+    if skip_limbo_chunks is not None:
+        overrides["skip_limbo_chunks"] = skip_limbo_chunks
+    if recent_ideas is not None or skip_limbo_chunks is not None:
         rc = cfg.recent_ideas.model_copy()
-        rc.enabled = recent_ideas
+        if recent_ideas is not None:
+            rc.enabled = recent_ideas
+        if skip_limbo_chunks is not None:
+            rc.skip_limbo_chunks = skip_limbo_chunks
         overrides["recent_ideas"] = rc
 
     if overrides:
@@ -1287,6 +1294,12 @@ def build_graph(
         "--similarity-high-confidence",
         help="Cosine similarity threshold above which chunks are directly assigned to an existing idea without LLM extraction (default: 0.90).",
     ),
+    skip_limbo_chunks: Optional[bool] = typer.Option(
+        None,
+        "--skip-limbo-chunks/--no-skip-limbo-chunks",
+        "--skip-limbo/--no-skip-limbo",
+        help="Skip limbo chunks (chunks between unassigned and high-confidence similarity thresholds) completely from LLM processing (default: False).",
+    ),
 ):
     """
     Ingest sections, perform semantic chunking, extract concepts via Ollama,
@@ -1325,6 +1338,7 @@ def build_graph(
     recent_ideas = _resolve_opt(recent_ideas)
     similarity_unassigned = _resolve_opt(similarity_unassigned)
     similarity_high_confidence = _resolve_opt(similarity_high_confidence)
+    skip_limbo_chunks = _resolve_opt(skip_limbo_chunks)
 
     cfg = _get_effective_settings(
         config_path,
@@ -1344,6 +1358,7 @@ def build_graph(
         recent_ideas=recent_ideas,
         similarity_unassigned=similarity_unassigned,
         similarity_high_confidence=similarity_high_confidence,
+        skip_limbo_chunks=skip_limbo_chunks,
     )
     output_dir = cfg.resolved_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2101,10 +2116,11 @@ def build_graph(
                             extraction = SectionExtraction(**raw_extraction)
                             dur = cached_rec.get("duration", 0.0)
                             srv = cached_rec.get("server_used", "cached")
+                            restored_status = "skipped_limbo" if srv == "skipped_limbo" else "extracted"
                             with stats_lock:
                                 durations.append(dur)
                                 extracted_results.append({
-                                    "status": "extracted",
+                                    "status": restored_status,
                                     "chunk": chk,
                                     "extraction": extraction,
                                     "duration": dur,
@@ -2149,6 +2165,7 @@ def build_graph(
 
                     # Semantic chunk routing if recent ideas are enabled
                     limbo_candidate_map: Dict[str, Tuple[str, str]] = {}
+                    should_skip_limbo = bool(cfg.skip_limbo_chunks or cfg.recent_ideas.skip_limbo_chunks)
                     if cfg.recent_ideas.enabled and unprocessed_fresh and embeddings is not None:
                         idea_index = IdeaEmbeddingIndex.build_from_graph(store, embeddings=embeddings)
                         if idea_index.vectors is not None and len(idea_index.idea_names) > 0:
@@ -2216,19 +2233,45 @@ def build_graph(
                                             f"High-confidence match ({rc.similarity:.2f}) -> directly assigned to '[bold cyan]{h_idea}[/bold cyan]' (skipped LLM)."
                                         )
 
-                            # Record limbo candidates for Priority 3 chunks
-                            for rc in routing.limbo:
-                                if rc.matched_idea:
-                                    limbo_candidate_map[rc.chunk.chunk_id] = (rc.matched_idea, rc.matched_idea_summary)
+                            # Priority 3: Limbo chunks (either skip completely if --skip-limbo-chunks enabled, or validate via LLM)
+                            if should_skip_limbo:
+                                for rc in routing.limbo:
+                                    l_chk = rc.chunk
+                                    book_state.mark_chunk_processed(
+                                        chunk_id=l_chk.chunk_id,
+                                        chunk_idx=l_chk.chunk_idx,
+                                        section_title=l_chk.section_title,
+                                        extraction_dict={"concepts": [], "extracted_ideas": []},
+                                        duration=0.0,
+                                        server_used="skipped_limbo",
+                                    )
+                                    with stats_lock:
+                                        extracted_results.append({
+                                            "status": "skipped_limbo",
+                                            "chunk": l_chk,
+                                            "extraction": SectionExtraction(concepts=[], extracted_ideas=[]),
+                                            "duration": 0.0,
+                                            "server_used": "skipped_limbo",
+                                        })
+                                    progress.advance(book_task, advance=1)
+                                    with display_lock:
+                                        console.print(
+                                            f"  [dim yellow]⏭ [{l_chk.section_title[:24]} p{l_chk.chunk_idx}][/dim yellow] "
+                                            f"Limbo chunk ({rc.similarity:.2f}) skipped (--skip-limbo-chunks enabled)."
+                                        )
+                            else:
+                                for rc in routing.limbo:
+                                    if rc.matched_idea:
+                                        limbo_candidate_map[rc.chunk.chunk_id] = (rc.matched_idea, rc.matched_idea_summary)
 
-                            # Order LLM extraction queue: Priority 1 (Unassigned) first, then Priority 3 (Limbo)
-                            priority_chunks = [rc.chunk for rc in routing.unassigned] + [rc.chunk for rc in routing.limbo]
-                            unprocessed_fresh = priority_chunks
+                            # Order LLM extraction queue: Priority 1 (Unassigned) first, then Priority 3 (Limbo) unless skipped
+                            unprocessed_fresh = routing.get_llm_queue_chunks(skip_limbo=should_skip_limbo)
                             if routing.high_confidence_count > 0 or routing.limbo_count > 0:
+                                limbo_desc = "skipped" if should_skip_limbo else "Priority 3 validation"
                                 console.print(
                                     f"  [dim cyan]Semantic Chunk Routing: {routing.unassigned_count} unassigned (Priority 1 brand-new ideas), "
                                     f"{routing.high_confidence_count} high-confidence (Priority 2 direct assignment), "
-                                    f"{routing.limbo_count} limbo (Priority 3 validation).[/dim cyan]"
+                                    f"{routing.limbo_count} limbo ({limbo_desc}).[/dim cyan]"
                                 )
 
                     fresh_batches = batch_chunks_by_context_size(

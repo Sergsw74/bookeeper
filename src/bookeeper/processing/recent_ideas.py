@@ -153,6 +153,15 @@ class BatchRoutingResult:
     def limbo_count(self) -> int:
         return len(self.limbo)
 
+    def get_llm_queue_chunks(self, skip_limbo: bool = False) -> List[Any]:
+        """
+        Return chunks ordered for LLM extraction:
+        Priority 1 (Unassigned) first, followed by Priority 3 (Limbo) unless skip_limbo=True.
+        """
+        if skip_limbo:
+            return [rc.chunk for rc in self.unassigned]
+        return [rc.chunk for rc in self.unassigned] + [rc.chunk for rc in self.limbo]
+
 
 @dataclass
 class IdeaEmbeddingIndex:

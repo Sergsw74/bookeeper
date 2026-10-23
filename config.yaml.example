@@ -37,6 +37,7 @@ max_chunk_batch: 3       # Top limit on number of chunks combined per extraction
 batch_books: 10          # Number of books grouped per chronological ingestion batch (default: 10)
 similarity_unassigned_threshold: 0.65       # Chunks below this similarity (<0.65) treated as brand new ideas
 similarity_high_confidence_threshold: 0.90  # Chunks above this similarity (>=0.90) directly assigned to idea (skips LLM)
+skip_limbo_chunks: false                    # Skip limbo chunks (0.65 <= sim < 0.90) completely from LLM processing
 
 # Dedicated local or remote Embeddings endpoint (Recommended for maximum performance)
 # Offloading embeddings to your local machine (e.g. Apple Silicon Mac on http://localhost:11434)

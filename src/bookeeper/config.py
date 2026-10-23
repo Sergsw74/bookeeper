@@ -397,6 +397,27 @@ class DualPassConfig(BaseModel):
     )
 
 
+class RecentIdeasConfig(BaseModel):
+    """Configuration for publication date sorting, batching, and embedding-based chunk routing."""
+
+    enabled: bool = Field(
+        default=True,
+        description="Whether to enable publication date sorting and batch-based chronological chunk routing.",
+    )
+    batch_books: int = Field(
+        default=10,
+        description="Number of books grouped into an ingestion batch for chronological processing (default: 10).",
+    )
+    similarity_unassigned_threshold: float = Field(
+        default=0.65,
+        description="Cosine similarity threshold below which a chunk is classified as unassigned (brand new idea, default: 0.65).",
+    )
+    similarity_high_confidence_threshold: float = Field(
+        default=0.90,
+        description="Cosine similarity threshold above which a chunk is directly assigned to an existing idea without LLM extraction (default: 0.90).",
+    )
+
+
 class Settings(BaseSettings):
     """Application settings for bookeeper."""
 
@@ -568,6 +589,22 @@ class Settings(BaseSettings):
         default=3,
         description="Top limit on the number of chunks combined in a single extraction task (default: 3).",
     )
+    batch_books: int = Field(
+        default=10,
+        description="Number of books grouped into an ingestion batch for chronological processing (default: 10).",
+    )
+    recent_ideas: RecentIdeasConfig = Field(
+        default_factory=RecentIdeasConfig,
+        description="Configuration for chronological batch idea ingestion and chunk routing.",
+    )
+    similarity_unassigned_threshold: float = Field(
+        default=0.65,
+        description="Cosine similarity threshold below which a chunk is classified as unassigned (brand new idea, default: 0.65).",
+    )
+    similarity_high_confidence_threshold: float = Field(
+        default=0.90,
+        description="Cosine similarity threshold above which a chunk is directly assigned to an existing idea without LLM extraction (default: 0.90).",
+    )
 
     @field_validator("max_chunk_batch", mode="before")
     @classmethod
@@ -578,6 +615,17 @@ class Settings(BaseSettings):
             return int(v)
         except (ValueError, TypeError):
             return 3
+
+    @field_validator("batch_books", mode="before")
+    @classmethod
+    def parse_batch_books(cls, v: Any) -> int:
+        if v is None:
+            return 10
+        try:
+            val = int(v)
+            return val if val > 0 else 10
+        except (ValueError, TypeError):
+            return 10
 
     @field_validator("max_context_size", mode="before")
     @classmethod

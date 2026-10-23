@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Set
 import networkx as nx
 from networkx.readwrite import json_graph
 
-from bookeeper.calibre.parser import BookParser
+from bookeeper.calibre.parser import BookParser, format_idea_month
 from bookeeper.processing.extractor import Concept
 
 logger = logging.getLogger(__name__)
@@ -76,16 +76,44 @@ class ConceptGraphStore:
                 nd["tags"] = book_tags
         return node_id
 
+    def update_idea_occurrence_month(
+        self,
+        concept_name: str,
+        date_val: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Record or update the first occurrence month of an idea.
+        If the idea already has an occurrence month, the EARLIER date wins!
+        Returns the effective first_occurrence_month (YYYY-MM).
+        """
+        concept_name = BookParser.repair_mojibake(concept_name)
+        concept_node_id = f"concept:{concept_name}"
+        month = format_idea_month(date_val)
+        if not month:
+            return None
+
+        if self.graph.has_node(concept_node_id):
+            nd = self.graph.nodes[concept_node_id]
+            curr_month = nd.get("first_occurrence_month") or nd.get("month")
+            if not curr_month or month < curr_month:
+                nd["first_occurrence_month"] = month
+                nd["month"] = month
+                return month
+            return curr_month
+        return None
+
     def add_book_idea_link(
         self,
         book_id: int,
         concept_name: str,
         occurrences: int = 1,
+        publication_date: Optional[str] = None,
     ) -> None:
         """
         Connect (:Book) -[:EXPLORES_IDEA]-> (:Concept/Idea)
         and (:Concept/Idea) -[:FEATURED_IN]-> (:Book)
         to anchor ideas to books for navigation and research synthesis.
+        Tracks first_occurrence_month where the earlier date wins.
         """
         concept_name = BookParser.repair_mojibake(concept_name)
         book_node_id = f"book:{book_id}"
@@ -94,21 +122,31 @@ class ConceptGraphStore:
         if not self.graph.has_node(book_node_id):
             self.add_book(book_id, title=f"Book {book_id}")
 
+        pub_date = publication_date
+        if not pub_date and self.graph.has_node(book_node_id):
+            pub_date = self.graph.nodes[book_node_id].get("publication_date")
+        month = format_idea_month(pub_date)
+
         if not self.graph.has_node(concept_node_id):
-            self.graph.add_node(
-                concept_node_id,
-                type="Concept",
-                tag="idea",
-                tags=["idea"],
-                is_idea=True,
-                name=concept_name,
-                category="Idea",
-                brief_description="",
-                detailed_explanation="",
-                summary="",
-                weight=5,
-                occurrences=1,
-            )
+            node_attrs = {
+                "type": "Concept",
+                "tag": "idea",
+                "tags": ["idea"],
+                "is_idea": True,
+                "name": concept_name,
+                "category": "Idea",
+                "brief_description": "",
+                "detailed_explanation": "",
+                "summary": "",
+                "weight": 5,
+                "occurrences": 1,
+            }
+            if month:
+                node_attrs["first_occurrence_month"] = month
+                node_attrs["month"] = month
+            self.graph.add_node(concept_node_id, **node_attrs)
+        elif month:
+            self.update_idea_occurrence_month(concept_name, month)
 
         if not self.graph.has_edge(book_node_id, concept_node_id):
             self.graph.add_edge(
@@ -347,11 +385,13 @@ class ConceptGraphStore:
         quote: str = "",
         brief_description: str = "",
         detailed_explanation: str = "",
+        publication_date: Optional[str] = None,
     ) -> None:
         """
         Link an Idea node directly to the supporting Chunk, Chapter, and Subtitle:
           (:Concept/Idea) -[:SUPPORTED_BY {quote, breadcrumb, chapter_title, subtitle, chunk_id}]-> (:Chunk)
           (:Chunk) -[:SUPPORTS_IDEA]-> (:Concept/Idea)
+        Tracks first_occurrence_month where the earlier date wins.
         """
         concept_name = BookParser.repair_mojibake(concept_name)
         quote = BookParser.repair_mojibake(quote) if quote else ""
@@ -361,21 +401,32 @@ class ConceptGraphStore:
         concept_node_id = f"concept:{concept_name}"
         chunk_node_id = self.add_chunk(chunk)
 
+        book_nid = f"book:{getattr(chunk, 'book_id', 0)}"
+        pub_date = publication_date or getattr(chunk, "publication_date", None)
+        if not pub_date and self.graph.has_node(book_nid):
+            pub_date = self.graph.nodes[book_nid].get("publication_date")
+        month = format_idea_month(pub_date)
+
         if not self.graph.has_node(concept_node_id):
-            self.graph.add_node(
-                concept_node_id,
-                type="Concept",
-                tag="idea",
-                tags=["idea"],
-                is_idea=True,
-                name=concept_name,
-                category="Idea",
-                brief_description=brief_description,
-                detailed_explanation=detailed_explanation,
-                summary=brief_description or detailed_explanation,
-                weight=5,
-                occurrences=1,
-            )
+            node_attrs = {
+                "type": "Concept",
+                "tag": "idea",
+                "tags": ["idea"],
+                "is_idea": True,
+                "name": concept_name,
+                "category": "Idea",
+                "brief_description": brief_description,
+                "detailed_explanation": detailed_explanation,
+                "summary": brief_description or detailed_explanation,
+                "weight": 5,
+                "occurrences": 1,
+            }
+            if month:
+                node_attrs["first_occurrence_month"] = month
+                node_attrs["month"] = month
+            self.graph.add_node(concept_node_id, **node_attrs)
+        elif month:
+            self.update_idea_occurrence_month(concept_name, month)
 
         # Edge: (:Concept/Idea) -[:SUPPORTED_BY]-> (:Chunk)
         self.graph.add_edge(

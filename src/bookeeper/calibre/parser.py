@@ -170,6 +170,30 @@ class BookParser:
         return _CONTROL_CHAR_RE.sub("", s)
 
     @classmethod
+    def format_idea_month(cls, val: Any) -> Optional[str]:
+        """
+        Extract normalized YYYY-MM month string from publication date or timestamp.
+        Handles YYYY-MM-DD, YYYY-MM, or YYYY (mapped to YYYY-01).
+        Returns None if missing or invalid.
+        """
+        if not val:
+            return None
+        s = cls.repair_mojibake(str(val)).strip()
+        if not s or s.startswith("0101-01-01"):
+            return None
+        m_full = re.match(r"^(\d{4})-(\d{2})", s)
+        if m_full:
+            y, m = int(m_full.group(1)), int(m_full.group(2))
+            if 1000 <= y <= 9999 and 1 <= m <= 12:
+                return f"{y:04d}-{m:02d}"
+        m_year = re.match(r"^(\d{4})", s)
+        if m_year:
+            y = int(m_year.group(1))
+            if 1000 <= y <= 9999:
+                return f"{y:04d}-01"
+        return None
+
+    @classmethod
     def parse_publication_date(cls, val: Any) -> Optional[str]:
         """
         Parse and normalize publication date into ISO string (YYYY-MM-DD, YYYY-MM, or YYYY).
@@ -1104,3 +1128,6 @@ class BookParser:
             return f"DjVu technical document: {file_hint}", file_hint
 
         return None, file_hint
+
+
+format_idea_month = BookParser.format_idea_month

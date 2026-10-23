@@ -60,6 +60,16 @@ from bookeeper.processing.idea_postprocessor import (
     IdeaPostProcessor,
     IdeaPostProcessorReport,
 )
+from bookeeper.processing.recent_ideas import (
+    BatchRoutingResult,
+    ChunkPriority,
+    IdeaEmbeddingIndex,
+    RecentIdeaChunkRouter,
+    RoutedChunk,
+    normalize_sort_date,
+    partition_books_into_batches,
+    sort_books_chronologically,
+)
 from bookeeper.processing.ollama_pool import (
     FailoverOllamaEmbeddings,
     OllamaPool,
@@ -211,6 +221,10 @@ def _get_effective_settings(
     books_dir: Optional[str] = None,
     max_context_size: Optional[int] = None,
     max_chunk_batch: Optional[int] = None,
+    batch_books: Optional[int] = None,
+    recent_ideas: Optional[bool] = None,
+    similarity_unassigned: Optional[float] = None,
+    similarity_high_confidence: Optional[float] = None,
 ) -> Settings:
     """Retrieve settings and merge explicit CLI arguments with highest precedence."""
     config_path = _resolve_opt(config_path)
@@ -226,6 +240,10 @@ def _get_effective_settings(
     books_dir = _resolve_opt(books_dir)
     max_context_size = _resolve_opt(max_context_size)
     max_chunk_batch = _resolve_opt(max_chunk_batch)
+    batch_books = _resolve_opt(batch_books)
+    recent_ideas = _resolve_opt(recent_ideas)
+    similarity_unassigned = _resolve_opt(similarity_unassigned)
+    similarity_high_confidence = _resolve_opt(similarity_high_confidence)
 
     cfg = get_settings(config_path)
     overrides = {}
@@ -258,6 +276,16 @@ def _get_effective_settings(
         overrides["max_context_size"] = max_context_size
     if max_chunk_batch is not None:
         overrides["max_chunk_batch"] = max_chunk_batch
+    if batch_books is not None:
+        overrides["batch_books"] = batch_books
+    if similarity_unassigned is not None:
+        overrides["similarity_unassigned_threshold"] = similarity_unassigned
+    if similarity_high_confidence is not None:
+        overrides["similarity_high_confidence_threshold"] = similarity_high_confidence
+    if recent_ideas is not None:
+        rc = cfg.recent_ideas.model_copy()
+        rc.enabled = recent_ideas
+        overrides["recent_ideas"] = rc
 
     if overrides:
         data = cfg.model_dump()
@@ -1239,6 +1267,26 @@ def build_graph(
         "--max-chunk-batch",
         help="Top limit on the number of chunks combined in a single extraction task (default: 3).",
     ),
+    batch_books: Optional[int] = typer.Option(
+        None,
+        "--batch-books",
+        help="Number of books grouped per chronological ingestion batch (default: 10).",
+    ),
+    recent_ideas: Optional[bool] = typer.Option(
+        None,
+        "--recent-ideas/--no-recent-ideas",
+        help="Enable chronological batch ingestion with semantic chunk routing (default: True).",
+    ),
+    similarity_unassigned: Optional[float] = typer.Option(
+        None,
+        "--similarity-unassigned",
+        help="Cosine similarity threshold below which chunks are classified as unassigned (brand new ideas, default: 0.65).",
+    ),
+    similarity_high_confidence: Optional[float] = typer.Option(
+        None,
+        "--similarity-high-confidence",
+        help="Cosine similarity threshold above which chunks are directly assigned to an existing idea without LLM extraction (default: 0.90).",
+    ),
 ):
     """
     Ingest sections, perform semantic chunking, extract concepts via Ollama,
@@ -1273,6 +1321,10 @@ def build_graph(
     books_dir = _resolve_opt(books_dir)
     max_context_size = _resolve_opt(max_context_size)
     max_chunk_batch = _resolve_opt(max_chunk_batch)
+    batch_books = _resolve_opt(batch_books)
+    recent_ideas = _resolve_opt(recent_ideas)
+    similarity_unassigned = _resolve_opt(similarity_unassigned)
+    similarity_high_confidence = _resolve_opt(similarity_high_confidence)
 
     cfg = _get_effective_settings(
         config_path,
@@ -1288,6 +1340,10 @@ def build_graph(
         books_dir=books_dir,
         max_context_size=max_context_size,
         max_chunk_batch=max_chunk_batch,
+        batch_books=batch_books,
+        recent_ideas=recent_ideas,
+        similarity_unassigned=similarity_unassigned,
+        similarity_high_confidence=similarity_high_confidence,
     )
     output_dir = cfg.resolved_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1487,7 +1543,15 @@ def build_graph(
         if BookParser.is_graphical_format(p):
             console.print(f"[yellow]Skipping graphical file '{p.name}': contains image-based content ({p.suffix}).[/yellow]")
             raise typer.Exit(0)
-        books_to_process.append({"id": 1, "title": p.stem, "author": "Unknown", "path": p})
+        p_pub = BookParser.extract_publication_date(p)
+        books_to_process.append({
+            "id": 1,
+            "title": p.stem,
+            "author": "Unknown",
+            "path": p,
+            "publication_date": p_pub,
+            "pubdate": p_pub,
+        })
 
     # Case 2: From Calibre / Download Folder / SMB share
     elif client.is_available():
@@ -1648,6 +1712,7 @@ def build_graph(
                 tracker.mark_skipped("build_graph", bid, title=b.get("title", f"Book {bid}"), reason=f"graphical: {fmts_label}")
                 continue
 
+            b_pub = b.get("publication_date") or b.get("pubdate")
             # If cached chunks exist locally, skip exporting or downloading EPUB from SMB share
             if chunk_store.has_chunks(bid) and not rechunk:
                 cached_files = [
@@ -1660,6 +1725,8 @@ def build_graph(
                         "title": b.get("title", f"Book {bid}"),
                         "author": ", ".join(b.get("authors", [])) or "Unknown",
                         "path": cached_files[0] if cached_files else None,
+                        "pubdate": b_pub,
+                        "publication_date": b_pub,
                     }
                 )
             else:
@@ -1676,6 +1743,8 @@ def build_graph(
                             "title": b.get("title", f"Book {bid}"),
                             "author": ", ".join(b.get("authors", [])) or "Unknown",
                             "path": book_file,
+                            "pubdate": b_pub,
+                            "publication_date": b_pub,
                         }
                     )
                 else:
@@ -1720,6 +1789,14 @@ def build_graph(
             console.print("[bold yellow]No books available to process.[/bold yellow]")
         raise typer.Exit(0)
 
+    if cfg.recent_ideas.enabled:
+        books_to_process = sort_books_chronologically(books_to_process)
+        dated_count = sum(1 for b in books_to_process if b.get("publication_date") or b.get("pubdate"))
+        console.print(
+            f"[bold cyan]Chronological Ingestion:[/bold cyan] Sorted {len(books_to_process)} book(s) "
+            f"by publication date ({dated_count} dated, {len(books_to_process) - dated_count} undated)."
+        )
+
     console.print(f"[bold green]Starting pipeline for {len(books_to_process)} book(s)...[/bold green]")
 
     num_servers = len(extractor.pool.alive_nodes) or len(extractor.pool.nodes)
@@ -1758,6 +1835,9 @@ def build_graph(
     book_state = None
     try:
         for book_idx, binfo in enumerate(books_to_process, start=1):
+            # Reload knowledge graph from previous state/batch to ensure synchronization
+            if graph_file.is_file():
+                store.load(graph_file)
             bid = binfo["id"]
             btitle = BookParser.repair_mojibake(binfo["title"])
             bauthor = BookParser.repair_mojibake(binfo["author"])
@@ -1851,9 +1931,13 @@ def build_graph(
                             clean_sec = (sec_title or f"Section #{completed + 1}").strip().replace("\n", " ")
                             if len(clean_sec) > 30:
                                 clean_sec = clean_sec[:27] + "..."
-                            st = chunker.embedding_stats or getattr(embeddings, "embedding_stats", {})
+                            raw_st = getattr(chunker, "embedding_stats", None) or getattr(embeddings, "embedding_stats", {})
+                            st = raw_st if isinstance(raw_st, dict) else {}
                             spd_txt = st.get("speed_texts_per_sec", 0.0)
-                            spd_kb = st.get("speed_chars_per_sec", 0.0) / 1024.0
+                            if not isinstance(spd_txt, (int, float)):
+                                spd_txt = 0.0
+                            raw_kb = st.get("speed_chars_per_sec", 0.0)
+                            spd_kb = (raw_kb / 1024.0) if isinstance(raw_kb, (int, float)) else 0.0
                             if spd_txt > 0:
                                 speed_badge = f" | [bold green]{spd_txt:.1f} sent/s[/bold green] [dim]({spd_kb:.1f} KB/s)[/dim]"
                             else:
@@ -2062,6 +2146,90 @@ def build_graph(
                                 unprocessed_fresh.append(chk)
                             else:
                                 unprocessed_retries.append((chk, init_attempt))
+
+                    # Semantic chunk routing if recent ideas are enabled
+                    limbo_candidate_map: Dict[str, Tuple[str, str]] = {}
+                    if cfg.recent_ideas.enabled and unprocessed_fresh and embeddings is not None:
+                        idea_index = IdeaEmbeddingIndex.build_from_graph(store, embeddings=embeddings)
+                        if idea_index.vectors is not None and len(idea_index.idea_names) > 0:
+                            router = RecentIdeaChunkRouter(
+                                idea_index=idea_index,
+                                embeddings=embeddings,
+                                unassigned_threshold=cfg.similarity_unassigned_threshold,
+                                high_confidence_threshold=cfg.similarity_high_confidence_threshold,
+                            )
+                            routing = router.route_chunks(unprocessed_fresh)
+
+                            # Priority 2: High confidence chunks (Fast-path: direct assignment, skip LLM extraction completely!)
+                            for rc in routing.high_confidence:
+                                h_chk = rc.chunk
+                                h_idea = rc.matched_idea
+                                if h_idea:
+                                    store.add_idea_support_link(
+                                        concept_name=h_idea,
+                                        chunk=h_chk,
+                                        quote=h_chk.text[:200] if h_chk.text else "",
+                                        brief_description=rc.matched_idea_summary,
+                                        publication_date=bpubdate,
+                                    )
+                                    store.add_book_idea_link(
+                                        book_id=bid,
+                                        concept_name=h_idea,
+                                        publication_date=bpubdate,
+                                    )
+                                    sec_node_id = store.add_section(
+                                        book_id=bid,
+                                        chapter_idx=h_chk.chapter_idx,
+                                        title=h_chk.section_title,
+                                        text=h_chk.text,
+                                    )
+                                    store.add_chunk(h_chk)
+                                    store.add_section_concept_link(
+                                        section_node_id=sec_node_id,
+                                        concept_name=h_idea,
+                                        summary=rc.matched_idea_summary,
+                                        quote=h_chk.text[:200] if h_chk.text else "",
+                                    )
+                                    book_state.mark_chunk_processed(
+                                        chunk_id=h_chk.chunk_id,
+                                        chunk_idx=h_chk.chunk_idx,
+                                        section_title=h_chk.section_title,
+                                        extraction_dict={"concepts": [{"name": h_idea, "summary": rc.matched_idea_summary, "category": "Idea"}]},
+                                        duration=0.0,
+                                        server_used="semantic_fastpath",
+                                    )
+                                    with stats_lock:
+                                        extracted_results.append({
+                                            "status": "extracted",
+                                            "chunk": h_chk,
+                                            "extraction": SectionExtraction(
+                                                concepts=[Concept(name=h_idea, summary=rc.matched_idea_summary, category="Idea")],
+                                                extracted_ideas=[],
+                                            ),
+                                            "duration": 0.0,
+                                            "server_used": "semantic_fastpath",
+                                        })
+                                    progress.advance(book_task, advance=1)
+                                    with display_lock:
+                                        console.print(
+                                            f"  [bold green]⚡ [{h_chk.section_title[:24]} p{h_chk.chunk_idx}][/bold green] "
+                                            f"High-confidence match ({rc.similarity:.2f}) -> directly assigned to '[bold cyan]{h_idea}[/bold cyan]' (skipped LLM)."
+                                        )
+
+                            # Record limbo candidates for Priority 3 chunks
+                            for rc in routing.limbo:
+                                if rc.matched_idea:
+                                    limbo_candidate_map[rc.chunk.chunk_id] = (rc.matched_idea, rc.matched_idea_summary)
+
+                            # Order LLM extraction queue: Priority 1 (Unassigned) first, then Priority 3 (Limbo)
+                            priority_chunks = [rc.chunk for rc in routing.unassigned] + [rc.chunk for rc in routing.limbo]
+                            unprocessed_fresh = priority_chunks
+                            if routing.high_confidence_count > 0 or routing.limbo_count > 0:
+                                console.print(
+                                    f"  [dim cyan]Semantic Chunk Routing: {routing.unassigned_count} unassigned (Priority 1 brand-new ideas), "
+                                    f"{routing.high_confidence_count} high-confidence (Priority 2 direct assignment), "
+                                    f"{routing.limbo_count} limbo (Priority 3 validation).[/dim cyan]"
+                                )
 
                     fresh_batches = batch_chunks_by_context_size(
                         unprocessed_fresh,
@@ -2388,6 +2556,7 @@ def build_graph(
                             store.add_book_idea_link(
                                 book_id=bid,
                                 concept_name=canonical_concept.name,
+                                publication_date=bpubdate,
                             )
 
                             # Validate textual grounding in this specific chunk
@@ -2407,6 +2576,7 @@ def build_graph(
                                     quote=valid_quote,
                                     brief_description=local_brief,
                                     detailed_explanation=local_detailed,
+                                    publication_date=bpubdate,
                                 )
                                 store.add_section_concept_link(
                                     section_node_id=sec_node_id,
@@ -2424,6 +2594,21 @@ def build_graph(
                                     src_concept_name=canonical_concept.name,
                                     tgt_concept_name=rel_name,
                                 )
+
+                        if chk.chunk_id in limbo_candidate_map:
+                            matched_cand_idea, matched_cand_summary = limbo_candidate_map[chk.chunk_id]
+                            store.add_idea_support_link(
+                                concept_name=matched_cand_idea,
+                                chunk=chk,
+                                quote=chk.text[:200] if chk.text else "",
+                                brief_description=matched_cand_summary,
+                                publication_date=bpubdate,
+                            )
+                            store.add_book_idea_link(
+                                book_id=bid,
+                                concept_name=matched_cand_idea,
+                                publication_date=bpubdate,
+                            )
 
                     # Ensure sequential NEXT and PREV relationships between chunks for this book
                     store.link_sequential_chunks(book_id=bid)
@@ -2498,6 +2683,23 @@ def build_graph(
                 store.save(graph_file)
                 completed_in_session += 1
                 console.print(f"  [dim green]✓ Book #{bid} concepts integrated and graph checkpoint saved.[/dim green]")
+
+                # Inter-batch post-processing
+                batch_size = cfg.batch_books if cfg.recent_ideas.enabled else 10
+                is_batch_end = (completed_in_session % batch_size == 0) or (book_idx == len(books_to_process))
+                should_dual_pass = cfg.dual_pass.enabled if dual_pass is None else dual_pass
+                if is_batch_end and should_dual_pass and not interrupted and store.graph.number_of_nodes() > 0:
+                    console.print(f"\n  [bold cyan]═══ Running Inter-Batch Dual-Pass Idea Consolidation (Batch size: {batch_size}) ═══[/bold cyan]")
+                    try:
+                        postprocessor = IdeaPostProcessor.from_settings(cfg)
+                        pp_report = postprocessor.process_graph(store, console=console)
+                        store.save(graph_file)
+                        console.print(
+                            f"  [bold green]✓ Inter-Batch Postprocessing Complete ({pp_report.duration_seconds:.2f}s):[/bold green] "
+                            f"{pp_report.total_clusters} clusters synthesized/consolidated."
+                        )
+                    except Exception as e:
+                        console.print(f"  [bold yellow]⚠ Inter-Batch Idea Postprocessor failed:[/bold yellow] {e}")
 
                 if limit is not None and limit > 0 and completed_in_session >= limit:
                     console.print(

@@ -42,7 +42,7 @@ from rich.progress import (
 )
 from rich.text import Text
 
-from bookeeper.calibre.parser import BookParser
+from bookeeper.calibre.parser import BookParser, format_idea_month
 from bookeeper.config import Settings
 from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings, OllamaPool
 
@@ -166,6 +166,7 @@ class IdeaObservation:
     weight: int = 5
     category: str = "Idea"
     related_concepts: List[str] = field(default_factory=list)
+    month: Optional[str] = None
 
 
 @dataclass
@@ -180,6 +181,7 @@ class IdeaCluster:
     category: str = "Idea"
     max_weight: int = 5
     embedding: Optional[np.ndarray] = None
+    first_occurrence_month: Optional[str] = None
 
     def add_observation(self, obs: IdeaObservation) -> None:
         self.observations.append(obs)
@@ -191,6 +193,16 @@ class IdeaCluster:
             self.max_weight = obs.weight
         if obs.category and obs.category not in ("Idea", "Concept", ""):
             self.category = obs.category
+        if obs.month:
+            if not self.first_occurrence_month or obs.month < self.first_occurrence_month:
+                self.first_occurrence_month = obs.month
+
+    def get_first_occurrence_month(self) -> Optional[str]:
+        """Find the earliest occurrence month across all observations and cluster metadata (earlier date wins)."""
+        valid = [o.month for o in self.observations if o.month]
+        if self.first_occurrence_month:
+            valid.append(self.first_occurrence_month)
+        return min(valid) if valid else None
 
     @property
     def total_occurrences(self) -> int:
@@ -520,6 +532,7 @@ class IdeaPostProcessor:
                 cat = attrs.get("category") or "Idea"
                 weight = int(attrs.get("weight") or 5)
                 clean_cand = clean_canonical_name(raw_name)
+                node_month = format_idea_month(attrs.get("first_occurrence_month") or attrs.get("month"))
 
                 if norm_name not in clusters_by_norm:
                     clusters_by_norm[norm_name] = IdeaCluster(
@@ -527,12 +540,16 @@ class IdeaPostProcessor:
                         normalized_name=norm_name,
                         category=cat,
                         max_weight=weight,
+                        first_occurrence_month=node_month,
                     )
 
                 cluster = clusters_by_norm[norm_name]
                 cluster.aliases.add(raw_name)
                 if clean_cand:
                     cluster.aliases.add(clean_cand)
+                if node_month:
+                    if not cluster.first_occurrence_month or node_month < cluster.first_occurrence_month:
+                        cluster.first_occurrence_month = node_month
 
                 # Update canonical name if current has leading determiner or candidate is better capitalized
                 if bool(re.match(r"^(?:the|a|an)\s+", cluster.canonical_name, re.IGNORECASE)):
@@ -573,6 +590,10 @@ class IdeaPostProcessor:
                     edge_brief = edge_data.get("brief_description") or brief
                     edge_detailed = edge_data.get("detailed_explanation") or detailed
 
+                    book_node = store.graph.nodes.get(f"book:{b_id}", {})
+                    book_pub = book_node.get("publication_date") or book_node.get("pubdate")
+                    obs_month = format_idea_month(book_pub) or node_month
+
                     obs = IdeaObservation(
                         concept_name=raw_name,
                         chunk_id=chunk_id,
@@ -585,6 +606,7 @@ class IdeaPostProcessor:
                         quote=quote,
                         weight=weight,
                         category=cat,
+                        month=obs_month,
                     )
                     cluster.add_observation(obs)
 
@@ -598,6 +620,7 @@ class IdeaPostProcessor:
                             local_detailed=detailed,
                             weight=weight,
                             category=cat,
+                            month=node_month,
                         )
                     )
         finally:
@@ -937,21 +960,25 @@ class IdeaPostProcessor:
         occurrences = cluster.total_occurrences
 
         # 1. Upsert Canonical Entity Node
+        earliest_month = cluster.get_first_occurrence_month()
         if not store.graph.has_node(canonical_nid):
-            store.graph.add_node(
-                canonical_nid,
-                type="Concept",
-                tag="idea",
-                tags=["idea", cat.lower().replace(" ", "-")],
-                is_idea=True,
-                name=canonical_name,
-                category=cat,
-                brief_description=brief,
-                detailed_explanation=detailed,
-                summary=brief or detailed,
-                weight=weight,
-                occurrences=occurrences,
-            )
+            node_attrs = {
+                "type": "Concept",
+                "tag": "idea",
+                "tags": ["idea", cat.lower().replace(" ", "-")],
+                "is_idea": True,
+                "name": canonical_name,
+                "category": cat,
+                "brief_description": brief,
+                "detailed_explanation": detailed,
+                "summary": brief or detailed,
+                "weight": weight,
+                "occurrences": occurrences,
+            }
+            if earliest_month:
+                node_attrs["first_occurrence_month"] = earliest_month
+                node_attrs["month"] = earliest_month
+            store.graph.add_node(canonical_nid, **node_attrs)
         else:
             nd = store.graph.nodes[canonical_nid]
             nd["type"] = "Concept"
@@ -964,6 +991,11 @@ class IdeaPostProcessor:
             nd["category"] = cat
             nd["weight"] = max(int(nd.get("weight") or 0), weight)
             nd["occurrences"] = max(int(nd.get("occurrences") or 0), occurrences)
+            if earliest_month:
+                curr_month = nd.get("first_occurrence_month") or nd.get("month")
+                if not curr_month or earliest_month < curr_month:
+                    nd["first_occurrence_month"] = earliest_month
+                    nd["month"] = earliest_month
             if "tags" not in nd:
                 nd["tags"] = ["idea", cat.lower().replace(" ", "-")]
 
@@ -973,6 +1005,12 @@ class IdeaPostProcessor:
                 continue
             alias_nid = f"concept:{alias}"
             if store.graph.has_node(alias_nid):
+                alias_month = store.graph.nodes[alias_nid].get("first_occurrence_month") or store.graph.nodes[alias_nid].get("month")
+                if alias_month:
+                    curr_m = store.graph.nodes[canonical_nid].get("first_occurrence_month") or store.graph.nodes[canonical_nid].get("month")
+                    if not curr_m or alias_month < curr_m:
+                        store.graph.nodes[canonical_nid]["first_occurrence_month"] = alias_month
+                        store.graph.nodes[canonical_nid]["month"] = alias_month
                 # Redirect in-edges to canonical
                 in_edges = list(store.graph.in_edges(alias_nid, data=True))
                 for src, _, edata in in_edges:

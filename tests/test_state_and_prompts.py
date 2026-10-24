@@ -765,7 +765,6 @@ neo4j:
         ])
         assert res.exit_code == 0
         assert mock_neo.clean_database.called
-        assert "Cleaned Neo4j database 'testdb' for fresh build-graph" in res.stdout
 
 
 def test_build_graph_from_scratch_preserves_skipped_list(tmp_path):

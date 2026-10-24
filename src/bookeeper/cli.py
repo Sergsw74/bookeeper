@@ -1446,12 +1446,8 @@ def build_graph(
         if should_export_neo4j:
             try:
                 neo_exp = Neo4jExporter.from_config(cfg.neo4j)
-                deleted_nodes = neo_exp.clean_database()
+                deleted_nodes = neo_exp.clean_database(console=console)
                 has_cleaned_neo4j = True
-                clean_str = f" (purged {deleted_nodes:,} previous nodes and all relationships)" if deleted_nodes > 0 else ""
-                console.print(
-                    f"[bold yellow]Cleaned Neo4j database '{cfg.neo4j.database}' for fresh build-graph{clean_str}.[/bold yellow]"
-                )
             except Exception as e:
                 console.print(
                     f"[bold red]✗ Failed to clean Neo4j database on start from scratch:[/bold red] {e}. "

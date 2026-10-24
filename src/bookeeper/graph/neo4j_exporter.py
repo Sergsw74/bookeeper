@@ -729,33 +729,84 @@ class Neo4jExporter:
             session.run(cypher, batch=rows)
         return len(rows)
 
-    def clean_database(self) -> int:
+    def clean_database(self, console: Optional[Any] = None, batch_size: int = 10000) -> int:
         """
         Delete all nodes and relationships in the target Neo4j database (clean start).
-        Uses iterative or batched detach delete to handle graphs cleanly.
+        Uses high-throughput transactional subquery batching (relationships first, then nodes)
+        to prevent monolithic transaction locks, JVM heap bloat, and prolonged fsync stalls.
         """
         self.verify_connectivity()
         driver = self.get_driver()
         deleted_count = 0
         with driver.session(database=self.database) as session:
-            result = session.run("MATCH (n) RETURN count(n) AS cnt")
-            record = result.single()
-            total_nodes = record["cnt"] if record else 0
-            if total_nodes > 0:
-                logger.info(
-                    f"Performing clean start: deleting {total_nodes} existing nodes and all relationships in Neo4j (db: {self.database})..."
-                )
+            rec_n = session.run("MATCH (n) RETURN count(n) AS cnt").single()
+            total_nodes = rec_n["cnt"] if rec_n else 0
+            rec_r = session.run("MATCH ()-[r]->() RETURN count(r) AS cnt").single()
+            total_rels = rec_r["cnt"] if rec_r else 0
+
+            if total_nodes == 0 and total_rels == 0:
+                logger.debug(f"Neo4j database '{self.database}' is already empty. Skipping purge.")
+                return 0
+
+            status_msg = f"Purging Neo4j database '{self.database}' ({total_nodes:,} nodes, {total_rels:,} relationships)..."
+            logger.info(status_msg)
+            if console is not None:
+                console.print(f"[bold cyan]⚡ {status_msg}[/bold cyan]")
+
+            t_start = time.monotonic()
+
+            # 1. Delete relationships FIRST in transactional subqueries
+            # Deleting relationships first eliminates graph edges and neighbor lock contention.
+            if total_rels > 0:
                 try:
-                    session.run("MATCH (n) DETACH DELETE n")
+                    rel_query = f"""
+                    MATCH ()-[r]->()
+                    CALL {{
+                        WITH r
+                        DELETE r
+                    }} IN TRANSACTIONS OF {batch_size} ROWS
+                    """
+                    session.run(rel_query)
                 except Exception as e:
-                    logger.debug(f"Direct DETACH DELETE failed ({e}), retrying with transaction batch...")
+                    logger.debug(f"Transactional subquery for relationship delete failed ({e}), falling back to iterative batches...")
                     while True:
-                        res = session.run("MATCH (n) WITH n LIMIT 10000 DETACH DELETE n RETURN count(n) AS c")
-                        rec = res.single()
-                        c = rec["c"] if rec else 0
+                        res = session.run(
+                            "MATCH ()-[r]->() WITH r LIMIT $batch_size DELETE r RETURN count(r) AS c",
+                            batch_size=batch_size,
+                        ).single()
+                        c = res["c"] if res else 0
                         if c == 0:
                             break
-                deleted_count = total_nodes
+
+            # 2. Delete remaining isolated nodes in transactional subqueries
+            if total_nodes > 0:
+                try:
+                    node_query = f"""
+                    MATCH (n)
+                    CALL {{
+                        WITH n
+                        DELETE n
+                    }} IN TRANSACTIONS OF {batch_size} ROWS
+                    """
+                    session.run(node_query)
+                except Exception as e:
+                    logger.debug(f"Transactional subquery for node delete failed ({e}), falling back to iterative batches...")
+                    while True:
+                        res = session.run(
+                            "MATCH (n) WITH n LIMIT $batch_size DELETE n RETURN count(n) AS c",
+                            batch_size=batch_size,
+                        ).single()
+                        c = res["c"] if res else 0
+                        if c == 0:
+                            break
+
+            duration = time.monotonic() - t_start
+            deleted_count = total_nodes
+            done_msg = f"Purged Neo4j database '{self.database}': cleared {total_nodes:,} nodes and {total_rels:,} relationships in {duration:.2f}s."
+            logger.info(done_msg)
+            if console is not None:
+                console.print(f"[bold green]✓ {done_msg}[/bold green]")
+
         return deleted_count
 
     def export(

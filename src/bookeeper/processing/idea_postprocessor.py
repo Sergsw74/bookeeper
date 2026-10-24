@@ -996,8 +996,9 @@ class IdeaPostProcessor:
         earliest_month = cluster.get_first_occurrence_month()
         emb_list: Optional[List[float]] = None
         if cluster.embedding is not None and len(cluster.embedding) > 1:
-            emb_list = [float(x) for x in cluster.embedding]
+            emb_list = [round(float(x), 6) for x in cluster.embedding]
 
+        node_changed = False
         if not store.graph.has_node(canonical_nid):
             node_attrs = {
                 "type": "Concept",
@@ -1018,8 +1019,14 @@ class IdeaPostProcessor:
             if emb_list is not None:
                 node_attrs["embedding"] = emb_list
             store.graph.add_node(canonical_nid, **node_attrs)
+            node_changed = True
         else:
             nd = store.graph.nodes[canonical_nid]
+            prev_brief = nd.get("brief_description")
+            prev_detailed = nd.get("detailed_explanation")
+            prev_month = nd.get("first_occurrence_month") or nd.get("month")
+            prev_has_emb = bool(nd.get("embedding"))
+
             nd["type"] = "Concept"
             nd["is_idea"] = True
             nd["tag"] = "idea"
@@ -1040,6 +1047,18 @@ class IdeaPostProcessor:
             if "tags" not in nd:
                 nd["tags"] = ["idea", cat.lower().replace(" ", "-")]
 
+            if (
+                prev_brief != brief
+                or prev_detailed != detailed
+                or (nd.get("first_occurrence_month") or nd.get("month")) != prev_month
+                or (not prev_has_emb and emb_list is not None)
+                or len(cluster.aliases) > 1
+            ):
+                node_changed = True
+
+        if node_changed:
+            store.mark_node_dirty(canonical_nid)
+
         # 2. Redirect alias nodes into canonical node and remove redundant nodes
         for alias in cluster.aliases:
             if alias == canonical_name:
@@ -1052,18 +1071,22 @@ class IdeaPostProcessor:
                     if not curr_m or alias_month < curr_m:
                         store.graph.nodes[canonical_nid]["first_occurrence_month"] = alias_month
                         store.graph.nodes[canonical_nid]["month"] = alias_month
+                        store.mark_node_dirty(canonical_nid)
                 # Redirect in-edges to canonical
                 in_edges = list(store.graph.in_edges(alias_nid, data=True))
                 for src, _, edata in in_edges:
                     if src != canonical_nid:
                         store.graph.add_edge(src, canonical_nid, **edata)
+                        store.mark_edge_dirty(src, canonical_nid)
                 # Redirect out-edges to canonical
                 out_edges = list(store.graph.out_edges(alias_nid, data=True))
                 for _, tgt, edata in out_edges:
                     if tgt != canonical_nid:
                         store.graph.add_edge(canonical_nid, tgt, **edata)
+                        store.mark_edge_dirty(canonical_nid, tgt)
                 # Remove alias node
                 store.graph.remove_node(alias_nid)
+                store.mark_node_removed(alias_nid)
 
         # 3. Link Provenance & Structural Edges
         # Connect consolidated idea node to all source chunks
@@ -1084,6 +1107,7 @@ class IdeaPostProcessor:
                         detailed_explanation=detailed,
                         chunk_id=chunk_id,
                     )
+                    store.mark_edge_dirty(canonical_nid, chunk_nid)
                     edges_added += 1
 
                 # (:Chunk) -[:SUPPORTS_IDEA]-> (:Concept)
@@ -1096,6 +1120,7 @@ class IdeaPostProcessor:
                         brief_description=brief,
                         detailed_explanation=detailed,
                     )
+                    store.mark_edge_dirty(chunk_nid, canonical_nid)
                     edges_added += 1
 
                 # Explicit [:MENTIONED_IN] provenance relation
@@ -1107,6 +1132,8 @@ class IdeaPostProcessor:
                         relation="MENTIONED_IN",
                         chunk_id=chunk_id,
                     )
+                    if node_changed:
+                        store.mark_edge_dirty(canonical_nid, chunk_nid)
                     edges_added += 1
 
         # 4. Emit directed relational edges ([:RELATES_TO])

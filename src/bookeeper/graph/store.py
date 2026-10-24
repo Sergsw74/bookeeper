@@ -27,6 +27,38 @@ class ConceptGraphStore:
 
     def __init__(self, graph: Optional[nx.DiGraph] = None):
         self.graph: nx.DiGraph = graph if graph is not None else nx.DiGraph()
+        self.dirty_nodes: Set[str] = set()
+        self.dirty_edges: Set[tuple[str, str]] = set()
+        self.removed_nodes: Set[str] = set()
+
+    def mark_node_dirty(self, node_id: str) -> None:
+        """Record a node as added/modified since the last incremental export."""
+        self.dirty_nodes.add(node_id)
+        self.removed_nodes.discard(node_id)
+
+    def mark_edge_dirty(self, src_id: str, tgt_id: str) -> None:
+        """Record a directed edge as added/modified since the last incremental export."""
+        self.dirty_edges.add((src_id, tgt_id))
+        self.dirty_nodes.add(src_id)
+        self.dirty_nodes.add(tgt_id)
+
+    def mark_node_removed(self, node_id: str) -> None:
+        """Record a node as deleted/merged so incremental export removes it from Neo4j."""
+        self.dirty_nodes.discard(node_id)
+        self.removed_nodes.add(node_id)
+        self.dirty_edges = {
+            (u, v) for (u, v) in self.dirty_edges if u != node_id and v != node_id
+        }
+
+    def has_dirty_changes(self) -> bool:
+        """Return True if any nodes or edges were modified or removed since the last incremental export."""
+        return bool(self.dirty_nodes or self.dirty_edges or self.removed_nodes)
+
+    def clear_dirty(self) -> None:
+        """Clear dirty node/edge tracking sets after a successful incremental export."""
+        self.dirty_nodes.clear()
+        self.dirty_edges.clear()
+        self.removed_nodes.clear()
 
     def add_book(
         self,
@@ -74,6 +106,7 @@ class ConceptGraphStore:
                 nd["publication_date"] = pub_date
             if "tags" not in nd:
                 nd["tags"] = book_tags
+        self.mark_node_dirty(node_id)
         return node_id
 
     def update_idea_occurrence_month(
@@ -98,6 +131,7 @@ class ConceptGraphStore:
             if not curr_month or month < curr_month:
                 nd["first_occurrence_month"] = month
                 nd["month"] = month
+                self.mark_node_dirty(concept_node_id)
                 return month
             return curr_month
         return None
@@ -164,6 +198,8 @@ class ConceptGraphStore:
                 book_node_id,
                 relation="FEATURED_IN",
             )
+        self.mark_edge_dirty(book_node_id, concept_node_id)
+        self.mark_edge_dirty(concept_node_id, book_node_id)
 
     def add_section(
         self,
@@ -196,6 +232,7 @@ class ConceptGraphStore:
             section_node_id,
             relation="HAS_SECTION",
         )
+        self.mark_edge_dirty(book_node_id, section_node_id)
         return section_node_id
 
     def add_concept(self, concept: Concept, embedding: Optional[List[float]] = None) -> str:
@@ -223,7 +260,7 @@ class ConceptGraphStore:
                 "occurrences": 1,
             }
             if emb:
-                node_attrs["embedding"] = [float(x) for x in emb]
+                node_attrs["embedding"] = [round(float(x), 6) for x in emb]
             self.graph.add_node(node_id, **node_attrs)
         else:
             node_data = self.graph.nodes[node_id]
@@ -240,12 +277,13 @@ class ConceptGraphStore:
             if len(summary_cand) > len(node_data.get("summary", "")):
                 node_data["summary"] = summary_cand
             if emb and not node_data.get("embedding"):
-                node_data["embedding"] = [float(x) for x in emb]
+                node_data["embedding"] = [round(float(x), 6) for x in emb]
 
+        self.mark_node_dirty(node_id)
         return node_id
 
     def add_chunk(self, chunk: Any) -> str:
-        """Add a Chunk node and connect (:Section) -[:HAS_CHUNK]-> (:Chunk)."""
+        """Add a Chunk node (preserving its embedding) and connect (:Section) -[:HAS_CHUNK]-> (:Chunk)."""
         chunk_node_id = f"chunk:{chunk.chunk_id}"
         section_node_id = f"section:{chunk.book_id}:{chunk.chapter_idx}"
 
@@ -260,26 +298,37 @@ class ConceptGraphStore:
         chunk_idx = getattr(chunk, "chunk_idx", 0)
         prev_chunk_id = getattr(chunk, "prev_chunk_id", None)
         next_chunk_id = getattr(chunk, "next_chunk_id", None)
-
-        self.graph.add_node(
-            chunk_node_id,
-            type="Chunk",
-            chunk_id=chunk.chunk_id,
-            book_id=chunk.book_id,
-            book_title=chunk.book_title,
-            chapter_idx=chunk.chapter_idx,
-            chapter_title=getattr(chunk, "chapter_title", chunk.section_title),
-            section_title=chunk.section_title,
-            subtitle=getattr(chunk, "subtitle", chunk.section_title),
-            breadcrumb=chunk.breadcrumb,
-            text=chunk.text,
-            char_count=chunk.char_count,
-            parent_chunk_id=getattr(chunk, "parent_chunk_id", None),
-            hierarchy_level=getattr(chunk, "hierarchy_level", "child"),
-            chunk_idx=chunk_idx,
-            prev_chunk_id=prev_chunk_id,
-            next_chunk_id=next_chunk_id,
+        emb = getattr(chunk, "embedding", None)
+        existing_emb = (
+            self.graph.nodes[chunk_node_id].get("embedding")
+            if self.graph.has_node(chunk_node_id)
+            else None
         )
+
+        chunk_attrs: Dict[str, Any] = {
+            "type": "Chunk",
+            "chunk_id": chunk.chunk_id,
+            "book_id": chunk.book_id,
+            "book_title": chunk.book_title,
+            "chapter_idx": chunk.chapter_idx,
+            "chapter_title": getattr(chunk, "chapter_title", chunk.section_title),
+            "section_title": chunk.section_title,
+            "subtitle": getattr(chunk, "subtitle", chunk.section_title),
+            "breadcrumb": chunk.breadcrumb,
+            "text": chunk.text,
+            "char_count": chunk.char_count,
+            "parent_chunk_id": getattr(chunk, "parent_chunk_id", None),
+            "hierarchy_level": getattr(chunk, "hierarchy_level", "child"),
+            "chunk_idx": chunk_idx,
+            "prev_chunk_id": prev_chunk_id,
+            "next_chunk_id": next_chunk_id,
+        }
+        if emb and len(emb) > 1:
+            chunk_attrs["embedding"] = [round(float(x), 6) for x in emb]
+        elif existing_emb and len(existing_emb) > 1:
+            chunk_attrs["embedding"] = existing_emb
+
+        self.graph.add_node(chunk_node_id, **chunk_attrs)
 
         # Edge: (:Section) -[:HAS_CHUNK]-> (:Chunk)
         self.graph.add_edge(
@@ -287,6 +336,7 @@ class ConceptGraphStore:
             chunk_node_id,
             relation="HAS_CHUNK",
         )
+        self.mark_edge_dirty(section_node_id, chunk_node_id)
 
         # Sequential edges between chunks: (:Chunk A) -[:NEXT]-> (:Chunk B), (:Chunk B) -[:PREV]-> (:Chunk A)
         if prev_chunk_id:
@@ -294,12 +344,16 @@ class ConceptGraphStore:
             if self.graph.has_node(p_nid):
                 self.graph.add_edge(p_nid, chunk_node_id, relation="NEXT")
                 self.graph.add_edge(chunk_node_id, p_nid, relation="PREV")
+                self.mark_edge_dirty(p_nid, chunk_node_id)
+                self.mark_edge_dirty(chunk_node_id, p_nid)
 
         if next_chunk_id:
             n_nid = f"chunk:{next_chunk_id}" if not str(next_chunk_id).startswith("chunk:") else str(next_chunk_id)
             if self.graph.has_node(n_nid):
                 self.graph.add_edge(chunk_node_id, n_nid, relation="NEXT")
                 self.graph.add_edge(n_nid, chunk_node_id, relation="PREV")
+                self.mark_edge_dirty(chunk_node_id, n_nid)
+                self.mark_edge_dirty(n_nid, chunk_node_id)
 
         return chunk_node_id
 
@@ -350,6 +404,9 @@ class ConceptGraphStore:
                 # Ensure edges exist
                 self.graph.add_edge(curr_id, next_id, relation="NEXT")
                 self.graph.add_edge(next_id, curr_id, relation="PREV")
+                if book_id is not None:
+                    self.mark_edge_dirty(curr_id, next_id)
+                    self.mark_edge_dirty(next_id, curr_id)
 
                 curr_cid = curr_attrs.get("chunk_id") or curr_id.replace("chunk:", "")
                 next_cid = next_attrs.get("chunk_id") or next_id.replace("chunk:", "")
@@ -374,12 +431,18 @@ class ConceptGraphStore:
                     if self.graph.has_node(p_nid):
                         self.graph.add_edge(p_nid, node_id, relation="NEXT")
                         self.graph.add_edge(node_id, p_nid, relation="PREV")
+                        if book_id is not None:
+                            self.mark_edge_dirty(p_nid, node_id)
+                            self.mark_edge_dirty(node_id, p_nid)
                 next_cid = attrs.get("next_chunk_id")
                 if next_cid:
                     n_nid = f"chunk:{next_cid}" if not str(next_cid).startswith("chunk:") else str(next_cid)
                     if self.graph.has_node(n_nid):
                         self.graph.add_edge(node_id, n_nid, relation="NEXT")
                         self.graph.add_edge(n_nid, node_id, relation="PREV")
+                        if book_id is not None:
+                            self.mark_edge_dirty(node_id, n_nid)
+                            self.mark_edge_dirty(n_nid, node_id)
 
         return linked_pairs
 
@@ -456,6 +519,8 @@ class ConceptGraphStore:
             brief_description=brief_description,
             detailed_explanation=detailed_explanation,
         )
+        self.mark_edge_dirty(concept_node_id, chunk_node_id)
+        self.mark_edge_dirty(chunk_node_id, concept_node_id)
 
     def add_section_concept_link(
         self,
@@ -494,6 +559,7 @@ class ConceptGraphStore:
             summary=summary,
             quote=quote,
         )
+        self.mark_edge_dirty(section_node_id, concept_node_id)
 
     def add_concept_relation(
         self,
@@ -528,6 +594,7 @@ class ConceptGraphStore:
             tgt_id,
             relation=relation_type,
         )
+        self.mark_edge_dirty(src_id, tgt_id)
 
     def remove_book(self, book_id: int) -> Dict[str, int]:
         """
@@ -587,6 +654,11 @@ class ConceptGraphStore:
         if orphan_concepts:
             self.graph.remove_nodes_from(orphan_concepts)
 
+        for rn in removed_nodes:
+            self.mark_node_removed(rn)
+        for oc in orphan_concepts:
+            self.mark_node_removed(oc)
+
         stats = {
             "book_removed": 1 if book_node_id in removed_nodes else 0,
             "sections_removed": len(section_nodes),
@@ -623,16 +695,27 @@ class ConceptGraphStore:
             "concept_weight_count": len(concept_weights),
         }
 
-    def save(self, file_path: Path | str) -> Path:
-        """Persist graph to JSON node-link format."""
+    def save(self, file_path: Path | str, link_chunks: bool = True) -> Path:
+        """
+        Persist graph to JSON node-link format.
+        Uses compact JSON formatting when the graph contains vector embeddings or >100 nodes
+        to avoid writing millions of indented float lines on every book checkpoint.
+        """
         path = Path(file_path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        self.link_sequential_chunks()
+        if link_chunks:
+            self.link_sequential_chunks()
 
         data = json_graph.node_link_data(self.graph)
+        use_compact = self.graph.number_of_nodes() > 100 or any(
+            "embedding" in attrs for _, attrs in self.graph.nodes(data=True)
+        )
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+            if use_compact:
+                json.dump(data, f, separators=(",", ":"))
+            else:
+                json.dump(data, f, indent=2)
 
         logger.info(f"Saved graph with {len(self.graph)} nodes to {path}")
         return path
@@ -682,20 +765,49 @@ class ConceptGraphStore:
         include_chunks: bool = True,
         batch_size: int = 64,
         console: Optional[Any] = None,
+        chunks_dir: Optional[Path | str] = None,
     ) -> Dict[str, int]:
         """
         Backfill missing 'embedding' vectors on existing :Idea (:Concept) and :Chunk nodes
-        in the knowledge graph using size-aware batching, without needing to rebuild the
-        knowledge graph from scratch.
+        in the knowledge graph using size-aware batching (and reusing cached chunk embeddings
+        from chunks_dir when available), without needing to rebuild the knowledge graph from scratch.
         """
-        if embeddings is None:
-            return {"ideas_embedded": 0, "chunks_embedded": 0}
-
         import numpy as np
         from bookeeper.processing.ollama_pool import (
             format_idea_for_embedding,
             partition_texts_for_embedding,
         )
+
+        # First, if chunks_dir is provided, reuse any chunk embeddings already stored in book_{id}.json
+        chunks_reused_from_disk = 0
+        if include_chunks and chunks_dir is not None:
+            cdir = Path(chunks_dir).expanduser().resolve()
+            if cdir.is_dir():
+                books_needing_chunks: Set[int] = set()
+                for _, attrs in self.graph.nodes(data=True):
+                    if attrs.get("type") == "Chunk" and not attrs.get("embedding"):
+                        bid = attrs.get("book_id")
+                        if bid is not None:
+                            books_needing_chunks.add(int(bid))
+                for bid in books_needing_chunks:
+                    cfile = cdir / f"book_{bid}.json"
+                    if cfile.is_file():
+                        try:
+                            with open(cfile, "r", encoding="utf-8") as f:
+                                cdata = json.load(f)
+                            for citem in cdata.get("chunks", []):
+                                cid = citem.get("chunk_id")
+                                cemb = citem.get("embedding")
+                                cnid = f"chunk:{cid}"
+                                if cid and cemb and len(cemb) > 1 and self.graph.has_node(cnid):
+                                    self.graph.nodes[cnid]["embedding"] = [round(float(x), 6) for x in cemb]
+                                    self.mark_node_dirty(cnid)
+                                    chunks_reused_from_disk += 1
+                        except Exception:
+                            pass
+
+        if embeddings is None:
+            return {"ideas_embedded": 0, "chunks_embedded": chunks_reused_from_disk}
 
         missing_idea_nodes: List[tuple[str, str]] = []
         missing_chunk_nodes: List[tuple[str, str]] = []
@@ -728,7 +840,7 @@ class ConceptGraphStore:
                     missing_chunk_nodes.append((node_id, chunk_text))
 
         ideas_embedded = 0
-        chunks_embedded = 0
+        chunks_embedded = chunks_reused_from_disk
 
         if missing_idea_nodes:
             idea_texts = [t for _, t in missing_idea_nodes]
@@ -770,7 +882,8 @@ class ConceptGraphStore:
                                     arr = np.array(v, dtype=np.float32)
                                     norm = float(np.linalg.norm(arr))
                                     unit = (arr / norm) if norm > 0.0 else arr
-                                    self.graph.nodes[nid]["embedding"] = [float(x) for x in unit.tolist()]
+                                    self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
+                                    self.mark_node_dirty(nid)
                                     ideas_embedded += 1
                         except Exception as e:
                             logger.warning(f"Failed backfilling idea embeddings batch at {offset}: {e}")
@@ -790,7 +903,8 @@ class ConceptGraphStore:
                                 arr = np.array(v, dtype=np.float32)
                                 norm = float(np.linalg.norm(arr))
                                 unit = (arr / norm) if norm > 0.0 else arr
-                                self.graph.nodes[nid]["embedding"] = [float(x) for x in unit.tolist()]
+                                self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
+                                self.mark_node_dirty(nid)
                                 ideas_embedded += 1
                     except Exception as e:
                         logger.warning(f"Failed backfilling idea embeddings batch at {offset}: {e}")
@@ -836,7 +950,8 @@ class ConceptGraphStore:
                                     arr = np.array(v, dtype=np.float32)
                                     norm = float(np.linalg.norm(arr))
                                     unit = (arr / norm) if norm > 0.0 else arr
-                                    self.graph.nodes[nid]["embedding"] = [float(x) for x in unit.tolist()]
+                                    self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
+                                    self.mark_node_dirty(nid)
                                     chunks_embedded += 1
                         except Exception as e:
                             logger.warning(f"Failed backfilling chunk embeddings batch at {offset}: {e}")
@@ -856,7 +971,8 @@ class ConceptGraphStore:
                                 arr = np.array(v, dtype=np.float32)
                                 norm = float(np.linalg.norm(arr))
                                 unit = (arr / norm) if norm > 0.0 else arr
-                                self.graph.nodes[nid]["embedding"] = [float(x) for x in unit.tolist()]
+                                self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
+                                self.mark_node_dirty(nid)
                                 chunks_embedded += 1
                     except Exception as e:
                         logger.warning(f"Failed backfilling chunk embeddings batch at {offset}: {e}")

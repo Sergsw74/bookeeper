@@ -5,7 +5,8 @@ and two-tier LLM-assisted verification and synthesis.
 
 import logging
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from langchain_core.embeddings import Embeddings
@@ -67,6 +68,22 @@ class EntityDeduplicator:
 
         # Canonical name -> (Normalized unit vector, Concept instance)
         self._cache: Dict[str, Tuple[Optional[np.ndarray], Concept]] = {}
+        # Normalized name -> Canonical name in _cache for O(1) lookup
+        self._norm_to_canon: Dict[str, str] = {}
+        # Cache of LLM disambiguation decisions: (norm_name_a, norm_name_b) -> decision
+        self._disambiguation_cache: Dict[Tuple[str, str], ConceptDeduplicationDecision] = {}
+
+    def _register_in_cache(
+        self,
+        canon_name: str,
+        vec: Optional[np.ndarray],
+        concept: Concept,
+    ) -> None:
+        """Register or update a concept in _cache and maintain _norm_to_canon index."""
+        self._cache[canon_name] = (vec, concept)
+        norm_key = self._normalize_name(canon_name)
+        if norm_key:
+            self._norm_to_canon[norm_key] = canon_name
 
     @classmethod
     def from_settings(
@@ -154,7 +171,7 @@ class EntityDeduplicator:
             )
             if emb_list is not None:
                 concept_obj.embedding = emb_list
-            self._cache[clean_name] = (vec_arr, concept_obj)
+            self._register_in_cache(clean_name, vec_arr, concept_obj)
             seeded += 1
         return seeded
 
@@ -173,9 +190,15 @@ class EntityDeduplicator:
         raw_name = concept.name
         norm_name = self._normalize_name(raw_name)
 
-        # 1. Exact or case-insensitive string match (highest confidence)
+        # 1. O(1) Exact or case-insensitive normalized string match (highest confidence)
+        matched_canon = self._norm_to_canon.get(norm_name)
+        if matched_canon and matched_canon in self._cache:
+            _, existing = self._cache[matched_canon]
+            self._merge_into(existing, concept)
+            return existing
         for canon_name, (_, existing) in self._cache.items():
             if self._normalize_name(canon_name) == norm_name:
+                self._norm_to_canon[norm_name] = canon_name
                 self._merge_into(existing, concept)
                 return existing
 
@@ -235,7 +258,7 @@ class EntityDeduplicator:
                     return best_match
 
         # 3. Register as new canonical node
-        self._cache[raw_name] = (concept_vec, concept)
+        self._register_in_cache(raw_name, concept_vec, concept)
         return concept
 
     def resolve_concepts_batch(
@@ -244,6 +267,7 @@ class EntityDeduplicator:
         neo4j_exporter: Optional[Any] = None,
         top_k: int = 3,
         batch_size: int = 64,
+        on_progress: Optional[Callable[[str, int, int, str], None]] = None,
     ) -> List[Concept]:
         """
         Batch-resolve all extracted ideas/concepts from an article or book:
@@ -252,7 +276,8 @@ class EntityDeduplicator:
            the native Neo4j HNSW vector index on :Idea(embedding)
            (UNWIND $idea_vectors AS vec CALL db.index.vector.queryNodes('idea_idx', 3, vec)),
            plus vectorized comparison against in-memory cached ideas.
-        3. Resolve each concept via two-tier thresholding and attach normalized embeddings.
+        3. Concurrently disambiguate any probable matches (0.80 <= sim < 0.95) across the LLM pool
+           and resolve each concept with live progress callbacks.
         """
         if not concepts:
             return []
@@ -269,6 +294,7 @@ class EntityDeduplicator:
 
         for c in concepts:
             raw_name = c.name
+            norm_name = self._normalize_name(raw_name)
             embed_text = format_idea_for_embedding(
                 raw_name,
                 brief_description=getattr(c, "brief_description", "") or "",
@@ -285,8 +311,9 @@ class EntityDeduplicator:
                 missing_text_to_vec[embed_text] = unit
                 continue
 
-            if raw_name in self._cache and self._cache[raw_name][0] is not None:
-                vec = self._cache[raw_name][0]
+            canon_hit = self._norm_to_canon.get(norm_name) or (raw_name if raw_name in self._cache else None)
+            if canon_hit and canon_hit in self._cache and self._cache[canon_hit][0] is not None:
+                vec = self._cache[canon_hit][0]
                 if vec is not None:
                     c.embedding = vec.tolist()
                     missing_text_to_vec[embed_text] = vec
@@ -302,6 +329,9 @@ class EntityDeduplicator:
                 max_batch_chars=12000,
                 max_batch_items=batch_size,
             )
+            embedded_so_far = 0
+            if on_progress:
+                on_progress("embed_ideas", 0, len(missing_texts), f"Embedding {len(missing_texts)} unique ideas")
             for b_idx, sub in enumerate(text_batches):
                 try:
                     if hasattr(self.embeddings, "embed_documents"):
@@ -316,6 +346,14 @@ class EntityDeduplicator:
                             missing_text_to_vec[txt] = unit
                 except Exception as e:
                     logger.debug(f"Batch concept embedding failed on sub-batch {b_idx}: {e}")
+                embedded_so_far += len(sub)
+                if on_progress:
+                    on_progress(
+                        "embed_ideas",
+                        embedded_so_far,
+                        len(missing_texts),
+                        f"Embedded {embedded_so_far}/{len(missing_texts)} ideas",
+                    )
 
         for c in concepts:
             embed_text = concept_to_embed_text.get(c.name, c.name)
@@ -333,6 +371,8 @@ class EntityDeduplicator:
                     query_indices.append(idx)
                     idea_vectors.append(c.embedding)
             if idea_vectors:
+                if on_progress:
+                    on_progress("hnsw_query", 0, len(idea_vectors), f"Querying Neo4j HNSW index for {len(idea_vectors)} ideas")
                 try:
                     batch_hnsw = neo4j_exporter.query_ideas_hnsw_batch(idea_vectors, top_k=top_k)
                     for q_pos, idx in enumerate(query_indices):
@@ -340,6 +380,113 @@ class EntityDeduplicator:
                             hnsw_candidates_by_idx[idx] = batch_hnsw[q_pos]
                 except Exception as e:
                     logger.debug(f"Neo4j HNSW batch query in resolve_concepts_batch fallback to cache: {e}")
+                if on_progress:
+                    on_progress("hnsw_query", len(idea_vectors), len(idea_vectors), f"Queried Neo4j HNSW index ({len(idea_vectors)} ideas)")
+
+        # Build a vectorized snapshot of in-memory cached vectors for fast matrix cosine comparison
+        cached_names: List[str] = []
+        cached_concepts: List[Concept] = []
+        cached_vecs_list: List[np.ndarray] = []
+        target_dim: Optional[int] = None
+        for cname, (cvec, cobj) in self._cache.items():
+            if cvec is not None and cvec.ndim == 1 and len(cvec) > 1:
+                if target_dim is None:
+                    target_dim = cvec.shape[0]
+                if cvec.shape[0] == target_dim:
+                    cached_names.append(cname)
+                    cached_concepts.append(cobj)
+                    cached_vecs_list.append(cvec)
+        cached_matrix: Optional[np.ndarray] = (
+            np.vstack(cached_vecs_list) if cached_vecs_list else None
+        )
+
+        # Pre-pass: identify any probable matches (0.80 <= sim < 0.95) against existing cache/HNSW
+        # so we can run LLM disambiguation concurrently across the Ollama pool instead of sequentially!
+        if self.extractor is not None:
+            pending_disambiguations: Dict[Tuple[str, str], Tuple[Concept, Concept, float]] = {}
+            for idx, concept in enumerate(concepts):
+                raw_name = concept.name
+                norm_name = self._normalize_name(raw_name)
+                if norm_name in self._norm_to_canon:
+                    continue
+
+                embed_text = concept_to_embed_text.get(raw_name, raw_name)
+                concept_vec = missing_text_to_vec.get(embed_text)
+                if concept_vec is None and concept.embedding and len(concept.embedding) > 1:
+                    arr = np.array(concept.embedding, dtype=np.float32)
+                    norm = float(np.linalg.norm(arr))
+                    concept_vec = (arr / norm) if norm > 0.0 else arr
+
+                best_sim = -1.0
+                best_match: Optional[Concept] = None
+                for cand in hnsw_candidates_by_idx.get(idx, []):
+                    cand_name = BookParser.repair_mojibake(str(cand.get("name") or "")).strip()
+                    cand_score = float(cand.get("score") or 0.0)
+                    if not cand_name:
+                        continue
+                    if cand_name in self._cache:
+                        _, existing_c = self._cache[cand_name]
+                    else:
+                        existing_c = Concept(
+                            name=cand_name,
+                            brief_description=cand.get("brief_description") or cand.get("summary") or "",
+                            detailed_explanation=cand.get("detailed_explanation") or "",
+                            summary=cand.get("summary") or cand.get("brief_description") or "",
+                            category="Idea",
+                        )
+                        self._register_in_cache(cand_name, None, existing_c)
+                    if cand_score > best_sim:
+                        best_sim = cand_score
+                        best_match = existing_c
+
+                if concept_vec is not None and cached_matrix is not None and concept_vec.shape[0] == cached_matrix.shape[1]:
+                    sims = np.dot(cached_matrix, concept_vec)
+                    max_i = int(np.argmax(sims))
+                    sim_val = float(sims[max_i])
+                    if sim_val > best_sim:
+                        best_sim = sim_val
+                        best_match = cached_concepts[max_i]
+
+                if (
+                    best_match is not None
+                    and self.similarity_threshold <= best_sim < self.high_similarity_threshold
+                ):
+                    pair_key = (self._normalize_name(best_match.name), norm_name)
+                    if pair_key not in self._disambiguation_cache and pair_key not in pending_disambiguations:
+                        pending_disambiguations[pair_key] = (best_match, concept, best_sim)
+
+            if pending_disambiguations:
+                total_disambig = len(pending_disambiguations)
+                pool_obj = getattr(self.extractor, "pool", None)
+                max_workers = max(1, min(total_disambig, len(getattr(pool_obj, "nodes", [1])) * 2 if pool_obj else 4))
+                if on_progress:
+                    on_progress(
+                        "llm_disambiguation",
+                        0,
+                        total_disambig,
+                        f"Disambiguating {total_disambig} probable idea match(es) via LLM",
+                    )
+                done_disambig = 0
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    fut_to_key = {
+                        ex.submit(self._ask_llm_disambiguation, b_match, inc_c, b_sim): p_key
+                        for p_key, (b_match, inc_c, b_sim) in pending_disambiguations.items()
+                    }
+                    for fut in as_completed(fut_to_key):
+                        p_key = fut_to_key[fut]
+                        try:
+                            self._disambiguation_cache[p_key] = fut.result()
+                        except Exception as e:
+                            logger.debug(f"Parallel LLM disambiguation failed for {p_key}: {e}")
+                            self._disambiguation_cache[p_key] = ConceptDeduplicationDecision(is_same_concept=False)
+                        done_disambig += 1
+                        if on_progress:
+                            on_progress(
+                                "llm_disambiguation",
+                                done_disambig,
+                                total_disambig,
+                                f"Disambiguated {done_disambig}/{total_disambig} probable idea match(es)",
+                            )
 
         # 3. Resolve each concept in order, combining HNSW candidates and in-memory cache
         resolved_list: List[Concept] = []
@@ -347,12 +494,17 @@ class EntityDeduplicator:
             raw_name = concept.name
             norm_name = self._normalize_name(raw_name)
 
-            # 3a. Exact or normalized name match in cache
+            # 3a. O(1) Exact or normalized name match in cache
             exact_hit: Optional[Concept] = None
-            for canon_name, (_, existing) in self._cache.items():
-                if self._normalize_name(canon_name) == norm_name:
-                    exact_hit = existing
-                    break
+            canon_hit = self._norm_to_canon.get(norm_name)
+            if canon_hit and canon_hit in self._cache:
+                _, exact_hit = self._cache[canon_hit]
+            else:
+                for canon_name, (_, existing) in self._cache.items():
+                    if self._normalize_name(canon_name) == norm_name:
+                        self._norm_to_canon[norm_name] = canon_name
+                        exact_hit = existing
+                        break
             if exact_hit is not None:
                 self._merge_into(exact_hit, concept)
                 if exact_hit.embedding is None and concept.embedding:
@@ -360,7 +512,8 @@ class EntityDeduplicator:
                 resolved_list.append(exact_hit)
                 continue
 
-            concept_vec = missing_text_to_vec.get(raw_name)
+            embed_text = concept_to_embed_text.get(raw_name, raw_name)
+            concept_vec = missing_text_to_vec.get(embed_text)
             if concept_vec is None and concept.embedding and len(concept.embedding) > 1:
                 arr = np.array(concept.embedding, dtype=np.float32)
                 norm = float(np.linalg.norm(arr))
@@ -387,21 +540,31 @@ class EntityDeduplicator:
                         summary=cand.get("summary") or cand.get("brief_description") or "",
                         category="Idea",
                     )
-                    self._cache[cand_name] = (None, existing_c)
+                    self._register_in_cache(cand_name, None, existing_c)
                 if cand_score > best_sim:
                     best_sim = cand_score
                     best_match = existing_c
                     best_canon_name = cand_name
 
-            # Also check in-memory _cache vectors (covers concepts added earlier in the same batch or when Neo4j is offline)
+            # Also check in-memory _cache vectors
             if concept_vec is not None and self._cache:
-                for canon_name, (cached_vec, existing_concept) in self._cache.items():
-                    if cached_vec is not None and cached_vec.shape == concept_vec.shape:
-                        sim = float(np.dot(concept_vec, cached_vec))
-                        if sim > best_sim:
-                            best_sim = sim
-                            best_match = existing_concept
-                            best_canon_name = canon_name
+                if cached_matrix is not None and concept_vec.shape[0] == cached_matrix.shape[1]:
+                    sims = np.dot(cached_matrix, concept_vec)
+                    max_i = int(np.argmax(sims))
+                    sim_val = float(sims[max_i])
+                    if sim_val > best_sim:
+                        best_sim = sim_val
+                        best_match = cached_concepts[max_i]
+                        best_canon_name = cached_names[max_i]
+                # Also check any newly added concepts in _cache during this loop beyond cached_matrix
+                if len(self._cache) > len(cached_names):
+                    for canon_name, (cached_vec, existing_concept) in list(self._cache.items())[len(cached_names) :]:
+                        if cached_vec is not None and cached_vec.shape == concept_vec.shape:
+                            sim = float(np.dot(concept_vec, cached_vec))
+                            if sim > best_sim:
+                                best_sim = sim
+                                best_match = existing_concept
+                                best_canon_name = canon_name
 
             # Case A: High Confidence (>= 0.95) -> Direct merge
             if best_match is not None and best_sim >= self.high_similarity_threshold:
@@ -411,10 +574,14 @@ class EntityDeduplicator:
                 resolved_list.append(best_match)
                 continue
 
-            # Case B: Probable match (0.80 <= similarity < 0.95) -> LLM disambiguation
+            # Case B: Probable match (0.80 <= similarity < 0.95) -> LLM disambiguation (reusing parallel pre-pass cache)
             if best_match is not None and best_sim >= self.similarity_threshold:
                 if self.extractor is not None:
-                    decision = self._ask_llm_disambiguation(best_match, concept, best_sim)
+                    pair_key = (self._normalize_name(best_match.name), norm_name)
+                    decision = self._disambiguation_cache.get(pair_key)
+                    if decision is None:
+                        decision = self._ask_llm_disambiguation(best_match, concept, best_sim)
+                        self._disambiguation_cache[pair_key] = decision
                     if decision.is_same_concept:
                         self._merge_with_llm_decision(best_match, concept, decision, best_canon_name)
                         if best_match.embedding is None and concept.embedding:
@@ -429,7 +596,7 @@ class EntityDeduplicator:
                     continue
 
             # Case C: Register as new canonical concept
-            self._cache[raw_name] = (concept_vec, concept)
+            self._register_in_cache(raw_name, concept_vec, concept)
             resolved_list.append(concept)
 
         return resolved_list
@@ -545,8 +712,8 @@ class EntityDeduplicator:
                 canonical.name = new_name
                 if canon_cache_key and canon_cache_key in self._cache:
                     cached_vec, _ = self._cache[canon_cache_key]
-                    self._cache[new_name] = (cached_vec, canonical)
-                    self._cache[old_name] = (cached_vec, canonical)
+                    self._register_in_cache(new_name, cached_vec, canonical)
+                    self._register_in_cache(old_name, cached_vec, canonical)
 
     def _merge_into(self, canonical: Concept, incoming: Concept) -> None:
         """Merge incoming concept's related concepts and details into canonical node (heuristic fallback)."""

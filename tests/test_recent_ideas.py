@@ -1298,6 +1298,128 @@ def test_size_aware_embedding_batching_for_sentences_chunks_and_full_ideas():
     assert legacy_store.graph.nodes["chunk:legacy_c1"].get("embedding") is not None
 
 
+def test_incremental_neo4j_export_only_affected_nodes_and_parallel_dedup_progress():
+    """
+    Verify:
+    1. ConceptGraphStore.add_chunk persists chunk.embedding directly on the :Chunk node.
+    2. Neo4jExporter.export(..., only_affected=True) exports ONLY dirty/affected nodes and edges,
+       creates both 'idea_idx' on :Idea(embedding) and 'chunk_idx' on :Chunk(embedding),
+       deletes any removed_nodes, and clears dirty tracking after export.
+    3. EntityDeduplicator.resolve_concepts_batch executes probable-match LLM disambiguation in parallel,
+       caches pair decisions, and invokes on_progress transparently.
+    """
+    from unittest.mock import patch
+    from bookeeper.graph.neo4j_exporter import Neo4jExporter
+    from bookeeper.graph.store import ConceptGraphStore
+    from bookeeper.processing.chunker import HierarchicalChunk
+    from bookeeper.processing.deduplicator import (
+        ConceptDeduplicationDecision,
+        EntityDeduplicator,
+    )
+    from bookeeper.processing.extractor import Concept
+
+    store = ConceptGraphStore()
+
+    # Batch 1: Add Book 1, Chunk 1 (with embedding), and Idea 1 (with embedding)
+    store.add_book(1, title="Book 1", publication_date="2024-01-10")
+    chk1 = HierarchicalChunk(
+        chunk_id="b1_c1",
+        book_id=1,
+        book_title="Book 1",
+        section_title="Ch 1",
+        chapter_idx=1,
+        chunk_idx=1,
+        text="Chunk 1 text",
+        embedding=[1.0, 0.0, 0.0],
+    )
+    store.add_chunk(chk1)
+    assert store.graph.nodes["chunk:b1_c1"].get("embedding") == [1.0, 0.0, 0.0]
+
+    store.add_concept(Concept(name="Idea One", brief_description="First idea"), embedding=[0.0, 1.0, 0.0])
+    store.add_idea_support_link("Idea One", chk1, quote="Chunk 1 text", publication_date="2024-01-10")
+
+    exporter = Neo4jExporter(uri="bolt://localhost:7687", user="neo4j", password="password")
+    executed_queries = []
+    mock_session = MagicMock()
+    mock_session.run.side_effect = lambda cypher, **params: executed_queries.append((cypher, params)) or MagicMock()
+    mock_driver = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    with patch.object(exporter, "get_driver", return_value=mock_driver):
+        # Export Batch 1 (only_affected=True)
+        res1 = exporter.export(store, clean=False, only_affected=True)
+        assert res1["only_affected"] is True
+        assert res1["nodes_upserted"] == 4  # book:1, section:1:1, chunk:b1_c1, concept:Idea One
+        assert not store.has_dirty_changes()
+
+        # Verify both idea_idx and chunk_idx vector indexes were ensured
+        assert any("CREATE VECTOR INDEX idea_idx IF NOT EXISTS" in q for q, _ in executed_queries)
+        assert any("CREATE VECTOR INDEX chunk_idx IF NOT EXISTS" in q and "FOR (n:Chunk) ON (n.embedding)" in q for q, _ in executed_queries)
+
+        # Batch 2: Modify ONLY Idea Two and Chunk 2, plus mark an old alias as removed
+        executed_queries.clear()
+        chk2 = HierarchicalChunk(
+            chunk_id="b1_c2",
+            book_id=1,
+            book_title="Book 1",
+            section_title="Ch 1",
+            chapter_idx=1,
+            chunk_idx=2,
+            text="Chunk 2 text",
+            embedding=[0.0, 0.0, 1.0],
+        )
+        store.add_chunk(chk2)
+        store.add_concept(Concept(name="Idea Two", brief_description="Second idea"), embedding=[0.0, 0.0, 1.0])
+        store.mark_node_removed("concept:Obsolete Alias")
+
+        res2 = exporter.export(store, clean=False, only_affected=True)
+        assert res2["only_affected"] is True
+        assert res2["removed_nodes_deleted"] == 1
+        # Only section:1:1, chunk:b1_c2, and concept:Idea Two were dirty (book:1, chunk:b1_c1, concept:Idea One were NOT re-exported!)
+        assert res2["nodes_upserted"] == 3
+        assert any("DETACH DELETE n" in q and params.get("ids") == ["concept:Obsolete Alias"] for q, params in executed_queries)
+        assert not store.has_dirty_changes()
+
+    # Verify parallel LLM disambiguation and progress callbacks in EntityDeduplicator.resolve_concepts_batch
+    mock_emb = MagicMock()
+    # Cosine similarity = 0.85 (in probable-match range 0.80 <= 0.85 < 0.95)
+    prob_vec = [0.85, float(np.sqrt(1.0 - 0.85**2))]
+    mock_emb.embed_documents.side_effect = lambda batch: [prob_vec for _ in batch]
+
+    mock_extractor = MagicMock()
+    mock_extractor._execute_structured_invoke.return_value = ConceptDeduplicationDecision(
+        is_same_concept=True,
+        canonical_name="Canonical Raft",
+        brief_description="Synthesized Raft consensus",
+        detailed_explanation="Synthesized detailed explanation",
+        reasoning="Same consensus algorithm",
+    )
+
+    dedup = EntityDeduplicator(
+        embeddings=mock_emb,
+        similarity_threshold=0.80,
+        high_similarity_threshold=0.95,
+        extractor=mock_extractor,
+    )
+    dedup._register_in_cache("Canonical Raft", np.array([1.0, 0.0], dtype=np.float32), Concept(name="Canonical Raft"))
+
+    progress_events = []
+    # Two duplicate occurrences of the same probable match should only invoke the LLM once due to pair caching!
+    incoming = [
+        Concept(name="Raft Protocol Variant", brief_description="Variant 1"),
+        Concept(name="Raft Protocol Variant", brief_description="Variant 2"),
+    ]
+    resolved = dedup.resolve_concepts_batch(
+        incoming,
+        on_progress=lambda stage, done, tot, detail: progress_events.append((stage, done, tot, detail)),
+    )
+    assert len(resolved) == 2
+    assert resolved[0].name == "Canonical Raft"
+    assert resolved[1].name == "Canonical Raft"
+    assert mock_extractor._execute_structured_invoke.call_count == 1
+    assert any(stage == "llm_disambiguation" for stage, _, _, _ in progress_events)
+
+
 
 
 

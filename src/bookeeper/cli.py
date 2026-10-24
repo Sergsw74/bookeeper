@@ -1858,11 +1858,20 @@ def build_graph(
 
     total_books = len(books_to_process)
     book_state = None
+    ran_batch_postproc_on_last_book = False
+    has_cleaned_neo4j = bool(has_cleaned)
+    batch_size_books = cfg.batch_books if cfg.recent_ideas.enabled else 10
     try:
         for book_idx, binfo in enumerate(books_to_process, start=1):
-            # Reload knowledge graph from previous state/batch to ensure synchronization
-            if graph_file.is_file():
+            # Reload knowledge graph at the start of each new batch to synchronize with previous batch state
+            if completed_in_session > 0 and (completed_in_session % batch_size_books == 0) and graph_file.is_file():
+                preserved_dirty_nodes = set(store.dirty_nodes)
+                preserved_dirty_edges = set(store.dirty_edges)
+                preserved_removed_nodes = set(store.removed_nodes)
                 store.load(graph_file)
+                store.dirty_nodes.update(preserved_dirty_nodes)
+                store.dirty_edges.update(preserved_dirty_edges)
+                store.removed_nodes.update(preserved_removed_nodes)
                 deduplicator.seed_from_graph(store)
             bid = binfo["id"]
             btitle = BookParser.repair_mojibake(binfo["title"])
@@ -2617,8 +2626,7 @@ def build_graph(
                     successful_results = [r for r in extracted_results if r.get("status") == "extracted"]
                     failed_poison_results = [r for r in extracted_results if r.get("status") == "failed_chunk"]
 
-                    # Atomically integrate successful extractions into knowledge graph
-                    store.add_book(bid, title=btitle, author=bauthor, publication_date=bpubdate)
+                    t_finalize_start = time.perf_counter()
 
                     # Batch-resolve all extracted concepts from this book/article in a single HNSW + embedding batch
                     all_book_concepts: List[Concept] = []
@@ -2627,11 +2635,63 @@ def build_graph(
                         if ext and ext.concepts:
                             all_book_concepts.extend(ext.concepts)
 
+                    # Update overall task before exiting chunk extraction progress bar
+                    overall_completed_fraction = float(book_idx)
+                    overall_remaining_fraction = max(0.0, total_books - overall_completed_fraction)
+                    overall_elapsed = time.perf_counter() - pipeline_start_time
+                    if overall_remaining_fraction == 0:
+                        overall_eta_str = "0d 0h 00m"
+                    elif overall_completed_fraction > 0 and overall_elapsed > 0:
+                        overall_rate = overall_elapsed / overall_completed_fraction
+                        overall_rem_sec = overall_rate * overall_remaining_fraction
+                        overall_eta_str = format_eta_days_h_m(overall_rem_sec)
+                    else:
+                        overall_eta_str = "--d --h --m"
+
+                    progress.update(overall_task, completed=book_idx, eta_str=overall_eta_str)
+
+                # Transparent 4-step Book Finalization Progress Display
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold cyan]{task.description}[/bold cyan]"),
+                    BarColumn(bar_width=24),
+                    TaskProgressColumn(),
+                    MofNCompleteColumn(),
+                    TimeElapsedColumn(),
+                    console=console,
+                    transient=False,
+                ) as fin_progress:
+                    fin_task = fin_progress.add_task(
+                        f"  Finalizing Book #{bid} [1/4]: Resolving {len(all_book_concepts)} extracted idea(s)...",
+                        total=4,
+                        completed=0,
+                    )
+
+                    # Step 1/4: Resolve & deduplicate extracted concepts (embedding + HNSW + parallel LLM disambiguation)
+                    t_step1 = time.perf_counter()
+
+                    def _on_resolve_progress(stage: str, done_cnt: int, tot_cnt: int, detail: str) -> None:
+                        fin_progress.update(
+                            fin_task,
+                            description=f"  Finalizing Book #{bid} [1/4]: {detail}...",
+                        )
+
                     resolved_book_concepts = deduplicator.resolve_concepts_batch(
                         all_book_concepts,
                         neo4j_exporter=active_neo4j_exporter,
                         top_k=3,
+                        on_progress=_on_resolve_progress,
                     )
+                    dur_resolve = time.perf_counter() - t_step1
+                    fin_progress.update(
+                        fin_task,
+                        completed=1,
+                        description=f"  Finalizing Book #{bid} [2/4]: Integrating {len(successful_results)} chunk(s) & grounded quotes...",
+                    )
+
+                    # Step 2/4: Integrate sections, chunks, concepts, and grounded quotes into Knowledge Graph
+                    t_step2 = time.perf_counter()
+                    store.add_book(bid, title=btitle, author=bauthor, publication_date=bpubdate)
                     resolved_concept_iter = iter(resolved_book_concepts)
                     upserted_ideas_for_neo4j: Dict[str, Dict[str, Any]] = {}
 
@@ -2719,28 +2779,70 @@ def build_graph(
                                 publication_date=bpubdate,
                             )
 
+                    dur_integrate = time.perf_counter() - t_step2
+                    fin_progress.update(
+                        fin_task,
+                        completed=2,
+                        description=f"  Finalizing Book #{bid} [3/4]: Linking sequential chunks & syncing HNSW vectors...",
+                    )
+
+                    # Step 3/4: Link sequential chunks for this book and upsert new idea vectors into Neo4j HNSW index
+                    t_step3 = time.perf_counter()
+                    store.link_sequential_chunks(book_id=bid)
                     if active_neo4j_exporter is not None and upserted_ideas_for_neo4j:
                         try:
                             active_neo4j_exporter.upsert_idea_vectors_batch(list(upserted_ideas_for_neo4j.values()))
                         except Exception as e:
                             logger.debug(f"Could not upsert idea vectors batch to Neo4j: {e}")
+                    dur_link = time.perf_counter() - t_step3
+                    fin_progress.update(
+                        fin_task,
+                        completed=3,
+                        description=f"  Finalizing Book #{bid} [4/4]: Saving Knowledge Graph checkpoint...",
+                    )
 
-                    # Ensure sequential NEXT and PREV relationships between chunks for this book
-                    store.link_sequential_chunks(book_id=bid)
-
-                    overall_completed_fraction = float(book_idx)
-                    overall_remaining_fraction = max(0.0, total_books - overall_completed_fraction)
-                    overall_elapsed = time.perf_counter() - pipeline_start_time
-                    if overall_remaining_fraction == 0:
-                        overall_eta_str = "0d 0h 00m"
-                    elif overall_completed_fraction > 0 and overall_elapsed > 0:
-                        overall_rate = overall_elapsed / overall_completed_fraction
-                        overall_rem_sec = overall_rate * overall_remaining_fraction
-                        overall_eta_str = format_eta_days_h_m(overall_rem_sec)
+                    # Step 4/4: Finalize book state & persist graph checkpoint (without redundant full-graph chunk re-linking)
+                    t_step4 = time.perf_counter()
+                    if failed_poison_results:
+                        book_state.finalize(has_errors=True)
+                        tracker.mark_partially_indexed(
+                            "build_graph",
+                            bid,
+                            title=btitle,
+                            failed_chunks=len(failed_poison_results),
+                            total_chunks=len(chunks),
+                            metadata={
+                                "assigned_chunks": book_assigned_chunks,
+                                "skipped_chunks": book_skipped_chunks,
+                                "publication_date": bpubdate,
+                            },
+                        )
                     else:
-                        overall_eta_str = "--d --h --m"
+                        book_state.finalize(has_errors=False)
+                        tracker.mark_completed(
+                            "build_graph",
+                            bid,
+                            title=btitle,
+                            metadata={
+                                "indexing_status": "fully_indexed",
+                                "total_chunks": len(chunks),
+                                "assigned_chunks": book_assigned_chunks,
+                                "skipped_chunks": book_skipped_chunks,
+                                "publication_date": bpubdate,
+                            },
+                        )
 
-                    progress.update(overall_task, completed=book_idx, eta_str=overall_eta_str)
+                    store.save(graph_file, link_chunks=False)
+                    dur_save = time.perf_counter() - t_step4
+                    total_fin_dur = time.perf_counter() - t_finalize_start
+                    fin_progress.update(
+                        fin_task,
+                        completed=4,
+                        description=(
+                            f"  [bold green]✓ Book #{bid} finalized in {total_fin_dur:.2f}s[/bold green] "
+                            f"[dim](resolve={dur_resolve:.2f}s, integrate={dur_integrate:.2f}s, link={dur_link:.2f}s, save={dur_save:.2f}s)[/dim]"
+                        ),
+                    )
 
                 if lightrag_engine is not None and chunks:
                     try:
@@ -2762,68 +2864,66 @@ def build_graph(
                     except Exception as e:
                         console.print(f"  [yellow]Warning: LightRAG indexing failed for '{btitle}': {e}[/yellow]")
 
-                # Finalize book state:
-                # If there are poison pill failed chunks -> partially indexed, state retained.
-                # If no errors -> fully indexed, state file deleted.
                 if failed_poison_results:
-                    book_state.finalize(has_errors=True)
-                    tracker.mark_partially_indexed(
-                        "build_graph",
-                        bid,
-                        title=btitle,
-                        failed_chunks=len(failed_poison_results),
-                        total_chunks=len(chunks),
-                        metadata={
-                            "assigned_chunks": book_assigned_chunks,
-                            "skipped_chunks": book_skipped_chunks,
-                            "publication_date": bpubdate,
-                        },
-                    )
                     console.print(
                         f"  [bold yellow]⚠ Book #{bid} partially indexed: {len(successful_results)}/{len(chunks)} chunks succeeded "
                         f"(assigned={book_assigned_chunks}, skipped={book_skipped_chunks}), "
                         f"{len(failed_poison_results)} failed poison chunk(s) skipped. State retained at {book_state.file_path}.[/bold yellow]"
                     )
                 else:
-                    book_state.finalize(has_errors=False)
-                    tracker.mark_completed(
-                        "build_graph",
-                        bid,
-                        title=btitle,
-                        metadata={
-                            "indexing_status": "fully_indexed",
-                            "total_chunks": len(chunks),
-                            "assigned_chunks": book_assigned_chunks,
-                            "skipped_chunks": book_skipped_chunks,
-                            "publication_date": bpubdate,
-                        },
-                    )
                     console.print(
                         f"  [dim green]✓ Book #{bid} fully indexed (all {len(chunks)} chunks succeeded; "
                         f"assigned={book_assigned_chunks}, skipped={book_skipped_chunks}). State retained at {book_state.file_path}.[/dim green]"
                     )
 
-                # Incremental persistence: save graph checkpoint after every processed book
-                store.save(graph_file)
                 completed_in_session += 1
                 console.print(f"  [dim green]✓ Book #{bid} concepts integrated and graph checkpoint saved.[/dim green]")
 
-                # Inter-batch post-processing
+                # Inter-batch post-processing & incremental Neo4j export of affected nodes
                 batch_size = cfg.batch_books if cfg.recent_ideas.enabled else 10
                 is_batch_end = (completed_in_session % batch_size == 0) or (book_idx == len(books_to_process))
                 should_dual_pass = cfg.dual_pass.enabled if dual_pass is None else dual_pass
-                if is_batch_end and should_dual_pass and not interrupted and store.graph.number_of_nodes() > 0:
-                    console.print(f"\n  [bold cyan]═══ Running Inter-Batch Dual-Pass Idea Consolidation (Batch size: {batch_size}) ═══[/bold cyan]")
-                    try:
-                        postprocessor = IdeaPostProcessor.from_settings(cfg)
-                        pp_report = postprocessor.process_graph(store, console=console)
-                        store.save(graph_file)
-                        console.print(
-                            f"  [bold green]✓ Inter-Batch Postprocessing Complete ({pp_report.duration_seconds:.2f}s):[/bold green] "
-                            f"{pp_report.total_clusters} clusters synthesized/consolidated."
-                        )
-                    except Exception as e:
-                        console.print(f"  [bold yellow]⚠ Inter-Batch Idea Postprocessor failed:[/bold yellow] {e}")
+                if is_batch_end and not interrupted and store.graph.number_of_nodes() > 0:
+                    if should_dual_pass:
+                        console.print(f"\n  [bold cyan]═══ Running Inter-Batch Dual-Pass Idea Consolidation (Batch size: {batch_size}) ═══[/bold cyan]")
+                        try:
+                            postprocessor = IdeaPostProcessor.from_settings(cfg)
+                            pp_report = postprocessor.process_graph(store, console=console)
+                            store.save(graph_file, link_chunks=False)
+                            if book_idx == len(books_to_process):
+                                ran_batch_postproc_on_last_book = True
+                            console.print(
+                                f"  [bold green]✓ Inter-Batch Postprocessing Complete ({pp_report.duration_seconds:.2f}s):[/bold green] "
+                                f"{pp_report.total_clusters} clusters synthesized/consolidated."
+                            )
+                        except Exception as e:
+                            console.print(f"  [bold yellow]⚠ Inter-Batch Idea Postprocessor failed:[/bold yellow] {e}")
+
+                    # Export ONLY affected nodes (chunks, ideas, books, sections) and relationships to Neo4j after each batch
+                    should_export_neo4j = cfg.neo4j.enabled if export_neo4j is None else export_neo4j
+                    if should_export_neo4j and store.has_dirty_changes():
+                        try:
+                            batch_neo_clean = bool((should_clean or cfg.neo4j.clean_export) and not has_cleaned_neo4j)
+                            console.print(
+                                f"  [bold cyan]Syncing Batch Affected Nodes to Neo4j "
+                                f"({len(store.dirty_nodes)} nodes, {len(store.dirty_edges)} relationships)...[/bold cyan]"
+                            )
+                            neo_exp = Neo4jExporter.from_config(cfg.neo4j)
+                            res = neo_exp.export(
+                                store,
+                                clean=batch_neo_clean,
+                                only_affected=not batch_neo_clean,
+                                show_progress=True,
+                                console=console,
+                            )
+                            has_cleaned_neo4j = True
+                            console.print(
+                                f"  [bold green]✓ Batch Neo4j Sync Complete:[/bold green] "
+                                f"upserted {res['nodes_upserted']} affected nodes, {res['edges_upserted']} relationships "
+                                f"in '{res['database']}'."
+                            )
+                        except Exception as e:
+                            console.print(f"  [bold yellow]⚠ Batch Neo4j sync failed:[/bold yellow] {e}")
 
                 if limit is not None and limit > 0 and completed_in_session >= limit:
                     console.print(
@@ -2870,7 +2970,7 @@ def build_graph(
 
         if store.graph.number_of_nodes() > 0:
             should_dual_pass = cfg.dual_pass.enabled if dual_pass is None else dual_pass
-            if should_dual_pass and not interrupted:
+            if should_dual_pass and not interrupted and not ran_batch_postproc_on_last_book:
                 console.print("\n[bold cyan]═══ Running Dual-Pass Idea Postprocessor & Synthesis ═══[/bold cyan]")
                 try:
                     postprocessor = IdeaPostProcessor.from_settings(cfg)
@@ -2884,7 +2984,7 @@ def build_graph(
                 except Exception as e:
                     console.print(f"[bold red]✗ Idea Postprocessor failed:[/bold red] {e}")
 
-            store.save(graph_file)
+            store.save(graph_file, link_chunks=False)
             final_clean = should_clean and not has_cleaned
             try:
                 obs = ObsidianExporter(vault_dest)
@@ -2899,12 +2999,22 @@ def build_graph(
                 console.print(f"[bold yellow]⚠ GraphML export skipped or incomplete:[/bold yellow] {e}")
 
             should_export_neo4j = cfg.neo4j.enabled if export_neo4j is None else export_neo4j
-            if should_export_neo4j:
+            neo_clean = final_clean or (cfg.neo4j.clean_export and not has_cleaned_neo4j)
+            if should_export_neo4j and (neo_clean or store.has_dirty_changes()):
                 try:
-                    console.print("\n[bold cyan]Exporting Knowledge Graph to Neo4j...[/bold cyan]")
-                    neo_clean = final_clean or (cfg.neo4j.clean_export and not has_cleaned)
+                    console.print(
+                        "\n[bold cyan]Exporting Affected Knowledge Graph Nodes to Neo4j...[/bold cyan]"
+                        if not neo_clean
+                        else "\n[bold cyan]Exporting Knowledge Graph to Neo4j...[/bold cyan]"
+                    )
                     neo_exp = Neo4jExporter.from_config(cfg.neo4j)
-                    res = neo_exp.export(store, clean=neo_clean, show_progress=True, console=console)
+                    res = neo_exp.export(
+                        store,
+                        clean=neo_clean,
+                        only_affected=not neo_clean,
+                        show_progress=True,
+                        console=console,
+                    )
                     clean_msg = f" (clean start: purged {res['cleaned_nodes']} previous nodes)" if res.get("clean_start") else ""
                     console.print(
                         f"[bold green]✓ Neo4j Export Complete{clean_msg}:[/bold green] "
@@ -3271,9 +3381,13 @@ def export_command(
         try:
             from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings
             emb_client = FailoverOllamaEmbeddings.from_settings(cfg, model=cfg.embedding_model)
-            bf_res = store.backfill_missing_embeddings(emb_client, console=console)
+            bf_res = store.backfill_missing_embeddings(
+                emb_client,
+                console=console,
+                chunks_dir=cfg.resolved_chunks_dir,
+            )
             if bf_res["ideas_embedded"] > 0 or bf_res["chunks_embedded"] > 0:
-                store.save(target_graph_file)
+                store.save(target_graph_file, link_chunks=False)
                 console.print(
                     f"[bold green]✓ Backfilled and saved missing embeddings:[/bold green] "
                     f"{bf_res['ideas_embedded']} ideas, {bf_res['chunks_embedded']} chunks."
@@ -3380,9 +3494,13 @@ def export_neo4j_command(
         try:
             from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings
             emb_client = FailoverOllamaEmbeddings.from_settings(cfg, model=cfg.embedding_model)
-            bf_res = store.backfill_missing_embeddings(emb_client, console=console)
+            bf_res = store.backfill_missing_embeddings(
+                emb_client,
+                console=console,
+                chunks_dir=cfg.resolved_chunks_dir,
+            )
             if bf_res["ideas_embedded"] > 0 or bf_res["chunks_embedded"] > 0:
-                store.save(target_graph_file)
+                store.save(target_graph_file, link_chunks=False)
                 console.print(
                     f"[bold green]✓ Backfilled and saved missing embeddings:[/bold green] "
                     f"{bf_res['ideas_embedded']} ideas, {bf_res['chunks_embedded']} chunks."

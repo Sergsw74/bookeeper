@@ -224,8 +224,7 @@ class Neo4jExporter:
         index_name: str = "idea_idx",
     ) -> bool:
         """
-        Create a native HNSW vector index exclusively on :Idea(embedding) in Neo4j.
-        Never indexes :Chunk or :Book nodes to keep the HNSW graph compact and fast.
+        Create a native HNSW vector index on :Idea(embedding) in Neo4j.
         """
         dim = max(1, int(dimensions or 1024))
         safe_idx = re.sub(r"[^A-Za-z0-9_]", "_", index_name) or "idea_idx"
@@ -242,6 +241,32 @@ class Neo4jExporter:
             return True
         except Exception as e:
             logger.debug(f"Could not create vector index '{safe_idx}' on :Idea(embedding): {e}")
+            return False
+
+    def ensure_chunk_vector_index(
+        self,
+        session: Any,
+        dimensions: int = 1024,
+        index_name: str = "chunk_idx",
+    ) -> bool:
+        """
+        Create a native HNSW vector index on :Chunk(embedding) in Neo4j.
+        """
+        dim = max(1, int(dimensions or 1024))
+        safe_idx = re.sub(r"[^A-Za-z0-9_]", "_", index_name) or "chunk_idx"
+        cypher = (
+            f"CREATE VECTOR INDEX {safe_idx} IF NOT EXISTS\n"
+            f"FOR (n:Chunk) ON (n.embedding)\n"
+            f"OPTIONS {{indexConfig: {{\n"
+            f"  `vector.dimensions`: {dim},\n"
+            f"  `vector.similarity_function`: 'cosine'\n"
+            f"}}}}"
+        )
+        try:
+            session.run(cypher)
+            return True
+        except Exception as e:
+            logger.debug(f"Could not create vector index '{safe_idx}' on :Chunk(embedding): {e}")
             return False
 
     def query_ideas_hnsw_batch(
@@ -413,12 +438,15 @@ class Neo4jExporter:
         show_progress: bool = False,
         progress_callback: Optional[Callable[[str, int, int, str], None]] = None,
         console: Optional[Any] = None,
+        only_affected: bool = False,
     ) -> dict[str, Any]:
         """
-        Export full ConceptGraphStore into Neo4j via batched upsert with live progress display.
+        Export ConceptGraphStore into Neo4j via batched upsert with live progress display.
 
         Semantics:
         - clean=True: Performs a clean start (deletes all content in database before export)
+        - only_affected=True: Upserts ONLY nodes and edges marked dirty in `store` (and deletes
+          any merged/removed nodes in `store.removed_nodes`), then clears `store`'s dirty tracking.
         - Nodes: MERGE on (id), ON CREATE SET props, ON MATCH SET props
         - Edges: MERGE (source)-[r:REL]->(target), ON CREATE SET props, ON MATCH SET props
         - show_progress=True: Displays rich real-time progress bars for nodes and relationships
@@ -448,6 +476,7 @@ class Neo4jExporter:
 
         with progress_cm as progress:
             effective_clean = self.clean_export if clean is None else clean
+            incremental_mode = bool(only_affected and not effective_clean)
             deleted_before_export = 0
             if effective_clean:
                 clean_task = (
@@ -467,11 +496,34 @@ class Neo4jExporter:
                     progress_callback("clean", deleted_before_export, deleted_before_export, "Clean start complete")
 
             # Ensure sequential NEXT and PREV relationships between chunks exist in graph
-            store.link_sequential_chunks()
+            if not incremental_mode:
+                store.link_sequential_chunks()
 
             g = store.graph
-            total_nodes = g.number_of_nodes()
-            total_edges = g.number_of_edges()
+            dirty_node_set: set[str] = set(getattr(store, "dirty_nodes", set())) if incremental_mode else set()
+            dirty_edge_set: set[tuple[str, str]] = set(getattr(store, "dirty_edges", set())) if incremental_mode else set()
+            removed_node_list: list[str] = list(getattr(store, "removed_nodes", set())) if incremental_mode else []
+
+            if incremental_mode:
+                for u_id, v_id in dirty_edge_set:
+                    if g.has_node(u_id):
+                        dirty_node_set.add(u_id)
+                    if g.has_node(v_id):
+                        dirty_node_set.add(v_id)
+                target_nodes_iter = [
+                    (nid, g.nodes[nid]) for nid in dirty_node_set if g.has_node(nid)
+                ]
+                target_edges_iter = [
+                    (u_id, v_id, g.edges[u_id, v_id])
+                    for (u_id, v_id) in dirty_edge_set
+                    if g.has_edge(u_id, v_id)
+                ]
+            else:
+                target_nodes_iter = list(g.nodes(data=True))
+                target_edges_iter = list(g.edges(data=True))
+
+            total_nodes = len(target_nodes_iter)
+            total_edges = len(target_edges_iter)
 
             node_counts: dict[str, int] = {}
             edge_counts: dict[str, int] = {}
@@ -481,19 +533,22 @@ class Neo4jExporter:
             nodes_by_group: dict[tuple[str, bool], list[dict[str, Any]]] = {}
             distinct_labels: set[str] = set()
             idea_vector_dim: int = 1024
+            chunk_vector_dim: int = 1024
 
-            for node_id, attrs in g.nodes(data=True):
+            for node_id, attrs in target_nodes_iter:
                 primary_label = sanitize_label(attrs.get("type", "Entity"))
                 is_idea = bool(attrs.get("is_idea", False) or attrs.get("tag") == "idea" or primary_label in ("Concept", "Idea"))
                 distinct_labels.add(primary_label)
+                raw_emb = attrs.get("embedding")
                 if is_idea:
                     distinct_labels.add("Idea")
-                raw_emb = attrs.get("embedding")
-                if isinstance(raw_emb, (list, tuple)) and len(raw_emb) > 0:
-                    idea_vector_dim = len(raw_emb)
+                    if isinstance(raw_emb, (list, tuple)) and len(raw_emb) > 0:
+                        idea_vector_dim = len(raw_emb)
+                elif primary_label == "Chunk":
+                    if isinstance(raw_emb, (list, tuple)) and len(raw_emb) > 0:
+                        chunk_vector_dim = len(raw_emb)
 
-                # Export embeddings on :Idea and :Chunk nodes; the HNSW vector index ('idea_idx')
-                # is created exclusively FOR (n:Idea) ON (n.embedding).
+                # Export embeddings on :Idea and :Chunk nodes
                 excl = None if (is_idea or primary_label == "Chunk") else {"embedding"}
                 props = clean_neo4j_properties(attrs, exclude_keys=excl)
                 props["id"] = node_id  # Guarantee primary key property
@@ -506,7 +561,7 @@ class Neo4jExporter:
             # 2. Prepare Edges Grouped by (SourceLabel, RelType, TargetLabel)
             edges_by_group: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
 
-            for src_id, tgt_id, attrs in g.edges(data=True):
+            for src_id, tgt_id, attrs in target_edges_iter:
                 src_node = g.nodes.get(src_id, {})
                 tgt_node = g.nodes.get(tgt_id, {})
 
@@ -527,28 +582,40 @@ class Neo4jExporter:
 
             # Execute Upserts inside Session
             with driver.session(database=self.database) as session:
+                # If incremental mode has removed/merged nodes, delete them first
+                if removed_node_list:
+                    for i in range(0, len(removed_node_list), self.batch_size):
+                        rem_batch = removed_node_list[i : i + self.batch_size]
+                        session.run(
+                            "UNWIND $ids AS nid MATCH (n {id: nid}) DETACH DELETE n",
+                            ids=rem_batch,
+                        )
+
                 # Step A: Ensure Schema Constraints & Indexes
-                schema_task = (
-                    progress.add_task(f"Verifying Schema Constraints ({len(distinct_labels)} labels)...", total=len(distinct_labels) or 1)
-                    if progress
-                    else None
-                )
-                self.ensure_constraints(session, list(distinct_labels))
-                if "Idea" in distinct_labels:
-                    self.ensure_idea_vector_index(session, dimensions=idea_vector_dim, index_name="idea_idx")
-                if progress and schema_task is not None:
-                    progress.update(
-                        schema_task,
-                        completed=len(distinct_labels) or 1,
-                        description=f"[bold green]✓ Schema Constraints Verified[/bold green] ({len(distinct_labels)} labels)",
+                if distinct_labels:
+                    schema_task = (
+                        progress.add_task(f"Verifying Schema Constraints ({len(distinct_labels)} labels)...", total=len(distinct_labels) or 1)
+                        if progress
+                        else None
                     )
-                if progress_callback:
-                    progress_callback("schema", len(distinct_labels), len(distinct_labels), "Constraints verified")
+                    self.ensure_constraints(session, list(distinct_labels))
+                    if "Idea" in distinct_labels:
+                        self.ensure_idea_vector_index(session, dimensions=idea_vector_dim, index_name="idea_idx")
+                    if "Chunk" in distinct_labels:
+                        self.ensure_chunk_vector_index(session, dimensions=chunk_vector_dim, index_name="chunk_idx")
+                    if progress and schema_task is not None:
+                        progress.update(
+                            schema_task,
+                            completed=len(distinct_labels) or 1,
+                            description=f"[bold green]✓ Schema Constraints Verified[/bold green] ({len(distinct_labels)} labels)",
+                        )
+                    if progress_callback:
+                        progress_callback("schema", len(distinct_labels), len(distinct_labels), "Constraints verified")
 
                 # Step B: Upsert Nodes in Batches
                 node_task = (
-                    progress.add_task("Upserting Nodes...", total=total_nodes)
-                    if progress
+                    progress.add_task("Upserting Affected Nodes..." if incremental_mode else "Upserting Nodes...", total=total_nodes)
+                    if progress and total_nodes > 0
                     else None
                 )
                 nodes_done = 0
@@ -587,8 +654,8 @@ class Neo4jExporter:
 
                 # Step C: Upsert Relationships in Batches
                 edge_task = (
-                    progress.add_task("Upserting Relationships...", total=total_edges)
-                    if progress
+                    progress.add_task("Upserting Affected Relationships..." if incremental_mode else "Upserting Relationships...", total=total_edges)
+                    if progress and total_edges > 0
                     else None
                 )
                 edges_done = 0
@@ -624,8 +691,11 @@ class Neo4jExporter:
                         description=f"[bold green]✓ Relationships Complete[/bold green] ({total_edges:,} relationships)",
                     )
 
+        if hasattr(store, "clear_dirty"):
+            store.clear_dirty()
+
         logger.info(
-            f"Successfully upserted {total_nodes} nodes and {total_edges} edges into Neo4j ({self.uri}, db={self.database})"
+            f"Successfully upserted {total_nodes} nodes and {total_edges} edges into Neo4j ({self.uri}, db={self.database}, only_affected={incremental_mode})"
         )
 
         return {
@@ -633,6 +703,8 @@ class Neo4jExporter:
             "uri": self.uri,
             "database": self.database,
             "clean_start": effective_clean,
+            "only_affected": incremental_mode,
+            "removed_nodes_deleted": len(removed_node_list),
             "cleaned_nodes": deleted_before_export,
             "nodes_upserted": total_nodes,
             "node_breakdown": node_counts,

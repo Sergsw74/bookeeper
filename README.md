@@ -113,11 +113,11 @@ Bookkeeper includes an intelligent multi-server routing engine designed for dist
 To handle massive knowledge bases efficiently without ingestion lag or GPU bottlenecks, Bookkeeper incorporates specialized architectural patterns:
 
 - **Chronological Book Ingestion & Idea Modernity Tracking**: Books are ingested chronologically by publication/file date. Ideas track `first_occurrence_month` and `month` (`YYYY-MM`), with earlier dates winning to reflect idea provenance.
-- **3-Tier Semantic Chunk Routing (`--skip-limbo-chunks`, `--min-batch-chunk-size`)**:
+- **3-Tier Semantic Chunk Routing (`--skip-limbo-chunks`, `--max-batch-chunk-size`)**:
   - **Priority 1 (Unassigned / Brand New)**: Similarity $< 0.65$ triggers full LLM extraction.
   - **Priority 2 (High-Confidence Fast-Path)**: Similarity $\ge 0.90$ directly assigns chunks to existing ideas, bypassing LLM calls entirely.
   - **Priority 3 (Limbo Chunks)**: $0.65 \le \text{sim} < 0.90$. Skipping these via `--skip-limbo-chunks` provides massive speedups for large libraries.
-  - **Forced Chunk Size Recovery (`--min-batch-chunk-size` / `--max-batch-chunk-size`)**: If a limbo chunk is this character size or bigger, it is forcibly recovered from limbo and restored to the Priority 1 unprocessed queue, even if embeddings suggested limbo or skipping. Resuming with this threshold also recovers previously skipped limbo chunks.
+  - **Forced Chunk Size Recovery (`--max-batch-chunk-size`)**: If a limbo chunk is this character size or bigger, it is forcibly recovered from limbo and restored to the Priority 1 unprocessed queue, even if embeddings suggested limbo or skipping. Resuming with this threshold also recovers previously skipped limbo chunks.
 - **Neo4j Search Index Suspension**: During bulk node and edge exports, Bookkeeper discovers and temporarily suspends `VECTOR` (`idea_idx`, `chunk_idx`) and `FULLTEXT` indexes while preserving unique ID constraints for $O(1)$ `MERGE`. Indexes are recreated in parallel post-ingestion and polled until reaching `ONLINE` state.
 - **Incremental Batch Sync**: Automatically exports only affected (dirty) nodes and edges after each configured book batch (default: 10 books).
 - **At-Most-Once LLM Refinement**: The `IdeaPostProcessor` clusters ideas semantically across the whole graph, but synthesizes each cluster at most once (tracking via `refined` state flags), bypassing thousands of untouched clusters in seconds.

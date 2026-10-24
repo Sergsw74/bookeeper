@@ -227,9 +227,7 @@ def _get_effective_settings(
     similarity_unassigned: Optional[float] = None,
     similarity_high_confidence: Optional[float] = None,
     skip_limbo_chunks: Optional[bool] = None,
-    min_batch_chunk_size: Optional[int] = None,
     max_batch_chunk_size: Optional[int] = None,
-    limbo_min_chunk_size: Optional[int] = None,
 ) -> Settings:
     """Retrieve settings and merge explicit CLI arguments with highest precedence."""
     config_path = _resolve_opt(config_path)
@@ -250,9 +248,7 @@ def _get_effective_settings(
     similarity_unassigned = _resolve_opt(similarity_unassigned)
     similarity_high_confidence = _resolve_opt(similarity_high_confidence)
     skip_limbo_chunks = _resolve_opt(skip_limbo_chunks)
-    min_batch_chunk_size = _resolve_opt(min_batch_chunk_size)
     max_batch_chunk_size = _resolve_opt(max_batch_chunk_size)
-    limbo_min_chunk_size = _resolve_opt(limbo_min_chunk_size)
 
     cfg = get_settings(config_path)
     overrides = {}
@@ -293,19 +289,13 @@ def _get_effective_settings(
         overrides["similarity_high_confidence_threshold"] = similarity_high_confidence
     if skip_limbo_chunks is not None:
         overrides["skip_limbo_chunks"] = skip_limbo_chunks
-    if min_batch_chunk_size is not None:
-        overrides["min_batch_chunk_size"] = min_batch_chunk_size
     if max_batch_chunk_size is not None:
         overrides["max_batch_chunk_size"] = max_batch_chunk_size
-    if limbo_min_chunk_size is not None:
-        overrides["limbo_min_chunk_size"] = limbo_min_chunk_size
 
     has_recent_override = (
         recent_ideas is not None
         or skip_limbo_chunks is not None
-        or min_batch_chunk_size is not None
         or max_batch_chunk_size is not None
-        or limbo_min_chunk_size is not None
     )
     if has_recent_override:
         rc = cfg.recent_ideas.model_copy()
@@ -313,12 +303,8 @@ def _get_effective_settings(
             rc.enabled = recent_ideas
         if skip_limbo_chunks is not None:
             rc.skip_limbo_chunks = skip_limbo_chunks
-        if min_batch_chunk_size is not None:
-            rc.min_batch_chunk_size = min_batch_chunk_size
         if max_batch_chunk_size is not None:
             rc.max_batch_chunk_size = max_batch_chunk_size
-        if limbo_min_chunk_size is not None:
-            rc.limbo_min_chunk_size = limbo_min_chunk_size
         overrides["recent_ideas"] = rc
 
     if overrides:
@@ -1327,20 +1313,10 @@ def build_graph(
         "--skip-limbo/--no-skip-limbo",
         help="Skip limbo chunks (chunks between unassigned and high-confidence similarity thresholds) completely from LLM processing (default: False).",
     ),
-    min_batch_chunk_size: Optional[int] = typer.Option(
-        None,
-        "--min-batch-chunk-size",
-        help="Minimum chunk size (in characters) to recover a limbo chunk and restore it to the unprocessed LLM queue.",
-    ),
     max_batch_chunk_size: Optional[int] = typer.Option(
         None,
         "--max-batch-chunk-size",
         help="Maximum batch chunk size threshold (in characters): if a limbo chunk is this size or bigger, recover it to unprocessed LLM queue.",
-    ),
-    limbo_min_chunk_size: Optional[int] = typer.Option(
-        None,
-        "--limbo-min-chunk-size",
-        help="Alias for min-batch-chunk-size: recover limbo chunks of this size or bigger into processing queue.",
     ),
 ):
     """
@@ -1381,9 +1357,7 @@ def build_graph(
     similarity_unassigned = _resolve_opt(similarity_unassigned)
     similarity_high_confidence = _resolve_opt(similarity_high_confidence)
     skip_limbo_chunks = _resolve_opt(skip_limbo_chunks)
-    min_batch_chunk_size = _resolve_opt(min_batch_chunk_size)
     max_batch_chunk_size = _resolve_opt(max_batch_chunk_size)
-    limbo_min_chunk_size = _resolve_opt(limbo_min_chunk_size)
 
     cfg = _get_effective_settings(
         config_path,
@@ -1404,9 +1378,7 @@ def build_graph(
         similarity_unassigned=similarity_unassigned,
         similarity_high_confidence=similarity_high_confidence,
         skip_limbo_chunks=skip_limbo_chunks,
-        min_batch_chunk_size=min_batch_chunk_size,
         max_batch_chunk_size=max_batch_chunk_size,
-        limbo_min_chunk_size=limbo_min_chunk_size,
     )
     output_dir = cfg.resolved_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2274,7 +2246,7 @@ def build_graph(
                                 unassigned_threshold=cfg.similarity_unassigned_threshold,
                                 high_confidence_threshold=cfg.similarity_high_confidence_threshold,
                                 neo4j_exporter=active_neo4j_exporter,
-                                min_batch_chunk_size=recovery_th,
+                                max_batch_chunk_size=recovery_th,
                             )
                             routing = router.route_chunks(unprocessed_fresh)
                             if routing.embeddings_updated:

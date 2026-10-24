@@ -98,7 +98,7 @@ flowchart TD
     Chunk["New Chunk Embedding\n(nomic-embed-text)"] --> SimCheck{"Compare against Idea Vector Index\nCosine Similarity (S)"}
     SimCheck -->|S < 0.65| P1["Tier 1: Unassigned / New Idea\n(Priority 1 LLM Extraction Queue)"]
     SimCheck -->|S >= 0.90| P2["Tier 2: High Confidence Fast-Path\n(Direct Assignment to Idea - Skips LLM)"]
-    SimCheck -->|0.65 <= S < 0.90| SizeCheck{"Chunk Size >= Threshold?\n(--min-batch-chunk-size)"}
+    SimCheck -->|0.65 <= S < 0.90| SizeCheck{"Chunk Size >= Threshold?\n(--max-batch-chunk-size)"}
     SizeCheck -->|Yes| P1Recov["Recovered from Limbo\n(Forced into Priority 1 Queue)"]
     SizeCheck -->|No| P3{"Tier 3: Limbo Chunk\n(--skip-limbo-chunks?)"}
     P3 -->|Yes| P3Skip["Skipped completely\n(Zero LLM Compute)"]
@@ -113,7 +113,7 @@ flowchart TD
    - **Bypasses LLM extraction entirely**: The chunk is directly assigned to the existing idea node with a `[:SUPPORTED_BY]` edge and stored as supporting evidence. This fast-path accelerates processing by $40\%\text{--}70\%$.
 3. **Tier 3 — Limbo Chunks ($0.65 \le S < 0.90$) & Chunk Size Recovery**:
    - Ambiguous similarity region that partially resembles existing ideas.
-   - **Chunk Size Recovery (`--min-batch-chunk-size` / `--max-batch-chunk-size` / `limbo_min_chunk_size`)**: If a limbo chunk is this character size or bigger, Bookkeeper forcibly recovers it from limbo and restores it to the unprocessed Priority 1 queue for LLM extraction, despite embeddings. When resuming existing book states with this threshold, previously skipped limbo chunks matching the threshold are automatically restored to unprocessed.
+   - **Chunk Size Recovery (`--max-batch-chunk-size`)**: If a limbo chunk is this character size or bigger, Bookkeeper forcibly recovers it from limbo and restores it to the unprocessed Priority 1 queue for LLM extraction, despite embeddings. When resuming existing book states with this threshold, previously skipped limbo chunks matching the threshold are automatically restored to unprocessed.
    - **`--skip-limbo-chunks` (or `--skip-limbo`)**: When enabled, remaining limbo chunks are skipped from LLM processing, focusing extraction purely on brand-new concepts and high-confidence connections.
    - **Live Progress & Status**: Bookkeeper tracks `assigned`, `skipped`, and `recovered` chunk totals in real-time progress bars, in `.book_states/book_*_state.json`, and via `bookeeper status`.
 
@@ -205,7 +205,7 @@ bookeeper build-graph --export-neo4j --clean-export
 | `--model`, `-m` | Primary Ollama LLM model for concept extraction. | From config |
 | `--model-fallback` | Fallback Ollama LLM model used after chunk retry threshold. | From config |
 | `--skip-limbo-chunks`, `--skip-limbo` | Skip ambiguous limbo chunks ($0.65 \le \text{similarity} < 0.90$) from LLM processing. | From config (`false`) |
-| `--min-batch-chunk-size`, `--max-batch-chunk-size`, `--limbo-min-chunk-size` | Threshold chunk size (chars): if a limbo chunk is this size or larger, forcibly recover it to unprocessed Priority 1 LLM queue. | From config (`null`) |
+| `--max-batch-chunk-size` | Threshold chunk size (chars): if a limbo chunk is this size or larger, forcibly recover it to unprocessed Priority 1 LLM queue. | From config (`null`) |
 | `--no-lightrag` | Disable simultaneous LightRAG indexing to accelerate graph extraction. | False |
 | `--export-neo4j` | Automatically upsert the updated graph into Neo4j upon completion. | False |
 | `--clean-export` | Purge existing Neo4j graph before upserting. | False |

@@ -40,8 +40,7 @@ batch_books: 10          # Number of books grouped per chronological ingestion b
 similarity_unassigned_threshold: 0.65       # Chunks below this similarity (<0.65) treated as brand new ideas (Tier 1)
 similarity_high_confidence_threshold: 0.90  # Chunks above this similarity (>=0.90) directly assigned to idea, skipping LLM (Tier 2)
 skip_limbo_chunks: false                    # Skip limbo chunks (0.65 <= sim < 0.90) completely from LLM processing (Tier 3)
-min_batch_chunk_size: null                  # Minimum chunk size (chars) to recover limbo chunks into unprocessed LLM queue
-max_batch_chunk_size: null                  # Threshold chunk size (chars): chunks this size or larger are recovered from limbo
+max_batch_chunk_size: null                  # If a limbo chunk is this size (chars) or larger, recover it from limbo into processing queue
 
 # Alternatively, configure as structured section:
 # recent_ideas:
@@ -50,8 +49,7 @@ max_batch_chunk_size: null                  # Threshold chunk size (chars): chun
 #   similarity_unassigned_threshold: 0.65
 #   similarity_high_confidence_threshold: 0.90
 #   skip_limbo_chunks: false
-#   min_batch_chunk_size: 500               # Recover limbo chunks >= 500 chars to unprocessed LLM queue
-#   max_batch_chunk_size: 500               # Alias / maximum batch chunk size threshold
+#   max_batch_chunk_size: 500               # Recover limbo chunks >= 500 chars to unprocessed LLM queue
 
 # Dedicated local or remote Embeddings endpoint (Recommended for maximum performance)
 # Offloading embeddings to your local machine (e.g. Apple Silicon Mac on http://localhost:11434)

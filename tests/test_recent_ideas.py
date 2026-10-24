@@ -759,7 +759,7 @@ def test_build_graph_recovers_limbo_chunk_by_size_cli(tmp_path: Path):
                 "--similarity-unassigned", "0.65",
                 "--similarity-high-confidence", "0.90",
                 "--skip-limbo-chunks",
-                "--min-batch-chunk-size", "300",
+                "--max-batch-chunk-size", "300",
             ],
             catch_exceptions=False,
         )
@@ -1578,27 +1578,17 @@ def test_get_chunk_size_helper():
 
 
 def test_recent_ideas_config_limbo_recovery_settings():
-    """Verify min_batch_chunk_size, max_batch_chunk_size, and effective_limbo_recovery_size in config."""
+    """Verify max_batch_chunk_size and effective_limbo_recovery_size in config."""
     from bookeeper.config import RecentIdeasConfig, Settings
 
-    rc1 = RecentIdeasConfig(min_batch_chunk_size=1500)
+    rc1 = RecentIdeasConfig(max_batch_chunk_size=1500)
     assert rc1.effective_limbo_recovery_size == 1500
-
-    rc2 = RecentIdeasConfig(max_batch_chunk_size=2000)
-    assert rc2.effective_limbo_recovery_size == 2000
-
-    rc3 = RecentIdeasConfig(limbo_min_chunk_size=1200)
-    assert rc3.effective_limbo_recovery_size == 1200
-
-    # If multiple are specified, min of valid positive thresholds is selected
-    rc4 = RecentIdeasConfig(min_batch_chunk_size=1000, max_batch_chunk_size=2500)
-    assert rc4.effective_limbo_recovery_size == 1000
 
     rc_none = RecentIdeasConfig()
     assert rc_none.effective_limbo_recovery_size is None
 
     # Test root Settings inheritance
-    s1 = Settings(min_batch_chunk_size=1800)
+    s1 = Settings(max_batch_chunk_size=1800)
     assert s1.effective_limbo_recovery_size == 1800
 
     s2 = Settings(recent_ideas=RecentIdeasConfig(max_batch_chunk_size=2200))
@@ -1607,7 +1597,7 @@ def test_recent_ideas_config_limbo_recovery_settings():
 
 def test_router_limbo_recovery_by_chunk_size():
     """
-    Verify that when min_batch_chunk_size or max_batch_chunk_size is configured,
+    Verify that when max_batch_chunk_size is configured,
     chunks whose similarity falls into limbo (0.65 <= sim < 0.90) but whose size
     is >= threshold are recovered from limbo to UNASSIGNED (unprocessed queue),
     while smaller limbo chunks remain in LIMBO.
@@ -1663,12 +1653,12 @@ def test_router_limbo_recovery_by_chunk_size():
         embedding=[0.20, float(np.sqrt(1.0 - 0.20**2))],
     )
 
-    # Router configured with min_batch_chunk_size = 500
+    # Router configured with max_batch_chunk_size = 500
     router = RecentIdeaChunkRouter(
         idea_index=idea_index,
         unassigned_threshold=0.65,
         high_confidence_threshold=0.90,
-        min_batch_chunk_size=500,
+        max_batch_chunk_size=500,
     )
 
     res = router.route_chunks([big_chunk, small_chunk, new_chunk])
@@ -1709,7 +1699,7 @@ def test_batch_routing_result_recover_limbo_chunks():
         ],
     )
 
-    rec_cnt = routing.recover_limbo_chunks(threshold=800)
+    rec_cnt = routing.recover_limbo_chunks(max_batch_chunk_size=800)
     assert rec_cnt == 1
     assert len(routing.unassigned) == 1
     assert routing.unassigned[0].chunk.chunk_id == "c_lb"

@@ -191,24 +191,22 @@ class BatchRoutingResult:
 
     def recover_limbo_chunks(
         self,
-        min_size: Optional[int] = None,
-        max_size: Optional[int] = None,
+        max_batch_chunk_size: Optional[int] = None,
         threshold: Optional[int] = None,
     ) -> int:
         """
-        Recover chunks currently in limbo whose size is >= threshold,
+        Recover chunks currently in limbo whose size is >= max_batch_chunk_size,
         restoring them to unassigned (Priority 1 unprocessed LLM extraction queue).
         Returns number of recovered chunks.
         """
-        candidates = [min_size, max_size, threshold]
-        valid = [int(c) for c in candidates if c is not None and int(c) > 0]
-        if not valid:
+        th = max_batch_chunk_size if max_batch_chunk_size is not None else threshold
+        if th is None or int(th) <= 0:
             return 0
-        th = min(valid)
+        th_val = int(th)
         remaining_limbo: List[RoutedChunk] = []
         recovered = 0
         for rc in self.limbo:
-            if get_chunk_size(rc.chunk) >= th:
+            if get_chunk_size(rc.chunk) >= th_val:
                 rc.priority = ChunkPriority.UNASSIGNED
                 rc.recovered_from_limbo = True
                 self.unassigned.append(rc)
@@ -488,28 +486,20 @@ class RecentIdeaChunkRouter:
         unassigned_threshold: float = 0.65,
         high_confidence_threshold: float = 0.90,
         neo4j_exporter: Optional[Any] = None,
-        min_batch_chunk_size: Optional[int] = None,
         max_batch_chunk_size: Optional[int] = None,
-        limbo_min_chunk_size: Optional[int] = None,
     ):
         self.idea_index = idea_index
         self.embeddings = embeddings
         self.unassigned_threshold = unassigned_threshold
         self.high_confidence_threshold = high_confidence_threshold
         self.neo4j_exporter = neo4j_exporter
-        self.min_batch_chunk_size = min_batch_chunk_size
         self.max_batch_chunk_size = max_batch_chunk_size
-        self.limbo_min_chunk_size = limbo_min_chunk_size
 
     @property
     def recovery_threshold(self) -> Optional[int]:
-        candidates = [
-            self.min_batch_chunk_size,
-            self.max_batch_chunk_size,
-            self.limbo_min_chunk_size,
-        ]
-        valid = [int(c) for c in candidates if c is not None and int(c) > 0]
-        return min(valid) if valid else None
+        if self.max_batch_chunk_size is not None and int(self.max_batch_chunk_size) > 0:
+            return int(self.max_batch_chunk_size)
+        return None
 
     def should_recover_from_limbo(self, chunk: Any) -> bool:
         th = self.recovery_threshold

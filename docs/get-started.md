@@ -147,7 +147,7 @@ bookeeper list-books --books-dir archive_downloader/downloads --limit 15
 ### Inspecting System Status & Configuration (`status`, `stats`, `config`)
 
 ```bash
-# View active checkpoint state, completed books, and skipped formats:
+# View active checkpoint state, completed books, assigned fast-path chunks, and skipped limbo chunks:
 bookeeper status
 
 # Inspect existing Knowledge Graph metrics (nodes, edges, categories, relationships):

@@ -82,6 +82,8 @@ bookeeper build-graph --no-lightrag
 
 ### Best Practices:
 - **Use `--no-lightrag`**: Bypasses heavy vector indexing during ingestion so Ollama focuses 100% of GPU compute on concept extraction.
+- **Use `--skip-limbo-chunks`**: Accelerates extraction by bypassing ambiguous chunks ($0.65 \le \text{similarity} < 0.90$), prioritizing brand-new ideas and high-confidence direct matches.
+- **Incremental Neo4j Sync**: Automatically syncs dirty nodes and edges to Neo4j every 10 books (`batch_books: 10`).
 - **Resumability**: If interrupted via `Ctrl+C` or a power outage, simply re-run `bookeeper build-graph`. It automatically resumes from the last completed book checkpoint.
 - **Offline Graph Rebuilds**: Once books are processed, their per-book states are preserved in `.book_states/`. If you ever need to wipe and rebuild your graph, run `bookeeper rebuild-graph` to reconstruct the entire graph in seconds without calling Ollama.
 
@@ -119,8 +121,8 @@ bookeeper postprocess-ideas
 Once your Knowledge Graph is built, export it directly to your target visualization, note-taking, or database environments:
 
 ```bash
-# Export to ALL destinations simultaneously (Obsidian, Neo4j, and GraphML):
-bookeeper export --clean
+# Export to ALL destinations simultaneously (Obsidian, Neo4j, and GraphML) with embedding backfill:
+bookeeper export --clean --backfill-embeddings
 ```
 
 ### Destination Specifics:
@@ -129,12 +131,13 @@ bookeeper export --clean
    - Generates interconnected notes with Wikilinks, tags, and quotes.
    - Master index `00_Index.md` sorted by concept significance weight (0–10).
 2. **Neo4j Property Graph** (`export-neo4j`):
-   - High-throughput Cypher `MERGE` upsert with real-time Rich progress bars.
-   - Enables Cypher graph querying, centrality analysis, and Bloom visualization.
+   - High-throughput Cypher `MERGE` upsert with search index suspension (temporarily drops `VECTOR` and `FULLTEXT` indexes while preserving unique constraints).
+   - Automatically recreates indexes in parallel post-ingestion and polls until `ONLINE`.
+   - Enables Cypher graph querying, centrality analysis, Bloom visualization, and Web UI vector search.
 3. **GraphML Export**:
    - Ready for visualization in Gephi or yEd.
 
-*(For full details, see **[Standalone Exporters](building-graph.md#7-standalone-exporters-no-book-re-processing)**).*
+*(For full details, see **[Standalone Exporters](building-graph.md#11-standalone-exporters--neo4j-high-throughput-ingestion)**).*
 
 ---
 
@@ -159,9 +162,9 @@ bookeeper query "What are the core consensus mechanisms and tradeoffs in Paxos v
 | Phase | Command | Goal |
 | :--- | :--- | :--- |
 | **1. Calibrate** | `python3 scripts/ab_test.py --books 2` | Find optimal model and chunk settings on small sample. |
-| **2. Build** | `bookeeper build-graph --no-lightrag` | Extract knowledge graph across your target library. |
-| **3. POC (Optional)** | `bookeeper postprocess-ideas` | *(Experimental POC / Not Finalized)* Second-pass synthesis. |
-| **4. Export** | `bookeeper export --clean` | Export to Obsidian vault, Neo4j, and GraphML. |
+| **2. Build** | `bookeeper build-graph --no-lightrag --skip-limbo-chunks` | Extract knowledge graph across your target library. |
+| **3. POC (Optional)** | `bookeeper postprocess-ideas` | *(Experimental POC / Not Finalized)* At-most-once synthesis. |
+| **4. Export** | `bookeeper export --clean --backfill-embeddings` | Export to Obsidian vault, Neo4j, and GraphML. |
 | **5. Query (Optional)** | `bookeeper build-rag && bookeeper query` | Index into LightRAG and query interactively. |
 
 ---

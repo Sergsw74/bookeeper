@@ -8,17 +8,24 @@ Bookkeeper extracts structured ideas, architectural principles, domain patterns,
 
 - [1. Ingestion & Extraction Architecture](#1-ingestion--extraction-architecture)
 - [2. Supported Book Sources](#2-supported-book-sources)
-- [3. Running `build-graph`](#3-running-build-graph)
+- [3. Chronological Ingestion & Modernity Tracking](#3-chronological-ingestion--modernity-tracking)
+- [4. 3-Tier Semantic Chunk Routing & Fast-Path](#4-3-tier-semantic-chunk-routing--fast-path)
+- [5. Transparent 4-Step Book Finalization](#5-transparent-4-step-book-finalization)
+- [6. Embedding Reuse & Dynamic Size-Aware Batching](#6-embedding-reuse--dynamic-size-aware-batching)
+- [7. Running `build-graph`](#7-running-build-graph)
   - [Common Usage Patterns](#common-usage-patterns)
   - [Full Flag Reference](#full-flag-reference)
-- [4. Instant Offline Rebuilds (`rebuild-graph`)](#4-instant-offline-rebuilds-rebuild-graph)
-- [5. Removing Books (`remove-book`)](#5-removing-books-remove-book)
-- [6. Concept Significance Weighting (0 to 10)](#6-concept-significance-weighting-0-to-10)
-- [7. Standalone Exporters (No Book Re-Processing)](#7-standalone-exporters-no-book-re-processing)
+- [8. Instant Offline Rebuilds (`rebuild-graph`)](#8-instant-offline-rebuilds-rebuild-graph)
+- [9. Removing Books (`remove-book`)](#9-removing-books-remove-book)
+- [10. Concept Significance Weighting (0 to 10)](#10-concept-significance-weighting-0-to-10)
+- [11. Standalone Exporters & Neo4j High-Throughput Ingestion](#11-standalone-exporters--neo4j-high-throughput-ingestion)
   - [Obsidian Markdown Vault (`export-obsidian`)](#obsidian-markdown-vault-export-obsidian)
   - [Neo4j Property Graph (`export-neo4j`)](#neo4j-property-graph-export-neo4j)
+  - [Search Index Suspension for High-Throughput Upserts](#search-index-suspension-for-high-throughput-upserts)
+  - [Incremental Batch Neo4j Sync](#incremental-batch-neo4j-sync)
+  - [Automatic Missing Embeddings Backfill](#automatic-missing-embeddings-backfill)
   - [Unified Export (`export`)](#unified-export-export)
-- [8. Next Steps](#8-next-steps)
+- [12. Next Steps](#12-next-steps)
 
 ---
 
@@ -68,7 +75,79 @@ bookeeper build-graph --books-dir archive_downloader/downloads --limit 10
 
 ---
 
-## 3. Running `build-graph`
+## 3. Chronological Ingestion & Modernity Tracking
+
+To accurately determine how ideas and concepts evolve over time, Bookkeeper supports chronological ingestion and provenance tracking:
+
+- **Chronological Sorting**: When ingesting library collections, books are sorted chronologically by publication date (falling back to file modification date or Calibre timestamp).
+- **Batch Processing Cycles (`batch_books: 10`)**: Books are processed in configured batch increments (default: 10 books per batch). After each batch, affected graph components are updated and incrementally synchronized to Neo4j.
+- **Idea Modernity Tracking (`first_occurrence_month`)**:
+  - Every extracted idea and concept node records its initial appearance:
+    - `first_occurrence_month`: Standardized format `YYYY-MM` (e.g., `2021-04`).
+    - `month`: Mirrored shorthand property (`YYYY-MM`) for Cypher and UI filtering.
+  - **Earlier Date Wins**: When deduplicating or merging an existing concept with an incoming book observation, the **earliest chronological date is preserved** (`min(existing_month, new_month)`), guaranteeing historical accuracy regardless of ingestion order.
+
+---
+
+## 4. 3-Tier Semantic Chunk Routing & Fast-Path
+
+Extracting concepts from every individual chunk using local LLMs is compute-intensive. Bookkeeper employs a **3-tier semantic routing pipeline** that compares chunk embeddings against existing idea embeddings in Neo4j and the local knowledge graph:
+
+```mermaid
+flowchart TD
+    Chunk["New Chunk Embedding\n(nomic-embed-text)"] --> SimCheck{"Compare against Idea Vector Index\nCosine Similarity (S)"}
+    SimCheck -->|S < 0.65| P1["Tier 1: Unassigned / New Idea\n(Priority 1 LLM Extraction Queue)"]
+    SimCheck -->|S >= 0.90| P2["Tier 2: High Confidence Fast-Path\n(Direct Assignment to Idea - Skips LLM)"]
+    SimCheck -->|0.65 <= S < 0.90| P3{"Tier 3: Limbo Chunk\n(--skip-limbo-chunks?)"}
+    P3 -->|Yes| P3Skip["Skipped completely\n(Zero LLM Compute)"]
+    P3 -->|No| P3LLM["Priority 3 LLM Validation Queue\n(Secondary Extraction)"]
+```
+
+1. **Tier 1 — Unassigned / Brand-New Ideas ($S < 0.65$)**:
+   - The chunk discusses novel topics not sufficiently covered by existing ideas in the graph.
+   - Enqueued for Priority 1 full LLM concept extraction.
+2. **Tier 2 — High-Confidence Direct Fast-Path ($S \ge 0.90$)**:
+   - The chunk strongly aligns with an existing canonical idea.
+   - **Bypasses LLM extraction entirely**: The chunk is directly assigned to the existing idea node with a `[:SUPPORTED_BY]` edge and stored as supporting evidence. This fast-path accelerates processing by $40\%\text{--}70\%$.
+3. **Tier 3 — Limbo Chunks ($0.65 \le S < 0.90$)**:
+   - Ambiguous similarity region that partially resembles existing ideas.
+   - **`--skip-limbo-chunks` (or `--skip-limbo`)**: When enabled, limbo chunks are skipped from LLM processing, focusing extraction purely on brand-new concepts and high-confidence connections.
+   - **Live Progress & Status**: Bookkeeper tracks `assigned` and `skipped` chunk totals in real-time progress bars, in `.book_states/book_*_state.json`, and via `bookeeper status`.
+
+---
+
+## 5. Transparent 4-Step Book Finalization
+
+Finalizing each processed book in the graph is broken into four distinct, visible steps with real-time spinners and metrics:
+
+1. **Step 1: Resolve & Deduplicate Concepts**:
+   - Merges newly extracted concepts with existing canonical graph nodes using normalized keys and semantic embedding similarity ($\ge 0.85$).
+   - Preserves maximum concept weight (`max(canonical, incoming)`) and earliest occurrence month (`min(date)`).
+2. **Step 2: Integrate Chunks & Supporting Quotes**:
+   - Stores chunk metadata and anchors top quotes to canonical idea nodes.
+3. **Step 3: Link Sequential Chunks & HNSW Vector Index Sync**:
+   - Emits ordered `[:NEXT]` edges between sequential chunks within each section.
+   - Updates local embedding cache and prepares vector payloads for Neo4j HNSW index ingestion.
+4. **Step 4: Finalize Book State & Save Graph**:
+   - Writes atomic `.book_states/book_<id>_state.json` checkpoint with assigned/skipped metrics.
+   - Serializes `output/knowledge_graph.json`.
+
+---
+
+## 6. Embedding Reuse & Dynamic Size-Aware Batching
+
+Generating dense vector embeddings (`nomic-embed-text`) is essential for semantic chunk routing and vector search:
+
+- **Embeddings Reuse**: Chunks and idea embeddings are permanently cached in the graph store and `.book_states/`. Embeddings are never recomputed if already present.
+- **Dynamic Size-Aware Batching (`partition_texts_for_embedding`)**:
+  - Different text items have radically different lengths (e.g. 5–15 word sentences vs. 500-word chunks vs. 200-word idea descriptions).
+  - Rather than sending rigid uniform batch counts that cause HTTP timeouts or underutilization, Bookkeeper dynamically partitions text into byte- and token-budgeted sub-batches.
+- **Concurrent Ollama Pool Distribution**:
+  - When `embedding_base_url: "pool"` is configured, embeddings are distributed across all active cluster nodes advertising `embedding` capability concurrently in round-robin fashion, fully saturating multi-server clusters.
+
+---
+
+## 7. Running `build-graph`
 
 The `build-graph` command ingests book sections, computes hierarchical chunks, extracts grounded concepts via Ollama, merges duplicates, and serializes the persistent graph into `output/knowledge_graph.json`.
 
@@ -102,7 +181,10 @@ bookeeper build-graph --retry-failed
 # 9. Wipe checkpoint state, delete existing graph, and rebuild from scratch:
 bookeeper build-graph --from-scratch
 
-# 10. Automatically export to Neo4j with clean start:
+# 10. Accelerate extraction by skipping ambiguous limbo chunks:
+bookeeper build-graph --skip-limbo-chunks
+
+# 11. Automatically export to Neo4j with clean start:
 bookeeper build-graph --export-neo4j --clean-export
 ```
 
@@ -119,6 +201,7 @@ bookeeper build-graph --export-neo4j --clean-export
 | `--books-dir` | Path to folder of books/papers to use as source instead of Calibre. | From config |
 | `--model`, `-m` | Primary Ollama LLM model for concept extraction. | From config |
 | `--model-fallback` | Fallback Ollama LLM model used after chunk retry threshold. | From config |
+| `--skip-limbo-chunks`, `--skip-limbo` | Skip ambiguous limbo chunks ($0.65 \le \text{similarity} < 0.90$) from LLM processing. | From config (`false`) |
 | `--no-lightrag` | Disable simultaneous LightRAG indexing to accelerate graph extraction. | False |
 | `--export-neo4j` | Automatically upsert the updated graph into Neo4j upon completion. | False |
 | `--clean-export` | Purge existing Neo4j graph before upserting. | False |
@@ -126,7 +209,7 @@ bookeeper build-graph --export-neo4j --clean-export
 
 ---
 
-## 4. Instant Offline Rebuilds (`rebuild-graph`)
+## 8. Instant Offline Rebuilds (`rebuild-graph`)
 
 Whenever `build-graph` successfully processes a book, it preserves an authoritative extraction checkpoint inside `output/.book_states/book_<id>_state.json`.
 
@@ -153,7 +236,7 @@ bookeeper rebuild-graph --limit 5
 
 ---
 
-## 5. Removing Books (`remove-book`)
+## 9. Removing Books (`remove-book`)
 
 If a book was ingested accidentally or contains corrupted content, safely purge it and all associated orphaned nodes:
 
@@ -174,7 +257,7 @@ This command:
 
 ---
 
-## 6. Concept Significance Weighting (0 to 10)
+## 10. Concept Significance Weighting (0 to 10)
 
 Every extracted idea and concept is assigned a significance weight on a scale from **0 to 10**:
 
@@ -194,7 +277,7 @@ Every extracted idea and concept is assigned a significance weight on a scale fr
 
 ---
 
-## 7. Standalone Exporters (No Book Re-Processing)
+## 11. Standalone Exporters & Neo4j High-Throughput Ingestion
 
 Export your existing `knowledge_graph.json` directly to Obsidian, Neo4j, or GraphML without touching Calibre or Ollama:
 
@@ -226,24 +309,50 @@ bookeeper export-neo4j
 
 # Clean export (purges existing graph before importing):
 bookeeper export-neo4j --clean
+
+# Export with automatic missing embeddings backfill:
+bookeeper export-neo4j --backfill-embeddings
 ```
 
-**Live Progress Bar Features:**
-- **Schema Stage**: Verifies uniqueness constraints on node IDs.
-- **Nodes Stage**: Live progress bar showing active node label (`:Book`, `:Section`, `:Chunk`, `:Concept`), items completed, rate, and ETA.
-- **Relationships Stage**: Live progress bar showing active edge type (`:CONTAINS`, `:SUPPORTED_BY`, `:RELATES_TO`), items completed, rate, and ETA.
+### Search Index Suspension for High-Throughput Upserts
+
+When upserting tens of thousands of `:Chunk` and `:Idea` nodes with 768- or 1024-dimensional dense vector embeddings, Neo4j's background index re-balancing causes severe transaction lag.
+
+To eliminate this bottleneck, Bookkeeper implements search index suspension:
+1. **Discovery & Capture**: Inspects `SHOW INDEXES` and captures the exact `createStatement` for all `VECTOR` (e.g. `idea_idx`, `chunk_idx`) and `FULLTEXT` indexes.
+2. **Preserves Constraints**: Excludes `LOOKUP`, `RANGE`, and unique constraints (e.g. `:Chunk(id)`, `:Concept(id)`), ensuring $O(1)$ fast lookups for `MERGE` statements without table scans.
+3. **Suspension**: Safely drops vector and full-text indexes before starting the write transactions.
+4. **Bulk Ingestion**: Upserts nodes and relationships in batched write transactions (`session.execute_write`).
+5. **Parallel Rebuild & Health Polling**: Recreates the search indexes in parallel post-ingestion, polling `SHOW INDEXES YIELD name, state, populationPercent` until all indexes reach state `ONLINE`.
+
+### Incremental Batch Neo4j Sync
+
+During long ingestion runs across hundreds of books, Bookkeeper performs **incremental batch synchronization**:
+- After every `batch_books` cycle (default: 10 books), Bookkeeper invokes `export_to_neo4j(only_affected=True)`.
+- Only `dirty_nodes`, `dirty_edges`, and `removed_nodes` recorded during the batch are transmitted to Neo4j, avoiding full-database re-exports.
+
+### Automatic Missing Embeddings Backfill
+
+If an existing Knowledge Graph contains ideas or chunks created before vector indexing was enabled:
+```bash
+# Backfill missing chunk and idea embeddings during export:
+bookeeper export --backfill-embeddings
+```
+- Scans nodes for missing `embedding` properties.
+- Computes missing vectors using the configured embedding model / Ollama pool in parallel batches.
+- Backfills vectors in-place without requiring you to rebuild the Knowledge Graph from scratch.
 
 ### Unified Export (`export`)
 
 Export current graph to **all** configured destinations simultaneously:
 
 ```bash
-bookeeper export --clean
+bookeeper export --clean --backfill-embeddings
 ```
 
 ---
 
-## 8. Next Steps
+## 12. Next Steps
 
 - 🔍 **[Decoupled Hybrid RAG](rag.md)** — Index pre-computed chunks with LightRAG and perform interactive queries.
 - 🧪 **[Two-Pass Idea Post-Processing (Experimental POC)](post-processing.md)** — Second-pass entity clustering and synthesis.

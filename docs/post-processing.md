@@ -15,12 +15,14 @@
 - [2. Algorithmic Pipeline](#2-algorithmic-pipeline)
   - [Step 1: Deterministic Grouping & Semantic Clustering](#step-1-deterministic-grouping--semantic-clustering)
   - [Step 2: Provenance Aggregation & Chronological Linearization](#step-2-provenance-aggregation--chronological-linearization)
-  - [Step 3: Branching & Structured LLM Synthesis](#step-3-branching--structured-llm-synthesis)
-  - [Step 4: Graph Ingestion & Edge Rewiring](#step-4-graph-ingestion--edge-rewiring)
+  - [Step 3: Branching, At-Most-Once Refinement & LLM Synthesis](#step-3-branching-at-most-once-refinement--llm-synthesis)
+  - [Step 4: Affected-Only Graph Upsert & Edge Rewiring](#step-4-affected-only-graph-upsert--edge-rewiring)
 - [3. CLI Usage](#3-cli-usage)
   - [Standalone Post-Processing (`postprocess-ideas`)](#standalone-post-processing-postprocess-ideas)
   - [Integrated Ingestion (`build-graph --dual-pass`)](#integrated-ingestion-build-graph---dual-pass)
-- [4. Persistent State Checkpointing & Auto-Continue](#4-persistent-state-checkpointing--auto-continue)
+- [4. Persistent State Checkpointing & Untouched Cluster Bypass](#4-persistent-state-checkpointing--untouched-cluster-bypass)
+  - [At-Most-Once LLM Refinement Guarantee](#at-most-once-llm-refinement-guarantee)
+  - [Bypassing Untouched Post-Processed Clusters](#bypassing-untouched-post-processed-clusters)
   - [Auto-Save Every 100 Ideas](#auto-save-every-100-ideas)
   - [Auto-Continue on Resume](#auto-continue-on-resume)
   - [Resetting State](#resetting-state)
@@ -67,15 +69,19 @@ For each resolved entity cluster:
 - Filters and deduplicates quotes, retaining the top 3–5 most representative supporting quotes.
 - Orders observations chronologically by `(book_id, chapter_idx, chunk_idx)` to maintain the logical progression of ideas across the text.
 
-### Step 3: Branching & Structured LLM Synthesis
-- **Single-Occurrence Clusters ($N = 1$)**: Pass through untouched. Bypasses the secondary LLM invocation to conserve compute.
-- **Multi-Occurrence Clusters ($N \ge 2$)**: Submits the aggregated chronological payload to the consolidation model (e.g. `llama3.1:8b`). Produces structured JSON:
-  - `brief_description`: Cohesive definition capturing the entity's macro-identity.
-  - `detailed_explanation`: Comprehensive explanation integrating distinct mechanisms, cause-and-effect chains, and conditions across all chunks.
-  - `related_entities`: Explicit co-occurring architectural patterns and concepts.
-  - `category` & `weight`: Refined domain classification and significance score (0–10).
+### Step 3: Branching, At-Most-Once Refinement & LLM Synthesis
+- **Single-Occurrence Clusters ($N = 1$)**: Pass through untouched (`bypassed`). Bypasses the secondary LLM invocation to conserve compute.
+- **Multi-Occurrence Clusters ($N \ge 2$)**:
+  - **At-Most-Once LLM Refinement**: Refinement is strictly executed **at most once per cluster**. Once synthesized, the cluster is marked with `refined: True` in the persistent checkpoint state.
+  - **Untouched Cluster Bypass**: In subsequent runs or batch cycles, clusters that have already been synthesized and have received no new observations are instantly **bypassed without calling the LLM or touching the database** (e.g. 16,034 resumed clusters take < 1 second).
+  - Submits the aggregated chronological payload to the consolidation model (e.g. `llama3.1:8b`). Produces structured JSON:
+    - `brief_description`: Cohesive definition capturing the entity's macro-identity.
+    - `detailed_explanation`: Comprehensive explanation integrating distinct mechanisms, cause-and-effect chains, and conditions across all chunks.
+    - `related_entities`: Explicit co-occurring architectural patterns and concepts.
+    - `category` & `weight`: Refined domain classification and significance score (0–10).
 
-### Step 4: Graph Ingestion & Edge Rewiring
+### Step 4: Affected-Only Graph Upsert & Edge Rewiring
+- **Affected-Only Writes**: Only genuinely modified clusters and edges are updated in the graph store, preventing costly full-graph overwrites after each batch cycle.
 - **Upsert Canonical Node**: Overwrites the canonical `:Concept` node with the unified definitions and aggregate weight.
 - **Redirect Aliases**: Redirects incoming and outgoing edges from redundant alias nodes to the canonical node, then removes the alias nodes.
 - **Provenance Edges**: Connects the canonical node to all source chunks via `[:SUPPORTED_BY]` and `[:MENTIONED_IN]` edges.
@@ -111,7 +117,21 @@ bookeeper build-graph --limit 5 --dual-pass
 
 ---
 
-## 4. Persistent State Checkpointing & Auto-Continue
+## 4. Persistent State Checkpointing & Untouched Cluster Bypass
+
+### At-Most-Once LLM Refinement Guarantee
+Synthesizing multi-occurrence ideas across thousands of concepts can consume substantial token budgets. Bookkeeper enforces an **at-most-once refinement guarantee**:
+- Once an entity cluster has been synthesized, its definition is frozen with `refined: True`.
+- Future ingestion cycles skip already-refined concepts unless brand new evidence or observations are added from newly processed books.
+
+### Bypassing Untouched Post-Processed Clusters
+In large knowledge bases (e.g. 16,000+ ideas):
+- Normalization and semantic clustering ($\ge 0.92$) scan the global graph to cluster incoming ideas with existing concepts.
+- Any cluster that was already synthesized in a previous run and has no new observations is instantly resumed:
+  ```text
+  [Idea Postprocessor] 16634/16634 ideas (100.0%) | 72.63 idea/s | ETA: 0m 00s | ✓ 1988 synthesized | 14646 bypassed | 16034 resumed | +13301 edges
+  ```
+- This skips redundant LLM inference completely and completes in seconds.
 
 ### Auto-Save Every 100 Ideas
 Because synthesizing multi-occurrence ideas across large graphs can take significant time, Bookkeeper persists progress checkpoints inside `.bookeeper_dual_pass_state.json`:
@@ -155,7 +175,10 @@ To eliminate dead time while loading large graphs and generating dense embedding
    ✓ Generated semantic embeddings for 154 clusters (nomic-embed-text)
    ```
 4. **Cosine Clustering**: `Clustering concepts via cosine similarity (>= 0.92)...` spinner with merge statistics.
-5. **Live Consolidation**: Displays current idea, mention count, and synthesis model before invoking Ollama.
+5. **Live Consolidation & Synthesis Progress**: Live status tracking ideas completed, processing speed, synthesized count, bypassed singles, resumed checkpoints, and new edges added:
+   ```text
+   [Idea Postprocessor] 16634/16634 ideas (100.0%) | 72.63 idea/s | ETA: 0m 00s | ✓ 1988 synthesized | 14646 bypassed | 16034 resumed | +13301 edges
+   ```
 
 ---
 

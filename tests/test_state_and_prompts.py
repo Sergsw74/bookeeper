@@ -284,6 +284,8 @@ def test_build_graph_cli_pool_and_chunks(tmp_path: Path):
     runner = CliRunner()
     out_dir = tmp_path / "output"
     chunks_dir = tmp_path / "custom_chunks"
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(f"output_dir: {out_dir}\nenable_lightrag: false\n", encoding="utf-8")
 
     # Create dummy text file
     book_file = tmp_path / "sample.epub"
@@ -316,7 +318,7 @@ def test_build_graph_cli_pool_and_chunks(tmp_path: Path):
             [
                 "build-graph",
                 "--file", str(book_file),
-                "--config", "/dev/null",
+                "--config", str(cfg_file),
                 "--skip-warmup",
                 "--chunks-dir", str(chunks_dir),
                 "--max-tasks", "2",

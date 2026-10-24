@@ -729,6 +729,45 @@ def test_build_graph_from_scratch(tmp_path):
         assert bids == {1, 2}
 
 
+def test_build_graph_from_scratch_cleans_neo4j(tmp_path):
+    """Verify that build-graph --from-scratch with Neo4j enabled purges Neo4j database on start."""
+    from typer.testing import CliRunner
+    from unittest.mock import MagicMock, patch
+    from bookeeper.cli import app
+
+    out_dir = tmp_path / "output"
+    out_dir.mkdir(parents=True)
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(f"""
+output_dir: {out_dir}
+neo4j:
+  enabled: true
+  database: testdb
+""", encoding="utf-8")
+
+    fake_file = tmp_path / "test_book.epub"
+    fake_file.write_text("dummy", encoding="utf-8")
+
+    runner = CliRunner()
+    mock_neo = MagicMock()
+    mock_neo.clean_database.return_value = 42
+
+    with patch("bookeeper.graph.neo4j_exporter.Neo4jExporter.from_config", return_value=mock_neo), \
+         patch("bookeeper.calibre.parser.BookParser.is_graphical_format", return_value=False), \
+         patch("bookeeper.calibre.parser.BookParser.parse", return_value=[]):
+        res = runner.invoke(app, [
+            "build-graph",
+            "--from-scratch",
+            "--file", str(fake_file),
+            "--config", str(cfg_file),
+            "--skip-warmup",
+            "--no-lightrag",
+        ])
+        assert res.exit_code == 0
+        assert mock_neo.clean_database.called
+        assert "Cleaned Neo4j database 'testdb' for fresh build-graph" in res.stdout
+
+
 def test_build_graph_from_scratch_preserves_skipped_list(tmp_path):
     """Verify that --from-scratch preserves memorized skipped books and bypasses them upfront."""
     import sqlite3

@@ -1392,6 +1392,7 @@ def build_graph(
     should_clean = cfg.clean_export if clean_export is None else clean_export
     should_export_neo4j = cfg.neo4j.enabled if export_neo4j is None else export_neo4j
     has_cleaned = False
+    has_cleaned_neo4j = False
 
     tracker_path = Path(state_file) if state_file else cfg.resolved_state_file
     tracker = ProgressTracker(tracker_path)
@@ -1407,8 +1408,7 @@ def build_graph(
         resume = False
         continue_run = False
         rechunk = True
-        if clean_export is None:
-            should_clean = True
+        should_clean = True
         if graph_file.is_file():
             try:
                 graph_file.unlink()
@@ -1441,6 +1441,23 @@ def build_graph(
             console.print(
                 f"[bold yellow]Deleted {purged_chunks} cached chunk file(s) from {target_chunks_path}.[/bold yellow]"
             )
+
+        # 3. Neo4j cleanup: ensure Neo4j database is completely wiped for a clean start synchronized with KG
+        if should_export_neo4j:
+            try:
+                neo_exp = Neo4jExporter.from_config(cfg.neo4j)
+                deleted_nodes = neo_exp.clean_database()
+                has_cleaned_neo4j = True
+                clean_str = f" (purged {deleted_nodes:,} previous nodes and all relationships)" if deleted_nodes > 0 else ""
+                console.print(
+                    f"[bold yellow]Cleaned Neo4j database '{cfg.neo4j.database}' for fresh build-graph{clean_str}.[/bold yellow]"
+                )
+            except Exception as e:
+                console.print(
+                    f"[bold red]✗ Failed to clean Neo4j database on start from scratch:[/bold red] {e}. "
+                    "Will attempt clean export during subsequent sync."
+                )
+                has_cleaned_neo4j = False
 
     store = ConceptGraphStore()
     if not from_scratch and graph_file.is_file():
@@ -1809,7 +1826,7 @@ def build_graph(
         )
         raise typer.Exit(1)
 
-    if should_clean:
+    if should_clean and not has_cleaned:
         indexed_books_count = len([n for n, d in store.graph.nodes(data=True) if d.get("type") == "Book"])
         export_reindex_str = f" and re-exporting {indexed_books_count} book(s) already in knowledge graph" if indexed_books_count > 0 else ""
         console.print(
@@ -1819,7 +1836,7 @@ def build_graph(
         obs.export(store, clean=True)
         gml = GraphMLExporter(graphml_dest)
         gml.export(store)
-        if should_export_neo4j:
+        if should_export_neo4j and not has_cleaned_neo4j:
             try:
                 neo_exp = Neo4jExporter.from_config(cfg.neo4j)
                 res = neo_exp.export(store, clean=True, show_progress=True, console=console)
@@ -1829,6 +1846,7 @@ def build_graph(
                     f"{res['nodes_upserted']} nodes, {res['edges_upserted']} relationships "
                     f"in database '{res['database']}' at {res['uri']}."
                 )
+                has_cleaned_neo4j = True
             except Exception as e:
                 console.print(f"[bold red]✗ Failed to export to Neo4j:[/bold red] {e}")
         has_cleaned = True
@@ -1887,7 +1905,7 @@ def build_graph(
     total_books = len(books_to_process)
     book_state = None
     ran_batch_postproc_on_last_book = False
-    has_cleaned_neo4j = bool(has_cleaned)
+    has_cleaned_neo4j = bool(has_cleaned_neo4j)
     batch_size_books = cfg.batch_books if cfg.recent_ideas.enabled else 10
     try:
         for book_idx, binfo in enumerate(books_to_process, start=1):

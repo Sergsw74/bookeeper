@@ -294,21 +294,34 @@ class RollingWindowSemanticChunker:
         text_to_idx = {t: i for i, t in enumerate(unique_texts)}
 
         # 2. Dynamically batch embed unique sentence/window texts by both item count and character size
-        from bookeeper.processing.ollama_pool import partition_texts_for_embedding
-
-        batches = partition_texts_for_embedding(
-            unique_texts,
-            max_batch_chars=self.max_batch_chars,
-            max_batch_items=self.batch_size,
+        from bookeeper.processing.ollama_pool import (
+            FailoverOllamaEmbeddings,
+            partition_texts_for_embedding,
         )
-        all_embeddings_list: List[np.ndarray] = []
-        for batch in batches:
-            b_emb = self._embed_fn(batch)
-            if b_emb.ndim == 1:
-                b_emb = b_emb.reshape(1, -1)
-            all_embeddings_list.append(b_emb)
 
-        all_embeddings = np.vstack(all_embeddings_list)
+        if isinstance(self.embedding_model, FailoverOllamaEmbeddings):
+            raw_embs = self.embedding_model.embed_documents(
+                unique_texts,
+                batch_size=self.batch_size,
+                max_batch_chars=self.max_batch_chars,
+            )
+            all_embeddings = np.asarray(raw_embs, dtype=np.float32)
+            if all_embeddings.ndim == 1:
+                all_embeddings = all_embeddings.reshape(1, -1)
+        else:
+            batches = partition_texts_for_embedding(
+                unique_texts,
+                max_batch_chars=self.max_batch_chars,
+                max_batch_items=self.batch_size,
+            )
+            all_embeddings_list: List[np.ndarray] = []
+            for batch in batches:
+                b_emb = self._embed_fn(batch)
+                if b_emb.ndim == 1:
+                    b_emb = b_emb.reshape(1, -1)
+                all_embeddings_list.append(b_emb)
+
+            all_embeddings = np.vstack(all_embeddings_list)
 
         # 3. Safe L2 normalization on unique embeddings
         norms = np.linalg.norm(all_embeddings, axis=1, keepdims=True)

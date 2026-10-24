@@ -5,6 +5,7 @@ Multi-server smart proxy and failover client for Ollama with priority routing an
 import atexit
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -16,6 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -250,6 +252,7 @@ class OllamaServerNode:
     total_duration: float = 0.0
     success_duration: float = 0.0
     stats_by_type: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    _last_embed_seq: int = 0
 
     def wake(self) -> bool:
         """Trigger Wake-on-LAN if node has a MAC address configured."""
@@ -387,6 +390,7 @@ class OllamaServerNode:
         self.total_duration = 0.0
         self.success_duration = 0.0
         self.stats_by_type.clear()
+        self._last_embed_seq = 0
 
 
 _thread_local = threading.local()
@@ -457,6 +461,7 @@ class OllamaPool:
         self.max_tasks_per_server = max(1, max_tasks_per_server)
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
+        self._embed_rr_seq: int = 0
         self.nodes: List[OllamaServerNode] = [
             OllamaServerNode(
                 url=s.url.rstrip("/"),
@@ -730,11 +735,29 @@ class OllamaPool:
                             if n.active_tasks < self.max_tasks_per_server
                         ]
                         if available:
-                            # Prefer lowest active tasks (idle first), then highest priority (lowest number)
-                            available.sort(key=lambda n: (n.active_tasks, n.priority))
+                            is_embedding_task = (
+                                (task_type and task_type.strip().lower() == "embedding")
+                                or (
+                                    capability
+                                    and capability.strip().lower()
+                                    in ("embedding", "embeddings", "embed", "embeds")
+                                )
+                            )
+                            if is_embedding_task:
+                                # Distribute embedding tasks across all idle embedding nodes (round-robin / least-recently-used),
+                                # falling back to node priority on initial cold start.
+                                available.sort(
+                                    key=lambda n: (n.active_tasks, n._last_embed_seq, n.priority)
+                                )
+                            else:
+                                # Prefer lowest active tasks (idle first), then highest priority (lowest number)
+                                available.sort(key=lambda n: (n.active_tasks, n.priority))
                             selected_node = available[0]
                             selected_node.active_tasks += 1
                             selected_node.last_task_start = time.time()
+                            if is_embedding_task:
+                                self._embed_rr_seq += 1
+                                selected_node._last_embed_seq = self._embed_rr_seq
                             break
                         else:
                             # All eligible servers are currently busy processing another task sequentially.
@@ -1154,16 +1177,34 @@ class FailoverOllamaEmbeddings(Embeddings):
         texts: List[str],
         batch_size: Optional[int] = None,
         max_batch_chars: Optional[int] = None,
+        on_progress: Optional[Callable[[int], None]] = None,
     ) -> List[List[float]]:
         """
         Embed a list of documents (sentences, chunks, or ideas) using dynamic size-aware
-        batching (bounded by both item count and character budget) with multi-server failover.
+        batching (bounded by both item count and character budget) and concurrent multi-server
+        distribution across all available embedding nodes in OllamaPool.
         """
         if not texts:
             return []
 
         eff_batch_items = batch_size if batch_size is not None else self.max_batch_items
         eff_batch_chars = max_batch_chars if max_batch_chars is not None else self.max_batch_chars
+
+        # Determine how many healthy embedding servers are available in the pool
+        alive_embed_nodes = self.pool.alive_nodes_for_capability("embedding")
+        if not alive_embed_nodes:
+            alive_embed_nodes = self.pool.nodes_for_capability("embedding") or list(self.pool.nodes)
+        num_alive = max(1, len(alive_embed_nodes))
+
+        # When multiple embedding servers are available, split the workload across all servers
+        # so every available embedding node in the pool participates in parallel.
+        if num_alive > 1 and len(texts) > 1:
+            per_server_items = max(1, math.ceil(len(texts) / num_alive))
+            eff_batch_items = min(eff_batch_items, per_server_items)
+            total_chars = sum(max(1, len(str(t or ""))) for t in texts)
+            if total_chars > 0 and eff_batch_chars and eff_batch_chars > 0:
+                per_server_chars = max(1000, math.ceil(total_chars / num_alive))
+                eff_batch_chars = min(eff_batch_chars, per_server_chars)
 
         def _embed_batch(batch_texts: List[str]) -> List[List[float]]:
             def _embed(url: str):
@@ -1195,18 +1236,15 @@ class FailoverOllamaEmbeddings(Embeddings):
                     raise exc
 
             batch_chars = sum(len(t) for t in batch_texts)
-            t0 = time.perf_counter()
             result = self.pool.execute_with_failover(
                 _embed,
                 capability="embedding",
                 input_chars=batch_chars,
                 task_type="embedding",
             )
-            elapsed = time.perf_counter() - t0
             with self._lock:
                 self.total_embedded_texts += len(batch_texts)
                 self.total_embedded_chars += batch_chars
-                self.total_embedding_seconds += elapsed
             return result
 
         batches = partition_texts_for_embedding(
@@ -1216,13 +1254,45 @@ class FailoverOllamaEmbeddings(Embeddings):
             max_item_chars=self.max_item_chars,
         )
 
-        if len(batches) == 1:
-            return _embed_batch(batches[0])
+        t_wall_start = time.perf_counter()
+        try:
+            if len(batches) == 1:
+                res_single = _embed_batch(batches[0])
+                if on_progress is not None:
+                    on_progress(len(batches[0]))
+                return res_single
 
-        all_embs: List[List[float]] = []
-        for b in batches:
-            all_embs.extend(_embed_batch(b))
-        return all_embs
+            max_workers = min(len(batches), num_alive)
+            if max_workers <= 1:
+                all_embs: List[List[float]] = []
+                for b in batches:
+                    b_res = _embed_batch(b)
+                    all_embs.extend(b_res)
+                    if on_progress is not None:
+                        on_progress(len(b))
+                return all_embs
+
+            ordered_results: List[Optional[List[List[float]]]] = [None] * len(batches)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_idx = {
+                    executor.submit(_embed_batch, b): idx
+                    for idx, b in enumerate(batches)
+                }
+                for fut in as_completed(future_to_idx):
+                    idx = future_to_idx[fut]
+                    ordered_results[idx] = fut.result()
+                    if on_progress is not None:
+                        on_progress(len(batches[idx]))
+
+            all_embs = []
+            for batch_res in ordered_results:
+                if batch_res:
+                    all_embs.extend(batch_res)
+            return all_embs
+        finally:
+            wall_elapsed = time.perf_counter() - t_wall_start
+            with self._lock:
+                self.total_embedding_seconds += wall_elapsed
 
     def embed_query(self, text: str) -> List[float]:
         """Embed query text with multi-server failover and curl fallback."""

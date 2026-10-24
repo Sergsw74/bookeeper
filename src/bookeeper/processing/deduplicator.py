@@ -5,6 +5,7 @@ and two-tier LLM-assisted verification and synthesis.
 
 import logging
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -17,6 +18,7 @@ from bookeeper.calibre.parser import BookParser
 from bookeeper.config import Settings
 from bookeeper.processing.extractor import Concept
 from bookeeper.processing.ollama_pool import (
+    FailoverOllamaEmbeddings,
     format_idea_for_embedding,
     partition_texts_for_embedding,
 )
@@ -94,6 +96,7 @@ class EntityDeduplicator:
         similarity_threshold: Optional[float] = None,
         high_similarity_threshold: Optional[float] = None,
         extractor: Optional[Any] = None,
+        embeddings: Optional[Embeddings] = None,
     ) -> "EntityDeduplicator":
         from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings, OllamaPool
 
@@ -108,16 +111,17 @@ class EntityDeduplicator:
             if high_similarity_threshold is not None
             else getattr(settings, "high_similarity_threshold", 0.95)
         )
-        try:
-            if base_url:
-                cd = getattr(settings, "resolved_analysis_cooldown_seconds", getattr(settings, "failover_cooldown_seconds", 600))
-                pool = OllamaPool.from_urls(urls, cooldown_seconds=cd)
-                embeddings = FailoverOllamaEmbeddings(pool=pool, model=e_model)
-            else:
-                embeddings = FailoverOllamaEmbeddings.from_settings(settings, model=e_model)
-        except Exception as e:
-            logger.warning(f"Could not initialize FailoverOllamaEmbeddings: {e}")
-            embeddings = None
+        if embeddings is None:
+            try:
+                if base_url:
+                    cd = getattr(settings, "resolved_analysis_cooldown_seconds", getattr(settings, "failover_cooldown_seconds", 600))
+                    pool = OllamaPool.from_urls([u.strip() for u in base_url.split(",") if u.strip()], cooldown_seconds=cd)
+                    embeddings = FailoverOllamaEmbeddings(pool=pool, model=e_model)
+                else:
+                    embeddings = FailoverOllamaEmbeddings.from_settings(settings, model=e_model)
+            except Exception as e:
+                logger.warning(f"Could not initialize FailoverOllamaEmbeddings: {e}")
+                embeddings = None
 
         return cls(
             embeddings=embeddings,
@@ -324,36 +328,64 @@ class EntityDeduplicator:
                 missing_texts.append(embed_text)
 
         if missing_texts and self.embeddings is not None:
-            text_batches = partition_texts_for_embedding(
-                missing_texts,
-                max_batch_chars=12000,
-                max_batch_items=batch_size,
-            )
             embedded_so_far = 0
+            prog_lock = threading.Lock()
             if on_progress:
                 on_progress("embed_ideas", 0, len(missing_texts), f"Embedding {len(missing_texts)} unique ideas")
-            for b_idx, sub in enumerate(text_batches):
+
+            def _on_batch_done(count: int) -> None:
+                nonlocal embedded_so_far
+                with prog_lock:
+                    embedded_so_far += count
+                    cur = embedded_so_far
+                if on_progress:
+                    on_progress(
+                        "embed_ideas",
+                        cur,
+                        len(missing_texts),
+                        f"Embedded {cur}/{len(missing_texts)} ideas",
+                    )
+
+            pooled_ok = False
+            if isinstance(self.embeddings, FailoverOllamaEmbeddings):
                 try:
-                    if hasattr(self.embeddings, "embed_documents"):
-                        raw_vecs = self.embeddings.embed_documents(sub)
-                    else:
-                        raw_vecs = [self.embeddings.embed_query(t) for t in sub]
-                    for txt, v in zip(sub, raw_vecs):
+                    raw_vecs = self.embeddings.embed_documents(
+                        missing_texts,
+                        batch_size=batch_size,
+                        max_batch_chars=12000,
+                        on_progress=_on_batch_done,
+                    )
+                    for txt, v in zip(missing_texts, raw_vecs):
                         if v and len(v) > 1:
                             arr = np.array(v, dtype=np.float32)
                             norm = float(np.linalg.norm(arr))
                             unit = (arr / norm) if norm > 0.0 else arr
                             missing_text_to_vec[txt] = unit
+                    pooled_ok = True
                 except Exception as e:
-                    logger.debug(f"Batch concept embedding failed on sub-batch {b_idx}: {e}")
-                embedded_so_far += len(sub)
-                if on_progress:
-                    on_progress(
-                        "embed_ideas",
-                        embedded_so_far,
-                        len(missing_texts),
-                        f"Embedded {embedded_so_far}/{len(missing_texts)} ideas",
-                    )
+                    logger.debug(f"Pooled batch concept embedding fallback to sub-batches: {e}")
+
+            if not pooled_ok:
+                text_batches = partition_texts_for_embedding(
+                    missing_texts,
+                    max_batch_chars=12000,
+                    max_batch_items=batch_size,
+                )
+                for b_idx, sub in enumerate(text_batches):
+                    try:
+                        if hasattr(self.embeddings, "embed_documents"):
+                            raw_vecs = self.embeddings.embed_documents(sub)
+                        else:
+                            raw_vecs = [self.embeddings.embed_query(t) for t in sub]
+                        for txt, v in zip(sub, raw_vecs):
+                            if v and len(v) > 1:
+                                arr = np.array(v, dtype=np.float32)
+                                norm = float(np.linalg.norm(arr))
+                                unit = (arr / norm) if norm > 0.0 else arr
+                                missing_text_to_vec[txt] = unit
+                    except Exception as e:
+                        logger.debug(f"Batch concept embedding failed on sub-batch {b_idx}: {e}")
+                    _on_batch_done(len(sub))
 
         for c in concepts:
             embed_text = concept_to_embed_text.get(c.name, c.name)

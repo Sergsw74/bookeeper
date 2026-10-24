@@ -1504,12 +1504,24 @@ def build_graph(
     if not skip_warmup:
         _perform_ollama_warmup(extractor, console)
 
+    # Initialize shared FailoverOllamaEmbeddings pool once so all pipeline stages
+    # (chunker, semantic router, entity deduplicator, and dual-pass postprocessor)
+    # distribute embedding requests across all available embedding nodes in the pool.
+    embeddings: Optional[FailoverOllamaEmbeddings] = None
+    try:
+        embeddings = FailoverOllamaEmbeddings.from_settings(cfg)
+        chunker = HierarchicalChunker(embeddings=embeddings)
+    except Exception as e:
+        console.print(f"[dim yellow]Warning: Embeddings init skipped ({e}); using paragraph chunker.[/dim yellow]")
+        chunker = HierarchicalChunker()
+
     deduplicator = EntityDeduplicator.from_settings(
         cfg,
         embedding_model=cfg.embedding_model,
         similarity_threshold=cfg.similarity_threshold,
         high_similarity_threshold=getattr(cfg, "high_similarity_threshold", 0.95),
         extractor=extractor,
+        embeddings=embeddings,
     )
     deduplicator.seed_from_graph(store)
 
@@ -1528,14 +1540,6 @@ def build_graph(
         console.print(f"[dim yellow]Purged {purged_count} cached chunk file(s) from {chunk_store.storage_dir}.[/dim yellow]")
         rechunk = True
     console.print(f"[dim]Persistent Chunks Directory: [bold cyan]{chunk_store.storage_dir}[/bold cyan][/dim]")
-
-    # Initialize HierarchicalChunker with Ollama embeddings using failover pool
-    try:
-        embeddings = FailoverOllamaEmbeddings.from_settings(cfg)
-        chunker = HierarchicalChunker(embeddings=embeddings)
-    except Exception as e:
-        console.print(f"[dim yellow]Warning: Embeddings init skipped ({e}); using paragraph chunker.[/dim yellow]")
-        chunker = HierarchicalChunker()
 
     effective_lightrag = cfg.enable_lightrag if enable_lightrag is None else enable_lightrag
     lightrag_engine: Optional[LightRAGEngine] = None
@@ -2887,7 +2891,11 @@ def build_graph(
                     if should_dual_pass:
                         console.print(f"\n  [bold cyan]═══ Running Inter-Batch Dual-Pass Idea Consolidation (Batch size: {batch_size}) ═══[/bold cyan]")
                         try:
-                            postprocessor = IdeaPostProcessor.from_settings(cfg)
+                            postprocessor = IdeaPostProcessor.from_settings(
+                                cfg,
+                                pool=extractor.pool,
+                                embeddings=embeddings,
+                            )
                             pp_report = postprocessor.process_graph(store, console=console)
                             store.save(graph_file, link_chunks=False)
                             if book_idx == len(books_to_process):
@@ -2973,7 +2981,11 @@ def build_graph(
             if should_dual_pass and not interrupted and not ran_batch_postproc_on_last_book:
                 console.print("\n[bold cyan]═══ Running Dual-Pass Idea Postprocessor & Synthesis ═══[/bold cyan]")
                 try:
-                    postprocessor = IdeaPostProcessor.from_settings(cfg)
+                    postprocessor = IdeaPostProcessor.from_settings(
+                        cfg,
+                        pool=extractor.pool,
+                        embeddings=embeddings,
+                    )
                     pp_report = postprocessor.process_graph(store, console=console)
                     console.print(
                         f"[bold green]✓ Idea Postprocessing Complete ({pp_report.duration_seconds:.2f}s):[/bold green] "

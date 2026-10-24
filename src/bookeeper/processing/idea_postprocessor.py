@@ -693,14 +693,29 @@ class IdeaPostProcessor:
                     )
                     with emb_progress:
                         task = emb_progress.add_task("embed", total=len(texts))
+                        if isinstance(self.embeddings, FailoverOllamaEmbeddings):
+                            vectors_raw = self.embeddings.embed_documents(
+                                texts,
+                                batch_size=32,
+                                max_batch_chars=12000,
+                                on_progress=lambda n: emb_progress.update(task, advance=n),
+                            )
+                        else:
+                            for batch in text_batches:
+                                vecs = self.embeddings.embed_documents(batch)
+                                vectors_raw.extend(vecs)
+                                emb_progress.update(task, advance=len(batch))
+                else:
+                    if isinstance(self.embeddings, FailoverOllamaEmbeddings):
+                        vectors_raw = self.embeddings.embed_documents(
+                            texts,
+                            batch_size=32,
+                            max_batch_chars=12000,
+                        )
+                    else:
                         for batch in text_batches:
                             vecs = self.embeddings.embed_documents(batch)
                             vectors_raw.extend(vecs)
-                            emb_progress.update(task, advance=len(batch))
-                else:
-                    for batch in text_batches:
-                        vecs = self.embeddings.embed_documents(batch)
-                        vectors_raw.extend(vecs)
 
                 if len(vectors_raw) != len(missing_indices):
                     logger.warning(

@@ -245,21 +245,34 @@ class IdeaEmbeddingIndex:
         # Batch embed only the ideas that do not yet have a cached embedding (size-aware batching for full ideas)
         newly_embedded: Dict[int, List[float]] = {}
         if missing_indices and embeddings is not None:
+            from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings
+
             missing_texts = [texts[idx] for idx in missing_indices]
-            idea_batches = partition_texts_for_embedding(
-                missing_texts,
-                max_batch_chars=12000,
-                max_batch_items=batch_size,
-            )
             computed_raw: List[List[float]] = []
-            for b_idx, sub_batch in enumerate(idea_batches):
+            if isinstance(embeddings, FailoverOllamaEmbeddings):
                 try:
-                    v = embeddings.embed_documents(sub_batch)
-                    computed_raw.extend(v)
+                    computed_raw = embeddings.embed_documents(
+                        missing_texts,
+                        batch_size=batch_size,
+                        max_batch_chars=12000,
+                    )
                 except Exception as e:
-                    logger.warning(f"Error embedding idea texts batch {b_idx}: {e}")
-                    for _ in sub_batch:
-                        computed_raw.append([])
+                    logger.warning(f"Error embedding idea texts across pool: {e}")
+                    computed_raw = []
+            if not computed_raw:
+                idea_batches = partition_texts_for_embedding(
+                    missing_texts,
+                    max_batch_chars=12000,
+                    max_batch_items=batch_size,
+                )
+                for b_idx, sub_batch in enumerate(idea_batches):
+                    try:
+                        v = embeddings.embed_documents(sub_batch)
+                        computed_raw.extend(v)
+                    except Exception as e:
+                        logger.warning(f"Error embedding idea texts batch {b_idx}: {e}")
+                        for _ in sub_batch:
+                            computed_raw.append([])
             for idx, vec in zip(missing_indices, computed_raw):
                 if vec and len(vec) > 1:
                     newly_embedded[idx] = [float(x) for x in vec]
@@ -482,21 +495,34 @@ class RecentIdeaChunkRouter:
                 return result
 
             if self.embeddings is not None:
+                from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings
+
                 missing_texts = [getattr(chunks[idx], "text", "") or "" for idx in missing_indices]
-                chunk_batches = partition_texts_for_embedding(
-                    missing_texts,
-                    max_batch_chars=12000,
-                    max_batch_items=min(batch_size, 16),
-                )
                 computed_raw: List[List[float]] = []
-                for b_idx, sub_batch in enumerate(chunk_batches):
+                if isinstance(self.embeddings, FailoverOllamaEmbeddings):
                     try:
-                        v = self.embeddings.embed_documents(sub_batch)
-                        computed_raw.extend(v)
+                        computed_raw = self.embeddings.embed_documents(
+                            missing_texts,
+                            batch_size=min(batch_size, 16),
+                            max_batch_chars=12000,
+                        )
                     except Exception as e:
-                        logger.warning(f"Error embedding chunks batch {b_idx}: {e}")
-                        for _ in sub_batch:
-                            computed_raw.append([])
+                        logger.warning(f"Error embedding chunks across pool: {e}")
+                        computed_raw = []
+                if not computed_raw:
+                    chunk_batches = partition_texts_for_embedding(
+                        missing_texts,
+                        max_batch_chars=12000,
+                        max_batch_items=min(batch_size, 16),
+                    )
+                    for b_idx, sub_batch in enumerate(chunk_batches):
+                        try:
+                            v = self.embeddings.embed_documents(sub_batch)
+                            computed_raw.extend(v)
+                        except Exception as e:
+                            logger.warning(f"Error embedding chunks batch {b_idx}: {e}")
+                            for _ in sub_batch:
+                                computed_raw.append([])
 
                 for idx, vec in zip(missing_indices, computed_raw):
                     if vec and len(vec) > 1:

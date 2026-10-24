@@ -774,6 +774,7 @@ class ConceptGraphStore:
         """
         import numpy as np
         from bookeeper.processing.ollama_pool import (
+            FailoverOllamaEmbeddings,
             format_idea_for_embedding,
             partition_texts_for_embedding,
         )
@@ -869,6 +870,68 @@ class ConceptGraphStore:
                     console=console,
                 ) as prog:
                     t_id = prog.add_task("ideas", total=len(missing_idea_nodes))
+                    pooled_done = False
+                    if isinstance(embeddings, FailoverOllamaEmbeddings):
+                        try:
+                            vecs = embeddings.embed_documents(
+                                idea_texts,
+                                batch_size=batch_size,
+                                max_batch_chars=12000,
+                                on_progress=lambda n: prog.update(t_id, advance=n),
+                            )
+                            for (nid, _), v in zip(missing_idea_nodes, vecs):
+                                if v and len(v) > 1:
+                                    arr = np.array(v, dtype=np.float32)
+                                    norm = float(np.linalg.norm(arr))
+                                    unit = (arr / norm) if norm > 0.0 else arr
+                                    self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
+                                    self.mark_node_dirty(nid)
+                                    ideas_embedded += 1
+                            pooled_done = True
+                        except Exception as e:
+                            logger.warning(f"Failed pooled backfill of idea embeddings, falling back to batches: {e}")
+                    if not pooled_done:
+                        offset = 0
+                        for sub in idea_batches:
+                            try:
+                                vecs = (
+                                    embeddings.embed_documents(sub)
+                                    if hasattr(embeddings, "embed_documents")
+                                    else [embeddings.embed_query(x) for x in sub]
+                                )
+                                for (nid, _), v in zip(missing_idea_nodes[offset : offset + len(sub)], vecs):
+                                    if v and len(v) > 1:
+                                        arr = np.array(v, dtype=np.float32)
+                                        norm = float(np.linalg.norm(arr))
+                                        unit = (arr / norm) if norm > 0.0 else arr
+                                        self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
+                                        self.mark_node_dirty(nid)
+                                        ideas_embedded += 1
+                            except Exception as e:
+                                logger.warning(f"Failed backfilling idea embeddings batch at {offset}: {e}")
+                            offset += len(sub)
+                            prog.update(t_id, advance=len(sub))
+            else:
+                pooled_done = False
+                if isinstance(embeddings, FailoverOllamaEmbeddings):
+                    try:
+                        vecs = embeddings.embed_documents(
+                            idea_texts,
+                            batch_size=batch_size,
+                            max_batch_chars=12000,
+                        )
+                        for (nid, _), v in zip(missing_idea_nodes, vecs):
+                            if v and len(v) > 1:
+                                arr = np.array(v, dtype=np.float32)
+                                norm = float(np.linalg.norm(arr))
+                                unit = (arr / norm) if norm > 0.0 else arr
+                                self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
+                                self.mark_node_dirty(nid)
+                                ideas_embedded += 1
+                        pooled_done = True
+                    except Exception as e:
+                        logger.warning(f"Failed pooled backfill of idea embeddings, falling back to batches: {e}")
+                if not pooled_done:
                     offset = 0
                     for sub in idea_batches:
                         try:
@@ -888,27 +951,6 @@ class ConceptGraphStore:
                         except Exception as e:
                             logger.warning(f"Failed backfilling idea embeddings batch at {offset}: {e}")
                         offset += len(sub)
-                        prog.update(t_id, advance=len(sub))
-            else:
-                offset = 0
-                for sub in idea_batches:
-                    try:
-                        vecs = (
-                            embeddings.embed_documents(sub)
-                            if hasattr(embeddings, "embed_documents")
-                            else [embeddings.embed_query(x) for x in sub]
-                        )
-                        for (nid, _), v in zip(missing_idea_nodes[offset : offset + len(sub)], vecs):
-                            if v and len(v) > 1:
-                                arr = np.array(v, dtype=np.float32)
-                                norm = float(np.linalg.norm(arr))
-                                unit = (arr / norm) if norm > 0.0 else arr
-                                self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
-                                self.mark_node_dirty(nid)
-                                ideas_embedded += 1
-                    except Exception as e:
-                        logger.warning(f"Failed backfilling idea embeddings batch at {offset}: {e}")
-                    offset += len(sub)
 
         if missing_chunk_nodes:
             chunk_texts = [t for _, t in missing_chunk_nodes]
@@ -937,6 +979,68 @@ class ConceptGraphStore:
                     console=console,
                 ) as prog:
                     t_id = prog.add_task("chunks", total=len(missing_chunk_nodes))
+                    pooled_done = False
+                    if isinstance(embeddings, FailoverOllamaEmbeddings):
+                        try:
+                            vecs = embeddings.embed_documents(
+                                chunk_texts,
+                                batch_size=min(batch_size, 16),
+                                max_batch_chars=12000,
+                                on_progress=lambda n: prog.update(t_id, advance=n),
+                            )
+                            for (nid, _), v in zip(missing_chunk_nodes, vecs):
+                                if v and len(v) > 1:
+                                    arr = np.array(v, dtype=np.float32)
+                                    norm = float(np.linalg.norm(arr))
+                                    unit = (arr / norm) if norm > 0.0 else arr
+                                    self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
+                                    self.mark_node_dirty(nid)
+                                    chunks_embedded += 1
+                            pooled_done = True
+                        except Exception as e:
+                            logger.warning(f"Failed pooled backfill of chunk embeddings, falling back to batches: {e}")
+                    if not pooled_done:
+                        offset = 0
+                        for sub in chunk_batches:
+                            try:
+                                vecs = (
+                                    embeddings.embed_documents(sub)
+                                    if hasattr(embeddings, "embed_documents")
+                                    else [embeddings.embed_query(x) for x in sub]
+                                )
+                                for (nid, _), v in zip(missing_chunk_nodes[offset : offset + len(sub)], vecs):
+                                    if v and len(v) > 1:
+                                        arr = np.array(v, dtype=np.float32)
+                                        norm = float(np.linalg.norm(arr))
+                                        unit = (arr / norm) if norm > 0.0 else arr
+                                        self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
+                                        self.mark_node_dirty(nid)
+                                        chunks_embedded += 1
+                            except Exception as e:
+                                logger.warning(f"Failed backfilling chunk embeddings batch at {offset}: {e}")
+                            offset += len(sub)
+                            prog.update(t_id, advance=len(sub))
+            else:
+                pooled_done = False
+                if isinstance(embeddings, FailoverOllamaEmbeddings):
+                    try:
+                        vecs = embeddings.embed_documents(
+                            chunk_texts,
+                            batch_size=min(batch_size, 16),
+                            max_batch_chars=12000,
+                        )
+                        for (nid, _), v in zip(missing_chunk_nodes, vecs):
+                            if v and len(v) > 1:
+                                arr = np.array(v, dtype=np.float32)
+                                norm = float(np.linalg.norm(arr))
+                                unit = (arr / norm) if norm > 0.0 else arr
+                                self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
+                                self.mark_node_dirty(nid)
+                                chunks_embedded += 1
+                        pooled_done = True
+                    except Exception as e:
+                        logger.warning(f"Failed pooled backfill of chunk embeddings, falling back to batches: {e}")
+                if not pooled_done:
                     offset = 0
                     for sub in chunk_batches:
                         try:
@@ -956,26 +1060,5 @@ class ConceptGraphStore:
                         except Exception as e:
                             logger.warning(f"Failed backfilling chunk embeddings batch at {offset}: {e}")
                         offset += len(sub)
-                        prog.update(t_id, advance=len(sub))
-            else:
-                offset = 0
-                for sub in chunk_batches:
-                    try:
-                        vecs = (
-                            embeddings.embed_documents(sub)
-                            if hasattr(embeddings, "embed_documents")
-                            else [embeddings.embed_query(x) for x in sub]
-                        )
-                        for (nid, _), v in zip(missing_chunk_nodes[offset : offset + len(sub)], vecs):
-                            if v and len(v) > 1:
-                                arr = np.array(v, dtype=np.float32)
-                                norm = float(np.linalg.norm(arr))
-                                unit = (arr / norm) if norm > 0.0 else arr
-                                self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
-                                self.mark_node_dirty(nid)
-                                chunks_embedded += 1
-                    except Exception as e:
-                        logger.warning(f"Failed backfilling chunk embeddings batch at {offset}: {e}")
-                    offset += len(sub)
 
         return {"ideas_embedded": ideas_embedded, "chunks_embedded": chunks_embedded}

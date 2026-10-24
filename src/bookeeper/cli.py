@@ -167,6 +167,96 @@ def format_eta_days_h_m(seconds: Optional[float]) -> str:
     return f"{d}d {h}h {m:02d}m"
 
 
+def compute_book_chunk_eta(
+    total_chunks: int,
+    completed_chunks_count: int,
+    durations: Sequence[float],
+    pool_concurrency: int = 1,
+) -> Tuple[Optional[float], str]:
+    """
+    Compute estimated remaining time for current book chunk extraction strictly based
+    on real LLM-processed chunk durations, ignoring zero-duration fastpath/skipped chunks.
+
+    Parameters:
+        total_chunks: Total number of chunks in the book.
+        completed_chunks_count: Chunks accounted for (including assigned, skipped, and extracted).
+        durations: Measured durations (in seconds) of chunks actually processed by LLM.
+        pool_concurrency: Parallel worker concurrency across the server pool.
+
+    Returns:
+        (rem_seconds, formatted_eta_str)
+    """
+    rem_chunks = max(0, total_chunks - completed_chunks_count)
+    if rem_chunks == 0:
+        return 0.0, "0h 00m 00s"
+
+    if not durations:
+        return None, "--h --m --s"
+
+    # Use sliding window of the last 50 LLM chunks to adapt to current cluster throughput
+    recent = durations[-50:] if len(durations) > 50 else durations
+    avg_chunk_dur = sum(recent) / len(recent)
+    if avg_chunk_dur <= 0:
+        return None, "--h --m --s"
+
+    concurrency = max(1, min(pool_concurrency, rem_chunks))
+    rem_sec = (rem_chunks * avg_chunk_dur) / concurrency
+    return rem_sec, format_eta_h_min_sec(rem_sec)
+
+
+def compute_overall_library_eta(
+    total_books: int,
+    current_book_idx: int,
+    current_book_rem_sec: Optional[float],
+    current_book_elapsed: float,
+    completed_book_records: Sequence[Dict[str, Any]],
+    batch_window: int = 10,
+) -> Tuple[Optional[float], Optional[float], str, str]:
+    """
+    Compute overall library processing ETA based on average book processing time
+    windowed across at most the last book batch (including extraction, indexing,
+    and batch post-processing).
+
+    Parameters:
+        total_books: Total books to process in the catalog.
+        current_book_idx: 1-based index of the currently processing book.
+        current_book_rem_sec: Estimated remaining seconds for current book (from compute_book_chunk_eta).
+        current_book_elapsed: Elapsed seconds so far for the current book.
+        completed_book_records: List of dicts with 'effective_total' (processing + indexing + batch overhead).
+        batch_window: Maximum books in the sliding window (typically batch_size_books).
+
+    Returns:
+        (avg_book_time_sec, overall_rem_sec, formatted_eta_str, formatted_avg_book_str)
+    """
+    recent_books = completed_book_records[-batch_window:] if completed_book_records else []
+    avg_book_time: Optional[float] = None
+
+    if recent_books:
+        avg_book_time = sum(r.get("effective_total", r.get("book_duration", 0.0)) for r in recent_books) / len(recent_books)
+    else:
+        # First batch in progress: estimate based on available time of current book
+        if current_book_rem_sec is not None:
+            avg_book_time = max(1.0, current_book_elapsed + current_book_rem_sec)
+        elif current_book_elapsed > 0:
+            avg_book_time = max(1.0, current_book_elapsed)
+
+    remaining_books_after = max(0, total_books - current_book_idx)
+
+    if total_books == 0 or (remaining_books_after == 0 and (current_book_rem_sec is None or current_book_rem_sec <= 0)):
+        overall_rem_sec: Optional[float] = 0.0
+        overall_eta_str = "0d 0h 00m"
+    elif avg_book_time is not None:
+        cur_part = current_book_rem_sec if current_book_rem_sec is not None else avg_book_time
+        overall_rem_sec = cur_part + (remaining_books_after * avg_book_time)
+        overall_eta_str = format_eta_days_h_m(overall_rem_sec)
+    else:
+        overall_rem_sec = None
+        overall_eta_str = "--d --h --m"
+
+    avg_book_fmt = format_eta_min_sec(avg_book_time) if avg_book_time is not None else "--m --s"
+    return avg_book_time, overall_rem_sec, overall_eta_str, avg_book_fmt
+
+
 class ChunkRemainingColumn(ProgressColumn):
     """Renders estimated chunking time remaining formatted as (min, sec)."""
 
@@ -1882,6 +1972,7 @@ def build_graph(
     display_lock = threading.Lock()
     active_tasks_count = 0
     durations: List[float] = []
+    completed_book_records: List[Dict[str, Any]] = []
     abort_event = threading.Event()
 
     def _calc_stats() -> Tuple[float, float, float, float]:
@@ -1941,6 +2032,7 @@ def build_graph(
                 f"[dim]| {model_banner} | Embeddings: [bold cyan]{cfg.embedding_model}[/bold cyan][/dim]"
             )
 
+            t_book_start = time.perf_counter()
             try:
                 # Check if chunks already exist in local ChunkStore
                 chunks = None
@@ -2104,6 +2196,7 @@ def build_graph(
                     extracted_results: List[Dict[str, Any]] = []
                     book_assigned_chunks = 0
                     book_skipped_chunks = 0
+                    book_llm_durations: List[float] = []
 
                     def _update_progress_description():
                         avg_s, p80_s, p18_s, fastest_s = _calc_stats()
@@ -2114,23 +2207,16 @@ def build_graph(
                             cur_book_skipped = book_skipped_chunks
                             cur_session_assigned = session_assigned_chunks
                             cur_session_skipped = session_skipped_chunks
+                            # Prefer current book's measured LLM durations; fallback to session durations
+                            cur_durations = list(book_llm_durations) if len(book_llm_durations) >= 2 else list(durations)
 
-                        # Calculate book analyses ETA formatted as (h, min, sec)
-                        rem_chunks = max(0, len(chunks) - num_extracted)
-                        book_elapsed = time.perf_counter() - t_book_extract_start
-                        if rem_chunks == 0:
-                            book_eta_str = "0h 00m 00s"
-                        elif num_extracted > 0 and book_elapsed > 0:
-                            rate = book_elapsed / num_extracted
-                            book_rem_sec = rate * rem_chunks
-                            book_eta_str = format_eta_h_min_sec(book_rem_sec)
-                        elif durations:
-                            avg_chunk_dur = sum(durations) / len(durations)
-                            concurrency = max(1, min(pool_concurrency, rem_chunks))
-                            book_rem_sec = (rem_chunks * avg_chunk_dur) / concurrency
-                            book_eta_str = format_eta_h_min_sec(book_rem_sec)
-                        else:
-                            book_eta_str = "--h --m --s"
+                        # 1. Calculate book analyses ETA strictly from real LLM-processed chunk durations
+                        book_rem_sec, book_eta_str = compute_book_chunk_eta(
+                            total_chunks=len(chunks),
+                            completed_chunks_count=num_extracted,
+                            durations=cur_durations,
+                            pool_concurrency=pool_concurrency,
+                        )
 
                         desc1 = (
                             f"[bold cyan]Current Book #{bid}[/bold cyan] ('{btitle[:18]}') | "
@@ -2145,28 +2231,27 @@ def build_graph(
                             )
                         progress.update(book_task, description=desc1, eta_str=book_eta_str)
 
-                        # Calculate overall library processing ETA formatted as (days, h, m)
-                        curr_fraction = (num_extracted / len(chunks)) if chunks else 0.0
-                        overall_completed_fraction = (book_idx - 1) + curr_fraction
-                        overall_remaining_fraction = max(0.0, total_books - overall_completed_fraction)
-                        overall_elapsed = time.perf_counter() - pipeline_start_time
-
-                        if overall_remaining_fraction == 0:
-                            overall_eta_str = "0d 0h 00m"
-                        elif overall_completed_fraction > 0 and overall_elapsed > 0:
-                            overall_rate = overall_elapsed / overall_completed_fraction
-                            overall_rem_sec = overall_rate * overall_remaining_fraction
-                            overall_eta_str = format_eta_days_h_m(overall_rem_sec)
-                        else:
-                            overall_eta_str = "--d --h --m"
+                        # 2. Calculate overall library processing ETA based on average book processing time
+                        # Windowed across at most the last book batch (including extraction, indexing, and batch post-processing)
+                        book_elapsed_so_far = time.perf_counter() - t_book_start
+                        avg_book_time, overall_rem_sec, overall_eta_str, avg_book_fmt = compute_overall_library_eta(
+                            total_books=total_books,
+                            current_book_idx=book_idx,
+                            current_book_rem_sec=book_rem_sec,
+                            current_book_elapsed=book_elapsed_so_far,
+                            completed_book_records=completed_book_records,
+                            batch_window=batch_size_books,
+                        )
 
                         desc2 = (
                             f"[bold magenta]Overall Progress[/bold magenta] ({book_idx}/{total_books} books) | "
+                            f"avg book: [bold yellow]{avg_book_fmt}[/bold yellow] | "
                             f"Assigned: [bold green]{cur_session_assigned}[/bold green] | "
                             f"Skipped: [bold yellow]{cur_session_skipped}[/bold yellow] | "
                             f"LLM: [bold green]{cfg.llm_model}[/bold green] | "
                             f"Embeddings: [bold cyan]{cfg.embedding_model}[/bold cyan]"
                         )
+                        curr_fraction = (num_extracted / len(chunks)) if chunks else 0.0
                         progress.update(
                             overall_task,
                             completed=book_idx - 1 + curr_fraction,
@@ -2498,6 +2583,7 @@ def build_graph(
                                 with stats_lock:
                                     for chk_item in chunk_batch:
                                         durations.append(chunk_dur)
+                                        book_llm_durations.append(chunk_dur)
                                         extraction = extractions.get(chk_item.chunk_id) or SectionExtraction(concepts=[], extracted_ideas=[])
                                         extracted_results.append({
                                             "status": "extracted",
@@ -2701,18 +2787,15 @@ def build_graph(
                             all_book_concepts.extend(ext.concepts)
 
                     # Update overall task before exiting chunk extraction progress bar
-                    overall_completed_fraction = float(book_idx)
-                    overall_remaining_fraction = max(0.0, total_books - overall_completed_fraction)
-                    overall_elapsed = time.perf_counter() - pipeline_start_time
-                    if overall_remaining_fraction == 0:
-                        overall_eta_str = "0d 0h 00m"
-                    elif overall_completed_fraction > 0 and overall_elapsed > 0:
-                        overall_rate = overall_elapsed / overall_completed_fraction
-                        overall_rem_sec = overall_rate * overall_remaining_fraction
-                        overall_eta_str = format_eta_days_h_m(overall_rem_sec)
-                    else:
-                        overall_eta_str = "--d --h --m"
-
+                    book_elapsed_so_far = time.perf_counter() - t_book_start
+                    avg_book_time, overall_rem_sec, overall_eta_str, avg_book_fmt = compute_overall_library_eta(
+                        total_books=total_books,
+                        current_book_idx=book_idx,
+                        current_book_rem_sec=0.0,
+                        current_book_elapsed=book_elapsed_so_far,
+                        completed_book_records=completed_book_records,
+                        batch_window=batch_size_books,
+                    )
                     progress.update(overall_task, completed=book_idx, eta_str=overall_eta_str)
 
                 # Transparent 4-step Book Finalization Progress Display
@@ -2942,13 +3025,22 @@ def build_graph(
                     )
 
                 completed_in_session += 1
-                console.print(f"  [dim green]✓ Book #{bid} concepts integrated and graph checkpoint saved.[/dim green]")
+                t_book_end = time.perf_counter()
+                book_total_dur = t_book_end - t_book_start
+                completed_book_records.append({
+                    "book_id": bid,
+                    "book_duration": book_total_dur,
+                    "batch_overhead_share": 0.0,
+                    "effective_total": book_total_dur,
+                })
+                console.print(f"  [dim green]✓ Book #{bid} concepts integrated and graph checkpoint saved ({book_total_dur:.1f}s).[/dim green]")
 
                 # Inter-batch post-processing & incremental Neo4j export of affected nodes
                 batch_size = cfg.batch_books if cfg.recent_ideas.enabled else 10
                 is_batch_end = (completed_in_session % batch_size == 0) or (book_idx == len(books_to_process))
                 should_dual_pass = cfg.dual_pass.enabled if dual_pass is None else dual_pass
                 if is_batch_end and not interrupted and store.graph.number_of_nodes() > 0:
+                    t_batch_start = time.perf_counter()
                     if should_dual_pass:
                         console.print(f"\n  [bold cyan]═══ Running Inter-Batch Dual-Pass Idea Consolidation (Batch size: {batch_size}) ═══[/bold cyan]")
                         try:
@@ -2993,6 +3085,15 @@ def build_graph(
                             )
                         except Exception as e:
                             console.print(f"  [bold yellow]⚠ Batch Neo4j sync failed:[/bold yellow] {e}")
+
+                    # Attribute batch postprocessing & sync overhead evenly to the books of this batch
+                    batch_overhead = time.perf_counter() - t_batch_start
+                    rem_in_batch = completed_in_session % batch_size
+                    books_in_this_batch = rem_in_batch if rem_in_batch != 0 else batch_size
+                    overhead_per_book = batch_overhead / max(1, books_in_this_batch)
+                    for r in completed_book_records[-books_in_this_batch:]:
+                        r["batch_overhead_share"] = overhead_per_book
+                        r["effective_total"] = r["book_duration"] + overhead_per_book
 
                 if limit is not None and limit > 0 and completed_in_session >= limit:
                     console.print(

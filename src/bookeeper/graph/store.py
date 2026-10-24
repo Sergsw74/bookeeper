@@ -269,13 +269,14 @@ class ConceptGraphStore:
             node_data["tag"] = "idea"
             # Update weight to the highest observed significance
             node_data["weight"] = max(node_data.get("weight", 0), weight)
-            if brief and len(brief) > len(node_data.get("brief_description", "")):
-                node_data["brief_description"] = brief
-            if detailed and len(detailed) > len(node_data.get("detailed_explanation", "")):
-                node_data["detailed_explanation"] = detailed
-            summary_cand = brief or detailed
-            if len(summary_cand) > len(node_data.get("summary", "")):
-                node_data["summary"] = summary_cand
+            if not node_data.get("refined"):
+                if brief and len(brief) > len(node_data.get("brief_description", "")):
+                    node_data["brief_description"] = brief
+                if detailed and len(detailed) > len(node_data.get("detailed_explanation", "")):
+                    node_data["detailed_explanation"] = detailed
+                summary_cand = brief or detailed
+                if len(summary_cand) > len(node_data.get("summary", "")):
+                    node_data["summary"] = summary_cand
             if emb and not node_data.get("embedding"):
                 node_data["embedding"] = [round(float(x), 6) for x in emb]
 
@@ -566,13 +567,16 @@ class ConceptGraphStore:
         src_concept_name: str,
         tgt_concept_name: str,
         relation_type: str = "RELATES_TO",
-    ) -> None:
-        """Connect (:Concept) -[:RELATES_TO]-> (:Concept)."""
+    ) -> bool:
+        """
+        Connect (:Concept) -[:RELATES_TO]-> (:Concept).
+        Returns True if a new edge (or node) was created/updated, False if it already existed unchanged.
+        """
         src_concept_name = BookParser.repair_mojibake(src_concept_name)
         tgt_concept_name = BookParser.repair_mojibake(tgt_concept_name)
 
         if src_concept_name == tgt_concept_name:
-            return
+            return False
 
         src_id = f"concept:{src_concept_name}"
         tgt_id = f"concept:{tgt_concept_name}"
@@ -588,6 +592,10 @@ class ConceptGraphStore:
                     weight=5,
                     occurrences=1,
                 )
+                self.mark_node_dirty(nid)
+
+        if self.graph.has_edge(src_id, tgt_id) and self.graph[src_id][tgt_id].get("relation") == relation_type:
+            return False
 
         self.graph.add_edge(
             src_id,
@@ -595,6 +603,7 @@ class ConceptGraphStore:
             relation=relation_type,
         )
         self.mark_edge_dirty(src_id, tgt_id)
+        return True
 
     def remove_book(self, book_id: int) -> Dict[str, int]:
         """

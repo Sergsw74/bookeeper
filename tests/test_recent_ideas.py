@@ -579,7 +579,7 @@ def test_build_graph_skip_limbo_chunks_flag(tmp_path: Path):
     def _embed_docs(texts):
         res_vecs = []
         for t in texts:
-            if t.startswith("Paxos Consensus:"):
+            if t.startswith("Paxos Consensus"):
                 res_vecs.append([1.0, 0.0])
             else:
                 res_vecs.append(limbo_vec)
@@ -887,6 +887,7 @@ def test_chunk_embeddings_reused_across_chunker_store_and_router(tmp_path: Path)
     2. ChunkStore persists and reloads chunk.embedding on disk.
     3. RecentIdeaChunkRouter.route_chunks reuses chunk.embedding without calling embed_documents again.
     """
+    from unittest.mock import patch
     from langchain_core.embeddings import Embeddings
     from bookeeper.calibre.parser import Section
     from bookeeper.processing.chunker import ChunkStore, HierarchicalChunker
@@ -1138,6 +1139,133 @@ def test_deduplicator_resolve_concepts_batch_single_transaction_for_20_ideas():
         assert resolved[i].name == f"Extracted Idea {i}"
         assert resolved[i].embedding is not None
         assert len(resolved[i].embedding) == 20
+
+
+def test_size_aware_embedding_batching_for_sentences_chunks_and_full_ideas():
+    """
+    Verify size-aware batching (`partition_texts_for_embedding`, `format_idea_for_embedding`,
+    `FailoverOllamaEmbeddings.embed_documents`, `RollingWindowSemanticChunker`, `HierarchicalChunker`,
+    `IdeaEmbeddingIndex`, `RecentIdeaChunkRouter`, `EntityDeduplicator`, and `IdeaPostProcessor`)
+    dynamically adjusts batch sizes based on whether the texts are short sentences, short ideas,
+    full ideas (name + brief + detailed explanation), or full chunks.
+    """
+    from unittest.mock import patch
+    from langchain_core.embeddings import Embeddings
+    from bookeeper.processing.ollama_pool import (
+        FailoverOllamaEmbeddings,
+        OllamaPool,
+        format_idea_for_embedding,
+        partition_texts_for_embedding,
+    )
+    from bookeeper.processing.chunker import HierarchicalChunk, HierarchicalChunker
+    from bookeeper.processing.recent_ideas import IdeaEmbeddingIndex, RecentIdeaChunkRouter
+    from bookeeper.processing.deduplicator import EntityDeduplicator
+    from bookeeper.processing.extractor import Concept
+    from bookeeper.processing.idea_postprocessor import IdeaCluster, IdeaObservation, IdeaPostProcessor
+    from bookeeper.calibre.parser import Section
+    from bookeeper.graph.store import ConceptGraphStore
+
+    # 1. Short sentences (~100 chars each): 60 sentences fit in 1 batch (6,000 chars <= 16,000 max_batch_chars, 60 <= 64 items)
+    sentences = [f"Sentence {i}: " + ("a" * 85) for i in range(60)]
+    sentence_batches = partition_texts_for_embedding(sentences, max_batch_chars=16000, max_batch_items=64)
+    assert len(sentence_batches) == 1
+    assert len(sentence_batches[0]) == 60
+
+    # 2. Full ideas (~1,500 chars each with name + brief + detailed_explanation):
+    #    20 full ideas (~30,000 chars total) are automatically split across 3 batches when max_batch_chars=12,000 (~8 ideas/batch)
+    full_ideas = [
+        format_idea_for_embedding(
+            f"Concept {i}",
+            brief_description="Brief summary " + ("b" * 180),
+            detailed_explanation="Detailed mechanism and trade-offs " + ("d" * 1250),
+        )
+        for i in range(20)
+    ]
+    idea_batches = partition_texts_for_embedding(full_ideas, max_batch_chars=12000, max_batch_items=64)
+    assert len(idea_batches) == 3
+    assert sum(len(b) for b in idea_batches) == 20
+    assert all(sum(len(t) for t in b) <= 12000 for b in idea_batches)
+
+    # 3. Full chunks (~2,500 chars each):
+    #    15 chunks (~37,500 chars total) are automatically split into smaller batches (~4 chunks/batch for 12,000 char budget)
+    chunks_texts = [f"Chunk {i}: " + ("c" * 2480) for i in range(15)]
+    chunk_batches = partition_texts_for_embedding(chunks_texts, max_batch_chars=12000, max_batch_items=16)
+    assert len(chunk_batches) == 4
+    assert sum(len(b) for b in chunk_batches) == 15
+    assert all(len(b) <= 4 for b in chunk_batches)
+
+    # 4. FailoverOllamaEmbeddings.embed_documents respects both max_batch_chars and batch_size
+    pool = OllamaPool.from_urls(["http://localhost:11434"])
+    failover_emb = FailoverOllamaEmbeddings(
+        pool=pool,
+        model="qwen3-embedding:8b",
+        batch_size=64,
+        max_batch_chars=10000,
+    )
+    mock_client = MagicMock()
+    mock_client.embed_documents.side_effect = lambda batch: [[1.0, 0.0] for _ in batch]
+    with patch("bookeeper.processing.ollama_pool.OllamaEmbeddings", return_value=mock_client):
+        # 50 short sentences (~5,000 chars) -> 1 HTTP batch call
+        res_sent = failover_emb.embed_documents(sentences[:50])
+        assert len(res_sent) == 50
+        assert mock_client.embed_documents.call_count == 1
+
+        mock_client.embed_documents.reset_mock()
+        # 12 large chunks (~30,000 chars) -> split into 3 HTTP batch calls (4 chunks per 10,000-char batch)
+        res_chunks = failover_emb.embed_documents(chunks_texts[:12])
+        assert len(res_chunks) == 12
+        assert mock_client.embed_documents.call_count == 3
+
+    # 5. HierarchicalChunker single-sentence & structural fallback (`_smart_split`) batch-embeds chunks
+    mock_emb = MagicMock(spec=Embeddings)
+    mock_emb.embed_documents.side_effect = lambda batch: [[0.5, 0.5] for _ in batch]
+    h_chunker = HierarchicalChunker(
+        max_chunk_chars=3000,
+        min_chunk_chars=20,
+        embeddings=mock_emb,
+    )
+    sec = Section(title="Short Chapter", chapter_idx=1, text="A short structural section that fits in one chunk.")
+    out_chunks = h_chunker.chunk_section(sec, book_id=1, book_title="Book")
+    assert len(out_chunks) == 1
+    assert out_chunks[0].embedding == pytest.approx([float(np.sqrt(0.5)), float(np.sqrt(0.5))], rel=1e-4)
+    assert mock_emb.embed_documents.call_count == 1
+
+    # 6. EntityDeduplicator.resolve_concepts_batch formats full ideas (name + brief + detailed) and partitions by size
+    mock_emb.embed_documents.reset_mock()
+    dedup = EntityDeduplicator(embeddings=mock_emb)
+    heavy_concepts = [
+        Concept(
+            name=f"Heavy Idea {i}",
+            brief_description="Brief " + ("x" * 200),
+            detailed_explanation="Detailed " + ("y" * 1300),
+        )
+        for i in range(20)
+    ]
+    resolved_heavy = dedup.resolve_concepts_batch(heavy_concepts, batch_size=64)
+    assert len(resolved_heavy) == 20
+    # 20 full ideas (~1,500 chars each = ~30,000 chars) with max_batch_chars=12000 -> 3 batched calls instead of 1 oversized call
+    assert mock_emb.embed_documents.call_count == 3
+
+    # 7. IdeaPostProcessor.cluster_by_semantic_similarity formats full ideas and batches by character budget
+    mock_emb.embed_documents.reset_mock()
+    post = IdeaPostProcessor(embeddings=mock_emb)
+    clusters = [
+        IdeaCluster(
+            canonical_name=f"Cluster Idea {i}",
+            normalized_name=f"cluster idea {i}",
+            observations=[
+                IdeaObservation(
+                    concept_name=f"Cluster Idea {i}",
+                    local_brief="Brief " + ("b" * 200),
+                    local_detailed="Detailed " + ("d" * 1300),
+                )
+            ],
+        )
+        for i in range(18)
+    ]
+    post.cluster_by_semantic_similarity(clusters, console=None)
+    assert mock_emb.embed_documents.call_count == 3
+    assert all(c.embedding is not None for c in clusters)
 
 
 

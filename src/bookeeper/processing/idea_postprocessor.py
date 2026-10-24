@@ -658,12 +658,25 @@ class IdeaPostProcessor:
         ]
 
         if missing_indices and self.embeddings is not None:
+            from bookeeper.processing.ollama_pool import (
+                format_idea_for_embedding,
+                partition_texts_for_embedding,
+            )
+
             texts = [
-                f"{clusters[idx].canonical_name}: {clusters[idx].get_representative_brief()}"
+                format_idea_for_embedding(
+                    clusters[idx].canonical_name,
+                    brief_description=clusters[idx].get_representative_brief(),
+                    detailed_explanation=clusters[idx].get_representative_detailed(),
+                )
                 for idx in missing_indices
             ]
             emb_model = getattr(self.embeddings, "model", "embeddings")
-            batch_size = 16
+            text_batches = partition_texts_for_embedding(
+                texts,
+                max_batch_chars=12000,
+                max_batch_items=32,
+            )
 
             try:
                 vectors_raw = []
@@ -680,13 +693,14 @@ class IdeaPostProcessor:
                     )
                     with emb_progress:
                         task = emb_progress.add_task("embed", total=len(texts))
-                        for i in range(0, len(texts), batch_size):
-                            batch = texts[i : i + batch_size]
+                        for batch in text_batches:
                             vecs = self.embeddings.embed_documents(batch)
                             vectors_raw.extend(vecs)
                             emb_progress.update(task, advance=len(batch))
                 else:
-                    vectors_raw = self.embeddings.embed_documents(texts)
+                    for batch in text_batches:
+                        vecs = self.embeddings.embed_documents(batch)
+                        vectors_raw.extend(vecs)
 
                 if len(vectors_raw) != len(missing_indices):
                     logger.warning(

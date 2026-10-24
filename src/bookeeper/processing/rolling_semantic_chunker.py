@@ -84,6 +84,7 @@ class RollingWindowSemanticChunker:
         overlap_sentences: int = 1,
         token_counter: Optional[Callable[[str], int]] = None,
         batch_size: int = 64,
+        max_batch_chars: int = 16000,
         breakpoint_threshold_type: str = "similarity_threshold",
         breakpoint_threshold_amount: float = 85.0,
         respect_paragraphs: bool = True,
@@ -109,6 +110,7 @@ class RollingWindowSemanticChunker:
         self.similarity_threshold = similarity_threshold
         self.overlap_sentences = overlap_sentences
         self.batch_size = batch_size
+        self.max_batch_chars = max_batch_chars
         self.breakpoint_threshold_type = breakpoint_threshold_type
         self.breakpoint_threshold_amount = breakpoint_threshold_amount
         self.respect_paragraphs = respect_paragraphs
@@ -291,10 +293,16 @@ class RollingWindowSemanticChunker:
         unique_texts = list(dict.fromkeys(left_contexts + right_contexts))
         text_to_idx = {t: i for i, t in enumerate(unique_texts)}
 
-        # 2. Batch embed unique texts
+        # 2. Dynamically batch embed unique sentence/window texts by both item count and character size
+        from bookeeper.processing.ollama_pool import partition_texts_for_embedding
+
+        batches = partition_texts_for_embedding(
+            unique_texts,
+            max_batch_chars=self.max_batch_chars,
+            max_batch_items=self.batch_size,
+        )
         all_embeddings_list: List[np.ndarray] = []
-        for b_start in range(0, len(unique_texts), self.batch_size):
-            batch = unique_texts[b_start : b_start + self.batch_size]
+        for batch in batches:
             b_emb = self._embed_fn(batch)
             if b_emb.ndim == 1:
                 b_emb = b_emb.reshape(1, -1)
@@ -407,19 +415,32 @@ class RollingWindowSemanticChunker:
         # Edge case: single-sentence document
         if num_sentences == 1:
             chunk_str = sentences[0]
-            return [
-                {
-                    "chunk_id": 0,
-                    "text": chunk_str,
-                    "token_count": self.count_tokens(chunk_str),
-                    "char_count": len(chunk_str),
-                    "word_count": len(chunk_str.split()),
-                    "start_sentence_idx": 0,
-                    "end_sentence_idx": 0,
-                    "split_reason": "document_end",
-                    "metadata": base_meta,
-                }
-            ]
+            single_emb: Optional[List[float]] = None
+            if self._embed_fn is not None:
+                try:
+                    raw_arr = self._embed_fn([chunk_str])
+                    if raw_arr is not None and raw_arr.size > 1:
+                        vec_1d = raw_arr.reshape(-1).astype(np.float32)
+                        n_val = float(np.linalg.norm(vec_1d))
+                        if n_val > 1e-12:
+                            vec_1d = vec_1d / n_val
+                        single_emb = [round(float(x), 6) for x in vec_1d]
+                except Exception:
+                    single_emb = None
+            single_dict: Dict[str, Any] = {
+                "chunk_id": 0,
+                "text": chunk_str,
+                "token_count": self.count_tokens(chunk_str),
+                "char_count": len(chunk_str),
+                "word_count": len(chunk_str.split()),
+                "start_sentence_idx": 0,
+                "end_sentence_idx": 0,
+                "split_reason": "document_end",
+                "metadata": base_meta,
+            }
+            if single_emb is not None:
+                single_dict["embedding"] = single_emb
+            return [single_dict]
 
         # Step B: Compute rolling window embeddings
         num_split_points = num_sentences - 1

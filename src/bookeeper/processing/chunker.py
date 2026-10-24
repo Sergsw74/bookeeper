@@ -234,6 +234,42 @@ class HierarchicalChunker:
                 all_chunks.append(chunk)
                 global_chunk_idx += 1
 
+        # Batch-embed any chunks that bypassed RollingWindowSemanticChunker (e.g. subsections <= max_chunk_chars)
+        if self.embeddings is not None and hasattr(self.embeddings, "embed_documents") and all_chunks:
+            missing_chunks = [c for c in all_chunks if not c.embedding]
+            if missing_chunks:
+                from bookeeper.processing.ollama_pool import partition_texts_for_embedding
+                import numpy as np
+
+                missing_texts = [c.text or "" for c in missing_chunks]
+                batches = partition_texts_for_embedding(
+                    missing_texts,
+                    max_batch_chars=12000,
+                    max_batch_items=16,
+                )
+                computed_vecs: List[Optional[List[float]]] = []
+                for b in batches:
+                    try:
+                        vecs = self.embeddings.embed_documents(b)
+                        if isinstance(vecs, list) and len(vecs) == len(b):
+                            for v in vecs:
+                                if isinstance(v, (list, tuple, np.ndarray)) and len(v) > 1:
+                                    arr = np.array(v, dtype=np.float32)
+                                    norm = float(np.linalg.norm(arr))
+                                    unit = (arr / norm).tolist() if norm > 0.0 else arr.tolist()
+                                    computed_vecs.append(unit)
+                                else:
+                                    computed_vecs.append(None)
+                        else:
+                            computed_vecs.extend([None] * len(b))
+                    except Exception as e:
+                        logger.debug(f"Could not batch-embed structural chunks: {e}")
+                        computed_vecs.extend([None] * len(b))
+
+                for chk_obj, vec_val in zip(missing_chunks, computed_vecs):
+                    if vec_val is not None:
+                        chk_obj.embedding = vec_val
+
         # Link sequential prev_chunk_id and next_chunk_id
         for i in range(len(all_chunks)):
             if i > 0:

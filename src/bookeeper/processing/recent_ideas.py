@@ -16,6 +16,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tupl
 import numpy as np
 
 from bookeeper.calibre.parser import BookParser, format_idea_month
+from bookeeper.processing.ollama_pool import (
+    format_idea_for_embedding,
+    partition_texts_for_embedding,
+)
 
 if TYPE_CHECKING:
     from langchain_core.embeddings import Embeddings
@@ -214,7 +218,14 @@ class IdeaEmbeddingIndex:
 
                     idx = len(names)
                     names.append(clean_name)
-                    texts.append(f"{clean_name}: {summary}")
+                    texts.append(
+                        format_idea_for_embedding(
+                            clean_name,
+                            brief_description=brief,
+                            detailed_explanation=detailed,
+                            summary=summary,
+                        )
+                    )
                     node_ids.append(node_id)
                     months[clean_name] = month
 
@@ -231,18 +242,22 @@ class IdeaEmbeddingIndex:
         if not cached_vecs and embeddings is None:
             return cls(idea_names=names, idea_summaries=texts, idea_months=months, vectors=None)
 
-        # Batch embed only the ideas that do not yet have a cached embedding
+        # Batch embed only the ideas that do not yet have a cached embedding (size-aware batching for full ideas)
         newly_embedded: Dict[int, List[float]] = {}
         if missing_indices and embeddings is not None:
             missing_texts = [texts[idx] for idx in missing_indices]
+            idea_batches = partition_texts_for_embedding(
+                missing_texts,
+                max_batch_chars=12000,
+                max_batch_items=batch_size,
+            )
             computed_raw: List[List[float]] = []
-            for i in range(0, len(missing_texts), batch_size):
-                sub_batch = missing_texts[i : i + batch_size]
+            for b_idx, sub_batch in enumerate(idea_batches):
                 try:
                     v = embeddings.embed_documents(sub_batch)
                     computed_raw.extend(v)
                 except Exception as e:
-                    logger.warning(f"Error embedding idea texts batch {i}: {e}")
+                    logger.warning(f"Error embedding idea texts batch {b_idx}: {e}")
                     for _ in sub_batch:
                         computed_raw.append([])
             for idx, vec in zip(missing_indices, computed_raw):
@@ -468,14 +483,18 @@ class RecentIdeaChunkRouter:
 
             if self.embeddings is not None:
                 missing_texts = [getattr(chunks[idx], "text", "") or "" for idx in missing_indices]
+                chunk_batches = partition_texts_for_embedding(
+                    missing_texts,
+                    max_batch_chars=12000,
+                    max_batch_items=min(batch_size, 16),
+                )
                 computed_raw: List[List[float]] = []
-                for i in range(0, len(missing_texts), batch_size):
-                    sub_batch = missing_texts[i : i + batch_size]
+                for b_idx, sub_batch in enumerate(chunk_batches):
                     try:
                         v = self.embeddings.embed_documents(sub_batch)
                         computed_raw.extend(v)
                     except Exception as e:
-                        logger.warning(f"Error embedding chunks batch {i}: {e}")
+                        logger.warning(f"Error embedding chunks batch {b_idx}: {e}")
                         for _ in sub_batch:
                             computed_raw.append([])
 

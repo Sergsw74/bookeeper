@@ -15,6 +15,10 @@ from pydantic import BaseModel, Field
 from bookeeper.calibre.parser import BookParser
 from bookeeper.config import Settings
 from bookeeper.processing.extractor import Concept
+from bookeeper.processing.ollama_pool import (
+    format_idea_for_embedding,
+    partition_texts_for_embedding,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -260,32 +264,45 @@ class EntityDeduplicator:
         # 1. Batch-embed any concepts missing embeddings and not already in exact-name cache
         missing_texts: List[str] = []
         missing_text_to_vec: Dict[str, np.ndarray] = {}
+        concept_to_embed_text: Dict[str, str] = {}
         seen_missing: set[str] = set()
 
         for c in concepts:
             raw_name = c.name
+            embed_text = format_idea_for_embedding(
+                raw_name,
+                brief_description=getattr(c, "brief_description", "") or "",
+                detailed_explanation=getattr(c, "detailed_explanation", "") or "",
+                summary=getattr(c, "summary", "") or "",
+            )
+            concept_to_embed_text[raw_name] = embed_text
+
             if c.embedding and len(c.embedding) > 1:
                 arr = np.array(c.embedding, dtype=np.float32)
                 norm = float(np.linalg.norm(arr))
                 unit = (arr / norm) if norm > 0.0 else arr
                 c.embedding = unit.tolist()
-                missing_text_to_vec[raw_name] = unit
+                missing_text_to_vec[embed_text] = unit
                 continue
 
             if raw_name in self._cache and self._cache[raw_name][0] is not None:
                 vec = self._cache[raw_name][0]
                 if vec is not None:
                     c.embedding = vec.tolist()
-                    missing_text_to_vec[raw_name] = vec
+                    missing_text_to_vec[embed_text] = vec
                     continue
 
-            if raw_name not in seen_missing:
-                seen_missing.add(raw_name)
-                missing_texts.append(raw_name)
+            if embed_text not in seen_missing:
+                seen_missing.add(embed_text)
+                missing_texts.append(embed_text)
 
         if missing_texts and self.embeddings is not None:
-            for i in range(0, len(missing_texts), batch_size):
-                sub = missing_texts[i : i + batch_size]
+            text_batches = partition_texts_for_embedding(
+                missing_texts,
+                max_batch_chars=12000,
+                max_batch_items=batch_size,
+            )
+            for b_idx, sub in enumerate(text_batches):
                 try:
                     if hasattr(self.embeddings, "embed_documents"):
                         raw_vecs = self.embeddings.embed_documents(sub)
@@ -298,11 +315,12 @@ class EntityDeduplicator:
                             unit = (arr / norm) if norm > 0.0 else arr
                             missing_text_to_vec[txt] = unit
                 except Exception as e:
-                    logger.debug(f"Batch concept embedding failed on sub-batch {i}: {e}")
+                    logger.debug(f"Batch concept embedding failed on sub-batch {b_idx}: {e}")
 
         for c in concepts:
-            if not c.embedding and c.name in missing_text_to_vec:
-                c.embedding = missing_text_to_vec[c.name].tolist()
+            embed_text = concept_to_embed_text.get(c.name, c.name)
+            if not c.embedding and embed_text in missing_text_to_vec:
+                c.embedding = missing_text_to_vec[embed_text].tolist()
 
         # 2. Query Neo4j HNSW vector index ('idea_idx') for all extracted idea vectors in a single batched transaction:
         #    UNWIND $idea_vectors AS vec CALL db.index.vector.queryNodes('idea_idx', 3, vec)

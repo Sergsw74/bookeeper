@@ -993,9 +993,96 @@ class OllamaPool:
         )
 
 
+def partition_texts_for_embedding(
+    texts: Sequence[str],
+    max_batch_chars: int = 16000,
+    max_batch_items: int = 64,
+    max_item_chars: int = 6000,
+) -> List[List[str]]:
+    """
+    Dynamically partition texts (sentences, chunks, short ideas, or full ideas) into
+    size-aware batches bounded by both character budget (`max_batch_chars`) and item count
+    (`max_batch_items`).
+
+    - Short sentences (~100-300 chars) pack up to `max_batch_items` (e.g. 64) per batch.
+    - Full ideas (name + brief + detailed explanation, ~500-2,000 chars) pack ~8-24 per batch.
+    - Full chunks (~1,500-3,000 chars) pack ~5-10 per batch so Ollama's embedding context
+      buffer never overflows or times out.
+    """
+    if not texts:
+        return []
+
+    eff_max_items = max(1, int(max_batch_items)) if max_batch_items and max_batch_items > 0 else len(texts)
+    eff_max_chars = int(max_batch_chars) if max_batch_chars and max_batch_chars > 0 else 0
+
+    batches: List[List[str]] = []
+    current_batch: List[str] = []
+    current_chars: int = 0
+
+    for raw in texts:
+        s = str(raw or "")
+        if max_item_chars and max_item_chars > 0 and len(s) > max_item_chars:
+            s = s[:max_item_chars]
+        item_len = max(1, len(s))
+
+        if current_batch and (
+            len(current_batch) >= eff_max_items
+            or (eff_max_chars > 0 and current_chars + item_len > eff_max_chars)
+        ):
+            batches.append(current_batch)
+            current_batch = []
+            current_chars = 0
+
+        current_batch.append(s)
+        current_chars += item_len
+
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
+
+
+def format_idea_for_embedding(
+    name: str,
+    brief_description: str = "",
+    detailed_explanation: str = "",
+    summary: str = "",
+    max_chars: int = 2400,
+) -> str:
+    """
+    Format an idea (or full idea with brief and detailed explanations) into a single
+    text string for semantic embedding, avoiding duplicate text and respecting max_chars.
+    """
+    clean_name = (name or "").strip()
+    brief = (brief_description or summary or "").strip()
+    detailed = (detailed_explanation or "").strip()
+
+    parts: List[str] = []
+    if clean_name:
+        parts.append(clean_name)
+    if brief and brief.lower() != clean_name.lower():
+        parts.append(brief)
+    if detailed and detailed.lower() != brief.lower() and detailed.lower() != clean_name.lower():
+        parts.append(detailed)
+
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        text = parts[0]
+    elif len(parts) == 2:
+        text = f"{parts[0]}: {parts[1]}"
+    else:
+        text = f"{parts[0]}: {parts[1]} — {parts[2]}"
+
+    if max_chars and max_chars > 0 and len(text) > max_chars:
+        return text[:max_chars]
+    return text
+
+
 class FailoverOllamaEmbeddings(Embeddings):
     """
-    LangChain Embeddings wrapper with multi-server failover support across OllamaPool.
+    LangChain Embeddings wrapper with multi-server failover and dynamic size-aware batching
+    across OllamaPool for sentences, chunks, and ideas (short or full ideas).
     """
 
     def __init__(
@@ -1003,11 +1090,17 @@ class FailoverOllamaEmbeddings(Embeddings):
         pool: OllamaPool,
         model: str = "nomic-embed-text",
         request_timeout: int = 120,
+        max_batch_chars: int = 16000,
+        max_batch_items: int = 64,
+        max_item_chars: int = 6000,
         **kwargs: Any,
     ):
         self.pool = pool
         self.model = model
         self.request_timeout = request_timeout
+        self.max_batch_chars = max_batch_chars
+        self.max_batch_items = max_batch_items
+        self.max_item_chars = max_item_chars
         self._lock = threading.Lock()
         self.total_embedded_texts: int = 0
         self.total_embedded_chars: int = 0
@@ -1056,10 +1149,21 @@ class FailoverOllamaEmbeddings(Embeddings):
                 "speed_chars_per_sec": speed_chars,
             }
 
-    def embed_documents(self, texts: List[str], batch_size: int = 64) -> List[List[float]]:
-        """Embed a list of documents with multi-server failover, batching, and curl fallback."""
+    def embed_documents(
+        self,
+        texts: List[str],
+        batch_size: Optional[int] = None,
+        max_batch_chars: Optional[int] = None,
+    ) -> List[List[float]]:
+        """
+        Embed a list of documents (sentences, chunks, or ideas) using dynamic size-aware
+        batching (bounded by both item count and character budget) with multi-server failover.
+        """
         if not texts:
             return []
+
+        eff_batch_items = batch_size if batch_size is not None else self.max_batch_items
+        eff_batch_chars = max_batch_chars if max_batch_chars is not None else self.max_batch_chars
 
         def _embed_batch(batch_texts: List[str]) -> List[List[float]]:
             def _embed(url: str):
@@ -1105,12 +1209,19 @@ class FailoverOllamaEmbeddings(Embeddings):
                 self.total_embedding_seconds += elapsed
             return result
 
-        if len(texts) <= batch_size:
-            return _embed_batch(texts)
+        batches = partition_texts_for_embedding(
+            texts,
+            max_batch_chars=eff_batch_chars,
+            max_batch_items=eff_batch_items,
+            max_item_chars=self.max_item_chars,
+        )
+
+        if len(batches) == 1:
+            return _embed_batch(batches[0])
 
         all_embs: List[List[float]] = []
-        for i in range(0, len(texts), batch_size):
-            all_embs.extend(_embed_batch(texts[i : i + batch_size]))
+        for b in batches:
+            all_embs.extend(_embed_batch(b))
         return all_embs
 
     def embed_query(self, text: str) -> List[float]:

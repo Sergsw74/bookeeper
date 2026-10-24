@@ -488,12 +488,13 @@ class Neo4jExporter:
                 distinct_labels.add(primary_label)
                 if is_idea:
                     distinct_labels.add("Idea")
-                    raw_emb = attrs.get("embedding")
-                    if isinstance(raw_emb, (list, tuple)) and len(raw_emb) > 0:
-                        idea_vector_dim = len(raw_emb)
+                raw_emb = attrs.get("embedding")
+                if isinstance(raw_emb, (list, tuple)) and len(raw_emb) > 0:
+                    idea_vector_dim = len(raw_emb)
 
-                # Store embeddings EXCLUSIVELY on :Idea nodes in Neo4j
-                excl = None if is_idea else {"embedding"}
+                # Export embeddings on :Idea and :Chunk nodes; the HNSW vector index ('idea_idx')
+                # is created exclusively FOR (n:Idea) ON (n.embedding).
+                excl = None if (is_idea or primary_label == "Chunk") else {"embedding"}
                 props = clean_neo4j_properties(attrs, exclude_keys=excl)
                 props["id"] = node_id  # Guarantee primary key property
 

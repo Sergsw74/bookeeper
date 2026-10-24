@@ -3235,6 +3235,11 @@ def export_command(
         "--clean/--no-clean",
         help="Perform clean start on export destinations before exporting (default: config.yaml clean_export).",
     ),
+    backfill_embeddings: bool = typer.Option(
+        True,
+        "--backfill-embeddings/--no-backfill-embeddings",
+        help="Automatically backfill missing embeddings on existing Idea and Chunk nodes before exporting.",
+    ),
 ):
     """
     Export current Knowledge Graph to all destinations (Obsidian, GraphML, and Neo4j)
@@ -3261,6 +3266,20 @@ def export_command(
     if node_count == 0:
         console.print("[yellow]Knowledge graph contains 0 nodes. Nothing to export.[/yellow]")
         return
+
+    if backfill_embeddings:
+        try:
+            from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings
+            emb_client = FailoverOllamaEmbeddings.from_settings(cfg, model=cfg.embedding_model)
+            bf_res = store.backfill_missing_embeddings(emb_client, console=console)
+            if bf_res["ideas_embedded"] > 0 or bf_res["chunks_embedded"] > 0:
+                store.save(target_graph_file)
+                console.print(
+                    f"[bold green]✓ Backfilled and saved missing embeddings:[/bold green] "
+                    f"{bf_res['ideas_embedded']} ideas, {bf_res['chunks_embedded']} chunks."
+                )
+        except Exception as e:
+            logger.debug(f"Could not backfill embeddings before export: {e}")
 
     effective_clean = cfg.clean_export if clean is None else clean
     target_vault = Path(vault_dir).expanduser().resolve() if vault_dir else cfg.resolved_output_dir / "obsidian_vault"
@@ -3312,6 +3331,11 @@ def export_neo4j_command(
         "--clean/--no-clean",
         help="Perform clean start: delete all existing content in target Neo4j database before export (default: config.yaml neo4j.clean_export).",
     ),
+    backfill_embeddings: bool = typer.Option(
+        True,
+        "--backfill-embeddings/--no-backfill-embeddings",
+        help="Automatically backfill missing embeddings on existing Idea and Chunk nodes before exporting.",
+    ),
 ):
     """
     Export and upsert the current Knowledge Graph into Neo4j.
@@ -3351,6 +3375,20 @@ def export_neo4j_command(
     if node_count == 0:
         console.print("[yellow]Knowledge graph contains 0 nodes. Nothing to export.[/yellow]")
         return
+
+    if backfill_embeddings:
+        try:
+            from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings
+            emb_client = FailoverOllamaEmbeddings.from_settings(cfg, model=cfg.embedding_model)
+            bf_res = store.backfill_missing_embeddings(emb_client, console=console)
+            if bf_res["ideas_embedded"] > 0 or bf_res["chunks_embedded"] > 0:
+                store.save(target_graph_file)
+                console.print(
+                    f"[bold green]✓ Backfilled and saved missing embeddings:[/bold green] "
+                    f"{bf_res['ideas_embedded']} ideas, {bf_res['chunks_embedded']} chunks."
+                )
+        except Exception as e:
+            logger.debug(f"Could not backfill embeddings before Neo4j export: {e}")
 
     export_type_str = (
         "[bold red]clean start + upsert[/bold red] (delete all existing content, then insert fresh)"

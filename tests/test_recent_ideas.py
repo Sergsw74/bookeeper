@@ -1032,7 +1032,8 @@ def test_neo4j_hnsw_vector_index_exclusively_on_idea_nodes_and_batched_unwind_qu
         assert "`vector.similarity_function`: 'cosine'" in index_queries[0]
         assert "`vector.dimensions`: 3" in index_queries[0]
 
-        # 2. Verify :Idea node has embedding in Neo4j export batch, while :Chunk and :Book do NOT
+        # 2. Verify :Idea and :Chunk nodes have embedding in Neo4j export batch, while :Book does NOT,
+        #    and HNSW vector index is created exclusively on :Idea(embedding)
         for q, params in executed_queries:
             if "UNWIND $batch AS row" in q and "MERGE (n:`" in q:
                 batch = params.get("batch", [])
@@ -1041,6 +1042,9 @@ def test_neo4j_hnsw_vector_index_exclusively_on_idea_nodes_and_batched_unwind_qu
                     if "SET n:Idea" in q or ":`Idea`" in q:
                         assert "embedding" in props
                         assert props["embedding"] == [1.0, 0.0, 0.0]
+                    elif "MERGE (n:`Chunk`" in q:
+                        assert "embedding" in props
+                        assert props["embedding"] == [0.5, 0.5, 0.7071]
                     else:
                         assert "embedding" not in props
 
@@ -1266,6 +1270,32 @@ def test_size_aware_embedding_batching_for_sentences_chunks_and_full_ideas():
     post.cluster_by_semantic_similarity(clusters, console=None)
     assert mock_emb.embed_documents.call_count == 3
     assert all(c.embedding is not None for c in clusters)
+
+    # 8. ConceptGraphStore.backfill_missing_embeddings backfills existing Ideas and Chunks without rebuilding from scratch
+    mock_emb.embed_documents.reset_mock()
+    legacy_store = ConceptGraphStore()
+    legacy_store.add_book(1, title="Legacy Book", publication_date="2023-06-01")
+    legacy_store.add_concept(
+        Concept(name="Legacy Idea", brief_description="Brief legacy idea", detailed_explanation="Detailed legacy idea")
+    )
+    legacy_store.add_chunk(
+        HierarchicalChunk(
+            chunk_id="legacy_c1",
+            book_id=1,
+            book_title="Legacy Book",
+            section_title="Chapter 1",
+            chapter_idx=1,
+            chunk_idx=0,
+            text="Legacy chunk text without pre-existing embedding.",
+        )
+    )
+    assert legacy_store.graph.nodes["concept:Legacy Idea"].get("embedding") is None
+    assert legacy_store.graph.nodes["chunk:legacy_c1"].get("embedding") is None
+
+    bf = legacy_store.backfill_missing_embeddings(mock_emb)
+    assert bf == {"ideas_embedded": 1, "chunks_embedded": 1}
+    assert legacy_store.graph.nodes["concept:Legacy Idea"].get("embedding") is not None
+    assert legacy_store.graph.nodes["chunk:legacy_c1"].get("embedding") is not None
 
 
 

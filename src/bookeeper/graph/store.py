@@ -674,3 +674,192 @@ class ConceptGraphStore:
             nx.relabel_nodes(self.graph, mapping, copy=False)
 
         logger.info(f"Loaded graph with {len(self.graph)} nodes from {path}")
+
+    def backfill_missing_embeddings(
+        self,
+        embeddings: Any,
+        include_ideas: bool = True,
+        include_chunks: bool = True,
+        batch_size: int = 64,
+        console: Optional[Any] = None,
+    ) -> Dict[str, int]:
+        """
+        Backfill missing 'embedding' vectors on existing :Idea (:Concept) and :Chunk nodes
+        in the knowledge graph using size-aware batching, without needing to rebuild the
+        knowledge graph from scratch.
+        """
+        if embeddings is None:
+            return {"ideas_embedded": 0, "chunks_embedded": 0}
+
+        import numpy as np
+        from bookeeper.processing.ollama_pool import (
+            format_idea_for_embedding,
+            partition_texts_for_embedding,
+        )
+
+        missing_idea_nodes: List[tuple[str, str]] = []
+        missing_chunk_nodes: List[tuple[str, str]] = []
+
+        for node_id, attrs in self.graph.nodes(data=True):
+            existing_emb = attrs.get("embedding")
+            if isinstance(existing_emb, (list, tuple, np.ndarray)) and len(existing_emb) > 1:
+                continue
+
+            ntype = attrs.get("type", "")
+            is_idea = bool(attrs.get("is_idea") or attrs.get("tag") == "idea" or ntype in ("Concept", "Idea"))
+            if is_idea and include_ideas:
+                raw_name = attrs.get("name") or str(node_id).replace("concept:", "")
+                clean_name = BookParser.repair_mojibake(raw_name).strip()
+                if not clean_name:
+                    continue
+                brief = attrs.get("brief_description") or attrs.get("summary") or ""
+                detailed = attrs.get("detailed_explanation") or ""
+                summary = attrs.get("summary") or ""
+                text = format_idea_for_embedding(
+                    clean_name,
+                    brief_description=brief,
+                    detailed_explanation=detailed,
+                    summary=summary,
+                )
+                missing_idea_nodes.append((node_id, text))
+            elif ntype == "Chunk" and include_chunks:
+                chunk_text = (attrs.get("text") or "").strip()
+                if chunk_text:
+                    missing_chunk_nodes.append((node_id, chunk_text))
+
+        ideas_embedded = 0
+        chunks_embedded = 0
+
+        if missing_idea_nodes:
+            idea_texts = [t for _, t in missing_idea_nodes]
+            idea_batches = partition_texts_for_embedding(
+                idea_texts,
+                max_batch_chars=12000,
+                max_batch_items=batch_size,
+            )
+            if console is not None:
+                from rich.progress import (
+                    BarColumn,
+                    MofNCompleteColumn,
+                    Progress,
+                    SpinnerColumn,
+                    TaskProgressColumn,
+                    TextColumn,
+                    TimeElapsedColumn,
+                )
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold cyan]Backfilling Idea Embeddings:[/bold cyan]"),
+                    BarColumn(bar_width=25),
+                    TaskProgressColumn(),
+                    MofNCompleteColumn(),
+                    TimeElapsedColumn(),
+                    console=console,
+                ) as prog:
+                    t_id = prog.add_task("ideas", total=len(missing_idea_nodes))
+                    offset = 0
+                    for sub in idea_batches:
+                        try:
+                            vecs = (
+                                embeddings.embed_documents(sub)
+                                if hasattr(embeddings, "embed_documents")
+                                else [embeddings.embed_query(x) for x in sub]
+                            )
+                            for (nid, _), v in zip(missing_idea_nodes[offset : offset + len(sub)], vecs):
+                                if v and len(v) > 1:
+                                    arr = np.array(v, dtype=np.float32)
+                                    norm = float(np.linalg.norm(arr))
+                                    unit = (arr / norm) if norm > 0.0 else arr
+                                    self.graph.nodes[nid]["embedding"] = [float(x) for x in unit.tolist()]
+                                    ideas_embedded += 1
+                        except Exception as e:
+                            logger.warning(f"Failed backfilling idea embeddings batch at {offset}: {e}")
+                        offset += len(sub)
+                        prog.update(t_id, advance=len(sub))
+            else:
+                offset = 0
+                for sub in idea_batches:
+                    try:
+                        vecs = (
+                            embeddings.embed_documents(sub)
+                            if hasattr(embeddings, "embed_documents")
+                            else [embeddings.embed_query(x) for x in sub]
+                        )
+                        for (nid, _), v in zip(missing_idea_nodes[offset : offset + len(sub)], vecs):
+                            if v and len(v) > 1:
+                                arr = np.array(v, dtype=np.float32)
+                                norm = float(np.linalg.norm(arr))
+                                unit = (arr / norm) if norm > 0.0 else arr
+                                self.graph.nodes[nid]["embedding"] = [float(x) for x in unit.tolist()]
+                                ideas_embedded += 1
+                    except Exception as e:
+                        logger.warning(f"Failed backfilling idea embeddings batch at {offset}: {e}")
+                    offset += len(sub)
+
+        if missing_chunk_nodes:
+            chunk_texts = [t for _, t in missing_chunk_nodes]
+            chunk_batches = partition_texts_for_embedding(
+                chunk_texts,
+                max_batch_chars=12000,
+                max_batch_items=min(batch_size, 16),
+            )
+            if console is not None:
+                from rich.progress import (
+                    BarColumn,
+                    MofNCompleteColumn,
+                    Progress,
+                    SpinnerColumn,
+                    TaskProgressColumn,
+                    TextColumn,
+                    TimeElapsedColumn,
+                )
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold cyan]Backfilling Chunk Embeddings:[/bold cyan]"),
+                    BarColumn(bar_width=25),
+                    TaskProgressColumn(),
+                    MofNCompleteColumn(),
+                    TimeElapsedColumn(),
+                    console=console,
+                ) as prog:
+                    t_id = prog.add_task("chunks", total=len(missing_chunk_nodes))
+                    offset = 0
+                    for sub in chunk_batches:
+                        try:
+                            vecs = (
+                                embeddings.embed_documents(sub)
+                                if hasattr(embeddings, "embed_documents")
+                                else [embeddings.embed_query(x) for x in sub]
+                            )
+                            for (nid, _), v in zip(missing_chunk_nodes[offset : offset + len(sub)], vecs):
+                                if v and len(v) > 1:
+                                    arr = np.array(v, dtype=np.float32)
+                                    norm = float(np.linalg.norm(arr))
+                                    unit = (arr / norm) if norm > 0.0 else arr
+                                    self.graph.nodes[nid]["embedding"] = [float(x) for x in unit.tolist()]
+                                    chunks_embedded += 1
+                        except Exception as e:
+                            logger.warning(f"Failed backfilling chunk embeddings batch at {offset}: {e}")
+                        offset += len(sub)
+                        prog.update(t_id, advance=len(sub))
+            else:
+                offset = 0
+                for sub in chunk_batches:
+                    try:
+                        vecs = (
+                            embeddings.embed_documents(sub)
+                            if hasattr(embeddings, "embed_documents")
+                            else [embeddings.embed_query(x) for x in sub]
+                        )
+                        for (nid, _), v in zip(missing_chunk_nodes[offset : offset + len(sub)], vecs):
+                            if v and len(v) > 1:
+                                arr = np.array(v, dtype=np.float32)
+                                norm = float(np.linalg.norm(arr))
+                                unit = (arr / norm) if norm > 0.0 else arr
+                                self.graph.nodes[nid]["embedding"] = [float(x) for x in unit.tolist()]
+                                chunks_embedded += 1
+                    except Exception as e:
+                        logger.warning(f"Failed backfilling chunk embeddings batch at {offset}: {e}")
+                    offset += len(sub)
+
+        return {"ideas_embedded": ideas_embedded, "chunks_embedded": chunks_embedded}

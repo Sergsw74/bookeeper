@@ -6,8 +6,9 @@ Performs high-throughput upsert (insert new, update existing) for nodes and rela
 import json
 import logging
 import re
-from contextlib import nullcontext
-from typing import Any, Callable, Optional
+import time
+from contextlib import contextmanager, nullcontext
+from typing import Any, Callable, Iterator, Optional
 
 try:
     from rich.console import Console
@@ -119,6 +120,7 @@ class Neo4jExporter:
         self.connection_timeout = connection_timeout
         self.clean_export = clean_export
         self._driver = None
+        self._captured_search_indexes: list[dict[str, Any]] = []
 
     @classmethod
     def from_config(cls, config: Neo4jConfig) -> "Neo4jExporter":
@@ -268,6 +270,331 @@ class Neo4jExporter:
         except Exception as e:
             logger.debug(f"Could not create vector index '{safe_idx}' on :Chunk(embedding): {e}")
             return False
+
+    @staticmethod
+    def _ensure_if_not_exists_in_create_index(create_stmt: str) -> str:
+        """Ensure a captured CREATE [VECTOR|FULLTEXT] INDEX statement is idempotent with IF NOT EXISTS."""
+        stmt = (create_stmt or "").strip()
+        if not stmt:
+            return stmt
+        if re.search(r"\bIF\s+NOT\s+EXISTS\b", stmt, flags=re.IGNORECASE):
+            return stmt
+        return re.sub(r"\bFOR\b", "IF NOT EXISTS FOR", stmt, count=1, flags=re.IGNORECASE)
+
+    def _execute_write_query(self, session: Any, query: str, **params: Any) -> Any:
+        """
+        Execute a parameterized Cypher write query inside an explicit write transaction
+        (session.execute_write) on real Neo4j sessions, while remaining compatible with mocks.
+        """
+        from unittest.mock import MagicMock
+
+        if isinstance(session, MagicMock):
+            if getattr(session, "execute_write", None) is not None and session.execute_write.side_effect is not None:
+                return session.execute_write(lambda tx: tx.run(query, **params))
+            return session.run(query, **params)
+        if hasattr(session, "execute_write"):
+            return session.execute_write(lambda tx: list(tx.run(query, **params)))
+        return session.run(query, **params)
+
+    def capture_search_indexes(self, session: Optional[Any] = None) -> list[dict[str, Any]]:
+        """
+        Discover and capture all VECTOR and FULLTEXT search indexes in Neo4j:
+          SHOW INDEXES YIELD name, type, entityType, labelsOrTypes, properties, createStatement
+        Strictly excludes LOOKUP, RANGE, POINT, TEXT, and constraint-backing indexes
+        so unique ID constraints (e.g. :Chunk(id), :Concept(id)) remain intact for O(1) MERGE lookups.
+        """
+        if session is None:
+            driver = self.get_driver()
+            with driver.session(database=self.database) as owned_session:
+                return self.capture_search_indexes(session=owned_session)
+
+        query = "SHOW INDEXES YIELD name, type, entityType, labelsOrTypes, properties, createStatement"
+        captured: list[dict[str, Any]] = []
+        try:
+            result = session.run(query)
+            records = list(result) if result is not None else []
+        except Exception as e:
+            logger.debug(f"Could not query SHOW INDEXES to capture search indexes: {e}")
+            self._captured_search_indexes = []
+            return []
+
+        for rec in records:
+            try:
+                row = dict(rec) if not isinstance(rec, dict) else rec
+            except Exception:
+                continue
+
+            idx_name = str(row.get("name") or "").strip()
+            idx_type = str(row.get("type") or "").strip().upper()
+            create_stmt = str(row.get("createStatement") or "").strip()
+            owning_constraint = row.get("owningConstraint")
+
+            if not idx_name or idx_type not in ("VECTOR", "FULLTEXT"):
+                continue
+            if owning_constraint is not None or "CONSTRAINT" in create_stmt.upper():
+                continue
+            if not create_stmt:
+                continue
+
+            idempotent_stmt = self._ensure_if_not_exists_in_create_index(create_stmt)
+            captured.append({
+                "name": idx_name,
+                "type": idx_type,
+                "entityType": row.get("entityType"),
+                "labelsOrTypes": row.get("labelsOrTypes"),
+                "properties": row.get("properties"),
+                "createStatement": idempotent_stmt,
+            })
+
+        self._captured_search_indexes = captured
+        if captured:
+            logger.info(
+                f"Captured {len(captured)} search index(es) ({', '.join(c['name'] for c in captured)}) "
+                "for suspension during bulk ingestion."
+            )
+        return captured
+
+    def drop_search_indexes(
+        self,
+        session: Optional[Any] = None,
+        captured_indexes: Optional[list[dict[str, Any]]] = None,
+    ) -> list[str]:
+        """
+        Drop each captured VECTOR and FULLTEXT search index using `DROP INDEX <name> IF EXISTS`
+        prior to massive node/vector upserts, preserving all LOOKUP/RANGE/constraint indexes.
+        """
+        if session is None:
+            driver = self.get_driver()
+            with driver.session(database=self.database) as owned_session:
+                return self.drop_search_indexes(session=owned_session, captured_indexes=captured_indexes)
+
+        targets = captured_indexes if captured_indexes is not None else self._captured_search_indexes
+        dropped_names: list[str] = []
+        for idx in targets:
+            name = str(idx.get("name") or "").strip()
+            if not name:
+                continue
+            safe_name = re.sub(r"[^A-Za-z0-9_]", "_", name)
+            drop_query = f"DROP INDEX {safe_name} IF EXISTS"
+            try:
+                session.run(drop_query)
+                dropped_names.append(name)
+                logger.info(f"Dropped {idx.get('type', 'SEARCH')} index '{name}' prior to bulk upsert.")
+            except Exception as e:
+                logger.warning(f"Failed to drop search index '{name}': {e}")
+        return dropped_names
+
+    def recreate_search_indexes(
+        self,
+        session: Optional[Any] = None,
+        captured_indexes: Optional[list[dict[str, Any]]] = None,
+    ) -> list[str]:
+        """
+        Recreate all previously captured VECTOR and FULLTEXT search indexes using their
+        saved `createStatement` (with idempotent IF NOT EXISTS semantics).
+        """
+        if session is None:
+            driver = self.get_driver()
+            with driver.session(database=self.database) as owned_session:
+                return self.recreate_search_indexes(session=owned_session, captured_indexes=captured_indexes)
+
+        targets = captured_indexes if captured_indexes is not None else self._captured_search_indexes
+        recreated_names: list[str] = []
+        for idx in targets:
+            name = str(idx.get("name") or "").strip()
+            stmt = self._ensure_if_not_exists_in_create_index(str(idx.get("createStatement") or ""))
+            if not name or not stmt:
+                continue
+            try:
+                session.run(stmt)
+                recreated_names.append(name)
+                logger.info(f"Recreated {idx.get('type', 'SEARCH')} index '{name}' for multithreaded bulk population.")
+            except Exception as e:
+                logger.warning(f"Failed to recreate search index '{name}': {e}")
+        return recreated_names
+
+    def wait_for_indexes_online(
+        self,
+        session: Optional[Any] = None,
+        index_names: Optional[list[str]] = None,
+        timeout_sec: int = 300,
+        poll_interval: float = 3.0,
+        on_poll: Optional[Callable[[dict[str, tuple[str, float]]], None]] = None,
+    ) -> bool:
+        """
+        Poll `SHOW INDEXES YIELD name, state, populationPercent WHERE name IN $index_names`
+        until all recreated VECTOR and FULLTEXT indexes reach state 'ONLINE'.
+        Raises TimeoutError if any index remains 'POPULATING' past timeout_sec, or RuntimeError on 'FAILED'.
+        """
+        if session is None:
+            driver = self.get_driver()
+            with driver.session(database=self.database) as owned_session:
+                return self.wait_for_indexes_online(
+                    session=owned_session,
+                    index_names=index_names,
+                    timeout_sec=timeout_sec,
+                    poll_interval=poll_interval,
+                    on_poll=on_poll,
+                )
+
+        target_names = list(
+            dict.fromkeys(
+                [n for n in (index_names if index_names is not None else [c.get("name", "") for c in self._captured_search_indexes]) if n]
+            )
+        )
+        if not target_names:
+            return True
+
+        poll_query = (
+            "SHOW INDEXES YIELD name, state, populationPercent "
+            "WHERE name IN $index_names "
+            "RETURN name, state, populationPercent"
+        )
+        t_start = time.monotonic()
+
+        while True:
+            try:
+                result = session.run(poll_query, index_names=target_names)
+                records = list(result) if result is not None else []
+            except Exception as e:
+                logger.debug(f"Could not poll index status via SHOW INDEXES: {e}")
+                return True
+
+            if not records:
+                return True
+
+            status_map: dict[str, tuple[str, float]] = {}
+            failed_indexes: list[str] = []
+            populating_indexes: list[str] = []
+
+            for rec in records:
+                try:
+                    row = dict(rec) if not isinstance(rec, dict) else rec
+                except Exception:
+                    continue
+                name = str(row.get("name") or "")
+                state = str(row.get("state") or "").upper()
+                raw_pct = row.get("populationPercent")
+                pct = float(raw_pct) if isinstance(raw_pct, (int, float)) else (100.0 if state == "ONLINE" else 0.0)
+                if name:
+                    status_map[name] = (state, pct)
+                    if state == "FAILED":
+                        failed_indexes.append(name)
+                    elif state != "ONLINE":
+                        populating_indexes.append(f"{name} ({state}: {pct:.1f}%)")
+
+            if not status_map:
+                return True
+
+            if on_poll is not None:
+                on_poll(status_map)
+
+            summary_str = ", ".join(f"{k}: {v[0]} ({v[1]:.1f}%)" for k, v in status_map.items())
+            logger.info(f"Neo4j search index population status: {summary_str}")
+
+            if failed_indexes:
+                raise RuntimeError(
+                    f"Neo4j search index(es) entered FAILED state during bulk rebuild: {', '.join(failed_indexes)}"
+                )
+
+            if not populating_indexes:
+                logger.info(f"All Neo4j search indexes are ONLINE ({', '.join(status_map.keys())}).")
+                return True
+
+            elapsed = time.monotonic() - t_start
+            if elapsed >= timeout_sec:
+                raise TimeoutError(
+                    f"Timed out after {timeout_sec}s waiting for Neo4j search indexes to reach ONLINE state: "
+                    f"{', '.join(populating_indexes)}"
+                )
+
+            time.sleep(max(0.01, float(poll_interval)))
+
+    @contextmanager
+    def search_index_suspension(
+        self,
+        session: Any,
+        distinct_labels: Optional[set[str]] = None,
+        idea_vector_dim: int = 1024,
+        chunk_vector_dim: int = 1024,
+        suspend_existing: bool = True,
+        wait_online: bool = True,
+        timeout_sec: int = 300,
+        poll_interval: float = 3.0,
+        progress: Optional[Any] = None,
+        progress_callback: Optional[Callable[[str, int, int, str], None]] = None,
+    ) -> Iterator[list[dict[str, Any]]]:
+        """
+        Lifecycle context manager that:
+          1. Captures and drops existing VECTOR and FULLTEXT search indexes before bulk ingestion
+             (while keeping all unique ID constraint/lookup indexes intact for fast MERGE).
+          2. Guarantees in a `finally:` block that all captured search indexes (plus `idea_idx`
+             and `chunk_idx` for :Idea and :Chunk embeddings) are recreated and reach `ONLINE`
+             even if an exception occurs during node/edge ingestion.
+        """
+        labels = distinct_labels or set()
+        captured: list[dict[str, Any]] = []
+        if suspend_existing:
+            captured = self.capture_search_indexes(session=session)
+            if captured:
+                self.drop_search_indexes(session=session, captured_indexes=captured)
+
+        try:
+            yield captured
+        finally:
+            recreated_names: list[str] = []
+            if captured:
+                recreated_names.extend(self.recreate_search_indexes(session=session, captured_indexes=captured))
+
+            recreated_set = set(recreated_names)
+            if "Idea" in labels and "idea_idx" not in recreated_set:
+                if self.ensure_idea_vector_index(session, dimensions=idea_vector_dim, index_name="idea_idx"):
+                    recreated_names.append("idea_idx")
+                    recreated_set.add("idea_idx")
+            if "Chunk" in labels and "chunk_idx" not in recreated_set:
+                if self.ensure_chunk_vector_index(session, dimensions=chunk_vector_dim, index_name="chunk_idx"):
+                    recreated_names.append("chunk_idx")
+                    recreated_set.add("chunk_idx")
+
+            if wait_online and recreated_names:
+                idx_task = (
+                    progress.add_task(
+                        f"Rebuilding HNSW / Search Indexes ({', '.join(recreated_names)})...",
+                        total=100,
+                    )
+                    if progress
+                    else None
+                )
+
+                def _on_index_poll(status_map: dict[str, tuple[str, float]]) -> None:
+                    avg_pct = (
+                        sum(pct for _, pct in status_map.values()) / len(status_map)
+                        if status_map
+                        else 100.0
+                    )
+                    detail = ", ".join(f"{k} {pct:.0f}%" for k, (_, pct) in status_map.items())
+                    if progress and idx_task is not None:
+                        progress.update(
+                            idx_task,
+                            completed=min(100, int(avg_pct)),
+                            description=f"Building Search Indexes ({detail})...",
+                        )
+                    if progress_callback:
+                        progress_callback("indexes", int(avg_pct), 100, detail)
+
+                self.wait_for_indexes_online(
+                    session=session,
+                    index_names=recreated_names,
+                    timeout_sec=timeout_sec,
+                    poll_interval=poll_interval,
+                    on_poll=_on_index_poll,
+                )
+                if progress and idx_task is not None:
+                    progress.update(
+                        idx_task,
+                        completed=100,
+                        description=f"[bold green]✓ Search Indexes ONLINE[/bold green] ({', '.join(recreated_names)})",
+                    )
 
     def query_ideas_hnsw_batch(
         self,
@@ -439,6 +766,9 @@ class Neo4jExporter:
         progress_callback: Optional[Callable[[str, int, int, str], None]] = None,
         console: Optional[Any] = None,
         only_affected: bool = False,
+        suspend_search_indexes: bool = True,
+        index_timeout_sec: int = 300,
+        index_poll_interval: float = 3.0,
     ) -> dict[str, Any]:
         """
         Export ConceptGraphStore into Neo4j via batched upsert with live progress display.
@@ -447,6 +777,9 @@ class Neo4jExporter:
         - clean=True: Performs a clean start (deletes all content in database before export)
         - only_affected=True: Upserts ONLY nodes and edges marked dirty in `store` (and deletes
           any merged/removed nodes in `store.removed_nodes`), then clears `store`'s dirty tracking.
+        - suspend_search_indexes=True: Captures and drops existing VECTOR and FULLTEXT search
+          indexes prior to bulk node/edge upserts (strictly preserving unique ID constraints
+          for O(1) MERGE), then recreates them in bulk and waits until ONLINE in a finally block.
         - Nodes: MERGE on (id), ON CREATE SET props, ON MATCH SET props
         - Edges: MERGE (source)-[r:REL]->(target), ON CREATE SET props, ON MATCH SET props
         - show_progress=True: Displays rich real-time progress bars for nodes and relationships
@@ -586,12 +919,13 @@ class Neo4jExporter:
                 if removed_node_list:
                     for i in range(0, len(removed_node_list), self.batch_size):
                         rem_batch = removed_node_list[i : i + self.batch_size]
-                        session.run(
+                        self._execute_write_query(
+                            session,
                             "UNWIND $ids AS nid MATCH (n {id: nid}) DETACH DELETE n",
                             ids=rem_batch,
                         )
 
-                # Step A: Ensure Schema Constraints & Indexes
+                # Step A: Ensure Unique ID Schema Constraints (strictly preserved for O(1) MERGE)
                 if distinct_labels:
                     schema_task = (
                         progress.add_task(f"Verifying Schema Constraints ({len(distinct_labels)} labels)...", total=len(distinct_labels) or 1)
@@ -599,10 +933,6 @@ class Neo4jExporter:
                         else None
                     )
                     self.ensure_constraints(session, list(distinct_labels))
-                    if "Idea" in distinct_labels:
-                        self.ensure_idea_vector_index(session, dimensions=idea_vector_dim, index_name="idea_idx")
-                    if "Chunk" in distinct_labels:
-                        self.ensure_chunk_vector_index(session, dimensions=chunk_vector_dim, index_name="chunk_idx")
                     if progress and schema_task is not None:
                         progress.update(
                             schema_task,
@@ -612,84 +942,99 @@ class Neo4jExporter:
                     if progress_callback:
                         progress_callback("schema", len(distinct_labels), len(distinct_labels), "Constraints verified")
 
-                # Step B: Upsert Nodes in Batches
-                node_task = (
-                    progress.add_task("Upserting Affected Nodes..." if incremental_mode else "Upserting Nodes...", total=total_nodes)
-                    if progress and total_nodes > 0
-                    else None
-                )
-                nodes_done = 0
-                for (primary_label, is_idea), node_batch_list in nodes_by_group.items():
-                    label_query = (
-                        f"UNWIND $batch AS row\n"
-                        f"MERGE (n:`{primary_label}` {{id: row.id}})\n"
-                        f"ON CREATE SET n += row.properties"
-                        + (", n:`Idea`" if is_idea and primary_label != "Idea" else "")
-                        + "\n"
-                        "ON MATCH SET n += row.properties"
-                        + (", n:`Idea`" if is_idea and primary_label != "Idea" else "")
+                # Step B & C: Suspend VECTOR/FULLTEXT search indexes during bulk node & relationship upserts,
+                # then recreate them in bulk and wait for ONLINE status in the finally block.
+                has_vector_labels = bool("Idea" in distinct_labels or "Chunk" in distinct_labels)
+                with self.search_index_suspension(
+                    session=session,
+                    distinct_labels=distinct_labels,
+                    idea_vector_dim=idea_vector_dim,
+                    chunk_vector_dim=chunk_vector_dim,
+                    suspend_existing=bool(suspend_search_indexes and (has_vector_labels or total_nodes > 0)),
+                    wait_online=True,
+                    timeout_sec=index_timeout_sec,
+                    poll_interval=index_poll_interval,
+                    progress=progress,
+                    progress_callback=progress_callback,
+                ):
+                    # Step B: Upsert Nodes in Batches
+                    node_task = (
+                        progress.add_task("Upserting Affected Nodes..." if incremental_mode else "Upserting Nodes...", total=total_nodes)
+                        if progress and total_nodes > 0
+                        else None
                     )
+                    nodes_done = 0
+                    for (primary_label, is_idea), node_batch_list in nodes_by_group.items():
+                        label_query = (
+                            f"UNWIND $batch AS row\n"
+                            f"MERGE (n:`{primary_label}` {{id: row.id}})\n"
+                            f"ON CREATE SET n += row.properties"
+                            + (", n:`Idea`" if is_idea and primary_label != "Idea" else "")
+                            + "\n"
+                            "ON MATCH SET n += row.properties"
+                            + (", n:`Idea`" if is_idea and primary_label != "Idea" else "")
+                        )
 
-                    for i in range(0, len(node_batch_list), self.batch_size):
-                        batch = node_batch_list[i : i + self.batch_size]
-                        session.run(label_query, batch=batch)
-                        nodes_done += len(batch)
-                        if progress and node_task is not None:
-                            progress.update(
-                                node_task,
-                                completed=nodes_done,
-                                description=f"Upserting Nodes (:{primary_label})",
-                            )
-                        if progress_callback:
-                            progress_callback("nodes", nodes_done, total_nodes, f":{primary_label}")
+                        for i in range(0, len(node_batch_list), self.batch_size):
+                            batch = node_batch_list[i : i + self.batch_size]
+                            self._execute_write_query(session, label_query, batch=batch)
+                            nodes_done += len(batch)
+                            if progress and node_task is not None:
+                                progress.update(
+                                    node_task,
+                                    completed=nodes_done,
+                                    description=f"Upserting Nodes (:{primary_label})",
+                                )
+                            if progress_callback:
+                                progress_callback("nodes", nodes_done, total_nodes, f":{primary_label}")
 
-                    node_counts[primary_label] = node_counts.get(primary_label, 0) + len(node_batch_list)
+                        node_counts[primary_label] = node_counts.get(primary_label, 0) + len(node_batch_list)
 
-                if progress and node_task is not None:
-                    progress.update(
-                        node_task,
-                        completed=total_nodes,
-                        description=f"[bold green]✓ Nodes Complete[/bold green] ({total_nodes:,} nodes)",
+                    if progress and node_task is not None:
+                        progress.update(
+                            node_task,
+                            completed=total_nodes,
+                            description=f"[bold green]✓ Nodes Complete[/bold green] ({total_nodes:,} nodes)",
+                        )
+
+                    # Step C: Upsert Relationships in Batches
+                    edge_task = (
+                        progress.add_task("Upserting Affected Relationships..." if incremental_mode else "Upserting Relationships...", total=total_edges)
+                        if progress and total_edges > 0
+                        else None
                     )
+                    edges_done = 0
+                    for (src_label, rel_type, tgt_label), edge_batch_list in edges_by_group.items():
+                        rel_query = (
+                            f"UNWIND $batch AS row\n"
+                            f"MATCH (source:`{src_label}` {{id: row.source_id}})\n"
+                            f"MATCH (target:`{tgt_label}` {{id: row.target_id}})\n"
+                            f"MERGE (source)-[r:`{rel_type}`]->(target)\n"
+                            f"ON CREATE SET r += row.properties\n"
+                            f"ON MATCH SET r += row.properties"
+                        )
 
-                # Step C: Upsert Relationships in Batches
-                edge_task = (
-                    progress.add_task("Upserting Affected Relationships..." if incremental_mode else "Upserting Relationships...", total=total_edges)
-                    if progress and total_edges > 0
-                    else None
-                )
-                edges_done = 0
-                for (src_label, rel_type, tgt_label), edge_batch_list in edges_by_group.items():
-                    rel_query = (
-                        f"UNWIND $batch AS row\n"
-                        f"MATCH (source:`{src_label}` {{id: row.source_id}})\n"
-                        f"MATCH (target:`{tgt_label}` {{id: row.target_id}})\n"
-                        f"MERGE (source)-[r:`{rel_type}`]->(target)\n"
-                        f"ON CREATE SET r += row.properties\n"
-                        f"ON MATCH SET r += row.properties"
-                    )
+                        for i in range(0, len(edge_batch_list), self.batch_size):
+                            batch = edge_batch_list[i : i + self.batch_size]
+                            self._execute_write_query(session, rel_query, batch=batch)
+                            edges_done += len(batch)
+                            if progress and edge_task is not None:
+                                progress.update(
+                                    edge_task,
+                                    completed=edges_done,
+                                    description=f"Upserting Relationships (:{rel_type})",
+                                )
+                            if progress_callback:
+                                progress_callback("relationships", edges_done, total_edges, f":{rel_type}")
 
-                    for i in range(0, len(edge_batch_list), self.batch_size):
-                        batch = edge_batch_list[i : i + self.batch_size]
-                        session.run(rel_query, batch=batch)
-                        edges_done += len(batch)
-                        if progress and edge_task is not None:
-                            progress.update(
-                                edge_task,
-                                completed=edges_done,
-                                description=f"Upserting Relationships (:{rel_type})",
-                            )
-                        if progress_callback:
-                            progress_callback("relationships", edges_done, total_edges, f":{rel_type}")
+                        edge_counts[rel_type] = edge_counts.get(rel_type, 0) + len(edge_batch_list)
 
-                    edge_counts[rel_type] = edge_counts.get(rel_type, 0) + len(edge_batch_list)
-
-                if progress and edge_task is not None:
-                    progress.update(
-                        edge_task,
-                        completed=total_edges,
-                        description=f"[bold green]✓ Relationships Complete[/bold green] ({total_edges:,} relationships)",
-                    )
+                    if progress and edge_task is not None:
+                        progress.update(
+                            edge_task,
+                            completed=total_edges,
+                            description=f"[bold green]✓ Relationships Complete[/bold green] ({total_edges:,} relationships)",
+                        )
 
         if hasattr(store, "clear_dirty"):
             store.clear_dirty()

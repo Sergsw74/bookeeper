@@ -415,4 +415,181 @@ def test_neo4j_routing_error_fallback_to_bolt():
         assert mock_bolt_driver.verify_connectivity.called
 
 
+def test_neo4j_search_index_suspension_and_bulk_recreation_during_export():
+    """
+    Verify that during export:
+    1. capture_search_indexes captures only VECTOR and FULLTEXT indexes (excluding LOOKUP, RANGE, POINT, constraints).
+    2. drop_search_indexes drops VECTOR and FULLTEXT indexes BEFORE node MERGE upserts.
+    3. recreate_search_indexes and wait_for_indexes_online recreate them and poll until ONLINE AFTER upserts.
+    """
+    import pytest
+
+    store = ConceptGraphStore()
+    store.add_book(book_id=1, title="High Throughput Neo4j")
+    chunk = HierarchicalChunk(
+        chunk_id="chk-bulk-1",
+        chunk_idx=1,
+        book_id=1,
+        book_title="High Throughput Neo4j",
+        chapter_idx=1,
+        section_title="Vectors",
+        breadcrumb="Book > Vectors",
+        text="Dense vector embeddings in HNSW.",
+        char_count=32,
+        embedding=[0.1, 0.2, 0.3],
+    )
+    store.add_chunk(chunk)
+    store.add_concept(
+        Concept(name="HNSW Index", category="Database", summary="Hierarchical Navigable Small World"),
+        embedding=[0.4, 0.5, 0.6],
+    )
+
+    show_indexes_catalog = [
+        {
+            "name": "constraint_chunk_id",
+            "type": "RANGE",
+            "entityType": "NODE",
+            "labelsOrTypes": ["Chunk"],
+            "properties": ["id"],
+            "owningConstraint": "constraint_chunk_id",
+            "createStatement": "CREATE RANGE INDEX constraint_chunk_id FOR (n:Chunk) ON (n.id)",
+        },
+        {
+            "name": "token_lookup_idx",
+            "type": "LOOKUP",
+            "entityType": "NODE",
+            "labelsOrTypes": None,
+            "properties": None,
+            "createStatement": "CREATE LOOKUP INDEX token_lookup_idx FOR (n) ON EACH labels(n)",
+        },
+        {
+            "name": "idea_idx",
+            "type": "VECTOR",
+            "entityType": "NODE",
+            "labelsOrTypes": ["Idea"],
+            "properties": ["embedding"],
+            "createStatement": "CREATE VECTOR INDEX idea_idx FOR (n:Idea) ON (n.embedding) OPTIONS {indexConfig: {`vector.dimensions`: 3, `vector.similarity_function`: 'cosine'}}",
+        },
+        {
+            "name": "idea_fulltext_idx",
+            "type": "FULLTEXT",
+            "entityType": "NODE",
+            "labelsOrTypes": ["Idea"],
+            "properties": ["name", "brief_description"],
+            "createStatement": "CREATE FULLTEXT INDEX idea_fulltext_idx FOR (n:Idea) ON EACH [n.name, n.brief_description]",
+        },
+    ]
+
+    poll_Counter = {"count": 0}
+    executed_queries: list[str] = []
+
+    def _mock_run(query: str, **params):
+        executed_queries.append(query)
+        if "SHOW INDEXES YIELD name, type, entityType" in query:
+            return show_indexes_catalog
+        if "SHOW INDEXES YIELD name, state, populationPercent" in query:
+            poll_Counter["count"] += 1
+            if poll_Counter["count"] == 1:
+                return [
+                    {"name": "idea_idx", "state": "POPULATING", "populationPercent": 45.0},
+                    {"name": "idea_fulltext_idx", "state": "ONLINE", "populationPercent": 100.0},
+                    {"name": "chunk_idx", "state": "POPULATING", "populationPercent": 60.0},
+                ]
+            return [
+                {"name": "idea_idx", "state": "ONLINE", "populationPercent": 100.0},
+                {"name": "idea_fulltext_idx", "state": "ONLINE", "populationPercent": 100.0},
+                {"name": "chunk_idx", "state": "ONLINE", "populationPercent": 100.0},
+            ]
+        return MagicMock()
+
+    mock_session = MagicMock()
+    mock_session.run.side_effect = _mock_run
+    mock_driver = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    with patch("bookeeper.graph.neo4j_exporter.GraphDatabase.driver", return_value=mock_driver):
+        exporter = Neo4jExporter(uri="bolt://localhost:7687", database="neo4j")
+        exporter.export(store, index_poll_interval=0.01)
+
+    # 1. Verify RANGE and LOOKUP indexes were NEVER dropped
+    assert not any("DROP INDEX constraint_chunk_id" in q for q in executed_queries)
+    assert not any("DROP INDEX token_lookup_idx" in q for q in executed_queries)
+
+    # 2. Verify VECTOR and FULLTEXT indexes WERE dropped before MERGE node upserts,
+    #    and recreated AFTER MERGE node upserts
+    drop_idea_idx_pos = next(i for i, q in enumerate(executed_queries) if "DROP INDEX idea_idx IF EXISTS" in q)
+    drop_ft_idx_pos = next(i for i, q in enumerate(executed_queries) if "DROP INDEX idea_fulltext_idx IF EXISTS" in q)
+    first_merge_pos = next(i for i, q in enumerate(executed_queries) if "MERGE (n:" in q)
+    last_merge_pos = max(i for i, q in enumerate(executed_queries) if "MERGE (" in q)
+    recreate_idea_pos = next(
+        i for i, q in enumerate(executed_queries)
+        if "CREATE VECTOR INDEX idea_idx IF NOT EXISTS FOR (n:Idea)" in q
+    )
+    recreate_ft_pos = next(
+        i for i, q in enumerate(executed_queries)
+        if "CREATE FULLTEXT INDEX idea_fulltext_idx IF NOT EXISTS FOR (n:Idea)" in q
+    )
+
+    assert drop_idea_idx_pos < first_merge_pos
+    assert drop_ft_idx_pos < first_merge_pos
+    assert recreate_idea_pos > last_merge_pos
+    assert recreate_ft_pos > last_merge_pos
+    assert poll_Counter["count"] == 2
+
+
+def test_neo4j_search_index_suspension_recreates_on_exception_and_timeout():
+    """
+    Verify that:
+    1. If an exception occurs during node ingestion inside search_index_suspension,
+       captured indexes are still safely recreated in the finally block.
+    2. wait_for_indexes_online raises TimeoutError when an index stays POPULATING past timeout_sec.
+    """
+    import pytest
+
+    mock_session = MagicMock()
+    executed_queries: list[str] = []
+
+    def _mock_run(query: str, **params):
+        executed_queries.append(query)
+        if "SHOW INDEXES YIELD name, type, entityType" in query:
+            return [
+                {
+                    "name": "chunk_idx",
+                    "type": "VECTOR",
+                    "entityType": "NODE",
+                    "labelsOrTypes": ["Chunk"],
+                    "properties": ["embedding"],
+                    "createStatement": "CREATE VECTOR INDEX chunk_idx FOR (n:Chunk) ON (n.embedding)",
+                }
+            ]
+        if "SHOW INDEXES YIELD name, state, populationPercent" in query:
+            return [{"name": "chunk_idx", "state": "POPULATING", "populationPercent": 12.5}]
+        return MagicMock()
+
+    mock_session.run.side_effect = _mock_run
+    mock_driver = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    with patch("bookeeper.graph.neo4j_exporter.GraphDatabase.driver", return_value=mock_driver):
+        exporter = Neo4jExporter(uri="bolt://localhost:7687", database="neo4j")
+
+        # 1. Exception during ingestion still triggers index recreation in finally block
+        with pytest.raises(ValueError, match="Simulated write failure"):
+            with exporter.search_index_suspension(session=mock_session, wait_online=False):
+                raise ValueError("Simulated write failure")
+
+        assert any("DROP INDEX chunk_idx IF EXISTS" in q for q in executed_queries)
+        assert any("CREATE VECTOR INDEX chunk_idx IF NOT EXISTS FOR (n:Chunk)" in q for q in executed_queries)
+
+        # 2. Timeout when index stays POPULATING past timeout_sec
+        with pytest.raises(TimeoutError, match="Timed out"):
+            exporter.wait_for_indexes_online(
+                session=mock_session,
+                index_names=["chunk_idx"],
+                timeout_sec=0,
+                poll_interval=0.01,
+            )
+
+
+
 

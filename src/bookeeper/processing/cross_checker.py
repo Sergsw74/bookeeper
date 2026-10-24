@@ -180,6 +180,16 @@ class CrossCheckSummary(BaseModel):
     total_new_against: int = 0
     delta_against: int = 0
 
+    @property
+    def delta_net_integrity(self) -> float:
+        """Backward-compatible alias for mean_delta_net_integrity."""
+        return self.mean_delta_net_integrity
+
+    @property
+    def delta_calibrated_fidelity(self) -> float:
+        """Backward-compatible alias for mean_delta_calibrated_fidelity."""
+        return self.mean_delta_calibrated_fidelity
+
 
 class CrossCheckReport(BaseModel):
     """Complete serialization report for Cross-Check verification mode."""

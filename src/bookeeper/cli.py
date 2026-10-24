@@ -5694,6 +5694,7 @@ def ab_compare_command(
     output_report: Optional[str] = typer.Option(
         None,
         "--output",
+        "--output-report",
         "-o",
         help="Optional path to save JSON comparative report (default: output_dir/ab_compare_report.json).",
     ),
@@ -5863,7 +5864,8 @@ def ab_compare_command(
             cc_tbl.add_row("Contradicted Assertions (-1.0)", str(sm.total_old_against), str(sm.total_new_against), f"[{'green' if sm.delta_against <= 0 else 'red'}]{sm.delta_against:+d}[/]")
             cc_tbl.add_row("Mean QA Recall (%)", f"{sm.mean_old_recall * 100:.2f}%", f"{sm.mean_new_recall * 100:.2f}%", f"[{'green' if sm.mean_delta_recall >= -0.03 else 'red'}]{sm.mean_delta_recall * 100:+.2f}% pts[/]")
             cc_tbl.add_row("Mean Seam Integrity Rate (%)", f"{sm.mean_old_seam_integrity * 100:.2f}%", f"{sm.mean_new_seam_integrity * 100:.2f}%", f"{(sm.mean_new_seam_integrity - sm.mean_old_seam_integrity) * 100:+.2f}% pts")
-            cc_tbl.add_row("Mean Net Semantic Integrity (S_net)", f"{sm.mean_old_net_integrity:+.2f}", f"{sm.mean_new_net_integrity:+.2f}", f"{sm.delta_net_integrity:+.2f}")
+            cc_tbl.add_row("Mean Net Semantic Integrity (S_net)", f"{sm.mean_old_net_integrity:+.2f}", f"{sm.mean_new_net_integrity:+.2f}", f"[{'green' if sm.mean_delta_net_integrity >= 0 else 'red'}]{sm.mean_delta_net_integrity:+.2f}[/]")
+            cc_tbl.add_row("Mean Calibrated Fidelity (R_calib) (%)", f"{sm.mean_old_calibrated_fidelity * 100:.1f}%", f"{sm.mean_new_calibrated_fidelity * 100:.1f}%", f"[{'green' if sm.mean_delta_calibrated_fidelity >= 0 else 'red'}]{sm.mean_delta_calibrated_fidelity * 100:+.1f}% pts[/]")
             cc_tbl.add_section()
             cc_tbl.add_row("Decision Gating Checklist", "-", "[bold green]PASS[/bold green]" if sm.decision_pass else "[bold red]FAIL[/bold red]", f"[dim]{sm.pass_reason}[/dim]")
             console.print(cc_tbl)
@@ -5908,7 +5910,8 @@ def ab_compare_command(
                 f"- **Decision Gate Status:** **{gate_badge}** ({sm_cc.get('pass_reason')})",
                 f"- **Mean QA Recall Delta:** `{sm_cc.get('mean_delta_recall', 0)*100:+.2f}% pts` (Baseline: `{sm_cc.get('mean_old_recall', 0)*100:.2f}%`, Candidate: `{sm_cc.get('mean_new_recall', 0)*100:.2f}%`)",
                 f"- **Mean Seam Integrity Rate:** `{sm_cc.get('mean_new_seam_integrity', 0)*100:.2f}%`",
-                f"- **Net Semantic Integrity (S_net):** Baseline: `{sm_cc.get('mean_old_net_integrity', 0):+.2f}`, Candidate: `{sm_cc.get('mean_new_net_integrity', 0):+.2f}` (Delta: `{sm_cc.get('delta_net_integrity', 0):+.2f}`)",
+                f"- **Net Semantic Integrity (S_net):** Baseline: `{sm_cc.get('mean_old_net_integrity', 0):+.2f}`, Candidate: `{sm_cc.get('mean_new_net_integrity', 0):+.2f}` (Delta: `{sm_cc.get('mean_delta_net_integrity', sm_cc.get('delta_net_integrity', 0)):+.2f}`)",
+                f"- **Calibrated Fidelity (R_calib):** Baseline: `{sm_cc.get('mean_old_calibrated_fidelity', 0)*100:.1f}%`, Candidate: `{sm_cc.get('mean_new_calibrated_fidelity', 0)*100:.1f}%` (Delta: `{sm_cc.get('mean_delta_calibrated_fidelity', sm_cc.get('delta_calibrated_fidelity', 0))*100:+.1f}% pts`)",
                 f"",
             ])
         md_dest.write_text("\n".join(md_lines), encoding="utf-8")

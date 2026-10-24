@@ -329,3 +329,74 @@ def test_cli_verify_cross_check_resolves_backup_archive(tmp_path: Path, sample_k
         assert res.exit_code == 0, f"Error output: {res.stdout}"
         assert "Cross-Check Verification Summary & Decision Gates" in res.stdout
         assert "PASS" in res.stdout
+
+
+def test_cli_ab_compare_cross_check_executes_cleanly(tmp_path: Path, sample_kg_payloads):
+    """Verify `bookeeper ab-compare --mode cross-check` executes without AttributeError on summary attributes."""
+    kg_a, kg_b = sample_kg_payloads
+
+    zip_a = _create_backup_zip(tmp_path / "baseline_run.zip", kg_a)
+    zip_b = _create_backup_zip(tmp_path / "candidate_run.zip", kg_b)
+
+    summary_obj = CrossCheckSummary(
+        total_samples=2,
+        total_assertions_count=6,
+        total_old_supported=5,
+        total_new_supported=6,
+        delta_supported=1,
+        total_old_not_mentioned=1,
+        total_new_not_mentioned=0,
+        delta_not_mentioned=-1,
+        total_old_against=0,
+        total_new_against=0,
+        delta_against=0,
+        mean_old_recall=0.833,
+        mean_new_recall=1.000,
+        mean_delta_recall=0.167,
+        mean_old_precision=0.95,
+        mean_new_precision=0.97,
+        mean_old_seam_integrity=0.85,
+        mean_new_seam_integrity=0.95,
+        mean_old_net_integrity=0.79,
+        mean_new_net_integrity=1.00,
+        mean_delta_net_integrity=0.21,
+        mean_old_calibrated_fidelity=0.80,
+        mean_new_calibrated_fidelity=0.95,
+        mean_delta_calibrated_fidelity=0.15,
+        mean_chunk_disproportion=0.95,
+        decision_pass=True,
+        pass_reason="Recall delta +16.7% and zero contradictions",
+    )
+    mock_cc_report = CrossCheckReport(
+        model_name="llama3.1:8b",
+        baseline_branch="baseline_run",
+        candidate_branch="candidate_run",
+        summary=summary_obj,
+        samples=[],
+    )
+
+    out_dir = tmp_path / "output"
+    out_dir.mkdir(parents=True)
+    report_json = out_dir / "custom_report.json"
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(f"output_dir: {out_dir}\n")
+
+    with patch("bookeeper.cli.run_cross_check", return_value=mock_cc_report), \
+         patch("bookeeper.processing.verifier.IdeaVerifier.warmup"):
+        res = runner.invoke(app, [
+            "ab-compare",
+            str(zip_a),
+            str(zip_b),
+            "--mode", "cross-check",
+            "--blocks", "2",
+            "--output", str(report_json),
+            "--config", str(cfg_file),
+        ])
+
+        assert res.exit_code == 0, f"Error output: {res.stdout}"
+        assert "Cross-Check Verification Summary & Decision Gates" in res.stdout
+        assert "Mean Net Semantic Integrity (S_net)" in res.stdout
+        assert "Mean Calibrated Fidelity (R_calib)" in res.stdout
+        assert report_json.is_file()
+        assert report_json.with_suffix(".md").is_file()
+

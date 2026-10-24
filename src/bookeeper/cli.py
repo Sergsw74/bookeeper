@@ -96,11 +96,15 @@ from bookeeper.processing.verifier import (
 )
 from bookeeper.backup import (
     clean_knowledge_artifacts,
+    compare_knowledge_graphs,
     create_backup,
     detect_archive_format,
     inspect_backup,
+    open_backup_target,
+    resolve_backup_target,
     resolve_target_books_dir,
     restore_backup,
+    ResolvedBackupTarget,
 )
 from bookeeper.rag.lightrag_engine import LightRAGEngine
 
@@ -4437,13 +4441,29 @@ def _execute_single_verification(
         cand_path_a = _resolve_candidate_path(graph_file)
         cand_path_b = _resolve_candidate_path(compare_graph)
 
+        temp_backup_targets: List[ResolvedBackupTarget] = []
+        archive_suffixes = (".zip", ".7z", ".tar", ".gz", ".tgz")
+
         target_graph_a: Optional[Path] = None
         target_graph_b: Optional[Path] = None
         branch_a_label = "Baseline (A)"
         branch_b_label = "Candidate (B)"
 
+        # 0. Check if either target is a backup archive (.zip, .7z)
+        if cand_path_a and cand_path_a.is_file() and any(cand_path_a.name.lower().endswith(s) for s in archive_suffixes):
+            bt_a = resolve_backup_target(cand_path_a, label_fallback="Baseline (A)")
+            temp_backup_targets.append(bt_a)
+            target_graph_a = bt_a.graph_file
+            branch_a_label = bt_a.label
+
+        if cand_path_b and cand_path_b.is_file() and any(cand_path_b.name.lower().endswith(s) for s in archive_suffixes):
+            bt_b = resolve_backup_target(cand_path_b, label_fallback="Candidate (B)")
+            temp_backup_targets.append(bt_b)
+            target_graph_b = bt_b.graph_file
+            branch_b_label = bt_b.label
+
         # 1. If compare_graph points to an A/B test result directory containing both branches:
-        if cand_path_b and cand_path_b.is_dir():
+        if not target_graph_b and cand_path_b and cand_path_b.is_dir():
             run_graphs = _discover_graphs_from_run_dir(cand_path_b)
             if run_graphs:
                 target_graph_a, target_graph_b, branch_a_label, branch_b_label = run_graphs
@@ -4763,26 +4783,37 @@ def _execute_single_verification(
         console.print(Panel(legend_content, title="[bold]📖 Metrics Legend[/bold]", border_style="dim", expand=False))
 
         # 4. Save JSON Report, Standalone Statistics, and Debug Trace
-        return _save_verification_artifacts(
-            report=report,
-            effective_mode=effective_mode,
-            effective_model=effective_model,
-            output_report=output_report or str(cfg.resolved_output_dir / "cross_check_report.json"),
-            stats_output=stats_output,
-            debug_output=debug_output,
-            effective_debug=effective_debug,
-            cfg=cfg,
-            pool=pool,
-            mode_label="cross-check verification",
-        )
+        try:
+            return _save_verification_artifacts(
+                report=report,
+                effective_mode=effective_mode,
+                effective_model=effective_model,
+                output_report=output_report or str(cfg.resolved_output_dir / "cross_check_report.json"),
+                stats_output=stats_output,
+                debug_output=debug_output,
+                effective_debug=effective_debug,
+                cfg=cfg,
+                pool=pool,
+                mode_label="cross-check verification",
+            )
+        finally:
+            for bt in temp_backup_targets:
+                bt.cleanup()
 
     # Mode: 'ideas'
     target_graph_file = Path(graph_file).expanduser().resolve() if graph_file else cfg.resolved_output_dir / "knowledge_graph.json"
+    temp_ideas_target: Optional[ResolvedBackupTarget] = None
+    if target_graph_file.is_file() and any(target_graph_file.name.lower().endswith(s) for s in (".zip", ".7z", ".tar", ".gz", ".tgz")):
+        temp_ideas_target = resolve_backup_target(target_graph_file, label_fallback="Target")
+        target_graph_file = temp_ideas_target.graph_file
+
     if not target_graph_file.is_file():
         console.print(
             f"[bold red]Knowledge graph file not found at {target_graph_file}[/bold red]\n"
             f"[yellow]Please run 'bookeeper build-graph' first to generate knowledge_graph.json.[/yellow]"
         )
+        if temp_ideas_target:
+            temp_ideas_target.cleanup()
         raise typer.Exit(1)
 
     store = ConceptGraphStore()
@@ -4790,6 +4821,8 @@ def _execute_single_verification(
         try:
             store.load(target_graph_file)
         except Exception as e:
+            if temp_ideas_target:
+                temp_ideas_target.cleanup()
             console.print(f"[bold red]Failed to load knowledge graph:[/bold red] {e}")
             raise typer.Exit(1)
 
@@ -4956,18 +4989,22 @@ def _execute_single_verification(
 
     # 3. Save JSON report
     # 3. Save JSON Report, Standalone Statistics, and Debug Trace
-    return _save_verification_artifacts(
-        report=report,
-        effective_mode=effective_mode,
-        effective_model=effective_model,
-        output_report=output_report,
-        stats_output=stats_output,
-        debug_output=debug_output,
-        effective_debug=effective_debug,
-        cfg=cfg,
-        pool=pool,
-        mode_label="ideas verification",
-    )
+    try:
+        return _save_verification_artifacts(
+            report=report,
+            effective_mode=effective_mode,
+            effective_model=effective_model,
+            output_report=output_report,
+            stats_output=stats_output,
+            debug_output=debug_output,
+            effective_debug=effective_debug,
+            cfg=cfg,
+            pool=pool,
+            mode_label="ideas verification",
+        )
+    finally:
+        if temp_ideas_target:
+            temp_ideas_target.cleanup()
 
 
 def _write_combined_multi_verification_report(
@@ -5365,6 +5402,265 @@ def verifiers_command(
         max_tasks=max_tasks,
         cooldown=cooldown,
     )
+
+
+@app.command("ab-compare")
+@app.command("ab-backup")
+def ab_compare_command(
+    target_a: str = typer.Argument(
+        ...,
+        help="Path to baseline Knowledge Graph (backup archive .zip/.7z, directory, or knowledge_graph.json).",
+    ),
+    target_b: Optional[str] = typer.Argument(
+        None,
+        help="Path to candidate Knowledge Graph or backup archive. Defaults to active output directory if omitted.",
+    ),
+    mode: str = typer.Option(
+        "cross-check",
+        "--mode",
+        "-m",
+        help="Comparison mode: 'cross-check' (NLI adversarial QA probe audit), 'ideas' (factual grounding audit), or 'stats' (fast topological & entity metrics).",
+    ),
+    blocks: int = typer.Option(
+        20,
+        "--blocks",
+        help="Number of contiguous chunk blocks to audit in cross-check mode (default: 20).",
+    ),
+    percent: float = typer.Option(
+        1.0,
+        "--percent",
+        "-p",
+        help="Percentage of ideas to sample in ideas verification mode (default: 1.0 for 1%).",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        help="Dedicated verifier LLM model (default: from config.yaml).",
+    ),
+    config_path: Optional[str] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to config.yaml file.",
+    ),
+    output_report: Optional[str] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Optional path to save JSON comparative report (default: output_dir/ab_compare_report.json).",
+    ),
+    print_chunks: Optional[int] = typer.Option(
+        None,
+        "--print-chunks",
+        help="Print text & QA probes comparison for up to X blocks (cross-check mode).",
+    ),
+    seed: Optional[int] = typer.Option(
+        None,
+        "--seed",
+        help="Random seed for reproducible block/sample selection.",
+    ),
+    max_tasks: Optional[int] = typer.Option(
+        None,
+        "--max-tasks",
+        "-t",
+        help="Max concurrent verification worker tasks across Ollama servers.",
+    ),
+):
+    """
+    Compare two Knowledge Bases (e.g. archived backup vs active graph, or backup vs backup)
+    without re-indexing through LLMs. Unpacks backup archives (.zip, .7z) into isolated temporary
+    folders, evaluates topological and idea differences, and executes comparative cross-check audits.
+    """
+    cfg = get_settings(config_path)
+    output_dir = cfg.resolved_output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    target_b_path = target_b
+    if not target_b_path:
+        default_b = output_dir / "knowledge_graph.json"
+        if not default_b.is_file():
+            console.print(
+                f"[bold red]Candidate target B not provided and default Knowledge Graph not found at '{default_b}'.[/bold red]\n"
+                f"[yellow]Specify target_b as a backup archive (.zip/.7z) or path to knowledge_graph.json.[/yellow]"
+            )
+            raise typer.Exit(1)
+        target_b_path = str(default_b)
+
+    with open_backup_target(target_a, label_fallback="Baseline (A)") as bt_a, \
+         open_backup_target(target_b_path, label_fallback="Candidate (B)") as bt_b:
+
+        if not bt_a.graph_file.is_file():
+            console.print(f"[bold red]Knowledge graph file not found in baseline target: '{target_a}'.[/bold red]")
+            raise typer.Exit(1)
+        if not bt_b.graph_file.is_file():
+            console.print(f"[bold red]Knowledge graph file not found in candidate target: '{target_b_path}'.[/bold red]")
+            raise typer.Exit(1)
+
+        store_a = ConceptGraphStore()
+        store_b = ConceptGraphStore()
+
+        with console.status(f"[bold cyan]Loading Baseline Knowledge Graph ({bt_a.label})...[/bold cyan]"):
+            store_a.load(bt_a.graph_file)
+        with console.status(f"[bold cyan]Loading Candidate Knowledge Graph ({bt_b.label})...[/bold cyan]"):
+            store_b.load(bt_b.graph_file)
+
+        comp_stats = compare_knowledge_graphs(store_a, store_b, label_a=bt_a.label, label_b=bt_b.label)
+
+        # 1. Header Banner
+        a_src = f"{Path(target_a).name} (recovered to temp)" if bt_a.is_temp else str(bt_a.graph_file)
+        b_src = f"{Path(target_b_path).name} (recovered to temp)" if bt_b.is_temp else str(bt_b.graph_file)
+        console.print(
+            Panel.fit(
+                f"[bold cyan]🔬 Knowledge Base A/B Backup Comparison[/bold cyan]\n"
+                f"• [bold]Baseline (A):[/bold] [cyan]{bt_a.label}[/cyan] ({a_src})\n"
+                f"• [bold]Candidate (B):[/bold] [magenta]{bt_b.label}[/magenta] ({b_src})\n"
+                f"• [bold]Mode:[/bold] [yellow]{mode.upper()}[/yellow]",
+                title="bookeeper ab-compare",
+                border_style="cyan",
+            )
+        )
+
+        # 2. Structural & Topological Metrics Table
+        s_tbl = Table(title="Knowledge Base Structural Comparison", border_style="cyan")
+        s_tbl.add_column("Entity / Dimension", style="bold")
+        s_tbl.add_column(f"Baseline A ({bt_a.label})", justify="right", style="cyan")
+        s_tbl.add_column(f"Candidate B ({bt_b.label})", justify="right", style="magenta")
+        s_tbl.add_column("Delta (B - A)", justify="right")
+
+        def _fmt_delta(val: int) -> str:
+            if val > 0:
+                return f"[green]+{val:,}[/green]"
+            if val < 0:
+                return f"[red]{val:,}[/red]"
+            return "[dim]0[/dim]"
+
+        b_st = comp_stats["books"]
+        s_tbl.add_row("Total Books", f"{b_st['a']:,}", f"{b_st['b']:,}", _fmt_delta(b_st["delta"]))
+        sec_st = comp_stats["sections"]
+        s_tbl.add_row("Total Sections", f"{sec_st['a']:,}", f"{sec_st['b']:,}", _fmt_delta(sec_st["delta"]))
+        chk_st = comp_stats["chunks"]
+        s_tbl.add_row("Total Chunks", f"{chk_st['a']:,}", f"{chk_st['b']:,}", _fmt_delta(chk_st["delta"]))
+        s_tbl.add_row("Avg Chunk Size (chars)", f"{chk_st['avg_chars_a']:.1f}", f"{chk_st['avg_chars_b']:.1f}", f"{chk_st['avg_chars_b'] - chk_st['avg_chars_a']:+.1f}")
+        s_tbl.add_section()
+
+        idea_st = comp_stats["ideas"]
+        s_tbl.add_row("Unique Concepts / Ideas", f"{idea_st['a']:,}", f"{idea_st['b']:,}", _fmt_delta(idea_st["delta"]))
+        s_tbl.add_row("Shared Ideas (A ∩ B)", f"{idea_st['common_count']:,}", f"{idea_st['common_count']:,}", f"[yellow]{idea_st['jaccard_similarity']*100:.1f}% Jaccard[/yellow]")
+        s_tbl.add_row("Unique to Baseline (A \\ B)", f"{idea_st['only_a_count']:,}", "-", "[dim]-[/dim]")
+        s_tbl.add_row("Novel to Candidate (B \\ A)", "-", f"{idea_st['only_b_count']:,}", f"[green]+{idea_st['only_b_count']:,}[/green]" if idea_st["only_b_count"] else "[dim]0[/dim]")
+        s_tbl.add_section()
+
+        edg_st = comp_stats["edges"]
+        s_tbl.add_row("Relationships / Edges", f"{edg_st['a']:,}", f"{edg_st['b']:,}", _fmt_delta(edg_st["delta"]))
+        console.print(s_tbl)
+
+        final_report: Dict[str, Any] = {
+            "mode": mode,
+            "target_a": str(target_a),
+            "target_b": str(target_b_path),
+            "label_a": bt_a.label,
+            "label_b": bt_b.label,
+            "structural_comparison": comp_stats,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+
+        # 3. Mode execution
+        if mode.lower() in ("cross-check", "cross_check"):
+            effective_model = model or cfg.resolved_verifier_model
+            effective_embedding_model = getattr(cfg, "embedding_model", "nomic-embed-text")
+            verifier_servers = cfg.resolved_verification_servers
+            pool = OllamaPool(
+                servers=verifier_servers,
+                cooldown_seconds=cfg.resolved_verification_cooldown_seconds,
+                max_tasks_per_server=1,
+            )
+            pool_concurrency = max_tasks if max_tasks is not None else cfg.calculate_pool_concurrency(len(pool.alive_nodes) or 1)
+
+            with console.status(f"[bold blue]Preloading and warming up verifier model '{effective_model}'...[/bold blue]"):
+                warmup_verifier = IdeaVerifier(pool=pool, model_name=effective_model)
+                warmup_verifier.warmup(timeout=90)
+
+            cc_report = run_cross_check(
+                store_a=store_a,
+                store_b=store_b,
+                num_blocks=blocks,
+                pool=pool,
+                model_name=effective_model,
+                embedding_model=effective_embedding_model,
+                branch_a_name=bt_a.label,
+                branch_b_name=bt_b.label,
+                seed=seed,
+                print_chunks=int(print_chunks or 0),
+                console=console,
+            )
+
+            sm = cc_report.summary
+            cc_tbl = Table(title="Cross-Check Verification Summary & Decision Gates", border_style="cyan")
+            cc_tbl.add_column("Metric", style="bold")
+            cc_tbl.add_column(f"Baseline ({bt_a.label})", justify="right", style="cyan")
+            cc_tbl.add_column(f"Candidate ({bt_b.label})", justify="right", style="magenta")
+            cc_tbl.add_column("Delta (B - A)", justify="right")
+
+            cc_tbl.add_row("Total Contiguous Blocks Audited", str(sm.total_samples), str(sm.total_samples), "-")
+            cc_tbl.add_row("Total Assertions Evaluated", str(sm.total_assertions_count), str(sm.total_assertions_count), "-")
+            cc_tbl.add_row("Supported Assertions (+1.0)", str(sm.total_old_supported), str(sm.total_new_supported), f"[{'green' if sm.delta_supported >= 0 else 'red'}]{sm.delta_supported:+d}[/]")
+            cc_tbl.add_row("Omission / Not Mentioned (-0.25)", str(sm.total_old_not_mentioned), str(sm.total_new_not_mentioned), f"[{'green' if sm.delta_not_mentioned <= 0 else 'yellow'}]{sm.delta_not_mentioned:+d}[/]")
+            cc_tbl.add_row("Contradicted Assertions (-1.0)", str(sm.total_old_against), str(sm.total_new_against), f"[{'green' if sm.delta_against <= 0 else 'red'}]{sm.delta_against:+d}[/]")
+            cc_tbl.add_row("Mean QA Recall (%)", f"{sm.mean_old_recall * 100:.2f}%", f"{sm.mean_new_recall * 100:.2f}%", f"[{'green' if sm.mean_delta_recall >= -0.03 else 'red'}]{sm.mean_delta_recall * 100:+.2f}% pts[/]")
+            cc_tbl.add_row("Mean Seam Integrity Rate (%)", f"{sm.mean_old_seam_integrity * 100:.2f}%", f"{sm.mean_new_seam_integrity * 100:.2f}%", f"{(sm.mean_new_seam_integrity - sm.mean_old_seam_integrity) * 100:+.2f}% pts")
+            cc_tbl.add_row("Mean Net Semantic Integrity (S_net)", f"{sm.mean_old_net_integrity:+.2f}", f"{sm.mean_new_net_integrity:+.2f}", f"{sm.delta_net_integrity:+.2f}")
+            cc_tbl.add_section()
+            cc_tbl.add_row("Decision Gating Checklist", "-", "[bold green]PASS[/bold green]" if sm.decision_pass else "[bold red]FAIL[/bold red]", f"[dim]{sm.pass_reason}[/dim]")
+            console.print(cc_tbl)
+
+            final_report["cross_check"] = cc_report.model_dump()
+            final_report["decision_pass"] = sm.decision_pass
+            final_report["pass_reason"] = sm.pass_reason
+
+        # 4. Save JSON Report and Markdown
+        report_dest = Path(output_report) if output_report else output_dir / "ab_compare_report.json"
+        md_dest = report_dest.with_suffix(".md")
+        with open(report_dest, "w", encoding="utf-8") as f:
+            json.dump(final_report, f, indent=2, ensure_ascii=False)
+
+        md_lines = [
+            f"# 🔬 Knowledge Base A/B Comparison Report",
+            f"",
+            f"- **Date:** {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
+            f"- **Baseline (A):** `{bt_a.label}` (`{target_a}`)",
+            f"- **Candidate (B):** `{bt_b.label}` (`{target_b_path}`)",
+            f"- **Mode:** `{mode}`",
+            f"",
+            f"## 1. Structural Comparison",
+            f"",
+            f"| Metric | Baseline (A) | Candidate (B) | Delta (B - A) |",
+            f"| :--- | :---: | :---: | :---: |",
+            f"| Books | {b_st['a']} | {b_st['b']} | {b_st['delta']:+d} |",
+            f"| Sections | {sec_st['a']} | {sec_st['b']} | {sec_st['delta']:+d} |",
+            f"| Chunks | {chk_st['a']} | {chk_st['b']} | {chk_st['delta']:+d} |",
+            f"| Ideas / Concepts | {idea_st['a']} | {idea_st['b']} | {idea_st['delta']:+d} |",
+            f"| Shared Ideas (A ∩ B) | {idea_st['common_count']} | {idea_st['common_count']} | Jaccard: {idea_st['jaccard_similarity']*100:.1f}% |",
+            f"| Novel Ideas (B \\ A) | - | {idea_st['only_b_count']} | +{idea_st['only_b_count']} |",
+            f"| Edges / Relationships | {edg_st['a']} | {edg_st['b']} | {edg_st['delta']:+d} |",
+            f"",
+        ]
+        if "cross_check" in final_report:
+            sm_cc = final_report["cross_check"]["summary"]
+            gate_badge = "✅ PASS" if sm_cc.get("decision_pass") else "❌ FAIL"
+            md_lines.extend([
+                f"## 2. Cross-Check Adversarial QA Probe Results",
+                f"",
+                f"- **Decision Gate Status:** **{gate_badge}** ({sm_cc.get('pass_reason')})",
+                f"- **Mean QA Recall Delta:** `{sm_cc.get('mean_delta_recall', 0)*100:+.2f}% pts` (Baseline: `{sm_cc.get('mean_old_recall', 0)*100:.2f}%`, Candidate: `{sm_cc.get('mean_new_recall', 0)*100:.2f}%`)",
+                f"- **Mean Seam Integrity Rate:** `{sm_cc.get('mean_new_seam_integrity', 0)*100:.2f}%`",
+                f"- **Net Semantic Integrity (S_net):** Baseline: `{sm_cc.get('mean_old_net_integrity', 0):+.2f}`, Candidate: `{sm_cc.get('mean_new_net_integrity', 0):+.2f}` (Delta: `{sm_cc.get('delta_net_integrity', 0):+.2f}`)",
+                f"",
+            ])
+        md_dest.write_text("\n".join(md_lines), encoding="utf-8")
+
+        console.print(f"\n[bold green]✓ Comparative Report saved to:[/bold green] [bold cyan]{report_dest}[/bold cyan]")
+        console.print(f"[bold green]✓ Markdown Summary saved to:[/bold green] [bold cyan]{md_dest}[/bold cyan]\n")
+        return final_report
 
 
 @app.command("remove-book")

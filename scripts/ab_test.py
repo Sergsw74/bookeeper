@@ -2395,6 +2395,13 @@ Examples:
         help="Path to pre-existing A/B test run directory to run cross-check comparative audit.",
     )
     parser.add_argument(
+        "--vs-backup",
+        dest="vs_backup",
+        type=str,
+        default=None,
+        help="Path to baseline backup archive (.zip, .7z) to compare against candidate or current graph.",
+    )
+    parser.add_argument(
         "--vs-lightrag",
         dest="vs_lightrag",
         action="store_true",
@@ -2617,6 +2624,37 @@ Examples:
             sys.exit(130)
         except Exception as exc:
             log_error(f"Benchmark execution failed: {exc}")
+            sys.exit(1)
+
+    # Backup Comparison Mode (vs-backup)
+    if args.vs_backup or (args.arg1 and (args.arg1.lower() in ("vs-backup", "backup", "ab-backup", "ab-compare") or args.arg1.endswith((".zip", ".7z")))):
+        is_cmd = args.arg1 and args.arg1.lower() in ("vs-backup", "backup", "ab-backup", "ab-compare")
+        backup_a = args.vs_backup or (args.arg2 if is_cmd else args.arg1)
+        backup_b = args.arg1 if args.vs_backup else (args.arg3 if is_cmd else args.arg2)
+        if not backup_a:
+            parser.error("Specify path to backup archive: 'vs-backup <path_to_backup_a> [path_to_backup_b]'")
+
+        cmd = ["bookeeper", "ab-compare", backup_a]
+        if backup_b and not backup_b.startswith("-") and not _is_number(backup_b):
+            cmd.append(backup_b)
+        if args.mode:
+            cmd.extend(["--mode", args.mode])
+        if args.blocks:
+            cmd.extend(["--blocks", str(args.blocks)])
+        if args.percent:
+            cmd.extend(["--percent", str(args.percent)])
+        if args.model:
+            cmd.extend(["--model", str(args.model)])
+        if args.config:
+            cmd.extend(["--config", str(args.config)])
+        try:
+            res = subprocess.run(cmd, check=False)
+            sys.exit(res.returncode)
+        except KeyboardInterrupt:
+            log_warning("\nExecution aborted by user.")
+            sys.exit(130)
+        except Exception as exc:
+            log_error(f"Backup comparison failed: {exc}")
             sys.exit(1)
 
     if args.cross_check_path:

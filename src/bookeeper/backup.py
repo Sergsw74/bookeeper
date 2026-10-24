@@ -14,8 +14,10 @@ import re
 import shutil
 import tempfile
 import zipfile
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 import py7zr
 
@@ -965,3 +967,219 @@ def restore_backup(
         "bytes_restored": restored_bytes,
         "inspection": inspection,
     }
+
+
+@dataclass
+class ResolvedBackupTarget:
+    """
+    Encapsulates a resolved Knowledge Graph target from an active directory, file, or restored archive.
+    Provides lifecycle cleanup for temporary folders created during archive extraction.
+    """
+
+    root_dir: Path
+    graph_file: Path
+    chunks_dir: Optional[Path] = None
+    states_dir: Optional[Path] = None
+    label: str = ""
+    is_temp: bool = False
+    temp_dir_obj: Optional[Any] = None
+
+    def cleanup(self) -> None:
+        """Purge temporary extraction folder if this target was restored from an archive."""
+        if self.temp_dir_obj is not None:
+            try:
+                self.temp_dir_obj.cleanup()
+            except Exception as e:
+                logger.debug(f"Could not clean up temporary backup directory: {e}")
+            self.temp_dir_obj = None
+
+    def __enter__(self) -> "ResolvedBackupTarget":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.cleanup()
+
+
+def resolve_backup_target(
+    target: Union[Path, str],
+    label_fallback: str = "Backup",
+) -> ResolvedBackupTarget:
+    """
+    Resolve a backup target from either:
+    1. A backup archive (.zip, .7z, .tar.gz) -> automatically unpacks into a secure TemporaryDirectory.
+    2. A directory containing knowledge_graph.json -> used directly.
+    3. A direct knowledge_graph.json file -> used directly.
+    """
+    p = Path(target).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"Target path does not exist: {target}")
+
+    # 1. Archive file (.zip, .7z, .tar, .gz, .tgz)
+    archive_suffixes = (".zip", ".7z", ".tar", ".gz", ".tgz")
+    if p.is_file() and any(p.name.lower().endswith(s) for s in archive_suffixes):
+        td = tempfile.TemporaryDirectory(prefix="bk_ab_")
+        target_dir = Path(td.name).resolve()
+        restore_backup(archive_path=p, target_dir=target_dir)
+
+        kg_file = target_dir / "knowledge_graph.json"
+        if not kg_file.is_file():
+            # Check subdirectories if archive had nested top-level folder
+            for sub in target_dir.rglob("knowledge_graph.json"):
+                kg_file = sub
+                break
+
+        if not kg_file.is_file():
+            td.cleanup()
+            raise FileNotFoundError(f"No knowledge_graph.json found in backup archive '{p.name}'.")
+
+        chunks_d = target_dir / "chunks"
+        if not chunks_d.is_dir() and kg_file.parent != target_dir:
+            chunks_d = kg_file.parent / "chunks"
+
+        states_d = target_dir / ".book_states"
+        if not states_d.is_dir() and kg_file.parent != target_dir:
+            states_d = kg_file.parent / ".book_states"
+
+        clean_label = p.stem
+        if clean_label.endswith(".tar"):
+            clean_label = clean_label[:-4]
+
+        return ResolvedBackupTarget(
+            root_dir=target_dir,
+            graph_file=kg_file,
+            chunks_dir=chunks_d if chunks_d.is_dir() else None,
+            states_dir=states_d if states_d.is_dir() else None,
+            label=clean_label,
+            is_temp=True,
+            temp_dir_obj=td,
+        )
+
+    # 2. Directory containing knowledge_graph.json
+    if p.is_dir():
+        kg_file = p / "knowledge_graph.json"
+        if not kg_file.is_file():
+            for sub in p.rglob("knowledge_graph.json"):
+                kg_file = sub
+                break
+
+        if not kg_file.is_file():
+            raise FileNotFoundError(f"No knowledge_graph.json found in directory '{p}'.")
+
+        chunks_d = p / "chunks" if (p / "chunks").is_dir() else (kg_file.parent / "chunks")
+        states_d = p / ".book_states" if (p / ".book_states").is_dir() else (kg_file.parent / ".book_states")
+
+        return ResolvedBackupTarget(
+            root_dir=p,
+            graph_file=kg_file,
+            chunks_dir=chunks_d if chunks_d.is_dir() else None,
+            states_dir=states_d if states_d.is_dir() else None,
+            label=p.name or label_fallback,
+            is_temp=False,
+        )
+
+    # 3. Direct knowledge_graph.json file
+    if p.is_file():
+        chunks_d = p.parent / "chunks"
+        states_d = p.parent / ".book_states"
+        return ResolvedBackupTarget(
+            root_dir=p.parent,
+            graph_file=p,
+            chunks_dir=chunks_d if chunks_d.is_dir() else None,
+            states_dir=states_d if states_d.is_dir() else None,
+            label=p.parent.name or label_fallback,
+            is_temp=False,
+        )
+
+    raise ValueError(f"Unsupported backup target: {target}")
+
+
+@contextmanager
+def open_backup_target(
+    target: Union[Path, str],
+    label_fallback: str = "Backup",
+) -> Iterator[ResolvedBackupTarget]:
+    """Context manager for safely extracting, inspecting, and auto-cleaning backup targets."""
+    bt = resolve_backup_target(target, label_fallback=label_fallback)
+    try:
+        yield bt
+    finally:
+        bt.cleanup()
+
+
+def compare_knowledge_graphs(
+    store_a: Any,
+    store_b: Any,
+    label_a: str = "Baseline (A)",
+    label_b: str = "Candidate (B)",
+) -> Dict[str, Any]:
+    """
+    Compute fast topological, lexical, and entity comparative metrics between two Knowledge Graphs.
+    Does not require LLM inference.
+    """
+    g_a = store_a.graph
+    g_b = store_b.graph
+
+    books_a = {n: d.get("title", n) for n, d in g_a.nodes(data=True) if d.get("type") == "Book"}
+    books_b = {n: d.get("title", n) for n, d in g_b.nodes(data=True) if d.get("type") == "Book"}
+
+    sections_a = {n for n, d in g_a.nodes(data=True) if d.get("type") == "Section"}
+    sections_b = {n for n, d in g_b.nodes(data=True) if d.get("type") == "Section"}
+
+    chunks_a = {n: len(d.get("text", "") or "") for n, d in g_a.nodes(data=True) if d.get("type") == "Chunk"}
+    chunks_b = {n: len(d.get("text", "") or "") for n, d in g_b.nodes(data=True) if d.get("type") == "Chunk"}
+
+    ideas_a = {d.get("name") or n.replace("concept:", "") for n, d in g_a.nodes(data=True) if d.get("type") in ("Concept", "Idea")}
+    ideas_b = {d.get("name") or n.replace("concept:", "") for n, d in g_b.nodes(data=True) if d.get("type") in ("Concept", "Idea")}
+
+    common_ideas = ideas_a.intersection(ideas_b)
+    only_a_ideas = ideas_a - ideas_b
+    only_b_ideas = ideas_b - ideas_a
+    union_ideas = ideas_a.union(ideas_b)
+
+    jaccard = (len(common_ideas) / len(union_ideas)) if union_ideas else 1.0
+    overlap_a = (len(common_ideas) / len(ideas_a)) if ideas_a else 1.0
+    overlap_b = (len(common_ideas) / len(ideas_b)) if ideas_b else 1.0
+
+    edges_a = len(g_a.edges())
+    edges_b = len(g_b.edges())
+
+    return {
+        "labels": {"a": label_a, "b": label_b},
+        "books": {
+            "a": len(books_a),
+            "b": len(books_b),
+            "delta": len(books_b) - len(books_a),
+            "common_titles": list(set(books_a.values()).intersection(set(books_b.values()))),
+        },
+        "sections": {
+            "a": len(sections_a),
+            "b": len(sections_b),
+            "delta": len(sections_b) - len(sections_a),
+        },
+        "chunks": {
+            "a": len(chunks_a),
+            "b": len(chunks_b),
+            "delta": len(chunks_b) - len(chunks_a),
+            "avg_chars_a": round(sum(chunks_a.values()) / len(chunks_a), 1) if chunks_a else 0,
+            "avg_chars_b": round(sum(chunks_b.values()) / len(chunks_b), 1) if chunks_b else 0,
+        },
+        "ideas": {
+            "a": len(ideas_a),
+            "b": len(ideas_b),
+            "delta": len(ideas_b) - len(ideas_a),
+            "common_count": len(common_ideas),
+            "only_a_count": len(only_a_ideas),
+            "only_b_count": len(only_b_ideas),
+            "jaccard_similarity": round(jaccard, 4),
+            "overlap_ratio_a": round(overlap_a, 4),
+            "overlap_ratio_b": round(overlap_b, 4),
+            "sample_only_b": sorted(list(only_b_ideas))[:10],
+            "sample_only_a": sorted(list(only_a_ideas))[:10],
+        },
+        "edges": {
+            "a": edges_a,
+            "b": edges_b,
+            "delta": edges_b - edges_a,
+        },
+    }
+

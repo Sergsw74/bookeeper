@@ -738,6 +738,10 @@ class ConceptGraphStore:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
+        # Backwards compatibility: NetworkX 2.x serialized 'edges' as 'links'
+        if "links" in data and "edges" not in data:
+            data["edges"] = data.pop("links")
+
         self.graph = json_graph.node_link_graph(data, directed=True, multigraph=False)
 
         # 1. Sanitize all node attributes

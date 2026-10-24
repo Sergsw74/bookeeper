@@ -11,6 +11,8 @@ Bookkeeper includes an automated test harness (`scripts/ab_test.sh` and `scripts
   - [Mode 1: Same-Branch Mode (Config A vs Config B)](#mode-1-same-branch-mode-config-a-vs-config-b)
   - [Mode 2: Branch vs Branch Mode](#mode-2-branch-vs-branch-mode)
   - [Mode 3: Baseline Comparison Mode](#mode-3-baseline-comparison-mode)
+  - [Mode 4: Bookkeeper Knowledge Graph vs. LightRAG Benchmark](#mode-4-bookkeeper-knowledge-graph-vs-lightrag-benchmark)
+  - [Mode 5: A/B Testing vs Archived Backups (`ab-compare`)](#mode-5-ab-testing-vs-archived-backups-ab-compare)
 - [3. Configuration Overlays (`config-a.yaml` & `config-b.yaml`)](#3-configuration-overlays-config-a-yaml--config-b-yaml)
   - [Deep-Merge Semantics](#deep-merge-semantics)
   - [Overlay Example](#overlay-example)
@@ -121,6 +123,36 @@ bookeeper lightrag-ui
 # Or point directly to a specific A/B benchmark run directory:
 bookeeper lightrag-ui --lightrag-dir ab_test_runs/run_20261014_144807
 ```
+
+### Mode 5: A/B Testing vs Archived Backups (`ab-compare`)
+
+Re-indexing books from scratch to run comparative evaluations can take tens of minutes of LLM inference time. If you maintain regular compressed backups (`.zip` or `.7z` generated via `bookeeper backup`), you can run instant A/B comparative evaluations directly against archived runs.
+
+The automated backup resolver unpacks archives into isolated temporal directories (`tempfile.TemporaryDirectory(prefix="bk_ab_")`), loads the graph topologies, runs audits, and guarantees clean purging of temporal directories on exit:
+
+```bash
+# 1. Topological & overlap metrics between two historical backups (instant, offline):
+bookeeper ab-compare backups/backup_run_oct10.zip backups/backup_run_oct20.zip --mode stats
+
+# 2. Compare a historical backup against your currently active knowledge graph:
+bookeeper ab-compare backups/baseline_prod.zip --mode stats
+
+# 3. Deep NLI Cross-Check audit (evaluates recall, seam integrity, and contradictions between backups):
+bookeeper ab-compare backups/baseline.zip backups/candidate.zip --mode cross-check --blocks 10
+
+# 4. Using the ab_test.py automation runner:
+python3 scripts/ab_test.py vs-backup backups/baseline.zip backups/candidate.zip --blocks 10
+python3 scripts/ab_test.py --vs-backup backups/baseline.zip
+
+# 5. Direct verification command accepting backup archives:
+bookeeper verify --graph-file backups/baseline.zip --compare-graph backups/candidate.zip --mode cross-check
+```
+
+#### What is Evaluated:
+- **Topological & Extraction Metrics**: Side-by-side comparison of Book counts, Section counts, hierarchical Chunks, extracted Ideas, total Edges, and Edge-to-Node Relational Density.
+- **Idea Set Overlap & Jaccard Similarity**: Exact intersection of extracted concepts, count and proportion of common ideas, ideas unique to Run A vs Run B, and Jaccard similarity coefficient.
+- **NLI Cross-Check Recall & Seam Integrity**: Evaluates atomic assertions from contiguous text spans against both graphs to compute comparative recall ($\Delta \text{Recall}$), seam integrity, and net semantic integrity $\Delta S_{net}$.
+- **Zero Disk Footprint**: Unpacked temporary files (`knowledge_graph.json`, `.book_states/`, `chunks/`) are strictly removed even if audits fail or are interrupted.
 
 ---
 
@@ -268,7 +300,28 @@ options:
   --questions-per-book Questions to generate per book if synthesizing library (default: 5)
 ```
 
-### 8.2 `bookeeper ab-benchmark`
+### 8.2 `bookeeper ab-compare` (alias `bookeeper ab-backup`)
+```text
+Usage: bookeeper ab-compare [OPTIONS] TARGET_A [TARGET_B]
+
+  Perform automated A/B comparative evaluation between archived backups (.zip, .7z)
+  or against the active knowledge graph. Automatically recovers targets to temporal
+  directories and guarantees full cleanup on exit.
+
+Arguments:
+  TARGET_A             First backup archive (.zip, .7z, .tar.gz) or graph JSON
+  [TARGET_B]           Second backup archive or graph JSON (defaults to active output/knowledge_graph.json)
+
+Options:
+  -m, --mode [stats|cross-check|ideas]
+                       Comparison mode: 'stats' (fast topological & Jaccard metrics),
+                       'cross-check' (NLI assertion audit), or 'ideas' (factual grounding) [default: stats]
+  -b, --blocks INTEGER Number of contiguous chunk blocks to audit in cross-check mode [default: 10]
+  -o, --output PATH    Destination path to save JSON comparison report
+  -c, --config PATH    Path to config.yaml [default: config.yaml]
+```
+
+### 8.3 `bookeeper ab-benchmark`
 ```text
 Usage: bookeeper ab-benchmark [OPTIONS] [NUM_BOOKS]
 

@@ -50,6 +50,7 @@ Bookkeeper provides a rich set of CLI commands. Below is a high-level overview o
 | **`config`** | `bookeeper config` | Displays active settings, resolved server pool, and node capabilities. | [Get Started](docs/get-started.md) |
 | **`backup`** | `bookeeper backup -o backup.zip` | Creates a compressed archive (`.zip` / `.7z`) of the graph, vault, chunks, and book states. | [Get Started](docs/get-started.md) |
 | **`restore`** | `bookeeper restore backup.zip --clean` | Restores knowledge graph, vault, chunks, and checkpoints from an archive. | [Get Started](docs/get-started.md) |
+| **`ab-compare`** | `bookeeper ab-compare backup_a.zip [backup_b.zip]` | Instant comparative A/B evaluation between archived backups or active graph in isolated temp directories. | [A/B Testing](docs/ab-tests.md) |
 
 ---
 

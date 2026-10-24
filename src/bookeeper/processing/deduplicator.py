@@ -5,7 +5,7 @@ and two-tier LLM-assisted verification and synthesis.
 
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from langchain_core.embeddings import Embeddings
@@ -111,6 +111,49 @@ class EntityDeduplicator:
         cleaned = re.sub(r"[^\w\s-]", "", name).strip().lower()
         return re.sub(r"\s+", " ", cleaned)
 
+    def seed_from_graph(self, store: Any) -> int:
+        """
+        Seed canonical concept cache from existing Concept/Idea nodes in ConceptGraphStore,
+        reusing stored node embeddings so existing ideas do not need to be re-embedded.
+        """
+        if store is None or getattr(store, "graph", None) is None:
+            return 0
+        seeded = 0
+        for node_id, attrs in store.graph.nodes(data=True):
+            if attrs.get("type") != "Concept" and not attrs.get("is_idea"):
+                continue
+            raw_name = attrs.get("name") or str(node_id).replace("concept:", "")
+            clean_name = BookParser.repair_mojibake(raw_name).strip()
+            if not clean_name or clean_name in self._cache:
+                continue
+
+            brief = attrs.get("brief_description") or attrs.get("summary") or ""
+            detailed = attrs.get("detailed_explanation") or ""
+            cat = attrs.get("category") or "Idea"
+            weight = int(attrs.get("weight") or 5)
+            existing_emb = attrs.get("embedding")
+            vec_arr: Optional[np.ndarray] = None
+            emb_list: Optional[List[float]] = None
+            if isinstance(existing_emb, (list, np.ndarray)) and len(existing_emb) > 1:
+                arr = np.array(existing_emb, dtype=np.float32)
+                norm = float(np.linalg.norm(arr))
+                vec_arr = (arr / norm) if norm > 0.0 else arr
+                emb_list = vec_arr.tolist()
+
+            concept_obj = Concept(
+                name=clean_name,
+                category=cat,
+                brief_description=brief,
+                detailed_explanation=detailed,
+                summary=brief or detailed,
+                weight=weight,
+            )
+            if emb_list is not None:
+                concept_obj.embedding = emb_list
+            self._cache[clean_name] = (vec_arr, concept_obj)
+            seeded += 1
+        return seeded
+
     def resolve_concept(self, concept: Concept) -> Concept:
         """
         Compare incoming concept against existing graph concepts.
@@ -132,15 +175,23 @@ class EntityDeduplicator:
                 self._merge_into(existing, concept)
                 return existing
 
-        # 2. Embedding-based semantic cosine similarity
-        concept_vec = self._embed(raw_name)
+        # 2. Embedding-based semantic cosine similarity (reuse concept.embedding if already set)
+        if concept.embedding and len(concept.embedding) > 1:
+            arr = np.array(concept.embedding, dtype=np.float32)
+            norm = float(np.linalg.norm(arr))
+            concept_vec: Optional[np.ndarray] = (arr / norm) if norm > 0.0 else arr
+        else:
+            concept_vec = self._embed(raw_name)
+            if concept_vec is not None:
+                concept.embedding = concept_vec.tolist()
+
         if concept_vec is not None and self._cache:
             best_sim = -1.0
             best_match: Optional[Concept] = None
             best_canon_name: Optional[str] = None
 
             for canon_name, (cached_vec, existing_concept) in self._cache.items():
-                if cached_vec is not None:
+                if cached_vec is not None and cached_vec.shape == concept_vec.shape:
                     sim = float(np.dot(concept_vec, cached_vec))
                     if sim > best_sim:
                         best_sim = sim
@@ -182,6 +233,188 @@ class EntityDeduplicator:
         # 3. Register as new canonical node
         self._cache[raw_name] = (concept_vec, concept)
         return concept
+
+    def resolve_concepts_batch(
+        self,
+        concepts: Sequence[Concept],
+        neo4j_exporter: Optional[Any] = None,
+        top_k: int = 3,
+        batch_size: int = 64,
+    ) -> List[Concept]:
+        """
+        Batch-resolve all extracted ideas/concepts from an article or book:
+        1. Batch-embed all unique concept names that do not yet have embeddings.
+        2. Query all extracted idea vectors in a single batched transaction against
+           the native Neo4j HNSW vector index on :Idea(embedding)
+           (UNWIND $idea_vectors AS vec CALL db.index.vector.queryNodes('idea_idx', 3, vec)),
+           plus vectorized comparison against in-memory cached ideas.
+        3. Resolve each concept via two-tier thresholding and attach normalized embeddings.
+        """
+        if not concepts:
+            return []
+
+        # Clean names first
+        for c in concepts:
+            c.name = BookParser.repair_mojibake(c.name.strip())
+
+        # 1. Batch-embed any concepts missing embeddings and not already in exact-name cache
+        missing_texts: List[str] = []
+        missing_text_to_vec: Dict[str, np.ndarray] = {}
+        seen_missing: set[str] = set()
+
+        for c in concepts:
+            raw_name = c.name
+            if c.embedding and len(c.embedding) > 1:
+                arr = np.array(c.embedding, dtype=np.float32)
+                norm = float(np.linalg.norm(arr))
+                unit = (arr / norm) if norm > 0.0 else arr
+                c.embedding = unit.tolist()
+                missing_text_to_vec[raw_name] = unit
+                continue
+
+            if raw_name in self._cache and self._cache[raw_name][0] is not None:
+                vec = self._cache[raw_name][0]
+                if vec is not None:
+                    c.embedding = vec.tolist()
+                    missing_text_to_vec[raw_name] = vec
+                    continue
+
+            if raw_name not in seen_missing:
+                seen_missing.add(raw_name)
+                missing_texts.append(raw_name)
+
+        if missing_texts and self.embeddings is not None:
+            for i in range(0, len(missing_texts), batch_size):
+                sub = missing_texts[i : i + batch_size]
+                try:
+                    if hasattr(self.embeddings, "embed_documents"):
+                        raw_vecs = self.embeddings.embed_documents(sub)
+                    else:
+                        raw_vecs = [self.embeddings.embed_query(t) for t in sub]
+                    for txt, v in zip(sub, raw_vecs):
+                        if v and len(v) > 1:
+                            arr = np.array(v, dtype=np.float32)
+                            norm = float(np.linalg.norm(arr))
+                            unit = (arr / norm) if norm > 0.0 else arr
+                            missing_text_to_vec[txt] = unit
+                except Exception as e:
+                    logger.debug(f"Batch concept embedding failed on sub-batch {i}: {e}")
+
+        for c in concepts:
+            if not c.embedding and c.name in missing_text_to_vec:
+                c.embedding = missing_text_to_vec[c.name].tolist()
+
+        # 2. Query Neo4j HNSW vector index ('idea_idx') for all extracted idea vectors in a single batched transaction:
+        #    UNWIND $idea_vectors AS vec CALL db.index.vector.queryNodes('idea_idx', 3, vec)
+        hnsw_candidates_by_idx: Dict[int, List[Dict[str, Any]]] = {}
+        if neo4j_exporter is not None and hasattr(neo4j_exporter, "query_ideas_hnsw_batch"):
+            query_indices: List[int] = []
+            idea_vectors: List[List[float]] = []
+            for idx, c in enumerate(concepts):
+                if c.embedding and len(c.embedding) > 1:
+                    query_indices.append(idx)
+                    idea_vectors.append(c.embedding)
+            if idea_vectors:
+                try:
+                    batch_hnsw = neo4j_exporter.query_ideas_hnsw_batch(idea_vectors, top_k=top_k)
+                    for q_pos, idx in enumerate(query_indices):
+                        if q_pos < len(batch_hnsw):
+                            hnsw_candidates_by_idx[idx] = batch_hnsw[q_pos]
+                except Exception as e:
+                    logger.debug(f"Neo4j HNSW batch query in resolve_concepts_batch fallback to cache: {e}")
+
+        # 3. Resolve each concept in order, combining HNSW candidates and in-memory cache
+        resolved_list: List[Concept] = []
+        for idx, concept in enumerate(concepts):
+            raw_name = concept.name
+            norm_name = self._normalize_name(raw_name)
+
+            # 3a. Exact or normalized name match in cache
+            exact_hit: Optional[Concept] = None
+            for canon_name, (_, existing) in self._cache.items():
+                if self._normalize_name(canon_name) == norm_name:
+                    exact_hit = existing
+                    break
+            if exact_hit is not None:
+                self._merge_into(exact_hit, concept)
+                if exact_hit.embedding is None and concept.embedding:
+                    exact_hit.embedding = concept.embedding
+                resolved_list.append(exact_hit)
+                continue
+
+            concept_vec = missing_text_to_vec.get(raw_name)
+            if concept_vec is None and concept.embedding and len(concept.embedding) > 1:
+                arr = np.array(concept.embedding, dtype=np.float32)
+                norm = float(np.linalg.norm(arr))
+                concept_vec = (arr / norm) if norm > 0.0 else arr
+
+            best_sim = -1.0
+            best_match: Optional[Concept] = None
+            best_canon_name: Optional[str] = None
+
+            # Check top-k candidates returned from Neo4j HNSW 'idea_idx'
+            hnsw_cands = hnsw_candidates_by_idx.get(idx, [])
+            for cand in hnsw_cands:
+                cand_name = BookParser.repair_mojibake(str(cand.get("name") or "")).strip()
+                cand_score = float(cand.get("score") or 0.0)
+                if not cand_name:
+                    continue
+                if cand_name in self._cache:
+                    _, existing_c = self._cache[cand_name]
+                else:
+                    existing_c = Concept(
+                        name=cand_name,
+                        brief_description=cand.get("brief_description") or cand.get("summary") or "",
+                        detailed_explanation=cand.get("detailed_explanation") or "",
+                        summary=cand.get("summary") or cand.get("brief_description") or "",
+                        category="Idea",
+                    )
+                    self._cache[cand_name] = (None, existing_c)
+                if cand_score > best_sim:
+                    best_sim = cand_score
+                    best_match = existing_c
+                    best_canon_name = cand_name
+
+            # Also check in-memory _cache vectors (covers concepts added earlier in the same batch or when Neo4j is offline)
+            if concept_vec is not None and self._cache:
+                for canon_name, (cached_vec, existing_concept) in self._cache.items():
+                    if cached_vec is not None and cached_vec.shape == concept_vec.shape:
+                        sim = float(np.dot(concept_vec, cached_vec))
+                        if sim > best_sim:
+                            best_sim = sim
+                            best_match = existing_concept
+                            best_canon_name = canon_name
+
+            # Case A: High Confidence (>= 0.95) -> Direct merge
+            if best_match is not None and best_sim >= self.high_similarity_threshold:
+                self._merge_into(best_match, concept)
+                if best_match.embedding is None and concept.embedding:
+                    best_match.embedding = concept.embedding
+                resolved_list.append(best_match)
+                continue
+
+            # Case B: Probable match (0.80 <= similarity < 0.95) -> LLM disambiguation
+            if best_match is not None and best_sim >= self.similarity_threshold:
+                if self.extractor is not None:
+                    decision = self._ask_llm_disambiguation(best_match, concept, best_sim)
+                    if decision.is_same_concept:
+                        self._merge_with_llm_decision(best_match, concept, decision, best_canon_name)
+                        if best_match.embedding is None and concept.embedding:
+                            best_match.embedding = concept.embedding
+                        resolved_list.append(best_match)
+                        continue
+                else:
+                    self._merge_into(best_match, concept)
+                    if best_match.embedding is None and concept.embedding:
+                        best_match.embedding = concept.embedding
+                    resolved_list.append(best_match)
+                    continue
+
+            # Case C: Register as new canonical concept
+            self._cache[raw_name] = (concept_vec, concept)
+            resolved_list.append(concept)
+
+        return resolved_list
 
     def _ask_llm_disambiguation(
         self,

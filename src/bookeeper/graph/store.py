@@ -198,30 +198,33 @@ class ConceptGraphStore:
         )
         return section_node_id
 
-    def add_concept(self, concept: Concept) -> str:
-        """Add or update an Idea / Concept node with brief description, detailed explanation, and significance weight."""
+    def add_concept(self, concept: Concept, embedding: Optional[List[float]] = None) -> str:
+        """Add or update an Idea / Concept node with brief description, detailed explanation, significance weight, and optional embedding."""
         name = BookParser.repair_mojibake(concept.name)
         category = BookParser.repair_mojibake(concept.category)
         node_id = f"concept:{name}"
         brief = BookParser.repair_mojibake(getattr(concept, "brief_description", "") or concept.summary)
         detailed = BookParser.repair_mojibake(getattr(concept, "detailed_explanation", "") or concept.summary)
         weight = getattr(concept, "weight", 5)
+        emb = embedding if embedding is not None else getattr(concept, "embedding", None)
 
         if not self.graph.has_node(node_id):
-            self.graph.add_node(
-                node_id,
-                type="Concept",
-                tag="idea",
-                tags=["idea", category.lower().replace(" ", "-")],
-                is_idea=True,
-                name=name,
-                category=category,
-                brief_description=brief,
-                detailed_explanation=detailed,
-                summary=brief or detailed,
-                weight=weight,
-                occurrences=1,
-            )
+            node_attrs: Dict[str, Any] = {
+                "type": "Concept",
+                "tag": "idea",
+                "tags": ["idea", category.lower().replace(" ", "-")],
+                "is_idea": True,
+                "name": name,
+                "category": category,
+                "brief_description": brief,
+                "detailed_explanation=detailed" if False else "detailed_explanation": detailed,
+                "summary": brief or detailed,
+                "weight": weight,
+                "occurrences": 1,
+            }
+            if emb:
+                node_attrs["embedding"] = [float(x) for x in emb]
+            self.graph.add_node(node_id, **node_attrs)
         else:
             node_data = self.graph.nodes[node_id]
             node_data["occurrences"] += 1
@@ -236,6 +239,8 @@ class ConceptGraphStore:
             summary_cand = brief or detailed
             if len(summary_cand) > len(node_data.get("summary", "")):
                 node_data["summary"] = summary_cand
+            if emb and not node_data.get("embedding"):
+                node_data["embedding"] = [float(x) for x in emb]
 
         return node_id
 

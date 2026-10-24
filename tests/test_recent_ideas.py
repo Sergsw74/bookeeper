@@ -336,6 +336,7 @@ def test_build_graph_chronological_batch_integration(tmp_path: Path):
 
         mock_dedup_instance = MagicMock()
         mock_dedup_instance.resolve_concept.side_effect = lambda c: c
+        mock_dedup_instance.resolve_concepts_batch.side_effect = lambda concepts, **kw: list(concepts)
         mock_dedup_cls.return_value = mock_dedup_instance
 
         res = runner.invoke(
@@ -458,6 +459,7 @@ def test_build_graph_high_confidence_chunk_skips_llm(tmp_path: Path):
 
         mock_dedup_instance = MagicMock()
         mock_dedup_instance.resolve_concept.side_effect = lambda c: c
+        mock_dedup_instance.resolve_concepts_batch.side_effect = lambda concepts, **kw: list(concepts)
         mock_dedup_cls.return_value = mock_dedup_instance
 
         res = runner.invoke(
@@ -599,6 +601,7 @@ def test_build_graph_skip_limbo_chunks_flag(tmp_path: Path):
 
         mock_dedup_instance = MagicMock()
         mock_dedup_instance.resolve_concept.side_effect = lambda c: c
+        mock_dedup_instance.resolve_concepts_batch.side_effect = lambda concepts, **kw: list(concepts)
         mock_dedup_cls.return_value = mock_dedup_instance
 
         res = runner.invoke(
@@ -874,6 +877,268 @@ def test_ui_server_ideas_http_endpoint(tmp_path: Path):
         finally:
             server.shutdown()
             server.server_close()
+
+
+def test_chunk_embeddings_reused_across_chunker_store_and_router(tmp_path: Path):
+    """
+    Verify that:
+    1. RollingWindowSemanticChunker / HierarchicalChunker attaches pooled normalized embeddings
+       to each HierarchicalChunk during initial chunking.
+    2. ChunkStore persists and reloads chunk.embedding on disk.
+    3. RecentIdeaChunkRouter.route_chunks reuses chunk.embedding without calling embed_documents again.
+    """
+    from langchain_core.embeddings import Embeddings
+    from bookeeper.calibre.parser import Section
+    from bookeeper.processing.chunker import ChunkStore, HierarchicalChunker
+    from bookeeper.processing.extractor import Concept
+
+    mock_embeddings = MagicMock(spec=Embeddings)
+    mock_embeddings.embed_documents.side_effect = lambda texts: [[1.0, 0.0, 0.0] for _ in texts]
+
+    chunker = HierarchicalChunker(embeddings=mock_embeddings, max_chunk_chars=80, min_chunk_chars=20)
+    section = Section(
+        title="Distributed Consensus",
+        chapter_idx=1,
+        text=(
+            "Paxos guarantees safety in asynchronous distributed systems across quorums. "
+            "Prepare and accept phases coordinate state replication across fault-tolerant replicas. "
+            "Leader election reduces split-vote contention during normal operation."
+        ),
+    )
+    chunks = chunker.chunk_section(section, book_id=42, book_title="Systems Book")
+    assert len(chunks) >= 1
+    for chk in chunks:
+        assert chk.embedding is not None
+        assert len(chk.embedding) == 3
+        assert np.isclose(np.linalg.norm(chk.embedding), 1.0, atol=1e-4)
+
+    # Persist to ChunkStore and reload
+    cstore = ChunkStore(tmp_path / "chunks")
+    cstore.save_chunks(42, "Systems Book", chunks)
+    loaded_chunks = cstore.load_chunks(42)
+    assert loaded_chunks is not None
+    assert len(loaded_chunks) == len(chunks)
+    for lchk in loaded_chunks:
+        assert lchk.embedding is not None
+        assert len(lchk.embedding) == 3
+
+    # Build an IdeaEmbeddingIndex with a pre-populated idea vector
+    store = ConceptGraphStore()
+    store.add_concept(
+        Concept(name="Paxos Quorum Safety", brief_description="Safety across distributed quorums"),
+        embedding=[1.0, 0.0, 0.0],
+    )
+
+    router_embeddings = MagicMock()
+    idea_index = IdeaEmbeddingIndex.build_from_graph(store, embeddings=router_embeddings)
+    # Idea already had its embedding stored on the node -> 0 embedding calls!
+    assert idea_index.reused_count == 1
+    assert idea_index.embedded_count == 0
+    router_embeddings.embed_documents.assert_not_called()
+
+    # Route loaded chunks -> should reuse chunk.embedding with 0 calls to router_embeddings.embed_documents!
+    router = RecentIdeaChunkRouter(
+        idea_index=idea_index,
+        embeddings=router_embeddings,
+        unassigned_threshold=0.65,
+        high_confidence_threshold=0.90,
+    )
+    routing_res = router.route_chunks(loaded_chunks)
+    assert routing_res.reused_embeddings_count == len(loaded_chunks)
+    assert routing_res.computed_embeddings_count == 0
+    assert not routing_res.embeddings_updated
+    router_embeddings.embed_documents.assert_not_called()
+    assert routing_res.high_confidence_count == len(loaded_chunks)
+
+
+def test_neo4j_hnsw_vector_index_exclusively_on_idea_nodes_and_batched_unwind_query():
+    """
+    Verify that:
+    1. Neo4jExporter creates the HNSW vector index 'idea_idx' exclusively on :Idea(embedding).
+    2. Non-Idea nodes (:Chunk, :Section, :Book) never have embedding exported to Neo4j.
+    3. Neo4jExporter.query_ideas_hnsw_batch queries all 20 extracted ideas from an article
+       in a single batched transaction using:
+       UNWIND $idea_vectors AS vec CALL db.index.vector.queryNodes('idea_idx', 3, vec)
+    """
+    from unittest.mock import patch
+    from bookeeper.graph.neo4j_exporter import Neo4jExporter
+    from bookeeper.processing.chunker import HierarchicalChunk
+    from bookeeper.processing.extractor import Concept
+
+    store = ConceptGraphStore()
+    store.add_book(1, title="Test Article", author="Author", publication_date="2025-01-15")
+    sec_id = store.add_section(1, 1, "Intro", "Text about distributed consensus")
+    chk = HierarchicalChunk(
+        chunk_id="b1_s001_c001",
+        book_id=1,
+        book_title="Test Article",
+        section_title="Intro",
+        chapter_idx=1,
+        chunk_idx=1,
+        text="Text about distributed consensus",
+        embedding=[0.5, 0.5, 0.7071],
+    )
+    store.add_chunk(chk)
+    # Even if a Chunk node in memory somehow had an embedding attribute, Neo4jExporter must strip it
+    store.graph.nodes[f"chunk:{chk.chunk_id}"]["embedding"] = [0.5, 0.5, 0.7071]
+
+    store.add_concept(
+        Concept(name="State Machine Replication", brief_description="Deterministic replica coordination"),
+        embedding=[1.0, 0.0, 0.0],
+    )
+
+    exporter = Neo4jExporter(uri="bolt://localhost:7687", user="neo4j", password="password")
+    executed_queries = []
+
+    mock_session = MagicMock()
+
+    def _run_side_effect(cypher, **params):
+        executed_queries.append((cypher, params))
+        if "CALL db.index.vector.queryNodes('idea_idx', 3, vec)" in cypher:
+            vecs = params.get("idea_vectors", [])
+            rows = []
+            for idx in range(len(vecs)):
+                rows.append({
+                    "vec_idx": idx,
+                    "matches": [
+                        {
+                            "node_id": "concept:State Machine Replication",
+                            "name": "State Machine Replication",
+                            "brief_description": "Deterministic replica coordination",
+                            "detailed_explanation": "",
+                            "summary": "Deterministic replica coordination",
+                            "month": "2025-01",
+                            "score": 0.96,
+                        }
+                    ],
+                })
+            return rows
+        return MagicMock()
+
+    mock_session.run.side_effect = _run_side_effect
+    mock_driver = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    with patch.object(exporter, "get_driver", return_value=mock_driver):
+        exporter.export(store, clean=False)
+
+        # 1. Verify native HNSW vector index creation on :Idea(embedding)
+        index_queries = [
+            q for q, _ in executed_queries
+            if "CREATE VECTOR INDEX idea_idx IF NOT EXISTS" in q and "FOR (n:Idea) ON (n.embedding)" in q
+        ]
+        assert len(index_queries) == 1
+        assert "`vector.similarity_function`: 'cosine'" in index_queries[0]
+        assert "`vector.dimensions`: 3" in index_queries[0]
+
+        # 2. Verify :Idea node has embedding in Neo4j export batch, while :Chunk and :Book do NOT
+        for q, params in executed_queries:
+            if "UNWIND $batch AS row" in q and "MERGE (n:`" in q:
+                batch = params.get("batch", [])
+                for row in batch:
+                    props = row.get("properties", {})
+                    if "SET n:Idea" in q or ":`Idea`" in q:
+                        assert "embedding" in props
+                        assert props["embedding"] == [1.0, 0.0, 0.0]
+                    else:
+                        assert "embedding" not in props
+
+        # 3. Query all 20 extracted ideas from an article in a single batched transaction
+        executed_queries.clear()
+        twenty_idea_vectors = [[float(i), 1.0, 0.0] for i in range(20)]
+        batch_results = exporter.query_ideas_hnsw_batch(twenty_idea_vectors, top_k=3)
+
+        assert len(batch_results) == 20
+        assert len(executed_queries) == 1
+        cypher_sent, params_sent = executed_queries[0]
+        assert "UNWIND $idea_vectors AS vec CALL db.index.vector.queryNodes('idea_idx', 3, vec)" in cypher_sent
+        assert len(params_sent["idea_vectors"]) == 20
+        assert batch_results[0][0]["name"] == "State Machine Replication"
+        assert batch_results[19][0]["score"] == pytest.approx(0.96)
+
+
+def test_deduplicator_resolve_concepts_batch_single_transaction_for_20_ideas():
+    """
+    Verify EntityDeduplicator.resolve_concepts_batch embeds 20 extracted ideas from an article
+    in a single batch call and queries the Neo4j HNSW 'idea_idx' index in a single batched transaction.
+    """
+    from bookeeper.processing.deduplicator import EntityDeduplicator
+    from bookeeper.processing.extractor import Concept
+
+    mock_embeddings = MagicMock()
+    mock_embeddings.embed_documents.side_effect = lambda texts: [[1.0, 0.0, 0.0] for _ in texts]
+
+    mock_neo4j = MagicMock()
+
+    def _mock_hnsw_batch(idea_vectors, top_k=3):
+        # First idea matches an existing high-similarity idea (>=0.95); others have low similarity (0.20)
+        results = []
+        for idx, _ in enumerate(idea_vectors):
+            if idx == 0:
+                results.append([
+                    {
+                        "node_id": "concept:Canonical Graph Attention",
+                        "name": "Canonical Graph Attention",
+                        "brief_description": "Attention mechanism over graph neighborhoods",
+                        "detailed_explanation": "",
+                        "summary": "Attention mechanism over graph neighborhoods",
+                        "score": 0.97,
+                    }
+                ])
+            else:
+                results.append([
+                    {
+                        "node_id": "concept:Canonical Graph Attention",
+                        "name": "Canonical Graph Attention",
+                        "brief_description": "Attention mechanism over graph neighborhoods",
+                        "detailed_explanation": "",
+                        "summary": "Attention mechanism over graph neighborhoods",
+                        "score": 0.20,
+                    }
+                ])
+        return results
+
+    mock_neo4j.query_ideas_hnsw_batch.side_effect = _mock_hnsw_batch
+
+    # Give each of the 20 extracted concepts a distinct orthogonal/unique vector after embedding
+    def _distinct_embed_docs(texts):
+        out = []
+        for i in range(len(texts)):
+            vec = [0.0] * 20
+            vec[i % 20] = 1.0
+            out.append(vec)
+        return out
+
+    mock_embeddings.embed_documents.side_effect = _distinct_embed_docs
+
+    dedup = EntityDeduplicator(
+        embeddings=mock_embeddings,
+        similarity_threshold=0.80,
+        high_similarity_threshold=0.95,
+    )
+
+    extracted_20 = [
+        Concept(name=f"Extracted Idea {i}", brief_description=f"Description for idea {i}")
+        for i in range(20)
+    ]
+
+    resolved = dedup.resolve_concepts_batch(extracted_20, neo4j_exporter=mock_neo4j, top_k=3)
+
+    assert len(resolved) == 20
+    # Exactly 1 batched embed_documents call and 1 batched HNSW query call for all 20 ideas!
+    assert mock_embeddings.embed_documents.call_count == 1
+    assert mock_neo4j.query_ideas_hnsw_batch.call_count == 1
+    called_vecs = mock_neo4j.query_ideas_hnsw_batch.call_args[0][0]
+    assert len(called_vecs) == 20
+
+    # Idea 0 matched 'Canonical Graph Attention' with score 0.97 >= 0.95
+    assert resolved[0].name == "Canonical Graph Attention"
+    # Ideas 1..19 were distinct new concepts and each has its normalized embedding attached
+    for i in range(1, 20):
+        assert resolved[i].name == f"Extracted Idea {i}"
+        assert resolved[i].embedding is not None
+        assert len(resolved[i].embedding) == 20
+
 
 
 

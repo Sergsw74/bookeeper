@@ -314,6 +314,9 @@ class RollingWindowSemanticChunker:
         left_normed = normed_embeddings[left_indices]
         right_normed = normed_embeddings[right_indices]
 
+        self._last_left_normed = left_normed
+        self._last_right_normed = right_normed
+
         similarities = np.sum(left_normed * right_normed, axis=1)
         return np.clip(similarities, -1.0, 1.0)
 
@@ -524,19 +527,39 @@ class RollingWindowSemanticChunker:
             chunk_text = "".join(chunk_pieces)
             final_token_count = self.count_tokens(chunk_text)
 
-            chunks.append(
-                {
-                    "chunk_id": chunk_id,
-                    "text": chunk_text,
-                    "token_count": final_token_count,
-                    "char_count": len(chunk_text),
-                    "word_count": len(chunk_text.split()),
-                    "start_sentence_idx": start_idx,
-                    "end_sentence_idx": split_idx,
-                    "split_reason": split_reason,
-                    "metadata": base_meta,
-                }
-            )
+            # Reuse already-computed rolling window embeddings to derive the chunk embedding without extra API calls
+            chunk_emb_list: Optional[List[float]] = None
+            left_normed = getattr(self, "_last_left_normed", None)
+            right_normed = getattr(self, "_last_right_normed", None)
+            if left_normed is not None and len(left_normed) > 0:
+                vec_slices: List[np.ndarray] = []
+                l_end = min(split_idx, len(left_normed) - 1)
+                if start_idx <= l_end:
+                    vec_slices.append(left_normed[start_idx : l_end + 1])
+                if right_normed is not None and 0 <= split_idx - 1 < len(right_normed):
+                    vec_slices.append(right_normed[split_idx - 1 : split_idx])
+                if vec_slices:
+                    stacked = np.vstack(vec_slices)
+                    mean_vec = np.mean(stacked, axis=0)
+                    norm_val = float(np.linalg.norm(mean_vec))
+                    if norm_val > 1e-12:
+                        mean_vec = mean_vec / norm_val
+                    chunk_emb_list = [round(float(x), 6) for x in mean_vec]
+
+            chunk_dict: Dict[str, Any] = {
+                "chunk_id": chunk_id,
+                "text": chunk_text,
+                "token_count": final_token_count,
+                "char_count": len(chunk_text),
+                "word_count": len(chunk_text.split()),
+                "start_sentence_idx": start_idx,
+                "end_sentence_idx": split_idx,
+                "split_reason": split_reason,
+                "metadata": base_meta,
+            }
+            if chunk_emb_list is not None:
+                chunk_dict["embedding"] = chunk_emb_list
+            chunks.append(chunk_dict)
             chunk_id += 1
             prev_split_idx = split_idx
 
@@ -583,6 +606,8 @@ class RollingWindowSemanticChunker:
                         "split_reason": c["split_reason"],
                     }
                 )
+                if "embedding" in c and c["embedding"] is not None:
+                    chunk_meta["embedding"] = c["embedding"]
                 docs.append(Document(page_content=c["text"], metadata=chunk_meta))
         return docs
 

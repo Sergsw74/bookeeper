@@ -544,6 +544,11 @@ class IdeaPostProcessor:
                     )
 
                 cluster = clusters_by_norm[norm_name]
+                existing_emb = attrs.get("embedding")
+                if cluster.embedding is None and isinstance(existing_emb, (list, np.ndarray)) and len(existing_emb) > 1:
+                    arr = np.array(existing_emb, dtype=np.float32)
+                    norm = float(np.linalg.norm(arr))
+                    cluster.embedding = (arr / norm) if norm > 0.0 else arr
                 cluster.aliases.add(raw_name)
                 if clean_cand:
                     cluster.aliases.add(clean_cand)
@@ -642,61 +647,74 @@ class IdeaPostProcessor:
     ) -> List[IdeaCluster]:
         """
         Step 1b: Semantic Similarity Clustering (Within Same Book / Corpus).
-        Computes dense embeddings for canonical_name + brief_description.
+        Reuses cached embeddings on IdeaCluster when available and only embeds missing clusters.
         Merges unmerged clusters if cosine similarity >= 0.92.
         """
-        if not clusters or self.embeddings is None:
+        if not clusters:
             return clusters
 
-        # Generate texts for embedding
-        texts = [f"{c.canonical_name}: {c.get_representative_brief()}" for c in clusters]
-        emb_model = getattr(self.embeddings, "model", "embeddings")
-        batch_size = 16
+        missing_indices: List[int] = [
+            idx for idx, c in enumerate(clusters) if c.embedding is None or len(c.embedding) <= 1
+        ]
 
-        try:
-            vectors_raw = []
-            if console is not None and len(texts) > 0:
-                emb_progress = Progress(
-                    SpinnerColumn(),
-                    TextColumn("[bold cyan]Generating Semantic Embeddings:[/bold cyan]"),
-                    BarColumn(bar_width=25),
-                    TaskProgressColumn(),
-                    MofNCompleteColumn(),
-                    TextColumn(f"[dim]• {emb_model}[/dim]"),
-                    TimeElapsedColumn(),
-                    console=console,
-                )
-                with emb_progress:
-                    task = emb_progress.add_task("embed", total=len(texts))
-                    for i in range(0, len(texts), batch_size):
-                        batch = texts[i : i + batch_size]
-                        vecs = self.embeddings.embed_documents(batch)
-                        vectors_raw.extend(vecs)
-                        emb_progress.update(task, advance=len(batch))
-            else:
-                vectors_raw = self.embeddings.embed_documents(texts)
+        if missing_indices and self.embeddings is not None:
+            texts = [
+                f"{clusters[idx].canonical_name}: {clusters[idx].get_representative_brief()}"
+                for idx in missing_indices
+            ]
+            emb_model = getattr(self.embeddings, "model", "embeddings")
+            batch_size = 16
 
-            if len(vectors_raw) != len(clusters):
-                logger.warning(
-                    f"Mismatch between clusters ({len(clusters)}) and embeddings ({len(vectors_raw)}). Skipping semantic merge."
-                )
+            try:
+                vectors_raw = []
+                if console is not None and len(texts) > 0:
+                    emb_progress = Progress(
+                        SpinnerColumn(),
+                        TextColumn("[bold cyan]Generating Semantic Embeddings:[/bold cyan]"),
+                        BarColumn(bar_width=25),
+                        TaskProgressColumn(),
+                        MofNCompleteColumn(),
+                        TextColumn(f"[dim]• {emb_model}[/dim]"),
+                        TimeElapsedColumn(),
+                        console=console,
+                    )
+                    with emb_progress:
+                        task = emb_progress.add_task("embed", total=len(texts))
+                        for i in range(0, len(texts), batch_size):
+                            batch = texts[i : i + batch_size]
+                            vecs = self.embeddings.embed_documents(batch)
+                            vectors_raw.extend(vecs)
+                            emb_progress.update(task, advance=len(batch))
+                else:
+                    vectors_raw = self.embeddings.embed_documents(texts)
+
+                if len(vectors_raw) != len(missing_indices):
+                    logger.warning(
+                        f"Mismatch between missing clusters ({len(missing_indices)}) and embeddings ({len(vectors_raw)}). Skipping semantic merge."
+                    )
+                    return clusters
+
+                if console is not None:
+                    reused_cnt = len(clusters) - len(missing_indices)
+                    reused_note = f", {reused_cnt} reused" if reused_cnt > 0 else ""
+                    console.print(
+                        f"[bold green]✓[/bold green] [dim]Generated semantic embeddings for {len(texts)} clusters ({emb_model}{reused_note})[/dim]"
+                    )
+
+                for idx, v in zip(missing_indices, vectors_raw):
+                    arr = np.array(v, dtype=np.float32)
+                    norm = np.linalg.norm(arr)
+                    clusters[idx].embedding = (arr / norm) if norm > 0 else arr
+            except Exception as e:
+                logger.warning(f"Error computing cluster embeddings: {e}. Skipping semantic merge.")
+                if console is not None:
+                    console.print(f"[yellow]⚠ Semantic embedding skipped: {e}[/yellow]")
                 return clusters
-
-            if console is not None:
-                console.print(
-                    f"[bold green]✓[/bold green] [dim]Generated semantic embeddings for {len(texts)} clusters ({emb_model})[/dim]"
-                )
-
-            # Normalize vectors to unit norm
-            vectors = []
-            for v in vectors_raw:
-                arr = np.array(v, dtype=np.float32)
-                norm = np.linalg.norm(arr)
-                vectors.append(arr / norm if norm > 0 else arr)
-        except Exception as e:
-            logger.warning(f"Error computing cluster embeddings: {e}. Skipping semantic merge.")
-            if console is not None:
-                console.print(f"[yellow]⚠ Semantic embedding skipped: {e}[/yellow]")
+        elif not missing_indices and console is not None:
+            console.print(
+                f"[bold green]✓[/bold green] [dim]Reused cached semantic embeddings for all {len(clusters)} clusters[/dim]"
+            )
+        elif self.embeddings is None:
             return clusters
 
         status = None
@@ -708,9 +726,6 @@ class IdeaPostProcessor:
             status.start()
 
         try:
-            for i, cluster in enumerate(clusters):
-                cluster.embedding = vectors[i]
-
             merged: List[IdeaCluster] = []
             consumed_indices: Set[int] = set()
 
@@ -727,7 +742,11 @@ class IdeaPostProcessor:
                         continue
 
                     other = clusters[j]
-                    if current.embedding is not None and other.embedding is not None:
+                    if (
+                        current.embedding is not None
+                        and other.embedding is not None
+                        and current.embedding.shape == other.embedding.shape
+                    ):
                         sim = float(np.dot(current.embedding, other.embedding))
                         if sim >= self.similarity_threshold:
                             logger.info(
@@ -961,6 +980,10 @@ class IdeaPostProcessor:
 
         # 1. Upsert Canonical Entity Node
         earliest_month = cluster.get_first_occurrence_month()
+        emb_list: Optional[List[float]] = None
+        if cluster.embedding is not None and len(cluster.embedding) > 1:
+            emb_list = [float(x) for x in cluster.embedding]
+
         if not store.graph.has_node(canonical_nid):
             node_attrs = {
                 "type": "Concept",
@@ -978,6 +1001,8 @@ class IdeaPostProcessor:
             if earliest_month:
                 node_attrs["first_occurrence_month"] = earliest_month
                 node_attrs["month"] = earliest_month
+            if emb_list is not None:
+                node_attrs["embedding"] = emb_list
             store.graph.add_node(canonical_nid, **node_attrs)
         else:
             nd = store.graph.nodes[canonical_nid]
@@ -996,6 +1021,8 @@ class IdeaPostProcessor:
                 if not curr_month or earliest_month < curr_month:
                     nd["first_occurrence_month"] = earliest_month
                     nd["month"] = earliest_month
+            if emb_list is not None:
+                nd["embedding"] = emb_list
             if "tags" not in nd:
                 nd["tags"] = ["idea", cat.lower().replace(" ", "-")]
 

@@ -1511,6 +1511,14 @@ def build_graph(
         high_similarity_threshold=getattr(cfg, "high_similarity_threshold", 0.95),
         extractor=extractor,
     )
+    deduplicator.seed_from_graph(store)
+
+    active_neo4j_exporter: Optional[Neo4jExporter] = None
+    if cfg.neo4j.enabled if export_neo4j is None else export_neo4j:
+        try:
+            active_neo4j_exporter = Neo4jExporter.from_config(cfg.neo4j)
+        except Exception as e:
+            logger.debug(f"Could not initialize active Neo4jExporter for HNSW idea index: {e}")
 
     # Initialize ChunkStore for local persistence and fast reuse of book chunks
     resolved_chunks_path = Path(chunks_dir).expanduser().resolve() if chunks_dir else cfg.resolved_chunks_dir
@@ -1855,6 +1863,7 @@ def build_graph(
             # Reload knowledge graph from previous state/batch to ensure synchronization
             if graph_file.is_file():
                 store.load(graph_file)
+                deduplicator.seed_from_graph(store)
             bid = binfo["id"]
             btitle = BookParser.repair_mojibake(binfo["title"])
             bauthor = BookParser.repair_mojibake(binfo["author"])
@@ -2187,14 +2196,20 @@ def build_graph(
                     should_skip_limbo = bool(cfg.skip_limbo_chunks or cfg.recent_ideas.skip_limbo_chunks)
                     if cfg.recent_ideas.enabled and unprocessed_fresh and embeddings is not None:
                         idea_index = IdeaEmbeddingIndex.build_from_graph(store, embeddings=embeddings)
-                        if idea_index.vectors is not None and len(idea_index.idea_names) > 0:
+                        if (idea_index.vectors is not None and len(idea_index.idea_names) > 0) or active_neo4j_exporter is not None:
                             router = RecentIdeaChunkRouter(
                                 idea_index=idea_index,
                                 embeddings=embeddings,
                                 unassigned_threshold=cfg.similarity_unassigned_threshold,
                                 high_confidence_threshold=cfg.similarity_high_confidence_threshold,
+                                neo4j_exporter=active_neo4j_exporter,
                             )
                             routing = router.route_chunks(unprocessed_fresh)
+                            if routing.embeddings_updated:
+                                try:
+                                    chunk_store.save_chunks(bid, btitle, chunks)
+                                except Exception as e:
+                                    logger.debug(f"Could not save updated chunk embeddings to ChunkStore: {e}")
 
                             # Priority 2: High confidence chunks (Fast-path: direct assignment, skip LLM extraction completely!)
                             for rc in routing.high_confidence:
@@ -2604,6 +2619,22 @@ def build_graph(
 
                     # Atomically integrate successful extractions into knowledge graph
                     store.add_book(bid, title=btitle, author=bauthor, publication_date=bpubdate)
+
+                    # Batch-resolve all extracted concepts from this book/article in a single HNSW + embedding batch
+                    all_book_concepts: List[Concept] = []
+                    for res in successful_results:
+                        ext = res["extraction"]
+                        if ext and ext.concepts:
+                            all_book_concepts.extend(ext.concepts)
+
+                    resolved_book_concepts = deduplicator.resolve_concepts_batch(
+                        all_book_concepts,
+                        neo4j_exporter=active_neo4j_exporter,
+                        top_k=3,
+                    )
+                    resolved_concept_iter = iter(resolved_book_concepts)
+                    upserted_ideas_for_neo4j: Dict[str, Dict[str, Any]] = {}
+
                     for res in successful_results:
                         chk = res["chunk"]
                         extraction = res["extraction"]
@@ -2617,8 +2648,19 @@ def build_graph(
                         store.add_chunk(chk)
 
                         for concept in extraction.concepts:
-                            canonical_concept = deduplicator.resolve_concept(concept)
-                            store.add_concept(canonical_concept)
+                            canonical_concept = next(resolved_concept_iter, None) or deduplicator.resolve_concept(concept)
+                            store.add_concept(canonical_concept, embedding=canonical_concept.embedding)
+                            if canonical_concept.embedding and len(canonical_concept.embedding) > 1:
+                                upserted_ideas_for_neo4j[canonical_concept.name] = {
+                                    "node_id": f"concept:{canonical_concept.name}",
+                                    "name": canonical_concept.name,
+                                    "brief_description": canonical_concept.brief_description or canonical_concept.summary,
+                                    "detailed_explanation": canonical_concept.detailed_explanation,
+                                    "summary": canonical_concept.summary,
+                                    "category": canonical_concept.category,
+                                    "weight": canonical_concept.weight,
+                                    "embedding": canonical_concept.embedding,
+                                }
 
                             store.add_book_idea_link(
                                 book_id=bid,
@@ -2676,6 +2718,12 @@ def build_graph(
                                 concept_name=matched_cand_idea,
                                 publication_date=bpubdate,
                             )
+
+                    if active_neo4j_exporter is not None and upserted_ideas_for_neo4j:
+                        try:
+                            active_neo4j_exporter.upsert_idea_vectors_batch(list(upserted_ideas_for_neo4j.values()))
+                        except Exception as e:
+                            logger.debug(f"Could not upsert idea vectors batch to Neo4j: {e}")
 
                     # Ensure sequential NEXT and PREV relationships between chunks for this book
                     store.link_sequential_chunks(book_id=bid)

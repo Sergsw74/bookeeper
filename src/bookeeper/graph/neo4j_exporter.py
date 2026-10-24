@@ -217,6 +217,166 @@ class Neo4jExporter:
                 except Exception as ex:
                     logger.debug(f"Could not create index for :{clean_lbl}: {ex}")
 
+    def ensure_idea_vector_index(
+        self,
+        session: Any,
+        dimensions: int = 1024,
+        index_name: str = "idea_idx",
+    ) -> bool:
+        """
+        Create a native HNSW vector index exclusively on :Idea(embedding) in Neo4j.
+        Never indexes :Chunk or :Book nodes to keep the HNSW graph compact and fast.
+        """
+        dim = max(1, int(dimensions or 1024))
+        safe_idx = re.sub(r"[^A-Za-z0-9_]", "_", index_name) or "idea_idx"
+        cypher = (
+            f"CREATE VECTOR INDEX {safe_idx} IF NOT EXISTS\n"
+            f"FOR (n:Idea) ON (n.embedding)\n"
+            f"OPTIONS {{indexConfig: {{\n"
+            f"  `vector.dimensions`: {dim},\n"
+            f"  `vector.similarity_function`: 'cosine'\n"
+            f"}}}}"
+        )
+        try:
+            session.run(cypher)
+            return True
+        except Exception as e:
+            logger.debug(f"Could not create vector index '{safe_idx}' on :Idea(embedding): {e}")
+            return False
+
+    def query_ideas_hnsw_batch(
+        self,
+        idea_vectors: list[list[float]],
+        top_k: int = 3,
+        index_name: str = "idea_idx",
+    ) -> list[list[dict[str, Any]]]:
+        """
+        Query all extracted idea vectors (e.g., 20 ideas from an article) in a single
+        batched Neo4j transaction against the native HNSW vector index on :Idea(embedding):
+            UNWIND $idea_vectors AS vec
+            CALL db.index.vector.queryNodes('idea_idx', 3, vec)
+        Returns a list of top_k matched idea dicts for each input vector in order.
+        """
+        if not idea_vectors:
+            return []
+
+        clean_vecs = [[float(x) for x in v] for v in idea_vectors]
+        k = max(1, int(top_k or 3))
+        safe_idx = re.sub(r"[^A-Za-z0-9_]", "_", index_name) or "idea_idx"
+
+        # Use the exact batched UNWIND + CALL db.index.vector.queryNodes('idea_idx', 3, vec) pattern
+        if safe_idx == "idea_idx" and k == 3:
+            cypher = (
+                "UNWIND $idea_vectors AS vec CALL db.index.vector.queryNodes('idea_idx', 3, vec)\n"
+                "YIELD node, score\n"
+                "RETURN vec, collect({\n"
+                "    id: node.id,\n"
+                "    name: node.name,\n"
+                "    category: node.category,\n"
+                "    brief_description: node.brief_description,\n"
+                "    detailed_explanation: node.detailed_explanation,\n"
+                "    summary: node.summary,\n"
+                "    weight: node.weight,\n"
+                "    first_occurrence_month: node.first_occurrence_month,\n"
+                "    month: node.month,\n"
+                "    score: score\n"
+                "}) AS matches"
+            )
+            params: dict[str, Any] = {"idea_vectors": clean_vecs}
+        else:
+            cypher = (
+                f"UNWIND $idea_vectors AS vec CALL db.index.vector.queryNodes('{safe_idx}', $top_k, vec)\n"
+                f"YIELD node, score\n"
+                f"RETURN vec, collect({{\n"
+                f"    id: node.id,\n"
+                f"    name: node.name,\n"
+                f"    category: node.category,\n"
+                f"    brief_description: node.brief_description,\n"
+                f"    detailed_explanation: node.detailed_explanation,\n"
+                f"    summary: node.summary,\n"
+                f"    weight: node.weight,\n"
+                f"    first_occurrence_month: node.first_occurrence_month,\n"
+                f"    month: node.month,\n"
+                f"    score: score\n"
+                f"}}) AS matches"
+            )
+            params = {"idea_vectors": clean_vecs, "top_k": k}
+
+        driver = self.get_driver()
+        with driver.session(database=self.database) as session:
+            result = session.run(cypher, **params)
+            records = list(result)
+
+        # Map results back to input order of idea_vectors
+        # If Neo4j returned 1 row per UNWIND item in order:
+        if len(records) == len(clean_vecs):
+            return [list(rec.get("matches") or []) for rec in records]
+
+        # Map by vector tuple key if some vectors had 0 matches in an empty index
+        by_vec_key: dict[tuple[float, ...], list[dict[str, Any]]] = {}
+        for rec in records:
+            r_vec = rec.get("vec")
+            if r_vec is not None:
+                key = tuple(round(float(x), 5) for x in r_vec[:16])
+                by_vec_key[key] = list(rec.get("matches") or [])
+
+        ordered_results: list[list[dict[str, Any]]] = []
+        for v in clean_vecs:
+            key = tuple(round(float(x), 5) for x in v[:16])
+            ordered_results.append(by_vec_key.get(key, []))
+        return ordered_results
+
+    def upsert_idea_vectors_batch(
+        self,
+        ideas_batch: list[dict[str, Any]],
+        dimensions: Optional[int] = None,
+        index_name: str = "idea_idx",
+    ) -> int:
+        """
+        Upsert a batch of :Idea(:Concept) nodes and their embeddings into Neo4j in a single transaction,
+        ensuring the HNSW vector index on :Idea(embedding) exists.
+        """
+        if not ideas_batch:
+            return 0
+
+        rows = []
+        detected_dim = dimensions
+        for item in ideas_batch:
+            name = BookParser.repair_mojibake(str(item.get("name") or "")).strip()
+            if not name:
+                continue
+            nid = str(item.get("id") or f"concept:{name}")
+            emb = item.get("embedding")
+            clean_emb = [float(x) for x in emb] if emb else None
+            if clean_emb and not detected_dim:
+                detected_dim = len(clean_emb)
+
+            props = clean_neo4j_properties(item, exclude_keys={"id", "embedding"})
+            props["id"] = nid
+            props["name"] = name
+            props["type"] = "Concept"
+            props["tag"] = "idea"
+            props["is_idea"] = True
+            if clean_emb:
+                props["embedding"] = clean_emb
+            rows.append({"id": nid, "properties": props})
+
+        if not rows:
+            return 0
+
+        driver = self.get_driver()
+        with driver.session(database=self.database) as session:
+            if detected_dim:
+                self.ensure_idea_vector_index(session, dimensions=detected_dim, index_name=index_name)
+            cypher = (
+                "UNWIND $batch AS row\n"
+                "MERGE (n:Concept {id: row.id})\n"
+                "ON CREATE SET n += row.properties, n:Idea\n"
+                "ON MATCH SET n += row.properties, n:Idea"
+            )
+            session.run(cypher, batch=rows)
+        return len(rows)
+
     def clean_database(self) -> int:
         """
         Delete all nodes and relationships in the target Neo4j database (clean start).
@@ -320,15 +480,21 @@ class Neo4jExporter:
             # Grouping allows using specific label indices for maximum Cypher performance
             nodes_by_group: dict[tuple[str, bool], list[dict[str, Any]]] = {}
             distinct_labels: set[str] = set()
+            idea_vector_dim: int = 1024
 
             for node_id, attrs in g.nodes(data=True):
                 primary_label = sanitize_label(attrs.get("type", "Entity"))
-                is_idea = bool(attrs.get("is_idea", False) or attrs.get("tag") == "idea")
+                is_idea = bool(attrs.get("is_idea", False) or attrs.get("tag") == "idea" or primary_label in ("Concept", "Idea"))
                 distinct_labels.add(primary_label)
                 if is_idea:
                     distinct_labels.add("Idea")
+                    raw_emb = attrs.get("embedding")
+                    if isinstance(raw_emb, (list, tuple)) and len(raw_emb) > 0:
+                        idea_vector_dim = len(raw_emb)
 
-                props = clean_neo4j_properties(attrs)
+                # Store embeddings EXCLUSIVELY on :Idea nodes in Neo4j
+                excl = None if is_idea else {"embedding"}
+                props = clean_neo4j_properties(attrs, exclude_keys=excl)
                 props["id"] = node_id  # Guarantee primary key property
 
                 group_key = (primary_label, is_idea)
@@ -367,6 +533,8 @@ class Neo4jExporter:
                     else None
                 )
                 self.ensure_constraints(session, list(distinct_labels))
+                if "Idea" in distinct_labels:
+                    self.ensure_idea_vector_index(session, dimensions=idea_vector_dim, index_name="idea_idx")
                 if progress and schema_task is not None:
                     progress.update(
                         schema_task,

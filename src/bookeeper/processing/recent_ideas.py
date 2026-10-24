@@ -136,6 +136,12 @@ class BatchRoutingResult:
     unassigned: List[RoutedChunk] = field(default_factory=list)
     high_confidence: List[RoutedChunk] = field(default_factory=list)
     limbo: List[RoutedChunk] = field(default_factory=list)
+    reused_embeddings_count: int = 0
+    computed_embeddings_count: int = 0
+
+    @property
+    def embeddings_updated(self) -> bool:
+        return self.computed_embeddings_count > 0
 
     @property
     def total_chunks(self) -> int:
@@ -167,11 +173,14 @@ class BatchRoutingResult:
 class IdeaEmbeddingIndex:
     """
     Vector index of existing knowledge graph ideas for fast cosine similarity routing.
+    Reuses persisted :Idea node embeddings and supports Neo4j HNSW vector index queries.
     """
     idea_names: List[str] = field(default_factory=list)
     idea_summaries: List[str] = field(default_factory=list)
     idea_months: Dict[str, Optional[str]] = field(default_factory=dict)
     vectors: Optional[np.ndarray] = None
+    reused_count: int = 0
+    embedded_count: int = 0
 
     @classmethod
     def build_from_graph(
@@ -181,11 +190,15 @@ class IdeaEmbeddingIndex:
         batch_size: int = 64,
     ) -> "IdeaEmbeddingIndex":
         """
-        Extract all Concept/Idea nodes from knowledge graph and compute their embeddings.
+        Extract all Concept/Idea nodes from knowledge graph and reuse or compute their embeddings.
+        Newly computed embeddings are cached back onto the Concept/Idea nodes in store.graph.
         """
         names: List[str] = []
         texts: List[str] = []
+        node_ids: List[str] = []
         months: Dict[str, Optional[str]] = {}
+        cached_vecs: Dict[int, List[float]] = {}
+        missing_indices: List[int] = []
 
         if store and store.graph:
             for node_id, attrs in store.graph.nodes(data=True):
@@ -199,35 +212,85 @@ class IdeaEmbeddingIndex:
                     summary = brief or detailed or clean_name
                     month = format_idea_month(attrs.get("first_occurrence_month") or attrs.get("month"))
 
+                    idx = len(names)
                     names.append(clean_name)
                     texts.append(f"{clean_name}: {summary}")
+                    node_ids.append(node_id)
                     months[clean_name] = month
 
-        if not names or embeddings is None:
+                    existing_emb = attrs.get("embedding")
+                    if isinstance(existing_emb, (list, np.ndarray)) and len(existing_emb) > 1:
+                        cached_vecs[idx] = [float(x) for x in existing_emb]
+                    else:
+                        missing_indices.append(idx)
+
+        if not names:
             return cls(idea_names=names, idea_summaries=texts, idea_months=months, vectors=None)
 
-        # Batch embed idea texts
+        # If all embeddings are missing and no embeddings client is provided, return without vectors
+        if not cached_vecs and embeddings is None:
+            return cls(idea_names=names, idea_summaries=texts, idea_months=months, vectors=None)
+
+        # Batch embed only the ideas that do not yet have a cached embedding
+        newly_embedded: Dict[int, List[float]] = {}
+        if missing_indices and embeddings is not None:
+            missing_texts = [texts[idx] for idx in missing_indices]
+            computed_raw: List[List[float]] = []
+            for i in range(0, len(missing_texts), batch_size):
+                sub_batch = missing_texts[i : i + batch_size]
+                try:
+                    v = embeddings.embed_documents(sub_batch)
+                    computed_raw.extend(v)
+                except Exception as e:
+                    logger.warning(f"Error embedding idea texts batch {i}: {e}")
+                    for _ in sub_batch:
+                        computed_raw.append([])
+            for idx, vec in zip(missing_indices, computed_raw):
+                if vec and len(vec) > 1:
+                    newly_embedded[idx] = [float(x) for x in vec]
+
+        # Determine vector dimension from cached or newly embedded vectors
+        dim = 0
+        for v in cached_vecs.values():
+            if len(v) > 1:
+                dim = len(v)
+                break
+        if dim == 0:
+            for v in newly_embedded.values():
+                if len(v) > 1:
+                    dim = len(v)
+                    break
+
+        if dim == 0:
+            return cls(idea_names=names, idea_summaries=texts, idea_months=months, vectors=None)
+
         all_vecs: List[List[float]] = []
-        for i in range(0, len(texts), batch_size):
-            sub_batch = texts[i : i + batch_size]
-            try:
-                v = embeddings.embed_documents(sub_batch)
-                all_vecs.extend(v)
-            except Exception as e:
-                logger.warning(f"Error embedding idea texts batch {i}: {e}")
-                for _ in sub_batch:
-                    all_vecs.append([0.0])
+        for idx in range(len(names)):
+            v = cached_vecs.get(idx) or newly_embedded.get(idx)
+            if v and len(v) == dim:
+                all_vecs.append(v)
+            else:
+                all_vecs.append([0.0] * dim)
 
         arr = np.array(all_vecs, dtype=np.float32)
         norms = np.linalg.norm(arr, axis=1, keepdims=True)
         norms[norms == 0.0] = 1.0
         normalized = arr / norms
 
+        # Persist newly computed normalized embeddings back onto Concept/Idea nodes in store.graph
+        if store and store.graph and newly_embedded:
+            for idx in newly_embedded:
+                nid = node_ids[idx]
+                if store.graph.has_node(nid):
+                    store.graph.nodes[nid]["embedding"] = normalized[idx].tolist()
+
         return cls(
             idea_names=names,
             idea_summaries=texts,
             idea_months=months,
             vectors=normalized,
+            reused_count=len(cached_vecs),
+            embedded_count=len(newly_embedded),
         )
 
     def find_best_match(self, query_vec: np.ndarray) -> Tuple[Optional[str], float, str]:
@@ -243,6 +306,9 @@ class IdeaEmbeddingIndex:
             return (None, 0.0, "")
         q_unit = query_vec / q_norm
 
+        if q_unit.shape[0] != self.vectors.shape[1]:
+            return (None, 0.0, "")
+
         sims = np.dot(self.vectors, q_unit)
         best_idx = int(np.argmax(sims))
         max_sim = float(sims[best_idx])
@@ -251,6 +317,75 @@ class IdeaEmbeddingIndex:
             max_sim,
             self.idea_summaries[best_idx],
         )
+
+    def query_batch(
+        self,
+        query_vectors: Sequence[Sequence[float]],
+        top_k: int = 3,
+        neo4j_exporter: Optional[Any] = None,
+    ) -> List[List[Dict[str, Any]]]:
+        """
+        Query top-k most similar Idea nodes for a batch of vectors.
+        Uses Neo4j native HNSW vector index ('idea_idx') in a single batched UNWIND transaction
+        if neo4j_exporter is provided; otherwise uses vectorized matrix cosine similarity.
+        """
+        if not query_vectors:
+            return []
+
+        if neo4j_exporter is not None and hasattr(neo4j_exporter, "query_ideas_hnsw_batch"):
+            try:
+                hnsw_res = neo4j_exporter.query_ideas_hnsw_batch(query_vectors, top_k=top_k)
+                if hnsw_res and any(hnsw_res):
+                    return hnsw_res
+            except Exception as e:
+                logger.debug(f"Neo4j HNSW batch query fallback to in-memory IdeaEmbeddingIndex: {e}")
+
+        if self.vectors is None or len(self.idea_names) == 0:
+            return [[] for _ in query_vectors]
+
+        q_arr = np.array(query_vectors, dtype=np.float32)
+        if q_arr.ndim == 1:
+            q_arr = q_arr.reshape(1, -1)
+        if q_arr.shape[1] != self.vectors.shape[1]:
+            return [[] for _ in query_vectors]
+
+        q_norms = np.linalg.norm(q_arr, axis=1, keepdims=True)
+        zero_mask = (q_norms.squeeze(-1) == 0.0)
+        q_norms[q_norms == 0.0] = 1.0
+        q_unit = q_arr / q_norms
+
+        # Vectorized cosine similarity matrix: (num_queries, num_ideas)
+        sim_matrix = np.dot(q_unit, self.vectors.T)
+        k = min(top_k, len(self.idea_names))
+
+        results: List[List[Dict[str, Any]]] = []
+        for row_idx in range(sim_matrix.shape[0]):
+            if zero_mask[row_idx]:
+                results.append([])
+                continue
+            row_sims = sim_matrix[row_idx]
+            if k == len(self.idea_names):
+                top_indices = np.argsort(row_sims)[::-1]
+            else:
+                part_idx = np.argpartition(row_sims, -k)[-k:]
+                top_indices = part_idx[np.argsort(row_sims[part_idx])[::-1]]
+            row_matches: List[Dict[str, Any]] = []
+            for idx in top_indices:
+                name = self.idea_names[int(idx)]
+                summary = self.idea_summaries[int(idx)]
+                row_matches.append(
+                    {
+                        "node_id": f"concept:{name}",
+                        "name": name,
+                        "brief_description": summary,
+                        "detailed_explanation": summary,
+                        "summary": summary,
+                        "month": self.idea_months.get(name),
+                        "score": float(row_sims[int(idx)]),
+                    }
+                )
+            results.append(row_matches)
+        return results
 
 
 class RecentIdeaChunkRouter:
@@ -267,11 +402,13 @@ class RecentIdeaChunkRouter:
         embeddings: Optional[Embeddings] = None,
         unassigned_threshold: float = 0.65,
         high_confidence_threshold: float = 0.90,
+        neo4j_exporter: Optional[Any] = None,
     ):
         self.idea_index = idea_index
         self.embeddings = embeddings
         self.unassigned_threshold = unassigned_threshold
         self.high_confidence_threshold = high_confidence_threshold
+        self.neo4j_exporter = neo4j_exporter
 
     def route_chunks(
         self,
@@ -279,14 +416,16 @@ class RecentIdeaChunkRouter:
         batch_size: int = 64,
     ) -> BatchRoutingResult:
         """
-        Compute embeddings for chunks and route each into Unassigned, High-Confidence, or Limbo.
+        Reuse cached chunk embeddings (or compute missing ones) and route each chunk
+        into Unassigned, High-Confidence, or Limbo.
         """
         result = BatchRoutingResult()
         if not chunks:
             return result
 
         # If knowledge base is empty (e.g. Batch 1), all chunks are unassigned brand new ideas
-        if self.idea_index.vectors is None or len(self.idea_index.idea_names) == 0 or self.embeddings is None:
+        has_ideas = self.idea_index.vectors is not None and len(self.idea_index.idea_names) > 0
+        if not has_ideas and self.neo4j_exporter is None:
             for chk in chunks:
                 result.unassigned.append(
                     RoutedChunk(
@@ -299,28 +438,111 @@ class RecentIdeaChunkRouter:
                 )
             return result
 
-        # Extract texts for embedding
-        chunk_texts: List[str] = []
-        for chk in chunks:
-            raw = getattr(chk, "text", "") or ""
-            chunk_texts.append(raw)
+        # Check which chunks already have cached embeddings from chunking / ChunkStore
+        cached_vecs: Dict[int, List[float]] = {}
+        missing_indices: List[int] = []
+        for idx, chk in enumerate(chunks):
+            existing_emb = getattr(chk, "embedding", None)
+            if isinstance(existing_emb, (list, np.ndarray)) and len(existing_emb) > 1:
+                cached_vecs[idx] = [float(x) for x in existing_emb]
+            else:
+                missing_indices.append(idx)
+
+        result.reused_embeddings_count = len(cached_vecs)
+
+        # Embed only chunks that are missing embeddings
+        newly_embedded: Dict[int, List[float]] = {}
+        if missing_indices:
+            if self.embeddings is None and not cached_vecs:
+                for chk in chunks:
+                    result.unassigned.append(
+                        RoutedChunk(
+                            chunk=chk,
+                            priority=ChunkPriority.UNASSIGNED,
+                            similarity=0.0,
+                            matched_idea=None,
+                            matched_idea_summary="",
+                        )
+                    )
+                return result
+
+            if self.embeddings is not None:
+                missing_texts = [getattr(chunks[idx], "text", "") or "" for idx in missing_indices]
+                computed_raw: List[List[float]] = []
+                for i in range(0, len(missing_texts), batch_size):
+                    sub_batch = missing_texts[i : i + batch_size]
+                    try:
+                        v = self.embeddings.embed_documents(sub_batch)
+                        computed_raw.extend(v)
+                    except Exception as e:
+                        logger.warning(f"Error embedding chunks batch {i}: {e}")
+                        for _ in sub_batch:
+                            computed_raw.append([])
+
+                for idx, vec in zip(missing_indices, computed_raw):
+                    if vec and len(vec) > 1:
+                        arr_v = np.array(vec, dtype=np.float32)
+                        norm_v = float(np.linalg.norm(arr_v))
+                        unit_v = (arr_v / norm_v).tolist() if norm_v > 0.0 else arr_v.tolist()
+                        newly_embedded[idx] = unit_v
+                        try:
+                            setattr(chunks[idx], "embedding", unit_v)
+                        except Exception:
+                            pass
+
+        result.computed_embeddings_count = len(newly_embedded)
+
+        # Assemble chunk vectors
+        dim = 0
+        if self.idea_index.vectors is not None and self.idea_index.vectors.ndim == 2:
+            dim = int(self.idea_index.vectors.shape[1])
+        if dim == 0:
+            for v in cached_vecs.values():
+                if len(v) > 1:
+                    dim = len(v)
+                    break
+        if dim == 0:
+            for v in newly_embedded.values():
+                if len(v) > 1:
+                    dim = len(v)
+                    break
+
+        if dim == 0:
+            for chk in chunks:
+                result.unassigned.append(
+                    RoutedChunk(
+                        chunk=chk,
+                        priority=ChunkPriority.UNASSIGNED,
+                        similarity=0.0,
+                        matched_idea=None,
+                        matched_idea_summary="",
+                    )
+                )
+            return result
 
         all_chunk_vecs: List[List[float]] = []
-        for i in range(0, len(chunk_texts), batch_size):
-            sub_batch = chunk_texts[i : i + batch_size]
-            try:
-                v = self.embeddings.embed_documents(sub_batch)
-                all_chunk_vecs.extend(v)
-            except Exception as e:
-                logger.warning(f"Error embedding chunks batch {i}: {e}")
-                for _ in sub_batch:
-                    all_chunk_vecs.append([0.0])
+        for idx in range(len(chunks)):
+            v = cached_vecs.get(idx) or newly_embedded.get(idx)
+            if v and len(v) == dim:
+                all_chunk_vecs.append(v)
+            else:
+                all_chunk_vecs.append([0.0] * dim)
 
-        chunk_arr = np.array(all_chunk_vecs, dtype=np.float32)
+        batch_matches = self.idea_index.query_batch(
+            all_chunk_vecs,
+            top_k=1,
+            neo4j_exporter=self.neo4j_exporter,
+        )
 
         for idx, chk in enumerate(chunks):
-            vec = chunk_arr[idx]
-            best_idea, sim, best_summary = self.idea_index.find_best_match(vec)
+            matches = batch_matches[idx] if idx < len(batch_matches) else []
+            if matches:
+                top_m = matches[0]
+                best_idea = top_m.get("name")
+                sim = float(top_m.get("score") or 0.0)
+                best_summary = top_m.get("brief_description") or top_m.get("summary") or ""
+            else:
+                best_idea, sim, best_summary = None, 0.0, ""
 
             if sim < self.unassigned_threshold:
                 result.unassigned.append(

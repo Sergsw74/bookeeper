@@ -40,6 +40,7 @@ class HierarchicalChunk(BaseModel):
     parent_text: Optional[str] = None
     prev_chunk_id: Optional[str] = None
     next_chunk_id: Optional[str] = None
+    embedding: Optional[List[float]] = None
 
     def model_post_init(self, __context) -> None:
         from bookeeper.calibre.parser import BookParser
@@ -188,25 +189,28 @@ class HierarchicalChunker:
             parent_chunk_id = f"b{book_id}_c{section.chapter_idx}_sub{sub_idx}_{sub_h}"
             parent_text = sub_text[:3000]
 
-            raw_chunks: List[str] = []
+            raw_chunks_with_emb: List[Tuple[str, Optional[List[float]]]] = []
 
             # 1. Attempt semantic chunking via embeddings if text is sufficiently large
             if self._semantic_splitter is not None and len(sub_text) > self.max_chunk_chars:
                 try:
                     docs = self._semantic_splitter.create_documents([sub_text])
-                    raw_chunks = [d.page_content.strip() for d in docs if d.page_content.strip()]
+                    for d in docs:
+                        if d.page_content.strip():
+                            doc_emb = d.metadata.get("embedding") if hasattr(d, "metadata") and isinstance(d.metadata, dict) else None
+                            raw_chunks_with_emb.append((d.page_content.strip(), doc_emb))
                 except Exception as e:
                     logger.debug(
                         f"Semantic chunking fallback on '{section.title}' > '{subtitle}': {e}"
                     )
-                    raw_chunks = []
+                    raw_chunks_with_emb = []
 
             # 2. Smart structural fallback: paragraphs, code blocks, tables, sentences
-            if not raw_chunks:
-                raw_chunks = self._smart_split(sub_text, self.max_chunk_chars)
+            if not raw_chunks_with_emb:
+                raw_chunks_with_emb = [(ct, None) for ct in self._smart_split(sub_text, self.max_chunk_chars)]
 
-            for chunk_text in raw_chunks:
-                if len(chunk_text) < self.min_chunk_chars and raw_chunks and len(raw_chunks) > 1:
+            for chunk_text, chunk_emb in raw_chunks_with_emb:
+                if len(chunk_text) < self.min_chunk_chars and raw_chunks_with_emb and len(raw_chunks_with_emb) > 1:
                     continue
 
                 h = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()[:8]
@@ -225,6 +229,7 @@ class HierarchicalChunker:
                     hierarchy_level="child",
                     parent_chunk_id=parent_chunk_id,
                     parent_text=parent_text,
+                    embedding=chunk_emb,
                 )
                 all_chunks.append(chunk)
                 global_chunk_idx += 1

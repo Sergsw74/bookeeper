@@ -637,5 +637,245 @@ def test_build_graph_skip_limbo_chunks_flag(tmp_path: Path):
         assert "skipped=1" in status_res.stdout
 
 
+def test_ui_ideas_list_and_search_with_month_range(tmp_path: Path):
+    """
+    Verify SearchEngineBackend.get_ideas_list_and_search supports:
+      1. Full ideas listing with first_occurrence_month / month
+      2. Exact lexical search for ideas
+      3. Embedded semantic search for ideas
+      4. Filtering by how modern the idea is (month_from and month_to in YYYY-MM / Month+Year)
+    """
+    import numpy as np
+    from unittest.mock import patch
+    from bookeeper.config import Settings
+    from bookeeper.processing.extractor import Concept, SectionExtraction
+    from bookeeper.ui.backend import SearchEngineBackend
+    from bookeeper.ui.embeddings import ConceptEmbeddingIndex
+
+    out_dir = tmp_path / "output"
+    out_dir.mkdir(parents=True)
+
+    store = ConceptGraphStore()
+    store.add_book(1, title="Classical Mechanics", author="Newton", publication_date="2018-03-15")
+    store.add_book(2, title="Transformer Architecture", author="Vaswani", publication_date="2021-06-10")
+    store.add_book(3, title="Modern Agentic Workflows", author="Deepmind", publication_date="2024-11-05")
+
+    store.add_concept(
+        Concept(
+            name="Hamiltonian Dynamics",
+            category="Physics",
+            brief_description="Phase space formulation of classical mechanics.",
+            weight=8,
+        )
+    )
+    store.add_book_idea_link(1, "Hamiltonian Dynamics", publication_date="2018-03-15")
+
+    store.add_concept(
+        Concept(
+            name="Multi-Head Self Attention",
+            category="Deep Learning",
+            brief_description="Parallel attention heads attending to different representation subspaces.",
+            weight=9,
+        )
+    )
+    store.add_book_idea_link(2, "Multi-Head Self Attention", publication_date="2021-06-10")
+
+    store.add_concept(
+        Concept(
+            name="Autonomous Tool-Use Agents",
+            category="AI Agents",
+            brief_description="LLM agents invoking external tools and reasoning loops.",
+            weight=10,
+        )
+    )
+    store.add_book_idea_link(3, "Autonomous Tool-Use Agents", publication_date="2024-11-05")
+    store.save(out_dir / "knowledge_graph.json")
+
+    cfg = Settings(output_dir=str(out_dir))
+    backend = SearchEngineBackend(cfg)
+
+    # Force Neo4j offline so local knowledge_graph.json is used deterministically
+    with patch.object(backend, "get_neo4j_driver", side_effect=RuntimeError("Neo4j offline")):
+        # 1. List all ideas (sorted newest month first by default)
+        res_all = backend.get_ideas_list_and_search(sort_by="month_desc")
+        assert res_all["total"] == 3
+        assert res_all["filtered"] == 3
+        assert res_all["min_month"] == "2018-03"
+        assert res_all["max_month"] == "2024-11"
+        names_ordered = [i["name"] for i in res_all["ideas"]]
+        assert names_ordered == [
+            "Autonomous Tool-Use Agents",
+            "Multi-Head Self Attention",
+            "Hamiltonian Dynamics",
+        ]
+
+        # 2. Filter by modernity (Month + Year From / To)
+        res_modern = backend.get_ideas_list_and_search(
+            month_from="2021-01",
+            month_to="2024-12",
+        )
+        assert res_modern["filtered"] == 2
+        assert [i["name"] for i in res_modern["ideas"]] == [
+            "Autonomous Tool-Use Agents",
+            "Multi-Head Self Attention",
+        ]
+
+        # Also test human Month + Year string formats (e.g. "Jan 2023" to "Dec 2025")
+        res_very_modern = backend.get_ideas_list_and_search(
+            month_from="Jan 2023",
+            month_to="12/2025",
+        )
+        assert res_very_modern["filtered"] == 1
+        assert res_very_modern["ideas"][0]["name"] == "Autonomous Tool-Use Agents"
+        assert res_very_modern["ideas"][0]["month"] == "2024-11"
+
+        # 3. Exact Search + Month Range Filter
+        res_exact = backend.get_ideas_list_and_search(
+            query="Attention",
+            search_type="exact",
+            month_from="2020-01",
+            month_to="2023-12",
+        )
+        assert res_exact["search_type"] == "exact"
+        assert res_exact["filtered"] == 1
+        assert res_exact["ideas"][0]["name"] == "Multi-Head Self Attention"
+        assert res_exact["ideas"][0]["match_type"] == "substring_name"
+
+        # Exact search excluded by modernity filter
+        res_exact_excluded = backend.get_ideas_list_and_search(
+            query="Attention",
+            search_type="exact",
+            month_from="2023-01",
+            month_to="2025-12",
+        )
+        assert res_exact_excluded["filtered"] == 0
+
+        # 4. Embedded Search + Month Range Filter
+        mock_emb_idx = ConceptEmbeddingIndex(cache_path=out_dir / "concept_embeddings.npz")
+        mock_emb_idx.concept_ids = [
+            "concept:Hamiltonian Dynamics",
+            "concept:Multi-Head Self Attention",
+            "concept:Autonomous Tool-Use Agents",
+        ]
+        mock_emb_idx.names = [
+            "Hamiltonian Dynamics",
+            "Multi-Head Self Attention",
+            "Autonomous Tool-Use Agents",
+        ]
+        mock_emb_idx.categories = ["Physics", "Deep Learning", "AI Agents"]
+        mock_emb_idx.weights = np.array([8.0, 9.0, 10.0], dtype=np.float32)
+        mock_emb_idx._norm_matrix = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 0.85, 0.5268],
+                [0.0, 0.98, 0.199],
+            ],
+            dtype=np.float32,
+        )
+
+        with patch.object(backend, "_get_concept_embedding_index", return_value=mock_emb_idx), \
+             patch.object(mock_emb_idx, "embed_text", return_value=np.array([0.0, 1.0, 0.0], dtype=np.float32)):
+            # Without date filter, both neural concepts match >= 0.70
+            res_emb = backend.get_ideas_list_and_search(
+                query="neural sequence modeling and agents",
+                search_type="embedded",
+                similarity_threshold=0.70,
+                sort_by="similarity_desc",
+            )
+            assert res_emb["search_type"] == "embedded"
+            assert res_emb["filtered"] == 2
+            assert res_emb["ideas"][0]["name"] == "Autonomous Tool-Use Agents"
+            assert res_emb["ideas"][0]["cosine_similarity"] == pytest.approx(0.98, abs=1e-3)
+            assert res_emb["ideas"][1]["name"] == "Multi-Head Self Attention"
+            assert res_emb["ideas"][1]["cosine_similarity"] == pytest.approx(0.85, abs=1e-3)
+
+            # With date filter restricting to 2021 only, only Multi-Head Self Attention remains
+            res_emb_filtered = backend.get_ideas_list_and_search(
+                query="neural sequence modeling and agents",
+                search_type="embedded",
+                month_from="2021-01",
+                month_to="2021-12",
+                similarity_threshold=0.70,
+            )
+            assert res_emb_filtered["filtered"] == 1
+            assert res_emb_filtered["ideas"][0]["name"] == "Multi-Head Self Attention"
+
+
+def test_ui_server_ideas_http_endpoint(tmp_path: Path):
+    """Verify GET /api/ideas and POST /api/ideas/search HTTP endpoints and UI index.html Ideas page."""
+    import json
+    import threading
+    from http.server import HTTPServer
+    from urllib.request import Request, urlopen
+    from unittest.mock import patch
+    from bookeeper.config import Settings
+    from bookeeper.processing.extractor import Concept, SectionExtraction
+    from bookeeper.ui.backend import SearchEngineBackend
+    from bookeeper.ui.server import BookeeperUIRequestHandler
+
+    out_dir = tmp_path / "output"
+    out_dir.mkdir(parents=True)
+
+    store = ConceptGraphStore()
+    store.add_book(10, title="Early Paper", publication_date="2019-04-01")
+    store.add_book(20, title="Recent Paper", publication_date="2025-02-01")
+    store.add_concept(Concept(name="Legacy Graph Kernel", category="ML", brief_description="Old kernel", weight=6))
+    store.add_book_idea_link(10, "Legacy Graph Kernel", publication_date="2019-04-01")
+    store.add_concept(Concept(name="Test-Time Compute Scaling", category="LLM", brief_description="Modern scaling law", weight=9))
+    store.add_book_idea_link(20, "Test-Time Compute Scaling", publication_date="2025-02-01")
+    store.save(out_dir / "knowledge_graph.json")
+
+    cfg = Settings(output_dir=str(out_dir))
+    backend = SearchEngineBackend(cfg)
+
+    with patch.object(backend, "get_neo4j_driver", side_effect=RuntimeError("Offline")):
+        BookeeperUIRequestHandler.backend = backend
+        server = HTTPServer(("127.0.0.1", 0), BookeeperUIRequestHandler)
+        port = server.server_port
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            # 1. Verify GET /api/ideas with month_from filter
+            with urlopen(f"http://127.0.0.1:{port}/api/ideas?month_from=2024-01&month_to=2025-12") as resp:
+                assert resp.status == 200
+                payload = json.loads(resp.read().decode("utf-8"))
+                assert payload["total"] == 2
+                assert payload["filtered"] == 1
+                assert payload["ideas"][0]["name"] == "Test-Time Compute Scaling"
+                assert payload["ideas"][0]["month"] == "2025-02"
+
+            # 2. Verify POST /api/ideas/search with exact search
+            req = Request(
+                f"http://127.0.0.1:{port}/api/ideas/search",
+                data=json.dumps({
+                    "query": "Legacy Graph",
+                    "search_type": "exact",
+                    "month_from": "2018-01",
+                    "month_to": "2020-12",
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req) as resp:
+                assert resp.status == 200
+                payload = json.loads(resp.read().decode("utf-8"))
+                assert payload["filtered"] == 1
+                assert payload["ideas"][0]["name"] == "Legacy Graph Kernel"
+
+            # 3. Verify index.html contains the Ideas tab, search mode selector, and month+year range controls
+            with urlopen(f"http://127.0.0.1:{port}/") as resp:
+                html_text = resp.read().decode("utf-8")
+                assert 'id="tab-btn-ideas"' in html_text
+                assert 'id="pane-ideas"' in html_text
+                assert 'id="ideas-search-input"' in html_text
+                assert 'id="ideas-month-from"' in html_text
+                assert 'id="ideas-month-to"' in html_text
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+
 
 

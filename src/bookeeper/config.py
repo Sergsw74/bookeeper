@@ -420,6 +420,28 @@ class RecentIdeasConfig(BaseModel):
         default=False,
         description="Whether to skip limbo chunks (similarity between unassigned and high-confidence thresholds) completely from LLM processing (default: False).",
     )
+    min_batch_chunk_size: Optional[int] = Field(
+        default=None,
+        description="Minimum chunk size (in characters). If a limbo chunk is this size or bigger, recover it from limbo and restore it to the unprocessed LLM queue.",
+    )
+    max_batch_chunk_size: Optional[int] = Field(
+        default=None,
+        description="Maximum batch chunk size threshold. If a limbo chunk is this size or bigger, recover it from limbo and restore it to the unprocessed LLM queue.",
+    )
+    limbo_min_chunk_size: Optional[int] = Field(
+        default=None,
+        description="Alias for min_batch_chunk_size: minimum chunk size to recover a limbo chunk into the processing queue.",
+    )
+
+    @property
+    def effective_limbo_recovery_size(self) -> Optional[int]:
+        candidates = [
+            self.min_batch_chunk_size,
+            self.max_batch_chunk_size,
+            self.limbo_min_chunk_size,
+        ]
+        valid = [int(c) for c in candidates if c is not None and int(c) > 0]
+        return min(valid) if valid else None
 
 
 class Settings(BaseSettings):
@@ -613,6 +635,34 @@ class Settings(BaseSettings):
         default=False,
         description="Whether to skip limbo chunks (similarity between unassigned and high-confidence thresholds) completely from LLM processing (default: False).",
     )
+    min_batch_chunk_size: Optional[int] = Field(
+        default=None,
+        description="Minimum chunk size (in characters). If a limbo chunk is this size or bigger, recover it from limbo and restore it to the unprocessed LLM queue.",
+    )
+    max_batch_chunk_size: Optional[int] = Field(
+        default=None,
+        description="Maximum batch chunk size threshold. If a limbo chunk is this size or bigger, recover it from limbo and restore it to the unprocessed LLM queue.",
+    )
+    limbo_min_chunk_size: Optional[int] = Field(
+        default=None,
+        description="Alias for min_batch_chunk_size: minimum chunk size to recover a limbo chunk into the processing queue.",
+    )
+
+    @property
+    def effective_limbo_recovery_size(self) -> Optional[int]:
+        candidates = [
+            self.min_batch_chunk_size,
+            self.max_batch_chunk_size,
+            self.limbo_min_chunk_size,
+        ]
+        if hasattr(self, "recent_ideas") and self.recent_ideas is not None:
+            candidates.extend([
+                self.recent_ideas.min_batch_chunk_size,
+                self.recent_ideas.max_batch_chunk_size,
+                self.recent_ideas.limbo_min_chunk_size,
+            ])
+        valid = [int(c) for c in candidates if c is not None and int(c) > 0]
+        return min(valid) if valid else None
 
     @field_validator("max_chunk_batch", mode="before")
     @classmethod

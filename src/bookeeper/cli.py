@@ -66,6 +66,7 @@ from bookeeper.processing.recent_ideas import (
     IdeaEmbeddingIndex,
     RecentIdeaChunkRouter,
     RoutedChunk,
+    get_chunk_size,
     normalize_sort_date,
     partition_books_into_batches,
     sort_books_chronologically,
@@ -226,6 +227,9 @@ def _get_effective_settings(
     similarity_unassigned: Optional[float] = None,
     similarity_high_confidence: Optional[float] = None,
     skip_limbo_chunks: Optional[bool] = None,
+    min_batch_chunk_size: Optional[int] = None,
+    max_batch_chunk_size: Optional[int] = None,
+    limbo_min_chunk_size: Optional[int] = None,
 ) -> Settings:
     """Retrieve settings and merge explicit CLI arguments with highest precedence."""
     config_path = _resolve_opt(config_path)
@@ -246,6 +250,9 @@ def _get_effective_settings(
     similarity_unassigned = _resolve_opt(similarity_unassigned)
     similarity_high_confidence = _resolve_opt(similarity_high_confidence)
     skip_limbo_chunks = _resolve_opt(skip_limbo_chunks)
+    min_batch_chunk_size = _resolve_opt(min_batch_chunk_size)
+    max_batch_chunk_size = _resolve_opt(max_batch_chunk_size)
+    limbo_min_chunk_size = _resolve_opt(limbo_min_chunk_size)
 
     cfg = get_settings(config_path)
     overrides = {}
@@ -286,12 +293,32 @@ def _get_effective_settings(
         overrides["similarity_high_confidence_threshold"] = similarity_high_confidence
     if skip_limbo_chunks is not None:
         overrides["skip_limbo_chunks"] = skip_limbo_chunks
-    if recent_ideas is not None or skip_limbo_chunks is not None:
+    if min_batch_chunk_size is not None:
+        overrides["min_batch_chunk_size"] = min_batch_chunk_size
+    if max_batch_chunk_size is not None:
+        overrides["max_batch_chunk_size"] = max_batch_chunk_size
+    if limbo_min_chunk_size is not None:
+        overrides["limbo_min_chunk_size"] = limbo_min_chunk_size
+
+    has_recent_override = (
+        recent_ideas is not None
+        or skip_limbo_chunks is not None
+        or min_batch_chunk_size is not None
+        or max_batch_chunk_size is not None
+        or limbo_min_chunk_size is not None
+    )
+    if has_recent_override:
         rc = cfg.recent_ideas.model_copy()
         if recent_ideas is not None:
             rc.enabled = recent_ideas
         if skip_limbo_chunks is not None:
             rc.skip_limbo_chunks = skip_limbo_chunks
+        if min_batch_chunk_size is not None:
+            rc.min_batch_chunk_size = min_batch_chunk_size
+        if max_batch_chunk_size is not None:
+            rc.max_batch_chunk_size = max_batch_chunk_size
+        if limbo_min_chunk_size is not None:
+            rc.limbo_min_chunk_size = limbo_min_chunk_size
         overrides["recent_ideas"] = rc
 
     if overrides:
@@ -1300,6 +1327,21 @@ def build_graph(
         "--skip-limbo/--no-skip-limbo",
         help="Skip limbo chunks (chunks between unassigned and high-confidence similarity thresholds) completely from LLM processing (default: False).",
     ),
+    min_batch_chunk_size: Optional[int] = typer.Option(
+        None,
+        "--min-batch-chunk-size",
+        help="Minimum chunk size (in characters) to recover a limbo chunk and restore it to the unprocessed LLM queue.",
+    ),
+    max_batch_chunk_size: Optional[int] = typer.Option(
+        None,
+        "--max-batch-chunk-size",
+        help="Maximum batch chunk size threshold (in characters): if a limbo chunk is this size or bigger, recover it to unprocessed LLM queue.",
+    ),
+    limbo_min_chunk_size: Optional[int] = typer.Option(
+        None,
+        "--limbo-min-chunk-size",
+        help="Alias for min-batch-chunk-size: recover limbo chunks of this size or bigger into processing queue.",
+    ),
 ):
     """
     Ingest sections, perform semantic chunking, extract concepts via Ollama,
@@ -1339,6 +1381,9 @@ def build_graph(
     similarity_unassigned = _resolve_opt(similarity_unassigned)
     similarity_high_confidence = _resolve_opt(similarity_high_confidence)
     skip_limbo_chunks = _resolve_opt(skip_limbo_chunks)
+    min_batch_chunk_size = _resolve_opt(min_batch_chunk_size)
+    max_batch_chunk_size = _resolve_opt(max_batch_chunk_size)
+    limbo_min_chunk_size = _resolve_opt(limbo_min_chunk_size)
 
     cfg = _get_effective_settings(
         config_path,
@@ -1359,6 +1404,9 @@ def build_graph(
         similarity_unassigned=similarity_unassigned,
         similarity_high_confidence=similarity_high_confidence,
         skip_limbo_chunks=skip_limbo_chunks,
+        min_batch_chunk_size=min_batch_chunk_size,
+        max_batch_chunk_size=max_batch_chunk_size,
+        limbo_min_chunk_size=limbo_min_chunk_size,
     )
     output_dir = cfg.resolved_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2193,6 +2241,16 @@ def build_graph(
                     deferred_retries: List[Tuple[List[HierarchicalChunk], int, Set[str]]] = []
                     retry_queue: queue.Queue[Tuple[List[HierarchicalChunk], int, Set[str]]] = queue.Queue()
 
+                    # Check if any previously skipped limbo chunks should be recovered from state by size
+                    recovery_th = cfg.effective_limbo_recovery_size
+                    if recovery_th is not None and recovery_th > 0:
+                        recovered_prev = book_state.recover_skipped_limbo_chunks(chunks, threshold=recovery_th)
+                        if recovered_prev:
+                            console.print(
+                                f"  [bold cyan]↺ Recovered {len(recovered_prev)} previously skipped limbo chunk(s) "
+                                f"(size >= {recovery_th}) -> restored to unprocessed queue.[/bold cyan]"
+                            )
+
                     unprocessed_fresh: List[HierarchicalChunk] = []
                     unprocessed_retries: List[Tuple[HierarchicalChunk, int]] = []
 
@@ -2216,6 +2274,7 @@ def build_graph(
                                 unassigned_threshold=cfg.similarity_unassigned_threshold,
                                 high_confidence_threshold=cfg.similarity_high_confidence_threshold,
                                 neo4j_exporter=active_neo4j_exporter,
+                                min_batch_chunk_size=recovery_th,
                             )
                             routing = router.route_chunks(unprocessed_fresh)
                             if routing.embeddings_updated:
@@ -2315,13 +2374,25 @@ def build_graph(
                                     if rc.matched_idea:
                                         limbo_candidate_map[rc.chunk.chunk_id] = (rc.matched_idea, rc.matched_idea_summary)
 
-                            # Order LLM extraction queue: Priority 1 (Unassigned) first, then Priority 3 (Limbo) unless skipped
+                            # Order LLM extraction queue: Priority 1 (Unassigned, including size-recovered limbo chunks) first
                             unprocessed_fresh = routing.get_llm_queue_chunks(skip_limbo=should_skip_limbo)
                             _update_progress_description()
-                            if routing.high_confidence_count > 0 or routing.limbo_count > 0:
+                            if routing.recovered_from_limbo_count > 0:
+                                with display_lock:
+                                    for rc in routing.recovered_from_limbo:
+                                        r_chk = rc.chunk
+                                        r_sec = getattr(r_chk, "section_title", "")[:24]
+                                        r_idx = getattr(r_chk, "chunk_idx", 0)
+                                        r_sz = get_chunk_size(r_chk)
+                                        console.print(
+                                            f"  [bold cyan]↺ [{r_sec} p{r_idx}][/bold cyan] "
+                                            f"Chunk size {r_sz} >= {recovery_th}: recovered from limbo ({rc.similarity:.2f}) -> restored to unprocessed (Priority 1 queue)."
+                                        )
+                            if routing.high_confidence_count > 0 or routing.limbo_count > 0 or routing.recovered_from_limbo_count > 0:
                                 limbo_desc = "skipped" if should_skip_limbo else "Priority 3 validation"
+                                recov_desc = f" ({routing.recovered_from_limbo_count} recovered from limbo by size)" if routing.recovered_from_limbo_count > 0 else ""
                                 console.print(
-                                    f"  [dim cyan]Semantic Chunk Routing: {routing.unassigned_count} unassigned (Priority 1 brand-new ideas), "
+                                    f"  [dim cyan]Semantic Chunk Routing: {routing.unassigned_count} unassigned{recov_desc} (Priority 1 brand-new ideas), "
                                     f"{routing.high_confidence_count} high-confidence (Priority 2 direct assignment), "
                                     f"{routing.limbo_count} limbo ({limbo_desc}).[/dim cyan]"
                                 )

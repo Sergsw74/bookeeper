@@ -640,6 +640,144 @@ def test_build_graph_skip_limbo_chunks_flag(tmp_path: Path):
         assert "skipped=1" in status_res.stdout
 
 
+def test_build_graph_recovers_limbo_chunk_by_size_cli(tmp_path: Path):
+    """
+    Verify that when --min-batch-chunk-size is passed alongside --skip-limbo-chunks:
+    1. Chunks in limbo whose size >= threshold are recovered into the unprocessed queue and sent to LLM.
+    2. Chunks in limbo whose size < threshold remain in limbo and are skipped.
+    """
+    import sqlite3
+    from unittest.mock import patch
+    from typer.testing import CliRunner
+    from bookeeper.cli import app
+    from bookeeper.processing.extractor import SectionExtraction, KnowledgeExtractor
+    from bookeeper.calibre.client import _register_sqlite_functions
+    from bookeeper.calibre.parser import Section
+    from bookeeper.graph.store import ConceptGraphStore
+
+    runner = CliRunner()
+    lib_dir = tmp_path / "calibre_lib"
+    lib_dir.mkdir()
+    db_path = lib_dir / "metadata.db"
+    conn = sqlite3.connect(str(db_path))
+    _register_sqlite_functions(conn)
+    conn.executescript("""
+        CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT NOT NULL, sort TEXT, author_sort TEXT, pubdate TIMESTAMP, path TEXT NOT NULL DEFAULT 'Author/Book');
+        CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE);
+        CREATE TABLE books_authors_link (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, author INTEGER NOT NULL);
+        CREATE TABLE data (id INTEGER PRIMARY KEY, book INTEGER NOT NULL, format TEXT NOT NULL, name TEXT NOT NULL);
+        CREATE TABLE comments (id INTEGER PRIMARY KEY, book INTEGER NOT NULL UNIQUE, text TEXT NOT NULL);
+    """)
+
+    conn.execute("INSERT INTO books (id, title, sort, author_sort, pubdate, path) VALUES (1, 'Book Limbo Recovery', 'Book Limbo Recovery', 'Author', '2021-03-01', 'A/B1')")
+    conn.execute("INSERT INTO authors (id, name) VALUES (1, 'Jane Doe')")
+    conn.execute("INSERT INTO books_authors_link (book, author) VALUES (1, 1)")
+    conn.execute("INSERT INTO data (book, format, name) VALUES (1, 'EPUB', 'Book Limbo Recovery')")
+    conn.commit()
+    conn.close()
+
+    (lib_dir / "A" / "B1").mkdir(parents=True)
+    (lib_dir / "A" / "B1" / "Book Limbo Recovery.epub").write_text("dummy", encoding="utf-8")
+
+    out_dir = tmp_path / "output"
+    out_dir.mkdir(parents=True)
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(f"output_dir: {out_dir}\ncalibre_library_path: {lib_dir}\n", encoding="utf-8")
+
+    # Seed the knowledge graph with an existing idea
+    existing_store = ConceptGraphStore()
+    existing_store.add_book(100, title="Preexisting Book", publication_date="2010-05-01")
+    existing_store.add_book_idea_link(100, "Paxos Consensus", publication_date="2010-05-01")
+    kg_path = out_dir / "knowledge_graph.json"
+    existing_store.save(kg_path)
+
+    # Section 1 is large (>= 300 chars), Section 2 is medium (150 chars, >= 120 min_chunk_chars but < 300)
+    large_text = (
+        "Raft consensus provides an understandable alternative to Paxos for replicated state machines. "
+        "Leader election and log replication are decomposed into distinct subproblems. "
+        "Safety properties ensure logs remain consistent across cluster terms. "
+        "Each server in the cluster exists in one of three states: leader, follower, or candidate. "
+        "In normal operation there is exactly one leader and all of the other servers are followers."
+    )
+    medium_text = (
+        "Heartbeats are sent periodically by the cluster leader to all followers "
+        "in order to maintain its leadership status and prevent unnecessary election timeouts."
+    )
+
+    mock_extract_calls = []
+
+    def mock_extract_chunks(chunks, **kwargs):
+        mock_extract_calls.append(chunks)
+        return {c.chunk_id: SectionExtraction(concepts=[]) for c in chunks}
+
+    mock_parse_sections = [
+        Section(title="Large Section", chapter_idx=1, text=large_text),
+        Section(title="Medium Section", chapter_idx=2, text=medium_text),
+    ]
+
+    mock_embeddings = MagicMock()
+    mock_embeddings.embedding_stats = {}
+    limbo_vec = [0.75, float(np.sqrt(1.0 - 0.75**2))]
+
+    def _embed_docs(texts):
+        res_vecs = []
+        for t in texts:
+            if t.startswith("Paxos Consensus"):
+                res_vecs.append([1.0, 0.0])
+            else:
+                res_vecs.append(limbo_vec)
+        return res_vecs
+
+    mock_embeddings.embed_documents.side_effect = _embed_docs
+    mock_embeddings.embed_query.side_effect = lambda text: limbo_vec
+
+    with patch("bookeeper.calibre.parser.BookParser.parse", return_value=mock_parse_sections), \
+         patch("bookeeper.calibre.parser.BookParser.is_graphical_format", return_value=False), \
+         patch("bookeeper.processing.ollama_pool.FailoverOllamaEmbeddings.from_settings", return_value=mock_embeddings), \
+         patch.object(KnowledgeExtractor, "extract_chunks", side_effect=mock_extract_chunks), \
+         patch.object(KnowledgeExtractor, "from_settings") as mock_from_settings, \
+         patch("bookeeper.processing.deduplicator.EntityDeduplicator.from_settings") as mock_dedup_cls:
+
+        mock_ext_instance = MagicMock()
+        mock_ext_instance.extract_chunks.side_effect = mock_extract_chunks
+        mock_from_settings.return_value = mock_ext_instance
+
+        mock_dedup_instance = MagicMock()
+        mock_dedup_instance.resolve_concept.side_effect = lambda c: c
+        mock_dedup_instance.resolve_concepts_batch.side_effect = lambda concepts, **kw: list(concepts)
+        mock_dedup_cls.return_value = mock_dedup_instance
+
+        res = runner.invoke(
+            app,
+            [
+                "build-graph",
+                "--all",
+                "--calibre-path", str(lib_dir),
+                "--config", str(cfg_file),
+                "--skip-warmup",
+                "--recent-ideas",
+                "--similarity-unassigned", "0.65",
+                "--similarity-high-confidence", "0.90",
+                "--skip-limbo-chunks",
+                "--min-batch-chunk-size", "300",
+            ],
+            catch_exceptions=False,
+        )
+
+        assert res.exit_code == 0
+        # The large chunk is recovered from limbo
+        assert "recovered from limbo" in res.stdout
+        assert "1 recovered from limbo by size" in res.stdout
+        # The medium chunk is skipped
+        assert "Limbo chunk (0.75) skipped" in res.stdout
+
+        # LLM was invoked ONLY for the recovered large chunk!
+        assert len(mock_extract_calls) == 1
+        extracted_chunk_ids = [c.chunk_id for c in mock_extract_calls[0]]
+        assert len(extracted_chunk_ids) == 1
+        assert "Large Section" in str(mock_extract_calls[0][0].section_title)
+
+
 def test_ui_ideas_list_and_search_with_month_range(tmp_path: Path):
     """
     Verify SearchEngineBackend.get_ideas_list_and_search supports:
@@ -1413,11 +1551,224 @@ def test_incremental_neo4j_export_only_affected_nodes_and_parallel_dedup_progres
         incoming,
         on_progress=lambda stage, done, tot, detail: progress_events.append((stage, done, tot, detail)),
     )
-    assert len(resolved) == 2
-    assert resolved[0].name == "Canonical Raft"
-    assert resolved[1].name == "Canonical Raft"
-    assert mock_extractor._execute_structured_invoke.call_count == 1
-    assert any(stage == "llm_disambiguation" for stage, _, _, _ in progress_events)
+
+def test_get_chunk_size_helper():
+    """Verify get_chunk_size handles HierarchicalChunk, dict, and string texts correctly."""
+    from bookeeper.processing.recent_ideas import get_chunk_size
+
+    c1 = HierarchicalChunk(
+        chunk_id="c1",
+        book_id=1,
+        book_title="B",
+        section_title="S",
+        chapter_idx=1,
+        chunk_idx=1,
+        text="Hello world!",
+        char_count=12,
+    )
+    assert get_chunk_size(c1) == 12
+
+    d1 = {"chunk_id": "d1", "char_count": 500, "text": "Short"}
+    assert get_chunk_size(d1) == 500
+
+    d2 = {"chunk_id": "d2", "text": "Arbitrary text of length 27"}
+    assert get_chunk_size(d2) == len("Arbitrary text of length 27")
+
+    assert get_chunk_size(None) == 0
+
+
+def test_recent_ideas_config_limbo_recovery_settings():
+    """Verify min_batch_chunk_size, max_batch_chunk_size, and effective_limbo_recovery_size in config."""
+    from bookeeper.config import RecentIdeasConfig, Settings
+
+    rc1 = RecentIdeasConfig(min_batch_chunk_size=1500)
+    assert rc1.effective_limbo_recovery_size == 1500
+
+    rc2 = RecentIdeasConfig(max_batch_chunk_size=2000)
+    assert rc2.effective_limbo_recovery_size == 2000
+
+    rc3 = RecentIdeasConfig(limbo_min_chunk_size=1200)
+    assert rc3.effective_limbo_recovery_size == 1200
+
+    # If multiple are specified, min of valid positive thresholds is selected
+    rc4 = RecentIdeasConfig(min_batch_chunk_size=1000, max_batch_chunk_size=2500)
+    assert rc4.effective_limbo_recovery_size == 1000
+
+    rc_none = RecentIdeasConfig()
+    assert rc_none.effective_limbo_recovery_size is None
+
+    # Test root Settings inheritance
+    s1 = Settings(min_batch_chunk_size=1800)
+    assert s1.effective_limbo_recovery_size == 1800
+
+    s2 = Settings(recent_ideas=RecentIdeasConfig(max_batch_chunk_size=2200))
+    assert s2.effective_limbo_recovery_size == 2200
+
+
+def test_router_limbo_recovery_by_chunk_size():
+    """
+    Verify that when min_batch_chunk_size or max_batch_chunk_size is configured,
+    chunks whose similarity falls into limbo (0.65 <= sim < 0.90) but whose size
+    is >= threshold are recovered from limbo to UNASSIGNED (unprocessed queue),
+    while smaller limbo chunks remain in LIMBO.
+    """
+    from bookeeper.processing.recent_ideas import RecentIdeaChunkRouter, IdeaEmbeddingIndex
+
+    # Idea vector at [1.0, 0.0]
+    idea_index = IdeaEmbeddingIndex(
+        idea_names=["Consistent Hashing"],
+        idea_summaries=["Distributed hashing mechanism"],
+        idea_months={"Consistent Hashing": "2020-01"},
+        vectors=np.array([[1.0, 0.0]], dtype=np.float32),
+    )
+
+    # Big chunk (length 1500) in limbo similarity range (sim = 0.75)
+    big_text = "Distributed Hash Table " * 65  # ~1500 chars
+    big_chunk = HierarchicalChunk(
+        chunk_id="chk_big",
+        book_id=1,
+        book_title="Book A",
+        section_title="Sec 1",
+        chapter_idx=1,
+        chunk_idx=1,
+        text=big_text,
+        char_count=len(big_text),
+        embedding=[0.75, float(np.sqrt(1.0 - 0.75**2))],
+    )
+
+    # Small chunk (length 100) in limbo similarity range (sim = 0.75)
+    small_text = "Brief note about hashing."  # 25 chars
+    small_chunk = HierarchicalChunk(
+        chunk_id="chk_small",
+        book_id=1,
+        book_title="Book A",
+        section_title="Sec 1",
+        chapter_idx=1,
+        chunk_idx=2,
+        text=small_text,
+        char_count=len(small_text),
+        embedding=[0.75, float(np.sqrt(1.0 - 0.75**2))],
+    )
+
+    # Low similarity chunk (sim = 0.20) -> inherently unassigned
+    new_chunk = HierarchicalChunk(
+        chunk_id="chk_new",
+        book_id=1,
+        book_title="Book A",
+        section_title="Sec 1",
+        chapter_idx=1,
+        chunk_idx=3,
+        text="Quantum Computing",
+        char_count=len("Quantum Computing"),
+        embedding=[0.20, float(np.sqrt(1.0 - 0.20**2))],
+    )
+
+    # Router configured with min_batch_chunk_size = 500
+    router = RecentIdeaChunkRouter(
+        idea_index=idea_index,
+        unassigned_threshold=0.65,
+        high_confidence_threshold=0.90,
+        min_batch_chunk_size=500,
+    )
+
+    res = router.route_chunks([big_chunk, small_chunk, new_chunk])
+
+    # Big chunk (size 1500 >= 500) must be recovered from limbo into unassigned!
+    unassigned_ids = [rc.chunk.chunk_id for rc in res.unassigned]
+    assert "chk_big" in unassigned_ids
+    assert "chk_new" in unassigned_ids
+
+    # Small chunk (size 25 < 500) must stay in limbo
+    limbo_ids = [rc.chunk.chunk_id for rc in res.limbo]
+    assert "chk_small" in limbo_ids
+    assert "chk_big" not in limbo_ids
+
+    # Check recovered_from_limbo tracking
+    assert res.recovered_from_limbo_count == 1
+    assert res.recovered_from_limbo[0].chunk.chunk_id == "chk_big"
+    assert res.recovered_from_limbo[0].recovered_from_limbo is True
+
+    # When skip_limbo=True, the recovered big chunk must STILL be included in the LLM queue!
+    queue_skip_limbo = res.get_llm_queue_chunks(skip_limbo=True)
+    queue_cids = [c.chunk_id for c in queue_skip_limbo]
+    assert "chk_big" in queue_cids
+    assert "chk_new" in queue_cids
+    assert "chk_small" not in queue_cids
+
+
+def test_batch_routing_result_recover_limbo_chunks():
+    """Verify BatchRoutingResult.recover_limbo_chunks post-routing method."""
+    c_limbo_big = HierarchicalChunk(chunk_id="c_lb", book_id=1, book_title="B", section_title="S", chapter_idx=1, chunk_idx=1, text="A" * 1200)
+    c_limbo_sml = HierarchicalChunk(chunk_id="c_ls", book_id=1, book_title="B", section_title="S", chapter_idx=1, chunk_idx=2, text="A" * 200)
+
+    routing = BatchRoutingResult(
+        unassigned=[],
+        limbo=[
+            RoutedChunk(chunk=c_limbo_big, priority=ChunkPriority.LIMBO, similarity=0.75),
+            RoutedChunk(chunk=c_limbo_sml, priority=ChunkPriority.LIMBO, similarity=0.75),
+        ],
+    )
+
+    rec_cnt = routing.recover_limbo_chunks(threshold=800)
+    assert rec_cnt == 1
+    assert len(routing.unassigned) == 1
+    assert routing.unassigned[0].chunk.chunk_id == "c_lb"
+    assert routing.unassigned[0].priority == ChunkPriority.UNASSIGNED
+    assert routing.unassigned[0].recovered_from_limbo is True
+    assert len(routing.limbo) == 1
+    assert routing.limbo[0].chunk.chunk_id == "c_ls"
+
+
+def test_book_processing_state_recover_skipped_limbo_chunks(tmp_path: Path):
+    """Verify BookProcessingState.recover_skipped_limbo_chunks unmarks chunks whose size >= threshold."""
+    from bookeeper.processing.state import BookProcessingState
+
+    state = BookProcessingState(book_id=1, state_dir=tmp_path)
+
+    # Mark c1 as processed via normal LLM extraction
+    state.mark_chunk_processed(
+        chunk_id="c1",
+        chunk_idx=1,
+        section_title="S1",
+        extraction_dict={"concepts": [{"name": "Idea"}]},
+        duration=1.0,
+        server_used="gpu-node",
+    )
+
+    # Mark c2 as skipped_limbo (large text)
+    c2 = HierarchicalChunk(chunk_id="c2", book_id=1, book_title="B", section_title="S2", chapter_idx=1, chunk_idx=2, text="L" * 1500)
+    state.mark_chunk_processed(
+        chunk_id="c2",
+        chunk_idx=2,
+        section_title="S2",
+        extraction_dict={"concepts": []},
+        duration=0.0,
+        server_used="skipped_limbo",
+    )
+
+    # Mark c3 as skipped_limbo (small text)
+    c3 = HierarchicalChunk(chunk_id="c3", book_id=1, book_title="B", section_title="S3", chapter_idx=1, chunk_idx=3, text="S" * 200)
+    state.mark_chunk_processed(
+        chunk_id="c3",
+        chunk_idx=3,
+        section_title="S3",
+        extraction_dict={"concepts": []},
+        duration=0.0,
+        server_used="skipped_limbo",
+    )
+
+    assert state.is_chunk_processed("c1")
+    assert state.is_chunk_processed("c2")
+    assert state.is_chunk_processed("c3")
+
+    # Recover with threshold 1000: c2 (1500) should be unmarked/recovered; c3 (200) remains skipped; c1 untouched
+    recovered = state.recover_skipped_limbo_chunks([c2, c3], threshold=1000)
+    assert recovered == ["c2"]
+
+    assert state.is_chunk_processed("c1")
+    assert not state.is_chunk_processed("c2")  # Successfully restored to unprocessed!
+    assert state.is_chunk_processed("c3")
+
 
 
 

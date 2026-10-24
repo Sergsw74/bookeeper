@@ -126,6 +126,26 @@ class ChunkPriority(str, Enum):
     LIMBO = "limbo"
 
 
+def get_chunk_size(chunk: Any) -> int:
+    """
+    Return the size of a chunk in characters (or length).
+    Supports HierarchicalChunk instances, dicts, or generic objects.
+    """
+    if chunk is None:
+        return 0
+    if isinstance(chunk, dict):
+        cnt = chunk.get("char_count")
+        if isinstance(cnt, int) and cnt > 0:
+            return cnt
+        text = str(chunk.get("text") or "")
+        return len(text)
+    if hasattr(chunk, "char_count") and getattr(chunk, "char_count", 0):
+        return int(chunk.char_count)
+    if hasattr(chunk, "text") and chunk.text:
+        return len(chunk.text)
+    return 0
+
+
 @dataclass
 class RoutedChunk:
     chunk: Any
@@ -133,6 +153,7 @@ class RoutedChunk:
     similarity: float = 0.0
     matched_idea: Optional[str] = None
     matched_idea_summary: str = ""
+    recovered_from_limbo: bool = False
 
 
 @dataclass
@@ -140,6 +161,7 @@ class BatchRoutingResult:
     unassigned: List[RoutedChunk] = field(default_factory=list)
     high_confidence: List[RoutedChunk] = field(default_factory=list)
     limbo: List[RoutedChunk] = field(default_factory=list)
+    recovered_from_limbo: List[RoutedChunk] = field(default_factory=list)
     reused_embeddings_count: int = 0
     computed_embeddings_count: int = 0
 
@@ -163,10 +185,45 @@ class BatchRoutingResult:
     def limbo_count(self) -> int:
         return len(self.limbo)
 
+    @property
+    def recovered_from_limbo_count(self) -> int:
+        return len(self.recovered_from_limbo)
+
+    def recover_limbo_chunks(
+        self,
+        min_size: Optional[int] = None,
+        max_size: Optional[int] = None,
+        threshold: Optional[int] = None,
+    ) -> int:
+        """
+        Recover chunks currently in limbo whose size is >= threshold,
+        restoring them to unassigned (Priority 1 unprocessed LLM extraction queue).
+        Returns number of recovered chunks.
+        """
+        candidates = [min_size, max_size, threshold]
+        valid = [int(c) for c in candidates if c is not None and int(c) > 0]
+        if not valid:
+            return 0
+        th = min(valid)
+        remaining_limbo: List[RoutedChunk] = []
+        recovered = 0
+        for rc in self.limbo:
+            if get_chunk_size(rc.chunk) >= th:
+                rc.priority = ChunkPriority.UNASSIGNED
+                rc.recovered_from_limbo = True
+                self.unassigned.append(rc)
+                self.recovered_from_limbo.append(rc)
+                recovered += 1
+            else:
+                remaining_limbo.append(rc)
+        self.limbo = remaining_limbo
+        return recovered
+
     def get_llm_queue_chunks(self, skip_limbo: bool = False) -> List[Any]:
         """
         Return chunks ordered for LLM extraction:
-        Priority 1 (Unassigned) first, followed by Priority 3 (Limbo) unless skip_limbo=True.
+        Priority 1 (Unassigned, including any chunks recovered from limbo) first,
+        followed by Priority 3 (Limbo) unless skip_limbo=True.
         """
         if skip_limbo:
             return [rc.chunk for rc in self.unassigned]
@@ -431,12 +488,34 @@ class RecentIdeaChunkRouter:
         unassigned_threshold: float = 0.65,
         high_confidence_threshold: float = 0.90,
         neo4j_exporter: Optional[Any] = None,
+        min_batch_chunk_size: Optional[int] = None,
+        max_batch_chunk_size: Optional[int] = None,
+        limbo_min_chunk_size: Optional[int] = None,
     ):
         self.idea_index = idea_index
         self.embeddings = embeddings
         self.unassigned_threshold = unassigned_threshold
         self.high_confidence_threshold = high_confidence_threshold
         self.neo4j_exporter = neo4j_exporter
+        self.min_batch_chunk_size = min_batch_chunk_size
+        self.max_batch_chunk_size = max_batch_chunk_size
+        self.limbo_min_chunk_size = limbo_min_chunk_size
+
+    @property
+    def recovery_threshold(self) -> Optional[int]:
+        candidates = [
+            self.min_batch_chunk_size,
+            self.max_batch_chunk_size,
+            self.limbo_min_chunk_size,
+        ]
+        valid = [int(c) for c in candidates if c is not None and int(c) > 0]
+        return min(valid) if valid else None
+
+    def should_recover_from_limbo(self, chunk: Any) -> bool:
+        th = self.recovery_threshold
+        if th is None or th <= 0:
+            return False
+        return get_chunk_size(chunk) >= th
 
     def route_chunks(
         self,
@@ -610,14 +689,27 @@ class RecentIdeaChunkRouter:
                     )
                 )
             else:
-                result.limbo.append(
-                    RoutedChunk(
+                if self.should_recover_from_limbo(chk):
+                    rc = RoutedChunk(
                         chunk=chk,
-                        priority=ChunkPriority.LIMBO,
+                        priority=ChunkPriority.UNASSIGNED,
                         similarity=sim,
                         matched_idea=best_idea,
                         matched_idea_summary=best_summary,
+                        recovered_from_limbo=True,
                     )
-                )
+                    result.unassigned.append(rc)
+                    result.recovered_from_limbo.append(rc)
+                else:
+                    result.limbo.append(
+                        RoutedChunk(
+                            chunk=chk,
+                            priority=ChunkPriority.LIMBO,
+                            similarity=sim,
+                            matched_idea=best_idea,
+                            matched_idea_summary=best_summary,
+                            recovered_from_limbo=False,
+                        )
+                    )
 
         return result

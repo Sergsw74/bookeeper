@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +372,40 @@ class BookProcessingState:
     def is_chunk_processed(self, chunk_id: str) -> bool:
         with self._lock:
             return chunk_id in self.data.get("processed_chunks", {})
+
+    def unmark_chunk_processed(self, chunk_id: str) -> bool:
+        """Remove chunk from processed_chunks (e.g. to recover a skipped limbo chunk) and persist."""
+        with self._lock:
+            if "processed_chunks" in self.data and chunk_id in self.data["processed_chunks"]:
+                del self.data["processed_chunks"][chunk_id]
+                self.save()
+                return True
+            return False
+
+    def recover_skipped_limbo_chunks(self, chunks: Sequence[Any], threshold: int) -> List[str]:
+        """
+        Recover chunks previously marked as skipped_limbo whose size is >= threshold,
+        unmarking them from processed_chunks so they are returned to unprocessed status.
+        Returns list of recovered chunk IDs.
+        """
+        recovered = []
+        with self._lock:
+            processed = self.data.get("processed_chunks", {})
+            for chk in chunks:
+                cid = getattr(chk, "chunk_id", None) or (chk.get("chunk_id") if isinstance(chk, dict) else None)
+                if not cid or cid not in processed:
+                    continue
+                rec = processed[cid]
+                if rec.get("server_used") == "skipped_limbo" or rec.get("status") == "skipped_limbo":
+                    c_size = getattr(chk, "char_count", 0) or len(getattr(chk, "text", "") or "")
+                    if isinstance(chk, dict) and not c_size:
+                        c_size = chk.get("char_count") or len(chk.get("text", "") or "")
+                    if c_size >= threshold:
+                        del processed[cid]
+                        recovered.append(cid)
+            if recovered:
+                self.save()
+        return recovered
 
     def is_chunk_failed(self, chunk_id: str) -> bool:
         with self._lock:

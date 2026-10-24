@@ -15,9 +15,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import typer
+import numpy as np
 from langchain_ollama import OllamaEmbeddings
 from rich.console import Console, Group
 from rich.live import Live
+from rich.logging import RichHandler
+from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
@@ -293,6 +296,191 @@ class IngestionRemainingColumn(ProgressColumn):
 
         style = "dim" if eta_str.startswith("--") else "bold yellow"
         return Text(f"ETA: {eta_str}", style=style)
+
+
+class CrossCheckProgressTracker:
+    """
+    Manages live status display and metrics tracking for Cross-Check A/B testing.
+    Renders two dynamic lines:
+      Line 1: Current comparative performance (Base vs Candidate) with Fidelity, Score (S_net), Recall, and deltas.
+      Line 2: Progress bar, block counter, elapsed time, block rate (s/blk), and ETA.
+    """
+
+    def __init__(
+        self,
+        total_blocks: int,
+        branch_a_label: str = "Baseline (A)",
+        branch_b_label: str = "Candidate (B)",
+        console: Optional[Console] = None,
+    ):
+        self.total_blocks = total_blocks
+        self.branch_a_label = str(branch_a_label)
+        self.branch_b_label = str(branch_b_label)
+        self.escaped_a = escape(self.branch_a_label)
+        self.escaped_b = escape(self.branch_b_label)
+        self.console = console or Console()
+        self.completed = 0
+        self.completed_samples: List[CrossCheckBlockResult] = []
+        self.block_durations: List[float] = []
+        self.t_start = time.perf_counter()
+        self.current_block_info = "Auditing block #1..."
+        self._live: Optional[Live] = None
+        self._progress: Optional[Progress] = None
+        self._task_id: Optional[Any] = None
+        self._log_handler: Optional[logging.Handler] = None
+
+    def get_performance_line(self) -> str:
+        """
+        Build Line 1:
+        Current performance, base model versus candidate model, with fidelity number and current score.
+        """
+        if not self.completed_samples:
+            status_desc = escape(str(self.current_block_info))
+            return (
+                f"[bold cyan]{self.escaped_a}[/] vs [bold magenta]{self.escaped_b}[/] | "
+                f"Current Performance: [dim]{status_desc}[/dim]"
+            )
+
+        mean_old_fid = float(np.mean([s.old_system.calibrated_fidelity for s in self.completed_samples]))
+        mean_new_fid = float(np.mean([s.new_system.calibrated_fidelity for s in self.completed_samples]))
+        delta_fid = mean_new_fid - mean_old_fid
+
+        mean_old_net = float(np.mean([s.old_system.net_integrity_score for s in self.completed_samples]))
+        mean_new_net = float(np.mean([s.new_system.net_integrity_score for s in self.completed_samples]))
+        delta_net = mean_new_net - mean_old_net
+
+        mean_old_rec = float(np.mean([s.old_system.qa_recall for s in self.completed_samples]))
+        mean_new_rec = float(np.mean([s.new_system.qa_recall for s in self.completed_samples]))
+        delta_rec = mean_new_rec - mean_old_rec
+
+        d_fid_col = "green" if delta_fid >= 0 else "red"
+        d_net_col = "green" if delta_net >= 0 else "red"
+        d_rec_col = "green" if delta_rec >= 0 else "red"
+
+        return (
+            f"[bold cyan]{self.escaped_a}[/] vs [bold magenta]{self.escaped_b}[/] | "
+            f"Fidelity: [cyan]{mean_old_fid * 100:.1f}%[/] vs [magenta]{mean_new_fid * 100:.1f}%[/] ([{d_fid_col}]{delta_fid * 100:+.1f}%[/]) | "
+            f"Score: [cyan]{mean_old_net:+.2f}[/] vs [magenta]{mean_new_net:+.2f}[/] ([{d_net_col}]{delta_net:+.2f}[/]) | "
+            f"Recall: [cyan]{mean_old_rec * 100:.1f}%[/] vs [magenta]{mean_new_rec * 100:.1f}%[/] ([{d_rec_col}]{delta_rec * 100:+.1f}% pts[/])"
+        )
+
+    def compute_eta_and_speed(self) -> Tuple[str, str, str]:
+        """
+        Compute (speed_str, elapsed_str, eta_str) for Line 2.
+        """
+        elapsed = time.perf_counter() - self.t_start
+        elapsed_str = format_eta_min_sec(elapsed)
+
+        if self.block_durations:
+            recent = self.block_durations[-10:]
+            avg_dur = float(np.mean(recent))
+            if avg_dur >= 1.0:
+                speed_str = f"{avg_dur:.1f} s/blk"
+            elif avg_dur > 0:
+                speed_str = f"{1.0 / avg_dur:.2f} blk/s"
+            else:
+                speed_str = "-- s/blk"
+
+            remaining = max(0, self.total_blocks - self.completed)
+            if self.completed >= self.total_blocks:
+                eta_str = "0m 00s"
+            else:
+                rem_sec = remaining * avg_dur
+                eta_str = format_eta_h_min_sec(rem_sec) if rem_sec >= 3600 else format_eta_min_sec(rem_sec)
+        else:
+            speed_str = "-- s/blk"
+            eta_str = "--m --s"
+
+        return speed_str, elapsed_str, eta_str
+
+    def get_progress_renderable(self) -> Group:
+        """Combine Line 1 and Line 2 into a single Group for Live rendering."""
+        line1 = Text.from_markup(self.get_performance_line())
+        return Group(line1, self._progress) if self._progress else Group(line1)
+
+    def __enter__(self) -> "CrossCheckProgressTracker":
+        # Attach RichHandler so warning logs (like chunk length ratio) scroll above the live area cleanly
+        target_logger = logging.getLogger("bookeeper.processing.cross_checker")
+        self._log_handler = RichHandler(console=self.console, show_time=False, show_path=False)
+        target_logger.addHandler(self._log_handler)
+
+        self._progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]Cross-Check Progress:[/bold cyan]"),
+            BarColumn(bar_width=25),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TextColumn("{task.fields[stats_line]}"),
+            console=self.console,
+        )
+        self._task_id = self._progress.add_task(
+            "cc_total",
+            total=self.total_blocks,
+            completed=0,
+            stats_line="[dim]Elapsed: 0m 00s[/dim] | [cyan]-- s/blk[/cyan] | [bold yellow]ETA: --m --s[/bold yellow]",
+        )
+        self._live = Live(self.get_progress_renderable(), console=self.console, refresh_per_second=10)
+        self._live.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._live:
+            self._live.stop()
+        if self._log_handler:
+            logging.getLogger("bookeeper.processing.cross_checker").removeHandler(self._log_handler)
+
+    def on_progress(
+        self,
+        completed: int,
+        total: int,
+        block_info: str,
+        item: Optional[CrossCheckBlockResult] = None,
+    ):
+        """
+        Progress callback invoked by run_cross_check.
+        """
+        self.completed = completed
+        self.total_blocks = total
+        self.current_block_info = block_info
+
+        if item is not None:
+            self.completed_samples.append(item)
+            dur = getattr(item, "duration_seconds", None)
+            if dur and dur > 0:
+                self.block_durations.append(dur)
+            else:
+                elapsed = time.perf_counter() - self.t_start
+                self.block_durations.append(max(0.1, elapsed / max(1, completed)))
+
+        speed_str, elapsed_str, eta_str = self.compute_eta_and_speed()
+        stats_str = f"[dim]Elapsed: {elapsed_str}[/dim] | [cyan]{speed_str}[/cyan] | [bold yellow]ETA: {eta_str}[/bold yellow]"
+
+        if self._progress and self._task_id is not None:
+            self._progress.update(self._task_id, completed=completed, total=total, stats_line=stats_str)
+
+        if self._live:
+            self._live.update(self.get_progress_renderable())
+
+        # Milestone periodic output (every 5 blocks or when finished)
+        if item is not None and (completed % 5 == 0 or completed == total):
+            pct = (completed / total * 100) if total > 0 else 0.0
+            mean_old_fid = float(np.mean([s.old_system.calibrated_fidelity for s in self.completed_samples]))
+            mean_new_fid = float(np.mean([s.new_system.calibrated_fidelity for s in self.completed_samples]))
+            delta_fid = mean_new_fid - mean_old_fid
+            d_fid_col = "green" if delta_fid >= 0 else "red"
+
+            mean_old_net = float(np.mean([s.old_system.net_integrity_score for s in self.completed_samples]))
+            mean_new_net = float(np.mean([s.new_system.net_integrity_score for s in self.completed_samples]))
+            delta_net = mean_new_net - mean_old_net
+            d_net_col = "green" if delta_net >= 0 else "red"
+
+            self.console.print(
+                f"[bold cyan][Cross-Check][/bold cyan] {completed}/{total} blocks ({pct:.1f}%) | "
+                f"Fid: {mean_old_fid * 100:.1f}% vs {mean_new_fid * 100:.1f}% ([{d_fid_col}]{delta_fid * 100:+.1f}%[/]) | "
+                f"Score: {mean_old_net:+.2f} vs {mean_new_net:+.2f} ([{d_net_col}]{delta_net:+.2f}[/]) | "
+                f"{speed_str} | ETA: {eta_str}"
+            )
+            sys.stdout.flush()
 
 
 def _resolve_opt(val: Any, default: Any = None) -> Any:
@@ -4670,67 +4858,12 @@ def _execute_single_verification(
             warmup_verifier = IdeaVerifier(pool=pool, model_name=effective_model)
             warmup_verifier.warmup(timeout=90)
 
-        t_start = time.perf_counter()
-        tot_delta = 0.0
-        tot_trunc = 0.0
-
-        cc_progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[bold cyan]Cross-Check Progress:[/bold cyan]"),
-            BarColumn(bar_width=25),
-            TaskProgressColumn(),
-            MofNCompleteColumn(),
-            TextColumn("{task.fields[stats_line]}"),
+        with CrossCheckProgressTracker(
+            total_blocks=effective_blocks,
+            branch_a_label=branch_a_label,
+            branch_b_label=branch_b_label,
             console=console,
-        )
-        tot_cc_task = cc_progress.add_task("cc_total", total=effective_blocks, completed=0, stats_line="")
-        cur_cc_line = Text.from_markup("[bold blue]Current Block:[/bold blue] Initializing cross-check auditor...")
-
-        with Live(Group(cur_cc_line, cc_progress), console=console, refresh_per_second=10) as live:
-            def _on_cc_progress(completed: int, total: int, block_info: str, item: Optional[CrossCheckBlockResult] = None):
-                nonlocal tot_delta, tot_trunc
-                if item is not None:
-                    tot_delta += item.delta_recall
-                    tot_trunc += item.new_system.truncation_rate
-                    avg_d = tot_delta / completed if completed > 0 else 0.0
-                    cur_text = (
-                        f"[bold blue]Current Block:[/bold blue] {block_info} | "
-                        f"ΔQA Recall: [{'green' if avg_d >= 0 else 'red'}]{avg_d * 100:+.1f}% pts[/] | "
-                        f"Net Int B: [magenta]{item.new_system.net_integrity_score:+.2f}[/magenta] | "
-                        f"Disprop: [cyan]{item.chunk_disproportion:.2f}[/cyan]"
-                    )
-                else:
-                    cur_text = f"[bold blue]Current Block:[/bold blue] {block_info} | [bold yellow]Auditing...[/bold yellow]"
-
-                elapsed = time.perf_counter() - t_start
-                rate = (completed / elapsed) if elapsed > 0 else 0.0
-                if completed > 0 and total > completed and rate > 0:
-                    rem_sec = (total - completed) / rate
-                    eta_str = format_eta_min_sec(rem_sec)
-                elif completed >= total:
-                    eta_str = "0m 00s"
-                else:
-                    eta_str = "--"
-
-                if rate >= 1.0:
-                    speed_str = f"{rate:.2f} blk/s"
-                elif rate > 0:
-                    sec_per_blk = 1.0 / rate
-                    speed_str = f"{sec_per_blk:.1f} s/blk ({rate:.3f} blk/s)"
-                else:
-                    speed_str = "-- blk/s"
-
-                stats_str = f"[cyan]{speed_str}[/cyan] | [yellow]ETA: {eta_str}[/yellow]"
-                cc_progress.update(tot_cc_task, completed=completed, total=total, stats_line=stats_str)
-                live.update(Group(Text.from_markup(cur_text), cc_progress))
-                if item is not None and (completed % 5 == 0 or completed == total):
-                    pct = (completed / total * 100) if total > 0 else 0.0
-                    console.print(
-                        f"[bold cyan][Cross-Check][/bold cyan] {completed}/{total} blocks ({pct:.1f}%)"
-                        f" | {speed_str} | ETA: {eta_str}"
-                    )
-                    sys.stdout.flush()
-
+        ) as tracker:
             report = run_cross_check(
                 store_a=store_a,
                 store_b=store_b,
@@ -4743,7 +4876,7 @@ def _execute_single_verification(
                 seed=seed,
                 print_chunks=int(print_chunks or 0),
                 console=console,
-                progress_callback=_on_cc_progress,
+                progress_callback=tracker.on_progress,
             )
 
         # 1. Summary Metrics Table
@@ -5695,19 +5828,26 @@ def ab_compare_command(
                 warmup_verifier = IdeaVerifier(pool=pool, model_name=effective_model)
                 warmup_verifier.warmup(timeout=90)
 
-            cc_report = run_cross_check(
-                store_a=store_a,
-                store_b=store_b,
-                num_blocks=blocks,
-                pool=pool,
-                model_name=effective_model,
-                embedding_model=effective_embedding_model,
-                branch_a_name=bt_a.label,
-                branch_b_name=bt_b.label,
-                seed=seed,
-                print_chunks=int(print_chunks or 0),
+            with CrossCheckProgressTracker(
+                total_blocks=blocks,
+                branch_a_label=bt_a.label,
+                branch_b_label=bt_b.label,
                 console=console,
-            )
+            ) as tracker:
+                cc_report = run_cross_check(
+                    store_a=store_a,
+                    store_b=store_b,
+                    num_blocks=blocks,
+                    pool=pool,
+                    model_name=effective_model,
+                    embedding_model=effective_embedding_model,
+                    branch_a_name=bt_a.label,
+                    branch_b_name=bt_b.label,
+                    seed=seed,
+                    print_chunks=int(print_chunks or 0),
+                    console=console,
+                    progress_callback=tracker.on_progress,
+                )
 
             sm = cc_report.summary
             cc_tbl = Table(title="Cross-Check Verification Summary & Decision Gates", border_style="cyan")

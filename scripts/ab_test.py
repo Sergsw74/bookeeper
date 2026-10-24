@@ -1452,20 +1452,31 @@ class ABTestRunner:
         else:
             from bookeeper.graph.store import ConceptGraphStore
             from bookeeper.processing.cross_checker import run_cross_check
+            from rich.console import Console
+            from bookeeper.cli import CrossCheckProgressTracker
 
             store_a = ConceptGraphStore()
             store_b = ConceptGraphStore()
             store_a.load(kg_a)
             store_b.load(kg_b)
 
-            rep_obj = run_cross_check(
-                store_a=store_a,
-                store_b=store_b,
-                num_blocks=num_blocks,
-                branch_a_name=self.branch1,
-                branch_b_name=self.branch2,
-                print_chunks=self.print_chunks,
-            )
+            console = Console()
+            with CrossCheckProgressTracker(
+                total_blocks=num_blocks,
+                branch_a_label=self.branch1,
+                branch_b_label=self.branch2,
+                console=console,
+            ) as tracker:
+                rep_obj = run_cross_check(
+                    store_a=store_a,
+                    store_b=store_b,
+                    num_blocks=num_blocks,
+                    branch_a_name=self.branch1,
+                    branch_b_name=self.branch2,
+                    print_chunks=self.print_chunks,
+                    console=console,
+                    progress_callback=tracker.on_progress,
+                )
             report_data = rep_obj.model_dump()
 
         # Save JSON & Markdown report

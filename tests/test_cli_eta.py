@@ -210,3 +210,87 @@ def test_compute_overall_library_eta():
     assert rem_sec == 420.0
     assert eta_str == "0d 0h 07m"
     assert avg_str == "1m 40s"
+
+
+def test_cross_check_progress_tracker():
+    """Verify CrossCheckProgressTracker status lines, performance metrics, and ETA computation."""
+    from rich.console import Console
+    from bookeeper.cli import CrossCheckProgressTracker
+    from bookeeper.processing.cross_checker import CrossCheckBlockResult, SystemBlockMetrics
+
+    console = Console(force_terminal=False)
+    tracker = CrossCheckProgressTracker(
+        total_blocks=10,
+        branch_a_label="Baseline (A)",
+        branch_b_label="Candidate (B)",
+        console=console,
+    )
+
+    # Initial state (0 completed blocks)
+    perf_line = tracker.get_performance_line()
+    assert "Baseline (A)" in perf_line
+    assert "Candidate (B)" in perf_line
+    assert "Current Performance:" in perf_line
+
+    speed, elapsed, eta = tracker.compute_eta_and_speed()
+    assert speed == "-- s/blk"
+    assert eta == "--m --s"
+
+    # Simulate Block 1 completed
+    sample1 = CrossCheckBlockResult(
+        sample_index=1,
+        book_id=1,
+        book_title="Test Book",
+        section_title="Sec 1",
+        old_chunk_ids=["c1"],
+        new_chunk_ids=["c2"],
+        passage_length_chars=1000,
+        block_a_total_len=1000,
+        block_b_total_len=1000,
+        union_len=1000,
+        chunk_disproportion=1.0,
+        oracle_ideas_count=5,
+        old_system=SystemBlockMetrics(
+            system="old",
+            calibrated_fidelity=0.80,
+            net_integrity_score=0.60,
+            qa_recall=0.85,
+        ),
+        new_system=SystemBlockMetrics(
+            system="new",
+            calibrated_fidelity=0.90,
+            net_integrity_score=0.80,
+            qa_recall=0.95,
+        ),
+        delta_recall=0.10,
+        delta_fail_ratio=-0.10,
+        duration_seconds=15.0,
+        delta_calibrated_fidelity=0.10,
+        delta_net_integrity=0.20,
+    )
+
+    tracker.on_progress(1, 10, "Block #1 (Test Book)", sample1)
+
+    perf_line = tracker.get_performance_line()
+    # Baseline vs Candidate fidelity: 80.0% vs 90.0% (+10.0%)
+    assert "80.0%" in perf_line
+    assert "90.0%" in perf_line
+    assert "+10.0%" in perf_line
+    # Net score: +0.60 vs +0.80 (+0.20)
+    assert "+0.60" in perf_line
+    assert "+0.80" in perf_line
+    assert "+0.20" in perf_line
+    # Recall: 85.0% vs 95.0%
+    assert "85.0%" in perf_line
+    assert "95.0%" in perf_line
+
+    # ETA after 1 block of 15.0s: 9 blocks remaining * 15.0s = 135s -> 2m 15s
+    speed, elapsed, eta = tracker.compute_eta_and_speed()
+    assert "15.0 s/blk" in speed
+    assert eta == "2m 15s"
+
+    # All blocks completed: ETA should be 0m 00s
+    tracker.completed = 10
+    speed, elapsed, eta = tracker.compute_eta_and_speed()
+    assert eta == "0m 00s"
+

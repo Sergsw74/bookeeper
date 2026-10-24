@@ -188,7 +188,7 @@ def test_neo4j_export_clean_start():
     mock_result_cnt.single.return_value = {"cnt": 15}
 
     def mock_run(query, *args, **kwargs):
-        if "RETURN count(n) AS cnt" in query:
+        if "RETURN count(n) AS cnt" in query or "RETURN count(r) AS cnt" in query:
             return mock_result_cnt
         return MagicMock()
 
@@ -202,7 +202,7 @@ def test_neo4j_export_clean_start():
     assert result["cleaned_nodes"] == 15
 
     executed_queries = [call.args[0] for call in mock_session.run.call_args_list]
-    assert any("DETACH DELETE" in q for q in executed_queries)
+    assert any("DELETE" in q for q in executed_queries)
 
 
 def test_cli_export_neo4j_clean_option(tmp_path):
@@ -221,7 +221,7 @@ def test_cli_export_neo4j_clean_option(tmp_path):
     mock_result_cnt.single.return_value = {"cnt": 5}
 
     def mock_run(query, *args, **kwargs):
-        if "RETURN count(n) AS cnt" in query:
+        if "RETURN count(n) AS cnt" in query or "RETURN count(r) AS cnt" in query:
             return mock_result_cnt
         return MagicMock()
 

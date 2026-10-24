@@ -1089,6 +1089,74 @@ def test_ab_test_cross_check_markdown_alignment(tmp_path):
     assert cells[status_b_idx] == "5/0/0"
 
 
+def test_run_cross_check_progress_callback(sample_graphs, mock_pool):
+    """Verify run_cross_check invokes progress_callback with start, auditing, and completed block results."""
+    store_a, store_b = sample_graphs
+
+    def fake_generate(model, prompt, **kwargs):
+        if "extract all core standalone ideas" in prompt.lower() or "knowledge extractor" in prompt.lower():
+            return (
+                json.dumps({
+                    "ideas": [
+                        {"name": "Fox Agility", "reasoning": "Fox jumping over dog"},
+                    ]
+                }),
+                {},
+            )
+        else:
+            return (
+                json.dumps({
+                    "verdict": "VALID_DETAIL",
+                    "rationale": "Accurate detail present in text",
+                }),
+                {},
+            )
+
+    mock_pool.generate = MagicMock(side_effect=fake_generate)
+
+    callback_calls = []
+
+    def mock_cb(completed, total, info, item=None):
+        callback_calls.append((completed, total, info, item))
+
+    report = run_cross_check(
+        store_a=store_a,
+        store_b=store_b,
+        num_blocks=1,
+        branch_a_name="Baseline",
+        branch_b_name="Candidate",
+        model_name="test-model",
+        pool=mock_pool,
+        progress_callback=mock_cb,
+    )
+
+    assert len(report.samples) == 1
+    assert len(callback_calls) >= 3
+
+    # 1. Initial call
+    c_init, t_init, info_init, item_init = callback_calls[0]
+    assert c_init == 0
+    assert t_init == 1
+    assert "Initializing" in info_init
+    assert item_init is None
+
+    # 2. Block auditing call
+    c_audit, t_audit, info_audit, item_audit = callback_calls[1]
+    assert c_audit == 0
+    assert t_audit == 1
+    assert "Auditing Block #1" in info_audit
+    assert item_audit is None
+
+    # 3. Block completed call
+    c_done, t_done, info_done, item_done = callback_calls[-1]
+    assert c_done == 1
+    assert t_done == 1
+    assert "Block #1" in info_done
+    assert item_done is not None
+    assert item_done.sample_index == 1
+
+
+
 
 
 

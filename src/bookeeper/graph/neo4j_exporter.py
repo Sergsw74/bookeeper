@@ -740,9 +740,15 @@ class Neo4jExporter:
         deleted_count = 0
         with driver.session(database=self.database) as session:
             rec_n = session.run("MATCH (n) RETURN count(n) AS cnt").single()
-            total_nodes = rec_n["cnt"] if rec_n else 0
+            try:
+                total_nodes = int(rec_n["cnt"]) if rec_n else 0
+            except (ValueError, TypeError):
+                total_nodes = 0
             rec_r = session.run("MATCH ()-[r]->() RETURN count(r) AS cnt").single()
-            total_rels = rec_r["cnt"] if rec_r else 0
+            try:
+                total_rels = int(rec_r["cnt"]) if rec_r else 0
+            except (ValueError, TypeError):
+                total_rels = 0
 
             if total_nodes == 0 and total_rels == 0:
                 logger.debug(f"Neo4j database '{self.database}' is already empty. Skipping purge.")

@@ -824,65 +824,61 @@ class IdeaPostProcessor:
         else:
             cluster_progress = nullcontext()
 
-        try:
-            with cluster_progress as c_prog:
-                c_task = c_prog.add_task("clustering", total=len(clusters), thresh=f"{self.similarity_threshold:.2f}") if c_prog else None
+        with cluster_progress as c_prog:
+            c_task = c_prog.add_task("clustering", total=len(clusters), thresh=f"{self.similarity_threshold:.2f}") if c_prog else None
 
-                for i in range(len(clusters)):
-                    if c_prog and c_task is not None:
-                        c_prog.update(c_task, completed=i)
-                    if i in consumed_indices:
+            for i in range(len(clusters)):
+                if c_prog and c_task is not None:
+                    c_prog.update(c_task, completed=i)
+                if i in consumed_indices:
+                    continue
+
+                current = clusters[i]
+                consumed_indices.add(i)
+
+                # Search remaining clusters for cosine similarity >= threshold
+                for j in range(i + 1, len(clusters)):
+                    if j in consumed_indices:
                         continue
 
-                    current = clusters[i]
-                    consumed_indices.add(i)
+                    other = clusters[j]
+                    if (
+                        current.embedding is not None
+                        and other.embedding is not None
+                        and current.embedding.shape == other.embedding.shape
+                    ):
+                        sim = float(np.dot(current.embedding, other.embedding))
+                        if sim >= self.similarity_threshold:
+                            logger.info(
+                                f"Semantic merge ({sim:.3f} >= {self.similarity_threshold}): "
+                                f"'{other.canonical_name}' into '{current.canonical_name}'"
+                            )
+                            # Merge other into current
+                            current.was_merged = True
+                            current.already_postprocessed = False
+                            current.existing_node_ids.update(other.existing_node_ids)
+                            if other.already_refined:
+                                if not current.already_refined:
+                                    current.already_refined = True
+                                    current.refined_brief = other.refined_brief
+                                    current.refined_detailed = other.refined_detailed
+                                    current.refined_related_entities = list(other.refined_related_entities)
+                                else:
+                                    for r_ent in other.refined_related_entities:
+                                        if r_ent not in current.refined_related_entities:
+                                            current.refined_related_entities.append(r_ent)
+                            current.aliases.update(other.aliases)
+                            current.aliases.add(other.canonical_name)
+                            for obs in other.observations:
+                                current.add_observation(obs)
+                            current.chunk_ids.update(other.chunk_ids)
+                            current.max_weight = max(current.max_weight, other.max_weight)
+                            consumed_indices.add(j)
 
-                    # Search remaining clusters for cosine similarity >= threshold
-                    for j in range(i + 1, len(clusters)):
-                        if j in consumed_indices:
-                            continue
+                merged.append(current)
 
-                        other = clusters[j]
-                        if (
-                            current.embedding is not None
-                            and other.embedding is not None
-                            and current.embedding.shape == other.embedding.shape
-                        ):
-                            sim = float(np.dot(current.embedding, other.embedding))
-                            if sim >= self.similarity_threshold:
-                                logger.info(
-                                    f"Semantic merge ({sim:.3f} >= {self.similarity_threshold}): "
-                                    f"'{other.canonical_name}' into '{current.canonical_name}'"
-                                )
-                                # Merge other into current
-                                current.was_merged = True
-                                current.already_postprocessed = False
-                                current.existing_node_ids.update(other.existing_node_ids)
-                                if other.already_refined:
-                                    if not current.already_refined:
-                                        current.already_refined = True
-                                        current.refined_brief = other.refined_brief
-                                        current.refined_detailed = other.refined_detailed
-                                        current.refined_related_entities = list(other.refined_related_entities)
-                                    else:
-                                        for r_ent in other.refined_related_entities:
-                                            if r_ent not in current.refined_related_entities:
-                                                current.refined_related_entities.append(r_ent)
-                                current.aliases.update(other.aliases)
-                                current.aliases.add(other.canonical_name)
-                                for obs in other.observations:
-                                    current.add_observation(obs)
-                                current.chunk_ids.update(other.chunk_ids)
-                                current.max_weight = max(current.max_weight, other.max_weight)
-                                consumed_indices.add(j)
-
-                    merged.append(current)
-
-                if c_prog and c_task is not None:
-                    c_prog.update(c_task, completed=len(clusters))
-        finally:
-            if status is not None:
-                status.stop()
+            if c_prog and c_task is not None:
+                c_prog.update(c_task, completed=len(clusters))
 
         if console is not None:
             merged_diff = len(clusters) - len(merged)

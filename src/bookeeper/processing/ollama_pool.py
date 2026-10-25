@@ -28,6 +28,43 @@ from bookeeper.config import DEFAULT_CAPABILITIES, OllamaServerConfig
 
 logger = logging.getLogger(__name__)
 
+
+class DaemonThreadPoolExecutor(ThreadPoolExecutor):
+    """ThreadPoolExecutor that creates daemon threads so cancellation terminates immediately without hanging."""
+
+    def _adjust_thread_count(self):
+        orig_thread = threading.Thread
+
+        def _daemon_thread(*args, **kwargs):
+            kwargs["daemon"] = True
+            return orig_thread(*args, **kwargs)
+
+        threading.Thread = _daemon_thread
+        try:
+            super()._adjust_thread_count()
+        finally:
+            threading.Thread = orig_thread
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        super().shutdown(wait=wait, cancel_futures=cancel_futures)
+        if not wait:
+            # Unregister daemon threads from Python's atexit handler so exit is instant
+            try:
+                import concurrent.futures.thread
+
+                with concurrent.futures.thread._global_shutdown_lock:
+                    for t in list(self._threads):
+                        concurrent.futures.thread._threads_queues.pop(t, None)
+            except Exception:
+                pass
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            self.shutdown(wait=False, cancel_futures=True)
+            return False
+        self.shutdown(wait=True)
+        return False
+
 _macos_bridge_lock = threading.Lock()
 _macos_bridge_tunnels: Dict[str, Tuple[str, subprocess.Popen]] = {}
 _url_resolution_cache: Dict[str, str] = {}
@@ -1273,7 +1310,7 @@ class FailoverOllamaEmbeddings(Embeddings):
                 return all_embs
 
             ordered_results: List[Optional[List[List[float]]]] = [None] * len(batches)
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            with DaemonThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_idx = {
                     executor.submit(_embed_batch, b): idx
                     for idx, b in enumerate(batches)

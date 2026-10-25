@@ -16,8 +16,44 @@ from rich.console import Console
 from rich.table import Table
 
 from bookeeper.graph.store import ConceptGraphStore
+from bookeeper.processing.memory_guard import (
+    DEFAULT_MAX_MEMORY_BYTES,
+    check_memory_limit,
+    cleanup_memory,
+    get_process_memory_gb,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def compute_max_cosine_sim_batched(
+    U: np.ndarray,
+    G: np.ndarray,
+    max_batch_mem_bytes: int = 64 * 1024 * 1024,
+) -> np.ndarray:
+    """
+    Computes max cosine similarity across G for each vector in U in memory-safe batches.
+    Caps intermediate projection matrices strictly to max_batch_mem_bytes (default 64MB).
+    """
+    if len(U) == 0 or len(G) == 0:
+        return np.zeros(len(U), dtype=np.float32)
+
+    n_u = len(U)
+    n_g = len(G)
+    # Estimate batch size so (batch_size * n_g * 4 bytes) <= max_batch_mem_bytes
+    item_bytes = max(1, n_g * 4)  # float32 = 4 bytes
+    batch_size = max(50, min(5000, max_batch_mem_bytes // item_bytes))
+
+    # Pre-cast to float32 contiguous array
+    G_T = np.ascontiguousarray(G.T, dtype=np.float32)
+    results = np.empty(n_u, dtype=np.float32)
+
+    for i in range(0, n_u, batch_size):
+        u_batch = np.ascontiguousarray(U[i : i + batch_size], dtype=np.float32)
+        sim_batch = u_batch @ G_T
+        results[i : i + batch_size] = np.max(sim_batch, axis=1)
+
+    return results
 
 
 # ==============================================================================
@@ -121,9 +157,10 @@ def evaluate_skipping_leverage(
     """
     def norm(x: np.ndarray) -> np.ndarray:
         if len(x) == 0:
-            return x
-        norms = np.linalg.norm(x, axis=1, keepdims=True)
-        return x / np.clip(norms, 1e-12, None)
+            return np.empty((0, 0), dtype=np.float32)
+        arr = np.asarray(x, dtype=np.float32)
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        return arr / np.clip(norms, 1e-12, None)
 
     G = norm(graph_embeddings)
     U_parent = norm(parent_chunk_embeddings)
@@ -133,10 +170,10 @@ def evaluate_skipping_leverage(
     n_s = len(U_skipped)
     n_total = n_p + n_s
 
-    # Max similarity to G for both sets
+    # Max similarity to G for both sets using memory-safe batched projection
     if len(G) > 0:
-        sim_parent = np.max(U_parent @ G.T, axis=1) if n_p > 0 else np.array([], dtype=np.float32)
-        sim_skipped = np.max(U_skipped @ G.T, axis=1) if n_s > 0 else np.array([], dtype=np.float32)
+        sim_parent = compute_max_cosine_sim_batched(U_parent, G) if n_p > 0 else np.array([], dtype=np.float32)
+        sim_skipped = compute_max_cosine_sim_batched(U_skipped, G) if n_s > 0 else np.array([], dtype=np.float32)
     else:
         sim_parent = np.zeros(n_p, dtype=np.float32)
         sim_skipped = np.zeros(n_s, dtype=np.float32)
@@ -188,6 +225,8 @@ def evaluate_graph_space(
     Returns:
         Dict matching GraphSpaceMetrics schema.
     """
+    check_memory_limit(context="evaluate_graph_space_start")
+
     if len(graph_embeddings) == 0 or len(universe_embeddings) == 0:
         return {
             "nodes_count": len(graph_embeddings),
@@ -210,24 +249,19 @@ def evaluate_graph_space(
             "compression_leverage_factor": None,
         }
 
-    # 1. Enforce L2 unit-norm for cosine dot products
+    # 1. Enforce L2 unit-norm for cosine dot products in float32
     def normalize(x: np.ndarray) -> np.ndarray:
-        norms = np.linalg.norm(x, axis=1, keepdims=True)
-        return x / np.clip(norms, 1e-12, None)
+        arr = np.asarray(x, dtype=np.float32)
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        return arr / np.clip(norms, 1e-12, None)
 
     U = normalize(universe_embeddings)
     G = normalize(graph_embeddings)
     n_nodes = len(G)
     n_universe = len(U)
 
-    # 2. Pairwise Cosine Projection (chunked to prevent OOM on large corpora)
-    max_sims_list: List[np.ndarray] = []
-    for i in range(0, n_universe, batch_size):
-        u_batch = U[i : i + batch_size]
-        sim_batch = u_batch @ G.T
-        max_sims_list.append(np.max(sim_batch, axis=1))
-
-    max_sims = np.concatenate(max_sims_list) if max_sims_list else np.zeros(n_universe)
+    # 2. Pairwise Cosine Projection (memory-bounded in float32 batches)
+    max_sims = compute_max_cosine_sim_batched(U, G, max_batch_mem_bytes=64 * 1024 * 1024)
 
     # 3. Distributional Metrics (Chamfer, Variance, Percentiles)
     chamfer_mean = float(np.mean(max_sims))
@@ -242,10 +276,28 @@ def evaluate_graph_space(
 
     # 5. Vendi Diversity Score (Effective Independent Concept Modes)
     # Kernel: linear dot-product shifted to [0, 1] PSD range: K_ij = (1 + G_i . G_j) / 2
+    # Dual Spectral Formulation:
+    # When n_nodes > D + 1, the non-zero eigenvalues of (1/M) K are IDENTICAL to the non-zero
+    # eigenvalues of the dual Gram matrix C = (1/2) * [[1, mean_g^T], [mean_g, (1/M) G^T G]] of size (D+1, D+1).
+    # This bounds memory strictly to min(M, D+1)^2 floats (< 5 MB for D=768) instead of allocating an
+    # (M x M) matrix which requires tens of gigabytes when M >= 30,000.
     if n_nodes > 1:
-        K = (1.0 + (G @ G.T)) / 2.0
-        K_norm = K / n_nodes
-        eigenvalues = np.linalg.eigvalsh(K_norm)
+        dim = G.shape[1] if G.ndim > 1 else 1
+        if n_nodes > dim + 1:
+            mean_g = np.mean(G, axis=0, dtype=np.float64)
+            C = np.empty((dim + 1, dim + 1), dtype=np.float64)
+            C[0, 0] = 1.0
+            C[0, 1:] = mean_g
+            C[1:, 0] = mean_g
+            # Compute G^T G in float64
+            C[1:, 1:] = (G.T.astype(np.float64) @ G.astype(np.float64)) / n_nodes
+            C *= 0.5
+            eigenvalues = np.linalg.eigvalsh(C)
+        else:
+            K = (1.0 + (G @ G.T)) / 2.0
+            K_norm = K / n_nodes
+            eigenvalues = np.linalg.eigvalsh(K_norm)
+
         # Numerical guard: zero out tiny or negative eigenvalues due to floating-point noise
         eigenvalues = eigenvalues[eigenvalues > 1e-10]
         vendi_score = float(np.exp(-np.sum(eigenvalues * np.log(eigenvalues))))
@@ -291,6 +343,9 @@ def evaluate_graph_space(
         s_retention_val = None
         gen_surplus_val = None
         comp_lev_val = None
+
+    check_memory_limit(context="evaluate_graph_space_finish")
+    cleanup_memory()
 
     return {
         "nodes_count": n_nodes,
@@ -527,7 +582,7 @@ def extract_concept_embeddings(store: ConceptGraphStore) -> Tuple[List[str], np.
     Extracts all Idea/Concept node IDs and their stored vector embeddings.
     """
     names: List[str] = []
-    vectors: List[List[float]] = []
+    vec_arrays: List[np.ndarray] = []
 
     for node_id, attrs in store.graph.nodes(data=True):
         ntype = attrs.get("type", "")
@@ -537,12 +592,12 @@ def extract_concept_embeddings(store: ConceptGraphStore) -> Tuple[List[str], np.
             if isinstance(emb, (list, tuple, np.ndarray)) and len(emb) > 1:
                 clean_name = attrs.get("name") or str(node_id).replace("concept:", "")
                 names.append(str(clean_name))
-                vectors.append([float(x) for x in emb])
+                vec_arrays.append(np.asarray(emb, dtype=np.float32))
 
-    if not vectors:
+    if not vec_arrays:
         return names, np.empty((0, 0), dtype=np.float32)
 
-    return names, np.array(vectors, dtype=np.float32)
+    return names, np.vstack(vec_arrays)
 
 
 def extract_chunk_embeddings(store: ConceptGraphStore) -> Tuple[List[str], np.ndarray]:
@@ -550,7 +605,7 @@ def extract_chunk_embeddings(store: ConceptGraphStore) -> Tuple[List[str], np.nd
     Extracts all Chunk node IDs and their stored vector embeddings.
     """
     chunk_ids: List[str] = []
-    vectors: List[List[float]] = []
+    vec_arrays: List[np.ndarray] = []
 
     for node_id, attrs in store.graph.nodes(data=True):
         if attrs.get("type") == "Chunk":
@@ -558,12 +613,12 @@ def extract_chunk_embeddings(store: ConceptGraphStore) -> Tuple[List[str], np.nd
             if isinstance(emb, (list, tuple, np.ndarray)) and len(emb) > 1:
                 cid = attrs.get("chunk_id") or str(node_id).replace("chunk:", "")
                 chunk_ids.append(str(cid))
-                vectors.append([float(x) for x in emb])
+                vec_arrays.append(np.asarray(emb, dtype=np.float32))
 
-    if not vectors:
+    if not vec_arrays:
         return chunk_ids, np.empty((0, 0), dtype=np.float32)
 
-    return chunk_ids, np.array(vectors, dtype=np.float32)
+    return chunk_ids, np.vstack(vec_arrays)
 
 
 def ensure_graph_embeddings(
@@ -655,29 +710,40 @@ def run_graph_space_comparison(
     cids_a, u1_mat = extract_chunk_embeddings(store_a)
     cids_b, u2_mat = extract_chunk_embeddings(store_b)
 
-    # Form unified universe chunks (deduplicated by chunk_id)
+    # Form unified universe chunks (deduplicated by chunk_id) with zero-copy numpy slicing
     seen_cids = set()
-    combined_u: List[List[float]] = []
     combined_cids: List[str] = []
+    keep_indices_a: List[int] = []
 
-    for cid, vec in zip(cids_a, u1_mat):
+    for idx, cid in enumerate(cids_a):
         if cid not in seen_cids:
             seen_cids.add(cid)
             combined_cids.append(cid)
-            combined_u.append(vec.tolist())
+            keep_indices_a.append(idx)
 
-    for cid, vec in zip(cids_b, u2_mat):
+    keep_indices_b: List[int] = []
+    for idx, cid in enumerate(cids_b):
         if cid not in seen_cids:
             seen_cids.add(cid)
             combined_cids.append(cid)
-            combined_u.append(vec.tolist())
+            keep_indices_b.append(idx)
 
-    if not combined_u:
-        # Fallback to store A or store B
-        u_arr = u1_mat if len(u1_mat) > 0 else u2_mat
-        combined_cids = cids_a if len(cids_a) > 0 else cids_b
+    parts: List[np.ndarray] = []
+    if keep_indices_a and len(u1_mat) > 0:
+        parts.append(u1_mat[keep_indices_a])
+    if keep_indices_b and len(u2_mat) > 0:
+        parts.append(u2_mat[keep_indices_b])
+
+    if parts:
+        u_arr = np.vstack(parts).astype(np.float32)
+    elif len(u1_mat) > 0:
+        u_arr = u1_mat
+        combined_cids = cids_a
+    elif len(u2_mat) > 0:
+        u_arr = u2_mat
+        combined_cids = cids_b
     else:
-        u_arr = np.array(combined_u, dtype=np.float32)
+        u_arr = np.empty((0, 0), dtype=np.float32)
 
     if len(u_arr) == 0:
         raise ValueError("No chunk embeddings found in either Graph A or Graph B to construct universe.")

@@ -1708,14 +1708,20 @@ def test_build_graph_limit_candidate_bounding(tmp_path):
 
     mock_concept = Concept(name="Concept Alpha", category="Idea", summary="Alpha idea", weight=5, related_concepts=[])
 
-    with patch("bookeeper.processing.extractor.ChatOllama") as mock_chat_cls, \
+    with patch("langchain_ollama.ChatOllama") as mock_chat_cls, \
+         patch("bookeeper.processing.extractor.ChatOllama") as mock_chat_cls_ext, \
+         patch("bookeeper.processing.extractor.KnowledgeExtractor.extract_chunks") as mock_extract, \
          patch("bookeeper.calibre.parser.BookParser.parse") as mock_parse, \
          patch("bookeeper.calibre.parser.BookParser.is_graphical_format", return_value=False):
 
         mock_parse.return_value = [Section(title="Ch 1", chapter_idx=1, text="Alpha text content " * 10)]
+        mock_extract.side_effect = lambda chunks, **kwargs: {
+            c.chunk_id: SectionExtraction(concepts=[mock_concept]) for c in chunks
+        }
         mock_inst = MagicMock()
         mock_inst.with_structured_output.return_value.invoke.return_value = SectionExtraction(concepts=[mock_concept])
         mock_chat_cls.return_value = mock_inst
+        mock_chat_cls_ext.return_value = mock_inst
 
         res = runner.invoke(
             app,

@@ -18,6 +18,7 @@ from bookeeper.calibre.parser import BookParser
 from bookeeper.config import Settings
 from bookeeper.processing.extractor import Concept
 from bookeeper.processing.ollama_pool import (
+    DaemonThreadPoolExecutor,
     FailoverOllamaEmbeddings,
     format_idea_for_embedding,
     partition_texts_for_embedding,
@@ -499,7 +500,7 @@ class EntityDeduplicator:
                         f"Disambiguating {total_disambig} probable idea match(es) via LLM",
                     )
                 done_disambig = 0
-                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                with DaemonThreadPoolExecutor(max_workers=max_workers) as ex:
                     fut_to_key = {
                         ex.submit(self._ask_llm_disambiguation, b_match, inc_c, b_sim): p_key
                         for p_key, (b_match, inc_c, b_sim) in pending_disambiguations.items()

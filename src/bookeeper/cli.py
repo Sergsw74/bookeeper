@@ -75,6 +75,7 @@ from bookeeper.processing.recent_ideas import (
     sort_books_chronologically,
 )
 from bookeeper.processing.ollama_pool import (
+    DaemonThreadPoolExecutor,
     FailoverOllamaEmbeddings,
     OllamaPool,
     aggregate_server_statistics,
@@ -131,22 +132,6 @@ app = typer.Typer(
 console = Console()
 logger = logging.getLogger(__name__)
 
-
-class DaemonThreadPoolExecutor(ThreadPoolExecutor):
-    """ThreadPoolExecutor that creates daemon threads so cancellation terminates immediately without hanging."""
-
-    def _adjust_thread_count(self):
-        orig_thread = threading.Thread
-
-        def _daemon_thread(*args, **kwargs):
-            kwargs["daemon"] = True
-            return orig_thread(*args, **kwargs)
-
-        threading.Thread = _daemon_thread
-        try:
-            super()._adjust_thread_count()
-        finally:
-            threading.Thread = orig_thread
 
 
 def format_eta_min_sec(seconds: Optional[float]) -> str:
@@ -1419,6 +1404,7 @@ def clean_metadata(
                 f"[bold yellow]Metadata cleaning stopped by user.[/bold yellow] "
                 f"Successfully completed before cancel: [bold green]{success_count}[/bold green] book(s)."
             )
+            raise typer.Exit(code=130)
         else:
             summary_text = f"[bold green]Metadata cleaning finished.[/bold green] Completed: [bold green]{success_count}[/bold green]"
             if skipped_graphical_count > 0:
@@ -3020,8 +3006,13 @@ def build_graph(
                         worker_futures = [
                             chunk_executor.submit(_chunk_worker) for _ in range(pool_concurrency)
                         ]
-                        for f in worker_futures:
-                            f.result()
+                        while not abort_event.is_set() and any(not f.done() for f in worker_futures):
+                            try:
+                                for f in worker_futures:
+                                    if not f.done():
+                                        f.result(timeout=0.15)
+                            except (concurrent.futures.TimeoutError, TimeoutError):
+                                pass
 
                     except KeyboardInterrupt:
                         abort_event.set()
@@ -3029,10 +3020,6 @@ def build_graph(
                         for f in worker_futures:
                             f.cancel()
                         chunk_executor.shutdown(wait=False, cancel_futures=True)
-                        import concurrent.futures.thread
-                        with concurrent.futures.thread._global_shutdown_lock:
-                            for t in list(chunk_executor._threads):
-                                concurrent.futures.thread._threads_queues.pop(t, None)
                         if book_state is not None:
                             book_state.data["stacked_chunks"] = {}
                             if book_state.data.get("status") != "fully_indexed":
@@ -3536,46 +3523,47 @@ def build_graph(
                     console.print(f"[bold red]✗ Idea Postprocessor failed:[/bold red] {e}")
 
             store.save(graph_file, link_chunks=False)
-            final_clean = should_clean and not has_cleaned
-            try:
-                obs = ObsidianExporter(vault_dest)
-                obs.export(store, clean=final_clean)
-            except Exception as e:
-                console.print(f"[bold yellow]⚠ Obsidian export skipped or incomplete:[/bold yellow] {e}")
-
-            try:
-                gml = GraphMLExporter(graphml_dest)
-                gml.export(store)
-            except Exception as e:
-                console.print(f"[bold yellow]⚠ GraphML export skipped or incomplete:[/bold yellow] {e}")
-
-            should_export_neo4j = cfg.neo4j.enabled if export_neo4j is None else export_neo4j
-            neo_clean = final_clean or (cfg.neo4j.clean_export and not has_cleaned_neo4j)
-            if should_export_neo4j and (neo_clean or store.has_dirty_changes()):
+            if not interrupted:
+                final_clean = should_clean and not has_cleaned
                 try:
-                    console.print(
-                        "\n[bold cyan]Exporting Affected Knowledge Graph Nodes to Neo4j...[/bold cyan]"
-                        if not neo_clean
-                        else "\n[bold cyan]Exporting Knowledge Graph to Neo4j...[/bold cyan]"
-                    )
-                    neo_exp = Neo4jExporter.from_config(cfg.neo4j)
-                    res = neo_exp.export(
-                        store,
-                        clean=neo_clean,
-                        only_affected=not neo_clean,
-                        show_progress=True,
-                        console=console,
-                    )
-                    clean_msg = f" (clean start: purged {res['cleaned_nodes']} previous nodes)" if res.get("clean_start") else ""
-                    console.print(
-                        f"[bold green]✓ Neo4j Export Complete{clean_msg}:[/bold green] "
-                        f"{res['nodes_upserted']} nodes, {res['edges_upserted']} relationships "
-                        f"in database '{res['database']}' at {res['uri']}."
-                    )
+                    obs = ObsidianExporter(vault_dest)
+                    obs.export(store, clean=final_clean)
                 except Exception as e:
-                    console.print(f"[bold red]✗ Failed to export to Neo4j:[/bold red] {e}")
+                    console.print(f"[bold yellow]⚠ Obsidian export skipped or incomplete:[/bold yellow] {e}")
 
-        if durations:
+                try:
+                    gml = GraphMLExporter(graphml_dest)
+                    gml.export(store)
+                except Exception as e:
+                    console.print(f"[bold yellow]⚠ GraphML export skipped or incomplete:[/bold yellow] {e}")
+
+                should_export_neo4j = cfg.neo4j.enabled if export_neo4j is None else export_neo4j
+                neo_clean = final_clean or (cfg.neo4j.clean_export and not has_cleaned_neo4j)
+                if should_export_neo4j and (neo_clean or store.has_dirty_changes()):
+                    try:
+                        console.print(
+                            "\n[bold cyan]Exporting Affected Knowledge Graph Nodes to Neo4j...[/bold cyan]"
+                            if not neo_clean
+                            else "\n[bold cyan]Exporting Knowledge Graph to Neo4j...[/bold cyan]"
+                        )
+                        neo_exp = Neo4jExporter.from_config(cfg.neo4j)
+                        res = neo_exp.export(
+                            store,
+                            clean=neo_clean,
+                            only_affected=not neo_clean,
+                            show_progress=True,
+                            console=console,
+                        )
+                        clean_msg = f" (clean start: purged {res['cleaned_nodes']} previous nodes)" if res.get("clean_start") else ""
+                        console.print(
+                            f"[bold green]✓ Neo4j Export Complete{clean_msg}:[/bold green] "
+                            f"{res['nodes_upserted']} nodes, {res['edges_upserted']} relationships "
+                            f"in database '{res['database']}' at {res['uri']}."
+                        )
+                    except Exception as e:
+                        console.print(f"[bold red]✗ Failed to export to Neo4j:[/bold red] {e}")
+
+        if durations and not interrupted:
             avg_s, p80_s, p18_s, fastest_s = _calc_stats()
             console.print(
                 f"\n[bold cyan]Concept Extraction Performance:[/bold cyan] "
@@ -3586,18 +3574,19 @@ def build_graph(
                 f"[dim](across {len(durations)} extracted chunk tasks)[/dim]"
             )
 
-        pools_to_report = [extractor.pool]
-        if hasattr(embeddings, "pool") and getattr(embeddings, "pool", None) is not extractor.pool:
-            pools_to_report.append(embeddings.pool)
-        _print_ollama_server_stats(pools_to_report, console=console)
+        if not interrupted:
+            pools_to_report = [extractor.pool]
+            if hasattr(embeddings, "pool") and getattr(embeddings, "pool", None) is not extractor.pool:
+                pools_to_report.append(embeddings.pool)
+            _print_ollama_server_stats(pools_to_report, console=console)
 
         if interrupted:
             console.print(
                 f"[bold yellow]Graph build stopped by user.[/bold yellow] "
                 f"Completed in this session: [bold green]{completed_in_session}[/bold green] book(s). "
-                f"Knowledge graph checkpoint and Obsidian vault preserved."
+                f"Knowledge graph checkpoint preserved at {graph_file}. (Exporters skipped due to cancellation)"
             )
-            raise typer.Exit(code=0)
+            raise typer.Exit(code=130)
 
     # Persist graph to JSON and exports
     console.print(f"\n[bold green]✓ Knowledge Graph persisted to:[/bold green] {graph_file}")
@@ -6807,133 +6796,145 @@ def rebuild_graph_command(
     total_rebuilt_chunks = 0
     total_rebuilt_concepts = 0
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold cyan]{task.description}[/bold cyan]"),
-        BarColumn(),
-        TaskProgressColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        StepRemainingColumn(),
-        console=console,
-    ) as progress:
-        rebuild_task = progress.add_task(
-            "Rebuilding Knowledge Graph...",
-            total=len(candidate_states),
-            completed=0,
-            eta_str="--m --s",
-        )
+    interrupted = False
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]{task.description}[/bold cyan]"),
+            BarColumn(),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            StepRemainingColumn(),
+            console=console,
+        ) as progress:
+            rebuild_task = progress.add_task(
+                "Rebuilding Knowledge Graph...",
+                total=len(candidate_states),
+                completed=0,
+                eta_str="--m --s",
+            )
 
-        for bid, sf, s_data, extracted_count in candidate_states:
-            btitle = BookParser.repair_mojibake(s_data.get("book_title", f"Book {bid}"))
-            bauthor = authors_by_id.get(bid) or "Unknown"
-            progress.update(rebuild_task, description=f"Rebuilding Book #{bid} ('{btitle[:20]}')...")
+            for bid, sf, s_data, extracted_count in candidate_states:
+                btitle = BookParser.repair_mojibake(s_data.get("book_title", f"Book {bid}"))
+                bauthor = authors_by_id.get(bid) or "Unknown"
+                progress.update(rebuild_task, description=f"Rebuilding Book #{bid} ('{btitle[:20]}')...")
 
-            # Load chunks
-            chunks = chunk_store.load_chunks(bid) if chunk_store.has_chunks(bid) else []
-            chunks_map = {c.chunk_id: c for c in chunks}
+                # Load chunks
+                chunks = chunk_store.load_chunks(bid) if chunk_store.has_chunks(bid) else []
+                chunks_map = {c.chunk_id: c for c in chunks}
 
-            processed = s_data.get("processed_chunks", {})
-            extracted_items = [v for v in processed.values() if v.get("status") == "extracted"]
-            extracted_items.sort(key=lambda x: x.get("chunk_idx", 0))
+                processed = s_data.get("processed_chunks", {})
+                extracted_items = [v for v in processed.values() if v.get("status") == "extracted"]
+                extracted_items.sort(key=lambda x: x.get("chunk_idx", 0))
 
-            rebuild_pubdate = s_data.get("publication_date")
-            store.add_book(bid, title=btitle, author=bauthor, publication_date=rebuild_pubdate)
+                rebuild_pubdate = s_data.get("publication_date")
+                store.add_book(bid, title=btitle, author=bauthor, publication_date=rebuild_pubdate)
 
-            for res in extracted_items:
-                chk_id = res["chunk_id"]
-                chk = chunks_map.get(chk_id)
-                if not chk:
-                    chk = HierarchicalChunk(
-                        chunk_id=chk_id,
+                for res in extracted_items:
+                    chk_id = res["chunk_id"]
+                    chk = chunks_map.get(chk_id)
+                    if not chk:
+                        chk = HierarchicalChunk(
+                            chunk_id=chk_id,
+                            book_id=bid,
+                            book_title=btitle,
+                            section_title=res.get("section_title", "Section"),
+                            chapter_idx=1,
+                            chunk_idx=res.get("chunk_idx", 1),
+                            text="",
+                        )
+                    total_rebuilt_chunks += 1
+                    sec_node_id = store.add_section(
                         book_id=bid,
-                        book_title=btitle,
-                        section_title=res.get("section_title", "Section"),
-                        chapter_idx=1,
-                        chunk_idx=res.get("chunk_idx", 1),
-                        text="",
+                        chapter_idx=chk.chapter_idx,
+                        title=chk.section_title,
+                        text=chk.text,
                     )
-                total_rebuilt_chunks += 1
-                sec_node_id = store.add_section(
-                    book_id=bid,
-                    chapter_idx=chk.chapter_idx,
-                    title=chk.section_title,
-                    text=chk.text,
-                )
-                store.add_chunk(chk)
+                    store.add_chunk(chk)
 
-                extraction = res.get("extraction", {})
-                for c_dict in extraction.get("concepts", []):
-                    try:
-                        concept = Concept(**c_dict)
-                    except Exception:
-                        continue
-                    canonical_concept = deduplicator.resolve_concept(concept) if deduplicator else concept
-                    store.add_concept(canonical_concept)
-                    store.add_book_idea_link(book_id=bid, concept_name=canonical_concept.name)
-                    total_rebuilt_concepts += 1
+                    extraction = res.get("extraction", {})
+                    for c_dict in extraction.get("concepts", []):
+                        try:
+                            concept = Concept(**c_dict)
+                        except Exception:
+                            continue
+                        canonical_concept = deduplicator.resolve_concept(concept) if deduplicator else concept
+                        store.add_concept(canonical_concept)
+                        store.add_book_idea_link(book_id=bid, concept_name=canonical_concept.name)
+                        total_rebuilt_concepts += 1
 
-                    local_brief = (concept.brief_description or "").strip()
-                    local_detailed = (concept.detailed_explanation or "").strip()
-                    is_grounded, valid_quote = validate_concept_chunk_grounding(
-                        concept_name=canonical_concept.name,
-                        supporting_quote=concept.supporting_quote,
-                        chunk_text=chk.text,
-                        brief_description=local_brief or local_detailed,
+                        local_brief = (concept.brief_description or "").strip()
+                        local_detailed = (concept.detailed_explanation or "").strip()
+                        is_grounded, valid_quote = validate_concept_chunk_grounding(
+                            concept_name=canonical_concept.name,
+                            supporting_quote=concept.supporting_quote,
+                            chunk_text=chk.text,
+                            brief_description=local_brief or local_detailed,
+                        )
+                        if is_grounded:
+                            store.add_idea_support_link(
+                                concept_name=canonical_concept.name,
+                                chunk=chk,
+                                quote=valid_quote,
+                                brief_description=local_brief,
+                                detailed_explanation=local_detailed,
+                            )
+                            store.add_section_concept_link(
+                                section_node_id=sec_node_id,
+                                concept_name=canonical_concept.name,
+                                summary=concept.summary,
+                                quote=valid_quote,
+                            )
+                        for rel_name in canonical_concept.related_concepts:
+                            store.add_concept_relation(
+                                src_concept_name=canonical_concept.name,
+                                tgt_concept_name=rel_name,
+                            )
+
+                # Link sequential chunks
+                store.link_sequential_chunks(book_id=bid)
+
+                # Mark state in tracker
+                total_expected = s_data.get("total_chunks", len(chunks))
+                failed_chunks = len(s_data.get("failed_chunks", []))
+                if failed_chunks == 0 and len(extracted_items) >= total_expected and total_expected > 0:
+                    tracker.mark_completed(
+                        "build_graph",
+                        bid,
+                        title=btitle,
+                        metadata={"indexing_status": "fully_indexed", "total_chunks": total_expected},
                     )
-                    if is_grounded:
-                        store.add_idea_support_link(
-                            concept_name=canonical_concept.name,
-                            chunk=chk,
-                            quote=valid_quote,
-                            brief_description=local_brief,
-                            detailed_explanation=local_detailed,
-                        )
-                        store.add_section_concept_link(
-                            section_node_id=sec_node_id,
-                            concept_name=canonical_concept.name,
-                            summary=concept.summary,
-                            quote=valid_quote,
-                        )
-                    for rel_name in canonical_concept.related_concepts:
-                        store.add_concept_relation(
-                            src_concept_name=canonical_concept.name,
-                            tgt_concept_name=rel_name,
-                        )
+                else:
+                    tracker.mark_partially_indexed(
+                        "build_graph",
+                        bid,
+                        title=btitle,
+                        failed_chunks=failed_chunks,
+                        total_chunks=total_expected,
+                    )
 
-            # Link sequential chunks
-            store.link_sequential_chunks(book_id=bid)
-
-            # Mark state in tracker
-            total_expected = s_data.get("total_chunks", len(chunks))
-            failed_chunks = len(s_data.get("failed_chunks", []))
-            if failed_chunks == 0 and len(extracted_items) >= total_expected and total_expected > 0:
-                tracker.mark_completed(
-                    "build_graph",
-                    bid,
-                    title=btitle,
-                    metadata={"indexing_status": "fully_indexed", "total_chunks": total_expected},
-                )
-            else:
-                tracker.mark_partially_indexed(
-                    "build_graph",
-                    bid,
-                    title=btitle,
-                    failed_chunks=failed_chunks,
-                    total_chunks=total_expected,
-                )
-
-            rebuilt_books += 1
-            el_r = time.perf_counter() - t0
-            rate_r = (rebuilt_books / el_r) if el_r > 0 else 0.0
-            rem_r = ((len(candidate_states) - rebuilt_books) / rate_r) if rate_r > 0 and len(candidate_states) > rebuilt_books else 0.0
-            eta_r = format_eta_min_sec(rem_r) if rebuilt_books < len(candidate_states) else "0m 00s"
-            progress.update(rebuild_task, completed=rebuilt_books, eta_str=eta_r)
+                rebuilt_books += 1
+                el_r = time.perf_counter() - t0
+                rate_r = (rebuilt_books / el_r) if el_r > 0 else 0.0
+                rem_r = ((len(candidate_states) - rebuilt_books) / rate_r) if rate_r > 0 and len(candidate_states) > rebuilt_books else 0.0
+                eta_r = format_eta_min_sec(rem_r) if rebuilt_books < len(candidate_states) else "0m 00s"
+                progress.update(rebuild_task, completed=rebuilt_books, eta_str=eta_r)
+    except KeyboardInterrupt:
+        interrupted = True
+        console.print("\n[bold yellow]Rebuild cancelled by user. Saving partial Knowledge Graph checkpoint...[/bold yellow]")
 
     elapsed = time.perf_counter() - t0
 
     # Save rebuilt graph
     store.save(graph_file)
+    if interrupted:
+        console.print(
+            f"[bold yellow]Knowledge graph rebuild stopped by user.[/bold yellow] "
+            f"Successfully reconstructed {rebuilt_books} book(s) into {graph_file}. (Exporters skipped due to cancellation)"
+        )
+        raise typer.Exit(code=130)
+
     obs = ObsidianExporter(vault_dest)
     obs.export(store, clean=False)
     gml = GraphMLExporter(graphml_dest)

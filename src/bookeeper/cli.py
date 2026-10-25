@@ -6264,14 +6264,27 @@ def ab_compare_command(
             bm = gs["baseline_metrics"]
             cm = gs["candidate_metrics"]
             gate_badge = "✅ PASS" if gs.get("decision_pass") else "❌ FAIL"
+            if (
+                gs.get("universe_chunks_count_a")
+                and gs.get("universe_chunks_count_b")
+                and gs["universe_chunks_count_a"] != gs["universe_chunks_count_b"]
+            ):
+                u_info = f"`{gs['universe_chunks_count_a']:,}` (Baseline A) / `{gs['universe_chunks_count_b']:,}` (Candidate B) literature chunks"
+            else:
+                u_info = f"`{gs.get('universe_chunks_count', 0):,}` literature chunks"
+
             md_lines.extend([
                 f"## 2. Knowledge Graph Embedding Space Evaluation (τ = {gs.get('tau', 0.75):.2f})",
                 f"",
                 f"- **Decision Gate Status:** **{gate_badge}** ({gs.get('pass_reason')})",
-                f"- **Universe Chunks:** `{gs.get('universe_chunks_count', 0):,}` literature chunks",
+                f"- **Universe Chunks:** {u_info}",
                 f"",
                 f"| Metric | Baseline ({bt_a.label}) | Candidate ({bt_b.label}) | Delta (B - A) | Operational Purpose |",
                 f"| :--- | :---: | :---: | :---: | :--- |",
+            ])
+            if bm.get("universe_chunks_count") and cm.get("universe_chunks_count") and bm["universe_chunks_count"] != cm["universe_chunks_count"]:
+                md_lines.append(f"| Corpus Chunks Evaluated (|U|) | {bm['universe_chunks_count']:,} | {cm['universe_chunks_count']:,} | {cm['universe_chunks_count'] - bm['universe_chunks_count']:+d} | Chunks in respective corpus space |")
+            md_lines.extend([
                 f"| Concept Nodes (|G|) | {bm['nodes_count']:,} | {cm['nodes_count']:,} | {gs['delta_nodes_count']:+d} | Total idea vertices |",
                 f"| Threshold Coverage (Cov_τ) | {bm['coverage_at_tau_pct']:.2f}% | {cm['coverage_at_tau_pct']:.2f}% | {gs['delta_coverage_at_tau_pct']:+.2f}% pts | Corpus reachable within radius τ |",
                 f"| Chamfer Mean (μ) | {bm['chamfer_mean']:.4f} | {cm['chamfer_mean']:.4f} | {gs['delta_chamfer_mean']:+.4f} | Expected semantic proximity |",

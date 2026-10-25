@@ -217,6 +217,40 @@ def test_run_graph_space_comparison_end_to_end(mock_stores_with_embeddings):
     assert report.universe_chunks_count == 10
 
 
+def test_run_graph_space_comparison_distinct_chunk_universes(mock_stores_with_embeddings):
+    """Verify each model evaluates against its own chunk set when chunk counts differ."""
+    store_a, store_b = mock_stores_with_embeddings
+
+    # Add extra chunks to store_b so store_a has 10 chunks, store_b has 13 chunks
+    for i in range(10, 13):
+        store_b.graph.add_node(
+            f"chunk:c_{i}",
+            type="Chunk",
+            chunk_id=f"c_{i}",
+            text=f"Unique chunk text {i}",
+            embedding=np.random.randn(32).tolist(),
+        )
+
+    report = run_graph_space_comparison(
+        store_a=store_a,
+        store_b=store_b,
+        tau=0.75,
+        label_a="Baseline A",
+        label_b="Candidate B",
+    )
+    assert report.universe_chunks_count_a == 10
+    assert report.universe_chunks_count_b == 13
+    assert report.baseline_metrics.universe_chunks_count == 10
+    assert report.candidate_metrics.universe_chunks_count == 13
+
+    # Format table and verify table displays separate N_A and N_B and Corpus Chunks row
+    tbl = format_graph_comparison_table(report)
+    assert "N_A = 10" in tbl.title
+    assert "N_B = 13" in tbl.title
+    cell_texts = [str(cell) for col in tbl.columns for cell in col._cells]
+    assert any("Corpus Chunks Evaluated (|U|)" in c for c in cell_texts)
+
+
 def test_cli_verify_mode_kg(tmp_path: Path, mock_stores_with_embeddings):
     """Verify `bookeeper verify --mode kg` executes from CLI."""
     store_a, _ = mock_stores_with_embeddings

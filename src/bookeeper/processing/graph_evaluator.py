@@ -90,11 +90,13 @@ class GraphSpaceMetrics(BaseModel):
 
 class GraphSpaceComparisonReport(BaseModel):
     """
-    A/B Comparative Benchmark Report comparing Baseline (A) vs Candidate (B) over a shared Universe.
+    A/B Comparative Benchmark Report comparing Baseline (A) vs Candidate (B) over their chunk Universes.
     """
 
     tau: float = 0.75
     universe_chunks_count: int
+    universe_chunks_count_a: Optional[int] = None
+    universe_chunks_count_b: Optional[int] = None
     label_a: str = "Baseline (A)"
     label_b: str = "Candidate (B)"
     baseline_metrics: GraphSpaceMetrics
@@ -383,13 +385,15 @@ def compare_graph_spaces(
     label_b: str = "Candidate (B)",
     parent_mask_a: Optional[np.ndarray] = None,
     parent_mask_b: Optional[np.ndarray] = None,
+    universe_embeddings_b: Optional[np.ndarray] = None,
 ) -> GraphSpaceComparisonReport:
     """
-    Evaluates and compares Baseline (G1) vs Candidate (G2) against a common Universe U
+    Evaluates and compares Baseline (G1) vs Candidate (G2) against their respective chunk Universes
     applying the multi-factor Practical Decision Matrix.
     """
+    u_b = universe_embeddings_b if universe_embeddings_b is not None else universe_embeddings
     raw_m1 = evaluate_graph_space(universe_embeddings, baseline_embeddings, tau=tau, parent_chunk_mask=parent_mask_a)
-    raw_m2 = evaluate_graph_space(universe_embeddings, candidate_embeddings, tau=tau, parent_chunk_mask=parent_mask_b)
+    raw_m2 = evaluate_graph_space(u_b, candidate_embeddings, tau=tau, parent_chunk_mask=parent_mask_b)
 
     m1 = GraphSpaceMetrics(**raw_m1)
     m2 = GraphSpaceMetrics(**raw_m2)
@@ -521,7 +525,9 @@ def compare_graph_spaces(
 
     return GraphSpaceComparisonReport(
         tau=tau,
-        universe_chunks_count=len(universe_embeddings),
+        universe_chunks_count=len(universe_embeddings) if universe_embeddings_b is None or len(universe_embeddings) == len(u_b) else len(u_b),
+        universe_chunks_count_a=len(universe_embeddings),
+        universe_chunks_count_b=len(u_b),
         label_a=label_a,
         label_b=label_b,
         baseline_metrics=m1,
@@ -710,42 +716,14 @@ def run_graph_space_comparison(
     cids_a, u1_mat = extract_chunk_embeddings(store_a)
     cids_b, u2_mat = extract_chunk_embeddings(store_b)
 
-    # Form unified universe chunks (deduplicated by chunk_id) with zero-copy numpy slicing
-    seen_cids = set()
-    combined_cids: List[str] = []
-    keep_indices_a: List[int] = []
+    if len(u1_mat) == 0 and len(u2_mat) > 0:
+        u1_mat = u2_mat
+        cids_a = cids_b
+    elif len(u2_mat) == 0 and len(u1_mat) > 0:
+        u2_mat = u1_mat
+        cids_b = cids_a
 
-    for idx, cid in enumerate(cids_a):
-        if cid not in seen_cids:
-            seen_cids.add(cid)
-            combined_cids.append(cid)
-            keep_indices_a.append(idx)
-
-    keep_indices_b: List[int] = []
-    for idx, cid in enumerate(cids_b):
-        if cid not in seen_cids:
-            seen_cids.add(cid)
-            combined_cids.append(cid)
-            keep_indices_b.append(idx)
-
-    parts: List[np.ndarray] = []
-    if keep_indices_a and len(u1_mat) > 0:
-        parts.append(u1_mat[keep_indices_a])
-    if keep_indices_b and len(u2_mat) > 0:
-        parts.append(u2_mat[keep_indices_b])
-
-    if parts:
-        u_arr = np.vstack(parts).astype(np.float32)
-    elif len(u1_mat) > 0:
-        u_arr = u1_mat
-        combined_cids = cids_a
-    elif len(u2_mat) > 0:
-        u_arr = u2_mat
-        combined_cids = cids_b
-    else:
-        u_arr = np.empty((0, 0), dtype=np.float32)
-
-    if len(u_arr) == 0:
+    if len(u1_mat) == 0:
         raise ValueError("No chunk embeddings found in either Graph A or Graph B to construct universe.")
     if len(g1_mat) == 0:
         raise ValueError(f"No concept embeddings found in Baseline ({label_a}).")
@@ -755,11 +733,11 @@ def run_graph_space_comparison(
     parent_cids_a = get_parent_chunk_ids(store_a)
     parent_cids_b = get_parent_chunk_ids(store_b)
 
-    parent_mask_a = np.array([cid in parent_cids_a for cid in combined_cids], dtype=bool) if parent_cids_a else None
-    parent_mask_b = np.array([cid in parent_cids_b for cid in combined_cids], dtype=bool) if parent_cids_b else None
+    parent_mask_a = np.array([cid in parent_cids_a for cid in cids_a], dtype=bool) if parent_cids_a else None
+    parent_mask_b = np.array([cid in parent_cids_b for cid in cids_b], dtype=bool) if parent_cids_b else None
 
     return compare_graph_spaces(
-        universe_embeddings=u_arr,
+        universe_embeddings=u1_mat,
         baseline_embeddings=g1_mat,
         candidate_embeddings=g2_mat,
         tau=tau,
@@ -767,6 +745,7 @@ def run_graph_space_comparison(
         label_b=label_b,
         parent_mask_a=parent_mask_a,
         parent_mask_b=parent_mask_b,
+        universe_embeddings_b=u2_mat,
     )
 
 
@@ -779,8 +758,17 @@ def format_graph_comparison_table(report: GraphSpaceComparisonReport) -> Table:
     """
     Renders the Comprehensive Metric Suite and Decision Matrix as a Rich Table.
     """
+    if (
+        report.universe_chunks_count_a
+        and report.universe_chunks_count_b
+        and report.universe_chunks_count_a != report.universe_chunks_count_b
+    ):
+        title = f"Knowledge Graph Embedding Space Comparison (τ = {report.tau:.2f}, N_A = {report.universe_chunks_count_a:,}, N_B = {report.universe_chunks_count_b:,} Chunks)"
+    else:
+        title = f"Knowledge Graph Embedding Space Comparison (τ = {report.tau:.2f}, N = {report.universe_chunks_count:,} Chunks)"
+
     tbl = Table(
-        title=f"Knowledge Graph Embedding Space Comparison (τ = {report.tau:.2f}, N = {report.universe_chunks_count:,} Chunks)",
+        title=title,
         border_style="cyan",
     )
     tbl.add_column("Metric", style="bold")
@@ -812,6 +800,14 @@ def format_graph_comparison_table(report: GraphSpaceComparisonReport) -> Table:
         return f"[{color}]{txt}[/{color}]"
 
     # Core Metric Rows
+    if m1.universe_chunks_count != m2.universe_chunks_count:
+        tbl.add_row(
+            "Corpus Chunks Evaluated (|U|)",
+            f"{m1.universe_chunks_count:,}",
+            f"{m2.universe_chunks_count:,}",
+            _delta_badge(m2.universe_chunks_count - m1.universe_chunks_count, decimals=0, higher_is_better=False),
+            "Total raw chunks in each model's corpus space",
+        )
     tbl.add_row(
         "Idea / Concept Nodes (|G|)",
         f"{m1.nodes_count:,}",

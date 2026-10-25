@@ -97,6 +97,18 @@ from bookeeper.processing.verifier import (
     export_verification_stats,
     export_verification_debug,
 )
+from bookeeper.processing.graph_evaluator import (
+    GraphSpaceComparisonReport,
+    GraphSpaceMetrics,
+    compare_graph_spaces,
+    evaluate_graph_space,
+    evaluate_skipping_leverage,
+    get_parent_chunk_ids,
+    format_graph_comparison_table,
+    format_graph_space_table,
+    run_graph_space_comparison,
+    run_graph_space_evaluation,
+)
 from bookeeper.backup import (
     clean_knowledge_artifacts,
     compare_knowledge_graphs,
@@ -4150,6 +4162,7 @@ def _execute_single_verification(
     debug: Optional[bool] = None,
     debug_output: Optional[str] = None,
     stats_output: Optional[str] = None,
+    tau: Optional[float] = None,
     cfg: Optional[Settings] = None,
 ) -> Optional[Dict[str, Any]]:
     """
@@ -4163,6 +4176,7 @@ def _execute_single_verification(
     book_id = _resolve_opt(book_id)
     all_books = _resolve_opt(all_books, False)
     threshold = _resolve_opt(threshold)
+    tau = _resolve_opt(tau)
     chunks_dir = _resolve_opt(chunks_dir)
     model = _resolve_opt(model)
     temperature = _resolve_opt(temperature)
@@ -4175,6 +4189,7 @@ def _execute_single_verification(
     debug = _resolve_opt(debug)
     debug_output = _resolve_opt(debug_output)
     stats_output = _resolve_opt(stats_output)
+    tau = _resolve_opt(tau)
 
     if cfg is None:
         cfg = _get_effective_settings(
@@ -5048,6 +5063,126 @@ def _execute_single_verification(
             for bt in temp_backup_targets:
                 bt.cleanup()
 
+    # Mode: 'graph' or 'kg' (Knowledge Graph Embedding Space Suite & Decision Matrix)
+    if effective_mode in ("graph", "kg", "graph-space", "graph_space"):
+        effective_tau = float(tau if tau is not None else 0.75)
+        temp_backup_targets: List[ResolvedBackupTarget] = []
+
+        try:
+            cand_path_a = Path(graph_file).expanduser().resolve() if graph_file else None
+            cand_path_b = Path(compare_graph).expanduser().resolve() if compare_graph else None
+
+            # Resolve archive formats
+            archive_suffixes = (".zip", ".7z", ".tar", ".gz", ".tgz")
+            target_graph_a: Optional[Path] = None
+            target_graph_b: Optional[Path] = None
+            branch_a_label = "Baseline (A)"
+            branch_b_label = "Candidate (B)"
+
+            if cand_path_a and cand_path_a.is_file() and any(cand_path_a.name.lower().endswith(s) for s in archive_suffixes):
+                bt_a = resolve_backup_target(cand_path_a, label_fallback="Baseline (A)")
+                temp_backup_targets.append(bt_a)
+                target_graph_a = bt_a.graph_file
+                branch_a_label = bt_a.label
+
+            if cand_path_b and cand_path_b.is_file() and any(cand_path_b.name.lower().endswith(s) for s in archive_suffixes):
+                bt_b = resolve_backup_target(cand_path_b, label_fallback="Candidate (B)")
+                temp_backup_targets.append(bt_b)
+                target_graph_b = bt_b.graph_file
+                branch_b_label = bt_b.label
+
+            # Check directory run resolution
+            if not target_graph_b and cand_path_b and cand_path_b.is_dir():
+                subdirs = sorted([p for p in cand_path_b.iterdir() if p.is_dir()])
+                cand_a = [p for p in subdirs if p.name.startswith("branch_A")]
+                cand_b = [p for p in subdirs if p.name.startswith("branch_B")]
+                if cand_a and cand_b:
+                    target_graph_a = cand_a[0] / "knowledge_graph.json"
+                    target_graph_b = cand_b[0] / "knowledge_graph.json"
+                    branch_a_label = cand_a[0].name.replace("branch_A_", "").replace("branch_A", "").strip("_") or cand_a[0].name
+                    branch_b_label = cand_b[0].name.replace("branch_B_", "").replace("branch_B", "").strip("_") or cand_b[0].name
+
+            if not target_graph_a:
+                if cand_path_a and cand_path_a.is_file():
+                    target_graph_a = cand_path_a
+                elif cand_path_a and cand_path_a.is_dir() and (cand_path_a / "knowledge_graph.json").is_file():
+                    target_graph_a = cand_path_a / "knowledge_graph.json"
+                else:
+                    default_kg = cfg.resolved_output_dir / "knowledge_graph.json"
+                    if default_kg.is_file():
+                        target_graph_a = default_kg
+
+            if not target_graph_b and cand_path_b:
+                if cand_path_b.is_file():
+                    target_graph_b = cand_path_b
+                elif cand_path_b and cand_path_b.is_dir() and (cand_path_b / "knowledge_graph.json").is_file():
+                    target_graph_b = cand_path_b / "knowledge_graph.json"
+
+            if not target_graph_a or not target_graph_a.is_file():
+                console.print(
+                    f"[bold red]Knowledge graph file not found at '{graph_file or cfg.resolved_output_dir}'.[/bold red]\n"
+                )
+                raise typer.Exit(1)
+
+            store_a = ConceptGraphStore()
+            with console.status(f"[bold cyan]Loading Graph A from {target_graph_a}...[/bold cyan]"):
+                store_a.load(target_graph_a)
+
+            # Initialize embeddings provider if needed
+            embeddings = None
+            try:
+                embedding_model_name = getattr(cfg, "embedding_model", "nomic-embed-text")
+                verifier_servers = cfg.resolved_verification_servers
+                pool = OllamaPool(servers=verifier_servers, cooldown_seconds=0, max_tasks_per_server=2)
+                embeddings = FailoverOllamaEmbeddings(model=embedding_model_name, pool=pool)
+            except Exception as e:
+                logger.debug(f"Could not initialize FailoverOllamaEmbeddings: {e}")
+
+            chunks_dir_resolved = Path(chunks_dir).expanduser().resolve() if chunks_dir else cfg.resolved_output_dir / "chunks"
+
+            if target_graph_b and target_graph_b.is_file():
+                # Comparative Mode (A/B)
+                store_b = ConceptGraphStore()
+                with console.status(f"[bold cyan]Loading Graph B from {target_graph_b}...[/bold cyan]"):
+                    store_b.load(target_graph_b)
+
+                with console.status(f"[bold cyan]Evaluating Graph Embedding Space Comparison (τ = {effective_tau:.2f})...[/bold cyan]"):
+                    kg_report = run_graph_space_comparison(
+                        store_a=store_a,
+                        store_b=store_b,
+                        tau=effective_tau,
+                        label_a=branch_a_label,
+                        label_b=branch_b_label,
+                        embeddings=embeddings,
+                        chunks_dir=chunks_dir_resolved,
+                        console=console,
+                    )
+                console.print(format_graph_comparison_table(kg_report))
+                report_dict = kg_report.model_dump()
+            else:
+                # Single Graph Evaluation Mode
+                with console.status(f"[bold cyan]Evaluating Graph Embedding Space (τ = {effective_tau:.2f})...[/bold cyan]"):
+                    metrics = run_graph_space_evaluation(
+                        store=store_a,
+                        tau=effective_tau,
+                        embeddings=embeddings,
+                        chunks_dir=chunks_dir_resolved,
+                        console=console,
+                    )
+                console.print(format_graph_space_table(metrics))
+                report_dict = metrics.model_dump()
+
+            # Save report
+            out_dest = Path(output_report) if output_report else cfg.resolved_output_dir / "graph_space_report.json"
+            out_dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_dest, "w", encoding="utf-8") as f:
+                json.dump(report_dict, f, indent=2, ensure_ascii=False)
+            console.print(f"[bold green]✓ Report saved to:[/bold green] [bold cyan]{out_dest}[/bold cyan]")
+            return report_dict
+        finally:
+            for bt in temp_backup_targets:
+                bt.cleanup()
+
     # Mode: 'ideas'
     target_graph_file = Path(graph_file).expanduser().resolve() if graph_file else cfg.resolved_output_dir / "knowledge_graph.json"
     temp_ideas_target: Optional[ResolvedBackupTarget] = None
@@ -5316,15 +5451,18 @@ def verify_command(
         None, "--percent", "-p", help="Percentage of ideas to randomly verify (default: 1.0 for 1%)."
     ),
     mode: Optional[str] = typer.Option(
-        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', 'chunk', or 'cross-check' (default: from config.yaml or 'ideas')."
+        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', 'chunk', 'cross-check', 'graph', or 'kg' (default: from config.yaml or 'ideas')."
     ),
     compare_graph: Optional[str] = typer.Option(
         None,
         "--compare-graph",
-        help="Path to A/B test result directory OR candidate knowledge_graph.json to compare against in cross-check mode.",
+        help="Path to A/B test result directory OR candidate knowledge_graph.json to compare against in cross-check or graph mode.",
     ),
     blocks: Optional[int] = typer.Option(
         None, "--blocks", help="Number of contiguous chunk blocks to audit in cross-check mode (default: 20)."
+    ),
+    tau: Optional[float] = typer.Option(
+        0.75, "--tau", help="Semantic proximity radius threshold for graph space coverage in 'graph'/'kg' mode (default: 0.75)."
     ),
     book_id: Optional[int] = typer.Option(
         None, "--book-id", "-b", help="Specific book ID to verify (in chunking mode)."
@@ -5410,6 +5548,7 @@ def verify_command(
     debug = _resolve_opt(debug)
     debug_output = _resolve_opt(debug_output)
     stats_output = _resolve_opt(stats_output)
+    tau = _resolve_opt(tau)
 
     cfg = _get_effective_settings(
         config_path=config_path,
@@ -5496,6 +5635,7 @@ def verify_command(
                 debug=v_debug,
                 debug_output=v_debug_file,
                 stats_output=v_stats,
+                tau=getattr(v, "tau", tau),
             )
             reports.append((v_mode, v_report, rep))
 
@@ -5559,6 +5699,7 @@ def verify_command(
         debug=debug,
         debug_output=debug_output,
         stats_output=stats_output,
+        tau=tau,
     )
 
 
@@ -5572,15 +5713,18 @@ def verifiers_command(
         None, "--percent", "-p", help="Percentage of ideas to randomly verify (default: 1.0 for 1%)."
     ),
     mode: Optional[str] = typer.Option(
-        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', 'chunk', or 'cross-check' (default: from config.yaml or 'ideas')."
+        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', 'chunk', 'cross-check', 'graph', or 'kg' (default: from config.yaml or 'ideas')."
     ),
     compare_graph: Optional[str] = typer.Option(
         None,
         "--compare-graph",
-        help="Path to A/B test result directory OR candidate knowledge_graph.json to compare against in cross-check mode.",
+        help="Path to A/B test result directory OR candidate knowledge_graph.json to compare against in cross-check or graph mode.",
     ),
     blocks: Optional[int] = typer.Option(
         None, "--blocks", help="Number of contiguous chunk blocks to audit in cross-check mode (default: 20)."
+    ),
+    tau: Optional[float] = typer.Option(
+        0.75, "--tau", help="Semantic proximity radius threshold for graph space coverage in 'graph'/'kg' mode (default: 0.75)."
     ),
     book_id: Optional[int] = typer.Option(
         None, "--book-id", "-b", help="Specific book ID to verify (in chunking mode)."
@@ -5667,7 +5811,12 @@ def ab_compare_command(
         "cross-check",
         "--mode",
         "-m",
-        help="Comparison mode: 'cross-check' (NLI adversarial QA probe audit), 'ideas' (factual grounding audit), or 'stats' (fast topological & entity metrics).",
+        help="Comparison mode: 'cross-check' (NLI adversarial QA probe audit), 'graph'/'kg' (semantic space coverage & Vendi diversity suite), 'ideas' (factual grounding audit), or 'stats' (fast topological & entity metrics).",
+    ),
+    tau: float = typer.Option(
+        0.75,
+        "--tau",
+        help="Semantic proximity radius threshold for graph space coverage in 'graph'/'kg' mode (default: 0.75).",
     ),
     blocks: int = typer.Option(
         20,
@@ -5874,6 +6023,36 @@ def ab_compare_command(
             final_report["decision_pass"] = sm.decision_pass
             final_report["pass_reason"] = sm.pass_reason
 
+        elif mode.lower() in ("graph", "kg", "graph-space", "graph_space"):
+            embeddings = None
+            try:
+                embedding_model_name = getattr(cfg, "embedding_model", "nomic-embed-text")
+                verifier_servers = cfg.resolved_verification_servers
+                pool = OllamaPool(servers=verifier_servers, cooldown_seconds=0, max_tasks_per_server=2)
+                embeddings = FailoverOllamaEmbeddings(model=embedding_model_name, pool=pool)
+            except Exception as e:
+                logger.debug(f"Could not initialize FailoverOllamaEmbeddings: {e}")
+
+            chunks_dir = cfg.resolved_output_dir / "chunks"
+
+            with console.status(f"[bold cyan]Evaluating Graph Embedding Space Comparison (τ = {tau:.2f})...[/bold cyan]"):
+                kg_report = run_graph_space_comparison(
+                    store_a=store_a,
+                    store_b=store_b,
+                    tau=tau,
+                    label_a=bt_a.label,
+                    label_b=bt_b.label,
+                    embeddings=embeddings,
+                    chunks_dir=chunks_dir,
+                    console=console,
+                )
+
+            console.print(format_graph_comparison_table(kg_report))
+
+            final_report["graph_space"] = kg_report.model_dump()
+            final_report["decision_pass"] = kg_report.decision_pass
+            final_report["pass_reason"] = kg_report.pass_reason
+
         # 4. Save JSON Report and Markdown
         report_dest = Path(output_report) if output_report else output_dir / "ab_compare_report.json"
         md_dest = report_dest.with_suffix(".md")
@@ -5914,6 +6093,60 @@ def ab_compare_command(
                 f"- **Calibrated Fidelity (R_calib):** Baseline: `{sm_cc.get('mean_old_calibrated_fidelity', 0)*100:.1f}%`, Candidate: `{sm_cc.get('mean_new_calibrated_fidelity', 0)*100:.1f}%` (Delta: `{sm_cc.get('mean_delta_calibrated_fidelity', sm_cc.get('delta_calibrated_fidelity', 0))*100:+.1f}% pts`)",
                 f"",
             ])
+        if "graph_space" in final_report:
+            gs = final_report["graph_space"]
+            bm = gs["baseline_metrics"]
+            cm = gs["candidate_metrics"]
+            gate_badge = "✅ PASS" if gs.get("decision_pass") else "❌ FAIL"
+            md_lines.extend([
+                f"## 2. Knowledge Graph Embedding Space Evaluation (τ = {gs.get('tau', 0.75):.2f})",
+                f"",
+                f"- **Decision Gate Status:** **{gate_badge}** ({gs.get('pass_reason')})",
+                f"- **Universe Chunks:** `{gs.get('universe_chunks_count', 0):,}` literature chunks",
+                f"",
+                f"| Metric | Baseline ({bt_a.label}) | Candidate ({bt_b.label}) | Delta (B - A) | Operational Purpose |",
+                f"| :--- | :---: | :---: | :---: | :--- |",
+                f"| Concept Nodes (|G|) | {bm['nodes_count']:,} | {cm['nodes_count']:,} | {gs['delta_nodes_count']:+d} | Total idea vertices |",
+                f"| Threshold Coverage (Cov_τ) | {bm['coverage_at_tau_pct']:.2f}% | {cm['coverage_at_tau_pct']:.2f}% | {gs['delta_coverage_at_tau_pct']:+.2f}% pts | Corpus reachable within radius τ |",
+                f"| Chamfer Mean (μ) | {bm['chamfer_mean']:.4f} | {cm['chamfer_mean']:.4f} | {gs['delta_chamfer_mean']:+.4f} | Expected semantic proximity |",
+                f"| Coverage Std Dev (σ) | {bm['chamfer_std']:.4f} | {cm['chamfer_std']:.4f} | {gs['delta_chamfer_std']:+.4f} | Regularity: lower is more uniform |",
+                f"| Worst-Decile (p10) | {bm['worst_decile_p10']:.4f} | {cm['worst_decile_p10']:.4f} | {gs['delta_worst_decile_p10']:+.4f} | Proximity of bottom 10% hardest chunks |",
+                f"| Median (p50) | {bm['median_p50']:.4f} | {cm['median_p50']:.4f} | {gs['delta_median_p50']:+.4f} | Robust central tendency |",
+                f"| Directed Hausdorff (dH) | {bm['worst_case_gap']:.4f} | {cm['worst_case_gap']:.4f} | {gs['delta_worst_case_gap']:+.4f} | Maximum blind spot (1 - min cos) |",
+                f"| Vendi Diversity Score | {bm['vendi_diversity_score']:.1f} | {cm['vendi_diversity_score']:.1f} | {gs['delta_vendi_diversity_score']:+.1f} | Effective orthogonal concept modes |",
+                f"| Compression Efficiency | {bm['coverage_per_node_efficiency']:.4f} | {cm['coverage_per_node_efficiency']:.4f} | {gs['delta_coverage_per_node_efficiency']:+.4f} | Corpus coverage % per node |",
+                f"| Concept Quality (Vendi/Node) | {bm['vendi_per_node']:.3f} | {cm['vendi_per_node']:.3f} | {gs['delta_vendi_per_node']:+.3f} | Information density per node |",
+            ])
+            if bm.get("parent_chunk_ratio_pct") is not None or cm.get("parent_chunk_ratio_pct") is not None:
+                d_pr = gs.get("delta_parent_chunk_ratio_pct")
+                d_sr = gs.get("delta_skipped_retention_pct")
+                d_gs = gs.get("delta_generalization_surplus_pct")
+                d_cl = gs.get("delta_compression_leverage_factor")
+                p_r_a = bm.get("parent_chunk_ratio_pct")
+                p_r_b = cm.get("parent_chunk_ratio_pct")
+                s_r_a = bm.get("skipped_retention_pct")
+                s_r_b = cm.get("skipped_retention_pct")
+                g_s_a = bm.get("generalization_surplus_pct")
+                g_s_b = cm.get("generalization_surplus_pct")
+                c_l_a = bm.get("compression_leverage_factor")
+                c_l_b = cm.get("compression_leverage_factor")
+                md_lines.extend([
+                    f"| Extraction Ratio (ρ_parent) | {p_r_a:.2f}% | {p_r_b:.2f}% | {d_pr:+.2f}% pts | Fraction of corpus compute spent on |" if p_r_a is not None and p_r_b is not None and d_pr is not None else "",
+                    f"| Skipped Retention (R_skipped) | {s_r_a:.2f}% | {s_r_b:.2f}% | {d_sr:+.2f}% pts | Bypassed chunks retained within radius τ |" if s_r_a is not None and s_r_b is not None and d_sr is not None else "",
+                    f"| Generalization Surplus (Δ_cov) | {g_s_a:+.2f}% pts | {g_s_b:+.2f}% pts | {d_gs:+.2f}% pts | Excess coverage gained over extraction ratio |" if g_s_a is not None and g_s_b is not None and d_gs is not None else "",
+                    f"| Compression Leverage (L_comp) | {c_l_a:.2f}x | {c_l_b:.2f}x | {d_cl:+.2f}x | Coverage multiplier per compute spent |" if c_l_a is not None and c_l_b is not None and d_cl is not None else "",
+                ])
+                md_lines = [line for line in md_lines if line]
+
+            md_lines.extend([
+                f"",
+                f"### Practical Decision Matrix Checklist",
+                f"",
+            ])
+            for k, gate in gs.get("gate_checklist", {}).items():
+                gb = "✅ PASS" if gate["passed"] else "❌ FAIL"
+                md_lines.append(f"- **{gate['name']}:** {gb} — {gate['details']} (Threshold: `{gate['threshold']}`)")
+            md_lines.append("")
         md_dest.write_text("\n".join(md_lines), encoding="utf-8")
 
         console.print(f"\n[bold green]✓ Comparative Report saved to:[/bold green] [bold cyan]{report_dest}[/bold cyan]")

@@ -1626,6 +1626,112 @@ class ABTestRunner:
         with open(dest, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
 
+    def graph_flow(
+        self,
+        src_dir_a: Path,
+        src_dir_b: Path,
+        tau: float = 0.75,
+    ) -> Path:
+        """Execute Knowledge Graph embedding space audit (Chamfer, Vendi, Hausdorff) comparing two graphs."""
+        log_header(f"A/B Testing Knowledge Graph Embedding Space Audit (τ = {tau:.2f})")
+        src_info = self.reverify_src_dir or getattr(self, "cross_check_src_dir", None) or "Direct Input"
+        print(f"• Source Archive:   {Colors.BOLD}{src_info}{Colors.RESET}")
+        print(f"• Output Archive:   {Colors.BOLD}{self.session_dir}{Colors.RESET}")
+        print(f"• Baseline (Old):   {Colors.BOLD}{self.branch1}{Colors.RESET}")
+        print(f"• Candidate (New):  {Colors.BOLD}{self.branch2}{Colors.RESET}")
+        print(f"• Semantic Radius:  {Colors.BOLD}τ = {tau:.2f}{Colors.RESET}")
+        print(f"• Repository Path:  {self.repo_dir}\n")
+
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        kg_a = src_dir_a / "knowledge_graph.json"
+        kg_b = src_dir_b / "knowledge_graph.json"
+
+        if not kg_a.is_file():
+            raise FileNotFoundError(f"Missing knowledge_graph.json in {src_dir_a}")
+        if not kg_b.is_file():
+            raise FileNotFoundError(f"Missing knowledge_graph.json in {src_dir_b}")
+
+        from bookeeper.graph.store import ConceptGraphStore
+        from bookeeper.processing.graph_evaluator import (
+            run_graph_space_comparison,
+            format_graph_comparison_table,
+        )
+        from rich.console import Console
+
+        store_a = ConceptGraphStore()
+        store_b = ConceptGraphStore()
+        store_a.load(kg_a)
+        store_b.load(kg_b)
+
+        console = Console()
+        rep_obj = run_graph_space_comparison(
+            store_a=store_a,
+            store_b=store_b,
+            tau=tau,
+            label_a=self.branch1,
+            label_b=self.branch2,
+            console=console,
+        )
+
+        console.print(format_graph_comparison_table(rep_obj))
+
+        report_data = rep_obj.model_dump()
+        json_out = self.session_dir / "graph_space_report.json"
+        with open(json_out, "w", encoding="utf-8") as f:
+            json.dump(report_data, f, indent=2, ensure_ascii=False)
+
+        md_out = self.session_dir / "graph_space_report.md"
+        lines = [
+            f"# 🔬 Knowledge Graph Embedding Space A/B Audit Report",
+            f"",
+            f"- **Mode:** `graph` / `kg` (Chamfer, Hausdorff & Vendi Spectral Diversity)",
+            f"- **Baseline:** `{self.branch1}`",
+            f"- **Candidate:** `{self.branch2}`",
+            f"- **Universe Chunks:** `{rep_obj.universe_chunks_count:,}`",
+            f"- **Decision Verdict:** **{'PASS' if rep_obj.decision_pass else 'FAIL'}** (`{rep_obj.pass_reason}`)",
+            f"",
+            f"### 📊 Embedding Space Metrics (τ = {tau:.2f})",
+            f"",
+            f"| Metric | Baseline ({self.branch1}) | Candidate ({self.branch2}) | Delta (B - A) | Operational Purpose |",
+            f"| :--- | :---: | :---: | :---: | :--- |",
+            f"| Concept Nodes (|G|) | {rep_obj.baseline_metrics.nodes_count:,} | {rep_obj.candidate_metrics.nodes_count:,} | {rep_obj.delta_nodes_count:+d} | Total idea vertices |",
+            f"| Threshold Coverage (Cov_τ) | {rep_obj.baseline_metrics.coverage_at_tau_pct:.2f}% | {rep_obj.candidate_metrics.coverage_at_tau_pct:.2f}% | {rep_obj.delta_coverage_at_tau_pct:+.2f}% pts | Reachable within radius τ |",
+            f"| Chamfer Mean (μ) | {rep_obj.baseline_metrics.chamfer_mean:.4f} | {rep_obj.candidate_metrics.chamfer_mean:.4f} | {rep_obj.delta_chamfer_mean:+.4f} | Expected semantic proximity |",
+            f"| Coverage Std Dev (σ) | {rep_obj.baseline_metrics.chamfer_std:.4f} | {rep_obj.candidate_metrics.chamfer_std:.4f} | {rep_obj.delta_chamfer_std:+.4f} | Regularity (lower is uniform) |",
+            f"| Worst-Decile (p10) | {rep_obj.baseline_metrics.worst_decile_p10:.4f} | {rep_obj.candidate_metrics.worst_decile_p10:.4f} | {rep_obj.delta_worst_decile_p10:+.4f} | Bottom 10% hardest chunks |",
+            f"| Median (p50) | {rep_obj.baseline_metrics.median_p50:.4f} | {rep_obj.candidate_metrics.median_p50:.4f} | {rep_obj.delta_median_p50:+.4f} | Robust centrality |",
+            f"| Directed Hausdorff (dH) | {rep_obj.baseline_metrics.worst_case_gap:.4f} | {rep_obj.candidate_metrics.worst_case_gap:.4f} | {rep_obj.delta_worst_case_gap:+.4f} | Maximum blind spot (1 - min cos) |",
+            f"| Vendi Diversity Score | {rep_obj.baseline_metrics.vendi_diversity_score:.1f} | {rep_obj.candidate_metrics.vendi_diversity_score:.1f} | {rep_obj.delta_vendi_diversity_score:+.1f} | Effective orthogonal concept modes |",
+            f"| Compression Efficiency | {rep_obj.baseline_metrics.coverage_per_node_efficiency:.4f} | {rep_obj.candidate_metrics.coverage_per_node_efficiency:.4f} | {rep_obj.delta_coverage_per_node_efficiency:+.4f} | Coverage % per node |",
+            f"| Concept Quality (Vendi/Node) | {rep_obj.baseline_metrics.vendi_per_node:.3f} | {rep_obj.candidate_metrics.vendi_per_node:.3f} | {rep_obj.delta_vendi_per_node:+.3f} | Information density per node |",
+        ]
+        bm = rep_obj.baseline_metrics
+        cm = rep_obj.candidate_metrics
+        if bm.parent_chunk_ratio_pct is not None or cm.parent_chunk_ratio_pct is not None:
+            if rep_obj.delta_parent_chunk_ratio_pct is not None and bm.parent_chunk_ratio_pct is not None and cm.parent_chunk_ratio_pct is not None:
+                lines.append(f"| Extraction Ratio (ρ_parent) | {bm.parent_chunk_ratio_pct:.2f}% | {cm.parent_chunk_ratio_pct:.2f}% | {rep_obj.delta_parent_chunk_ratio_pct:+.2f}% pts | Fraction of corpus compute spent on |")
+            if rep_obj.delta_skipped_retention_pct is not None and bm.skipped_retention_pct is not None and cm.skipped_retention_pct is not None:
+                lines.append(f"| Skipped Retention (R_skipped) | {bm.skipped_retention_pct:.2f}% | {cm.skipped_retention_pct:.2f}% | {rep_obj.delta_skipped_retention_pct:+.2f}% pts | Bypassed chunks retained within radius τ |")
+            if rep_obj.delta_generalization_surplus_pct is not None and bm.generalization_surplus_pct is not None and cm.generalization_surplus_pct is not None:
+                lines.append(f"| Generalization Surplus (Δ_cov) | {bm.generalization_surplus_pct:+.2f}% pts | {cm.generalization_surplus_pct:+.2f}% pts | {rep_obj.delta_generalization_surplus_pct:+.2f}% pts | Excess coverage gained over extraction ratio |")
+            if rep_obj.delta_compression_leverage_factor is not None and bm.compression_leverage_factor is not None and cm.compression_leverage_factor is not None:
+                lines.append(f"| Compression Leverage (L_comp) | {bm.compression_leverage_factor:.2f}x | {cm.candidate_metrics.compression_leverage_factor if hasattr(cm, 'candidate_metrics') else cm.compression_leverage_factor:.2f}x | {rep_obj.delta_compression_leverage_factor:+.2f}x | Coverage multiplier per compute spent |")
+
+        lines.extend([
+            f"",
+            f"### 🎯 Practical Decision Matrix Checklist",
+            f"",
+        ])
+        for k, gate in rep_obj.gate_checklist.items():
+            gb = "✅ PASS" if gate["passed"] else "❌ FAIL"
+            lines.append(f"- **{gate['name']}:** {gb} — {gate['details']} (Threshold: `{gate['threshold']}`)")
+        lines.append("")
+        md_out.write_text("\n".join(lines), encoding="utf-8")
+
+        log_success(f"Full graph space JSON saved to: {Colors.BOLD}{json_out}{Colors.RESET}")
+        log_success(f"Full graph space Markdown report saved to: {Colors.BOLD}{md_out}{Colors.RESET}\n")
+        return self.session_dir
+
     def compare_results(self, dir_a: Path, dir_b: Path) -> Dict[str, Any]:
         """Compute side-by-side comparison between the two verification reports."""
         log_header("Verification A/B Comparison Analysis")
@@ -2491,8 +2597,14 @@ Examples:
         "-m",
         type=str,
         default=None,
-        choices=["ideas", "chunking", "chunk", "cross-check"],
-        help="Verification mode: 'ideas', 'chunking', 'chunk', or 'cross-check' (default: ideas).",
+        choices=["ideas", "chunking", "chunk", "cross-check", "graph", "kg"],
+        help="Verification mode: 'ideas', 'chunking', 'chunk', 'cross-check', 'graph', or 'kg' (default: ideas).",
+    )
+    parser.add_argument(
+        "--tau",
+        type=float,
+        default=0.75,
+        help="Semantic proximity radius threshold for graph space coverage in 'graph'/'kg' mode (default: 0.75).",
     )
     parser.add_argument(
         "--timeout",
@@ -2675,6 +2787,16 @@ Examples:
                 num_blocks = int(args.arg1)
             except ValueError:
                 pass
+    elif args.arg1 and args.arg1.lower() in ("graph", "--graph", "kg", "--kg", "graph-space"):
+        if not args.arg2:
+            parser.error("In 'graph'/'kg' mode, specify previous A/B test run directory: 'graph <path_to_abtest_result> [tau]'")
+        cross_check_path = args.arg2
+        verification_mode = "graph"
+        if args.arg3:
+            try:
+                args.tau = float(args.arg3)
+            except ValueError:
+                parser.error(f"Invalid tau threshold: '{args.arg3}'")
     elif args.arg1 and args.arg1.lower() in ("cross-check", "--cross-check", "cross_check"):
         if not args.arg2:
             parser.error("In 'cross-check' mode, specify previous A/B test run directory: 'cross-check <path_to_abtest_result> [number_blocks]'")
@@ -2868,7 +2990,10 @@ Examples:
                 config_a=args.config_a,
                 config_b=args.config_b,
             )
-            runner.cross_check_flow(dir_a, dir_b, num_blocks=num_blocks)
+            if verification_mode in ("graph", "kg", "graph-space"):
+                runner.graph_flow(dir_a, dir_b, tau=getattr(args, "tau", 0.75))
+            else:
+                runner.cross_check_flow(dir_a, dir_b, num_blocks=num_blocks)
         except KeyboardInterrupt:
             log_warning("\nExecution aborted by user.")
             sys.exit(130)

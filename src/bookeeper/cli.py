@@ -4935,13 +4935,13 @@ def _execute_single_verification(
 
         # 0. Check if either target is a backup archive (.zip, .7z)
         if cand_path_a and cand_path_a.is_file() and any(cand_path_a.name.lower().endswith(s) for s in archive_suffixes):
-            bt_a = resolve_backup_target(cand_path_a, label_fallback="Baseline (A)")
+            bt_a = resolve_backup_target(cand_path_a, label_fallback="Baseline (A)", console=console)
             temp_backup_targets.append(bt_a)
             target_graph_a = bt_a.graph_file
             branch_a_label = bt_a.label
 
         if cand_path_b and cand_path_b.is_file() and any(cand_path_b.name.lower().endswith(s) for s in archive_suffixes):
-            bt_b = resolve_backup_target(cand_path_b, label_fallback="Candidate (B)")
+            bt_b = resolve_backup_target(cand_path_b, label_fallback="Candidate (B)", console=console)
             temp_backup_targets.append(bt_b)
             target_graph_b = bt_b.graph_file
             branch_b_label = bt_b.label
@@ -5226,8 +5226,11 @@ def _execute_single_verification(
                 mode_label="cross-check verification",
             )
         finally:
-            for bt in temp_backup_targets:
-                bt.cleanup()
+            if temp_backup_targets:
+                console.print("[dim cyan]🧹 Verification complete: cleaning up temporal backup folders to spare memory...[/dim cyan]")
+                for bt in temp_backup_targets:
+                    bt.cleanup()
+                temp_backup_targets.clear()
 
     # Mode: 'graph' or 'kg' (Knowledge Graph Embedding Space Suite & Decision Matrix)
     if effective_mode in ("graph", "kg", "graph-space", "graph_space"):
@@ -5246,13 +5249,13 @@ def _execute_single_verification(
             branch_b_label = "Candidate (B)"
 
             if cand_path_a and cand_path_a.is_file() and any(cand_path_a.name.lower().endswith(s) for s in archive_suffixes):
-                bt_a = resolve_backup_target(cand_path_a, label_fallback="Baseline (A)")
+                bt_a = resolve_backup_target(cand_path_a, label_fallback="Baseline (A)", console=console)
                 temp_backup_targets.append(bt_a)
                 target_graph_a = bt_a.graph_file
                 branch_a_label = bt_a.label
 
             if cand_path_b and cand_path_b.is_file() and any(cand_path_b.name.lower().endswith(s) for s in archive_suffixes):
-                bt_b = resolve_backup_target(cand_path_b, label_fallback="Candidate (B)")
+                bt_b = resolve_backup_target(cand_path_b, label_fallback="Candidate (B)", console=console)
                 temp_backup_targets.append(bt_b)
                 target_graph_b = bt_b.graph_file
                 branch_b_label = bt_b.label
@@ -5338,6 +5341,13 @@ def _execute_single_verification(
                 console.print(format_graph_space_table(metrics))
                 report_dict = metrics.model_dump()
 
+            # Clean up temporary folders immediately after verification to spare memory
+            if temp_backup_targets:
+                console.print("[dim cyan]🧹 Verification complete: cleaning up temporal backup folders to spare memory...[/dim cyan]")
+                for bt in temp_backup_targets:
+                    bt.cleanup()
+                temp_backup_targets.clear()
+
             # Save report
             out_dest = Path(output_report) if output_report else cfg.resolved_output_dir / "graph_space_report.json"
             out_dest.parent.mkdir(parents=True, exist_ok=True)
@@ -5353,7 +5363,7 @@ def _execute_single_verification(
     target_graph_file = Path(graph_file).expanduser().resolve() if graph_file else cfg.resolved_output_dir / "knowledge_graph.json"
     temp_ideas_target: Optional[ResolvedBackupTarget] = None
     if target_graph_file.is_file() and any(target_graph_file.name.lower().endswith(s) for s in (".zip", ".7z", ".tar", ".gz", ".tgz")):
-        temp_ideas_target = resolve_backup_target(target_graph_file, label_fallback="Target")
+        temp_ideas_target = resolve_backup_target(target_graph_file, label_fallback="Target", console=console)
         target_graph_file = temp_ideas_target.graph_file
 
     if not target_graph_file.is_file():
@@ -6050,8 +6060,8 @@ def ab_compare_command(
             raise typer.Exit(1)
         target_b_path = str(default_b)
 
-    with open_backup_target(target_a, label_fallback="Baseline (A)") as bt_a, \
-         open_backup_target(target_b_path, label_fallback="Candidate (B)") as bt_b:
+    with open_backup_target(target_a, label_fallback="Baseline (A)", console=console) as bt_a, \
+         open_backup_target(target_b_path, label_fallback="Candidate (B)", console=console) as bt_b:
 
         if not bt_a.graph_file.is_file():
             console.print(f"[bold red]Knowledge graph file not found in baseline target: '{target_a}'.[/bold red]")
@@ -6071,8 +6081,8 @@ def ab_compare_command(
         comp_stats = compare_knowledge_graphs(store_a, store_b, label_a=bt_a.label, label_b=bt_b.label)
 
         # 1. Header Banner
-        a_src = f"{Path(target_a).name} (recovered to temp)" if bt_a.is_temp else str(bt_a.graph_file)
-        b_src = f"{Path(target_b_path).name} (recovered to temp)" if bt_b.is_temp else str(bt_b.graph_file)
+        a_src = f"{Path(target_a).name} (temporal: [yellow]{bt_a.root_dir}[/yellow])" if bt_a.is_temp else str(bt_a.graph_file)
+        b_src = f"{Path(target_b_path).name} (temporal: [yellow]{bt_b.root_dir}[/yellow])" if bt_b.is_temp else str(bt_b.graph_file)
         console.print(
             Panel.fit(
                 f"[bold cyan]🔬 Knowledge Base A/B Backup Comparison[/bold cyan]\n"
@@ -6218,6 +6228,14 @@ def ab_compare_command(
             final_report["graph_space"] = kg_report.model_dump()
             final_report["decision_pass"] = kg_report.decision_pass
             final_report["pass_reason"] = kg_report.pass_reason
+
+        # Clean up temporary folders immediately after verification to spare memory & disk
+        if bt_a.is_temp or bt_b.is_temp:
+            console.print("[dim cyan]🧹 Verification complete: cleaning up temporal backup folders to spare memory...[/dim cyan]")
+            if bt_a.is_temp:
+                bt_a.cleanup()
+            if bt_b.is_temp:
+                bt_b.cleanup()
 
         # 4. Save JSON Report and Markdown
         report_dest = Path(output_report) if output_report else output_dir / "ab_compare_report.json"

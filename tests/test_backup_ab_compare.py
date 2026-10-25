@@ -221,6 +221,8 @@ def test_cli_ab_compare_stats_mode(tmp_path: Path, sample_kg_payloads):
     ])
 
     assert res.exit_code == 0, f"Error output: {res.stdout}"
+    assert "Unpacking backup archive" in res.stdout
+    assert "Cleaned up temporal backup folder" in res.stdout
     assert "Knowledge Base Structural Comparison" in res.stdout
     assert "Unique Concepts / Ideas" in res.stdout
     assert "Shared Ideas (A ∩ B)" in res.stdout

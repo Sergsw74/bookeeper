@@ -983,15 +983,24 @@ class ResolvedBackupTarget:
     label: str = ""
     is_temp: bool = False
     temp_dir_obj: Optional[Any] = None
+    console: Optional[Any] = None
 
     def cleanup(self) -> None:
         """Purge temporary extraction folder if this target was restored from an archive."""
         if self.temp_dir_obj is not None:
+            r_dir = str(self.root_dir)
             try:
                 self.temp_dir_obj.cleanup()
+                msg = f"[dim green]✓ Cleaned up temporal backup folder:[/dim green] [dim]{r_dir}[/dim]"
+                if self.console is not None:
+                    self.console.print(msg)
+                else:
+                    logger.info(f"Cleaned up temporal backup directory: {r_dir}")
             except Exception as e:
                 logger.debug(f"Could not clean up temporary backup directory: {e}")
             self.temp_dir_obj = None
+            import gc
+            gc.collect()
 
     def __enter__(self) -> "ResolvedBackupTarget":
         return self
@@ -1003,6 +1012,7 @@ class ResolvedBackupTarget:
 def resolve_backup_target(
     target: Union[Path, str],
     label_fallback: str = "Backup",
+    console: Optional[Any] = None,
 ) -> ResolvedBackupTarget:
     """
     Resolve a backup target from either:
@@ -1019,6 +1029,12 @@ def resolve_backup_target(
     if p.is_file() and any(p.name.lower().endswith(s) for s in archive_suffixes):
         td = tempfile.TemporaryDirectory(prefix="bk_ab_")
         target_dir = Path(td.name).resolve()
+        if console is not None:
+            console.print(
+                f"[bold cyan]📦 Unpacking backup archive '[magenta]{p.name}[/magenta]' into temporal folder:[/bold cyan] [yellow]{target_dir}[/yellow]"
+            )
+        else:
+            logger.info(f"Unpacking backup archive '{p.name}' into temporal folder: {target_dir}")
         restore_backup(archive_path=p, target_dir=target_dir)
 
         kg_file = target_dir / "knowledge_graph.json"
@@ -1052,6 +1068,7 @@ def resolve_backup_target(
             label=clean_label,
             is_temp=True,
             temp_dir_obj=td,
+            console=console,
         )
 
     # 2. Directory containing knowledge_graph.json
@@ -1075,6 +1092,7 @@ def resolve_backup_target(
             states_dir=states_d if states_d.is_dir() else None,
             label=p.name or label_fallback,
             is_temp=False,
+            console=console,
         )
 
     # 3. Direct knowledge_graph.json file
@@ -1088,6 +1106,7 @@ def resolve_backup_target(
             states_dir=states_d if states_d.is_dir() else None,
             label=p.parent.name or label_fallback,
             is_temp=False,
+            console=console,
         )
 
     raise ValueError(f"Unsupported backup target: {target}")
@@ -1097,9 +1116,10 @@ def resolve_backup_target(
 def open_backup_target(
     target: Union[Path, str],
     label_fallback: str = "Backup",
+    console: Optional[Any] = None,
 ) -> Iterator[ResolvedBackupTarget]:
     """Context manager for safely extracting, inspecting, and auto-cleaning backup targets."""
-    bt = resolve_backup_target(target, label_fallback=label_fallback)
+    bt = resolve_backup_target(target, label_fallback=label_fallback, console=console)
     try:
         yield bt
     finally:

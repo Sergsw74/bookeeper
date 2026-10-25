@@ -10,11 +10,12 @@ Bookkeeper extracts structured ideas, architectural principles, domain patterns,
 - [2. Supported Book Sources](#2-supported-book-sources)
 - [3. Chronological Ingestion & Modernity Tracking](#3-chronological-ingestion--modernity-tracking)
 - [4. 3-Tier Semantic Chunk Routing & Fast-Path](#4-3-tier-semantic-chunk-routing--fast-path)
-- [5. Transparent 4-Step Book Finalization](#5-transparent-4-step-book-finalization)
+- [5. Transparent 4-Step Book Finalization & Real-Time Progress](#5-transparent-4-step-book-finalization--real-time-progress)
 - [6. Embedding Reuse & Dynamic Size-Aware Batching](#6-embedding-reuse--dynamic-size-aware-batching)
 - [7. Running `build-graph`](#7-running-build-graph)
   - [Common Usage Patterns](#common-usage-patterns)
   - [Full Flag Reference](#full-flag-reference)
+  - [Graceful Immediate Cancellation (Ctrl+C / SIGINT)](#graceful-immediate-cancellation-ctrlc--sigint)
 - [8. Instant Offline Rebuilds (`rebuild-graph`)](#8-instant-offline-rebuilds-rebuild-graph)
 - [9. Removing Books (`remove-book`)](#9-removing-books-remove-book)
 - [10. Concept Significance Weighting (0 to 10)](#10-concept-significance-weighting-0-to-10)
@@ -119,15 +120,21 @@ flowchart TD
 
 ---
 
-## 5. Transparent 4-Step Book Finalization
+## 5. Transparent 4-Step Book Finalization & Real-Time Progress
 
-Finalizing each processed book in the graph is broken into four distinct, visible steps with real-time spinners and metrics:
+Bookkeeper provides end-to-end operational visibility during both book extraction and graph finalization. All pipeline stages feature Rich progress bars, live throughput indicators, and adaptive ETAs:
+
+- **Smart Chunking Progress**: As the `HierarchicalChunker` parses table-of-contents trees and breaks sections into hierarchical windows, speed indicators report processed tokens/sec and total emitted chunks.
+- **Inline LightRAG Indexing**: When running with simultaneous LightRAG vector/graph indexing, an inline sub-progress bar tracks LightRAG entity/relationship extraction and vector insertion concurrently.
+
+Finalizing each processed book in the graph is broken into four distinct, visible steps with real-time spinners, item counters, and time remaining (ETA):
 
 1. **Step 1: Resolve & Deduplicate Concepts**:
-   - Merges newly extracted concepts with existing canonical graph nodes using normalized keys and semantic embedding similarity ($\ge 0.85$).
+   - Compares newly extracted concepts with existing canonical graph nodes using normalized keys and semantic embedding similarity ($\ge 0.85$).
+   - Features an adaptive progress bar tracking deduplication speed and ETA.
    - Preserves maximum concept weight (`max(canonical, incoming)`) and earliest occurrence month (`min(date)`).
 2. **Step 2: Integrate Chunks & Supporting Quotes**:
-   - Stores chunk metadata and anchors top quotes to canonical idea nodes.
+   - Stores chunk metadata and anchors top quotes to canonical idea nodes with a dedicated sub-step progress bar and item counter.
 3. **Step 3: Link Sequential Chunks & HNSW Vector Index Sync**:
    - Emits ordered `[:NEXT]` edges between sequential chunks within each section.
    - Updates local embedding cache and prepares vector payloads for Neo4j HNSW index ingestion.
@@ -210,6 +217,18 @@ bookeeper build-graph --export-neo4j --clean-export
 | `--export-neo4j` | Automatically upsert the updated graph into Neo4j upon completion. | False |
 | `--clean-export` | Purge existing Neo4j graph before upserting. | False |
 | `--dual-pass` | Run experimental second-pass idea consolidation (POC). | False |
+
+### Graceful Immediate Cancellation (Ctrl+C / SIGINT)
+
+When ingesting large collections of books, you may need to stop execution at any point. Bookkeeper is engineered for **instant, clean termination**:
+
+- **Sub-Second Signal Delivery (150ms Loop)**: Python worker thread futures use non-blocking `f.result(timeout=0.15)` polling. Pressing `Ctrl+C` delivers `SIGINT` to the main thread immediately rather than blocking indefinitely on background HTTP requests.
+- **Worker Thread Teardown**: The custom `DaemonThreadPoolExecutor` promptly discards pending queue tasks upon interrupt, avoiding Python `atexit` hangs.
+- **Bypasses Heavy Downstream Exporters**:
+  - Under normal completion, `build-graph` and `rebuild-graph` automatically invoke full Obsidian vault generation, GraphML serializations, and Neo4j database synchronization.
+  - On `Ctrl+C`, Bookkeeper immediately skips these heavy downstream operations to prevent slow terminal freezes or corrupt partial vault writes.
+- **Preserves In-Flight Checkpoints**: Any book that finished Step 4 before the interrupt remains safely recorded in `.book_states/book_<id>_state.json` and `output/knowledge_graph.json`. You can resume seamlessly with `bookeeper build-graph --continue`.
+- **Clean Exit Code**: Returns standard POSIX interrupt exit code `130` (`typer.Exit(code=130)`).
 
 ---
 

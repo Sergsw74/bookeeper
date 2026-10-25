@@ -18,8 +18,8 @@ The documentation is split into specialized subchapters stored in the [`docs/`](
 | 🌐 **[Interactive Web UI & Search](docs/ui.md)** | **Idea Search & Explorer**: Interactive Cytoscape Neo4j graph, dedicated **💡 Ideas Page** (exact, embedded vector search, modernity range filter), Obsidian note panel, and embedded LightRAG WebUI. |
 | 🔍 **[Decoupled Hybrid RAG](docs/rag.md)** | LightRAG vector/graph indexing from cached chunks and multi-mode querying (`hybrid`, `local`, `global`). |
 | 🧪 **[Two-Pass Idea Post-Processing (POC)](docs/post-processing.md)** | **Experimental POC**: second-pass entity synthesis, clustering, at-most-once LLM refinement, and state checkpointing. |
-| 🔬 **[A/B Testing & Benchmarking](docs/ab-tests.md)** | Automated test harness, same-branch vs branch-vs-branch testing, configuration overlays, and delta reporting. |
-| 🛡️ **[Factual Verification & Auditing](docs/verification.md)** | Multi-mode verification suite: Ideas Grounding, Chunk Coherence, Dual-KG Cross-Checking, and Oracle QA probes. |
+| 🔬 **[A/B Testing & Benchmarking](docs/ab-tests.md)** | Automated test harness, same-branch vs branch-vs-branch testing, configuration overlays, delta reporting, and live cross-check status monitor. |
+| 🛡️ **[Factual Verification & Auditing](docs/verification.md)** | Multi-mode verification suite: Ideas Grounding, Chunk Coherence, Dual-KG Cross-Checking, Oracle QA probes, and Graph Embedding Space & Skipping Leverage (`--mode graph` / `kg`). |
 
 ---
 
@@ -31,12 +31,12 @@ Bookkeeper provides a rich set of CLI commands. Below is a high-level overview o
 | :--- | :--- | :--- | :--- |
 | **`ui`** | `bookeeper ui --lightrag-server` | Launches interactive Web UI with Cytoscape Neo4j graph, dedicated **💡 Ideas Page** (exact/vector search & modernity filtering), Obsidian panel, and LightRAG WebUI. | [Web UI Guide](docs/ui.md) |
 | **`lightrag-ui`** | `bookeeper lightrag-ui --port 9621` | Starts the official embedded LightRAG FastAPI server with document manager and workspace query UI. | [Web UI Guide](docs/ui.md) |
-| **`build-graph`** | `bookeeper build-graph --limit 5 --skip-limbo-chunks` | Ingests books chronologically, runs 3-tier semantic chunk routing, and extracts concepts into `knowledge_graph.json`. | [Building Graph](docs/building-graph.md) |
-| **`rebuild-graph`** | `bookeeper rebuild-graph` | Fast offline rebuild of the graph from `.book_states/` in seconds without LLM inference. | [Building Graph](docs/building-graph.md) |
+| **`build-graph`** | `bookeeper build-graph --limit 5 --skip-limbo-chunks` | Ingests books chronologically, runs 3-tier semantic chunk routing, and extracts concepts into `knowledge_graph.json` with real-time ETA tracking and instant Ctrl+C cancellation. | [Building Graph](docs/building-graph.md) |
+| **`rebuild-graph`** | `bookeeper rebuild-graph` | Fast offline rebuild of the graph from `.book_states/` in seconds without LLM inference, with sub-step progress and safe cancellation. | [Building Graph](docs/building-graph.md) |
 | **`query`** | `bookeeper query "Explain Paxos"` | Queries the library using LightRAG hybrid retrieval (local entity graphs + global summaries). | [Hybrid RAG](docs/rag.md) |
 | **`build-rag`** | `bookeeper build-rag` | Indexes pre-computed SSD chunks into LightRAG independently from book ingestion. | [Hybrid RAG](docs/rag.md) |
 | **`postprocess-ideas`** | `bookeeper postprocess-ideas` | **(Experimental POC)** At-most-once LLM synthesis of multi-occurrence ideas with untouched cluster skipping and state checkpointing. | [Post-Processing](docs/post-processing.md) |
-| **`verify`** | `bookeeper verify --mode ideas` | Audits factual grounding of ideas, chunk boundary coherence, or cross-KG NLI entailment. | [Verification](docs/verification.md) |
+| **`verify`** | `bookeeper verify --mode graph --tau 0.75` | Audits factual grounding of ideas, chunk boundary coherence, cross-KG NLI entailment, or graph embedding space & skipping leverage (`--mode graph` / `kg`) under 10 GB memory guard. | [Verification](docs/verification.md) |
 | **`verifiers`** | `bookeeper verifiers` | Runs all configured verification suites from `config.yaml` concurrently. | [Verification](docs/verification.md) |
 | **`test-run`** | `bookeeper test-run 5` | End-to-end integration test: builds a clean graph for $N$ books, then automatically verifies grounding. | [Verification](docs/verification.md) |
 | **`export`** | `bookeeper export --clean --backfill-embeddings` | Exports Knowledge Graph to Obsidian, GraphML, and Neo4j, with optional automatic embedding backfill. | [Building Graph](docs/building-graph.md) |
@@ -50,7 +50,7 @@ Bookkeeper provides a rich set of CLI commands. Below is a high-level overview o
 | **`config`** | `bookeeper config` | Displays active settings, resolved server pool, and node capabilities. | [Get Started](docs/get-started.md) |
 | **`backup`** | `bookeeper backup -o backup.zip` | Creates a compressed archive (`.zip` / `.7z`) of the graph, vault, chunks, and book states. | [Get Started](docs/get-started.md) |
 | **`restore`** | `bookeeper restore backup.zip --clean` | Restores knowledge graph, vault, chunks, and checkpoints from an archive. | [Get Started](docs/get-started.md) |
-| **`ab-compare`** | `bookeeper ab-compare backup_a.zip [backup_b.zip]` | Instant comparative A/B evaluation between archived backups or active graph in isolated temp directories. | [A/B Testing](docs/ab-tests.md) |
+| **`ab-compare`** | `bookeeper ab-compare backup_a.zip [backup_b.zip]` | Instant comparative A/B evaluation (topology, cross-check NLI, or embedding space) between archived backups or active graph with live performance status. | [A/B Testing](docs/ab-tests.md) |
 
 ---
 
@@ -122,6 +122,8 @@ To handle massive knowledge bases efficiently without ingestion lag or GPU bottl
 - **Neo4j Search Index Suspension**: During bulk node and edge exports, Bookkeeper discovers and temporarily suspends `VECTOR` (`idea_idx`, `chunk_idx`) and `FULLTEXT` indexes while preserving unique ID constraints for $O(1)$ `MERGE`. Indexes are recreated in parallel post-ingestion and polled until reaching `ONLINE` state.
 - **Incremental Batch Sync**: Automatically exports only affected (dirty) nodes and edges after each configured book batch (default: 10 books).
 - **At-Most-Once LLM Refinement**: The `IdeaPostProcessor` clusters ideas semantically across the whole graph, but synthesizes each cluster at most once (tracking via `refined` state flags), bypassing thousands of untouched clusters in seconds.
+- **Strict 10.0 GB RSS Memory Guard**: `MemoryGuard` tracks process memory dynamically, enforcing a strict 10.0 GB ceiling across all verification and processing modes with proactive garbage collection at 85%. Employs a Dual Spectral Gram matrix reduction for Vendi diversity scores ($< 5\text{ MB}$ RAM vs $28.8\text{ GB}$ naive) and memory-capped cosine similarity projections (64 MB chunk cap).
+- **Immediate Graceful Ctrl+C Cancellation**: Background thread futures poll every 150ms for instant SIGINT signal propagation; heavy downstream export tasks are automatically bypassed on cancellation, preserving atomic checkpoints and cleanly exiting with exit code 130 without hanging or freezing.
 
 ---
 

@@ -13,10 +13,12 @@ Bookkeeper incorporates a comprehensive, multi-mode verification framework to au
   - [Mode 2: Semantic Chunking Coherence (`--mode chunking`)](#mode-2-semantic-chunking-coherence---mode-chunking)
   - [Mode 3: Dual-KG Cross-Check Audit (`--mode cross-check`)](#mode-3-dual-kg-cross-check-audit---mode-cross-check)
   - [Mode 4: Chunk Oracle Alignment (`--mode chunk`)](#mode-4-chunk-oracle-alignment---mode-chunk)
-- [4. Debug JSON Logging (`--debug-json`)](#4-debug-json-logging---debug-json)
-- [5. Automated Test-Run Pipeline (`test-run`)](#5-automated-test-run-pipeline-test-run)
-- [6. Full CLI Reference](#6-full-cli-reference)
-- [7. Next Steps](#7-next-steps)
+  - [Mode 5: Graph Embedding Space & Skipping Leverage (`--mode graph` / `--mode kg`)](#mode-5-graph-embedding-space--skipping-leverage---mode-graph----mode-kg)
+- [4. Memory Guard Architecture (10 GB Ceiling)](#4-memory-guard-architecture-10-gb-ceiling)
+- [5. Debug JSON Logging (`--debug-json`)](#5-debug-json-logging---debug-json)
+- [6. Automated Test-Run Pipeline (`test-run`)](#6-automated-test-run-pipeline-test-run)
+- [7. Full CLI Reference](#7-full-cli-reference)
+- [8. Next Steps](#8-next-steps)
 
 ---
 
@@ -38,6 +40,7 @@ flowchart TD
         D -->|--mode chunking| F["Chunk Coherence Audit\nCosine Distance Expansion\nBoundary Verification"]
         D -->|--mode cross-check| G["NLI Cross-Check Audit\nAtomic Assertion Entailment\nRecall & Seam Integrity"]
         D -->|--mode chunk| H["Chunk Oracle Audit\n3-nary QA Generation\nIdea Context Verification"]
+        D -->|--mode graph / kg| L["Graph Space & Skipping Leverage\nChamfer & Vendi Spectral Diversity\nHausdorff Gap & Skipping Surplus"]
     end
 
     subgraph Outputs ["Reports & Diagnostics"]
@@ -45,6 +48,7 @@ flowchart TD
         F --> I
         G --> J["cross_check_report.json"]
         H --> K["Debug JSON Logs (Optional)"]
+        L --> M["graph_space_report.json"]
     end
 ```
 
@@ -182,9 +186,74 @@ bookeeper verify --mode chunk --blocks 15 --model "llama3.1:8b"
 3. **Verification**: The question is verified strictly against the extracted idea context.
 4. **Per-Chunk Recall**: Computes recall statistics per chunk to measure knowledge retention without requiring an external graph comparison.
 
+### Mode 5: Graph Embedding Space & Skipping Leverage (`--mode graph` / `--mode kg`)
+
+Evaluates how effectively extracted knowledge graph concept nodes $G$ cover and disperse across the entire literature corpus embedding universe $U$, and quantifies the exact efficiency and information retention of the chunk skipping heuristic:
+
+```bash
+# Evaluate graph embedding space and skipping leverage on current graph:
+bookeeper verify --mode graph --tau 0.75
+
+# Or use shorthand mode 'kg':
+bookeeper verify --mode kg --tau 0.75
+
+# Compare candidate graph space vs baseline or backup:
+bookeeper verify --mode graph --compare-graph ./output/knowledge_graph.json --tau 0.75
+```
+
+#### Core Metric Suite for Knowledge Graph Space
+
+| Metric | Category | Formula / Definition | Operational Purpose |
+| :--- | :--- | :--- | :--- |
+| **Chamfer Coverage ($\mu$)** | Global Coverage | $\frac{1}{\|U\|} \sum_{c \in U} \max_{v \in G} \cos(c, v)$ | Expected semantic proximity of arbitrary literature chunks to the graph concepts. |
+| **Coverage Std Dev ($\sigma$)** | Regularity | $\sqrt{\frac{1}{\|U\|} \sum (s_i - \mu)^2}$ | Detects whether coverage is uniform (low $\sigma$) or clumped in few topics while leaving gaps (high $\sigma$). |
+| **Worst-Decile ($p_{10}$)** | Tail Risk | 10th percentile of $\{s_i\}$ | Measures depth of semantic blind spots across the bottom 10% hardest chunks. |
+| **Median ($p_{50}$)** | Robust Centrality | 50th percentile of $\{s_i\}$ | Typical proximity unaffected by heavy tails or extreme outliers. |
+| **Threshold Coverage ($\text{Cov}_\tau$)** | Bounded Recall | $\frac{\|\{c \in U \mid \max_v \cos(c, v) \ge \tau\}\|}{\|U\|} \times 100$ | Percentage of the total literature corpus reachable within cosine radius $\tau$ (default: 0.75). |
+| **Directed Hausdorff ($d_H$)** | Maximum Blind Spot | $\max_{c \in U} \min_{v \in G} (1 - \cos(c, v))$ | Absolute worst-case gap in the graph (distance to the single most isolated chunk). |
+| **Vendi Score ($VS$)** | Extrinsic Diversity | $\exp\left(-\sum \lambda_i \ln \lambda_i\right)$ where $\lambda = \text{eig}(K / \|G\|)$ | Effective number of orthogonal, non-redundant concept directions spanned by $G$. |
+| **Compression Efficiency** | Node Economy | $\frac{\text{Cov}_\tau(G, U)}{\|V_G\|}$ | Percentage of total corpus space covered per node retained in the graph. |
+
+#### Skipping Mechanism Leverage Suite
+
+Comparing **Threshold Coverage ($\text{Cov}_\tau$)** against the **Extraction (Parent) Ratio ($\rho_{\text{parent}}$)** evaluates whether bypassed chunks are successfully represented:
+
+* Let $N = \|U\|$: Total chunks in the universe.
+* $N_{\text{parent}}$: Chunks from which an idea was extracted.
+* $N_{\text{skipped}} = N - N_{\text{parent}}$: Chunks deliberately bypassed.
+* **Extraction Ratio ($\rho_{\text{parent}} = \frac{N_{\text{parent}}}{N}$)**: Fraction of the corpus spent on LLM compute.
+* **Generalization Surplus ($\Delta_{\text{cov}} = \text{Cov}_\tau - \rho_{\text{parent}}$)**:
+  - $\Delta_{\text{cov}} > 0$: Skipping heuristic is working. Extracted ideas act as genuine semantic umbrellas covering skipped chunks for free.
+  - $\Delta_{\text{cov}} \approx 0$: Ideas are narrow and only cover their own immediate parent chunks.
+* **Compression Leverage Ratio ($L_{\text{comp}} = \frac{\text{Cov}_\tau}{\rho_{\text{parent}}}$)**:
+  - Factor of concept space represented per unit of corpus processed (e.g. $L_{\text{comp}} = 2.5\times$ means each 1% of processed chunks represents 2.5% of total corpus concept space).
+* **Skipped Chunk Retention Rate ($R_{\text{skipped}}$)**:
+  $$R_{\text{skipped}} = \frac{\|\{c \in U_{\text{skipped}} \mid \max_{v \in G} \cos(c, v) \ge \tau\}\|}{\|U_{\text{skipped}}\|}$$
+  Direct percentage of deliberately ignored chunks that remain safely within semantic radius $\tau$.
+
 ---
 
-## 4. Debug JSON Logging (`--debug-json`)
+## 4. Memory Guard Architecture (10 GB Ceiling)
+
+Evaluating tens of thousands of chunks and concept embeddings can quickly consume tens of gigabytes of RAM if implemented naively. Bookkeeper enforces an engineered memory budget keeping total process RSS strictly within **10.0 GB**:
+
+1. **Dual Spectral Gram Matrix for Vendi Score ($< 5\text{ MB}$ Memory)**:
+   - *Naive Approach*: Evaluating $K = \frac{1 + G G^T}{2}$ on $M = 30,000$ idea nodes requires a $30,000 \times 30,000$ matrix (7.2 GB for $K$, 7.2 GB for $K_{\text{norm}}$, and 14.4 GB for LAPACK work arrays = **28.8 GB total**).
+   - *Dual Gram Formulation*: The non-zero eigenvalues of $\frac{1}{M} K$ are **identical** to the eigenvalues of the dual Gram matrix $C \in \mathbb{R}^{(D+1) \times (D+1)}$:
+     $$C = \frac{1}{2} \begin{bmatrix} 1 & \bar{g}^T \\ \bar{g} & \frac{1}{M} G^T G \end{bmatrix}$$
+   - For standard embedding dimension $D = 768$, $C$ is only $(769 \times 769)$, occupying **4.7 Megabytes** and computing eigendecomposition in **5 milliseconds** with machine-epsilon exact equivalence ($< 10^{-15}$).
+2. **Memory-Bounded Cosine Projections (64 MB Chunk Cap)**:
+   - Chunk similarity projections in `compute_max_cosine_sim_batched` dynamically size batches so intermediate matrix allocations never exceed 64 MB of RAM.
+3. **Zero-Copy Vector Slicing**:
+   - Replaced Python list-of-floats parsing (`vec.tolist()`) with contiguous `np.float32` array slices, eliminating tens of millions of heap-allocated Python float objects.
+4. **Memory Watcher Ceiling**:
+   - `MemoryGuard` continuously monitors process RSS via `psutil`.
+   - Automatically triggers proactive garbage collection when usage crosses 85% of limit (8.5 GB).
+   - Enforces the hard 10.0 GB ceiling (customizable via `BOOKEEPER_MEMORY_LIMIT_GB`).
+
+---
+
+## 5. Debug JSON Logging (`--debug-json`)
 
 When debugging verification discrepancies, enable `--debug-json` to emit complete raw request payloads, contexts, and model responses:
 
@@ -198,7 +267,7 @@ bookeeper verify --mode chunk --blocks 5 --debug-json
 
 ---
 
-## 5. Automated Test-Run Pipeline (`test-run`)
+## 6. Automated Test-Run Pipeline (`test-run`)
 
 Executes an end-to-end integration test across a fixed number of books from scratch, then automatically launches factual grounding verification:
 
@@ -219,18 +288,19 @@ bookeeper test-run 10 --timeout 60 --percent 2.0 --mode ideas
 
 ---
 
-## 6. Full CLI Reference
+## 7. Full CLI Reference
 
 ```text
 Usage: bookeeper verify [OPTIONS]
 
 Options:
-  -m, --mode [ideas|chunking|cross-check|chunk]
+  -m, --mode [ideas|chunking|cross-check|chunk|graph|kg]
                                   Verification mode (default: ideas).
   -p, --percent FLOAT             Sample percentage of ideas to audit (default: 1.0).
+  --tau FLOAT                     Semantic proximity radius threshold for graph space mode (default: 0.75).
   --model TEXT                    Dedicated LLM model for verification.
   --blocks INTEGER                Number of chunk blocks to evaluate in cross-check or chunk mode.
-  --compare-graph PATH            Candidate knowledge graph path for cross-check mode.
+  --compare-graph PATH            Candidate knowledge graph path for cross-check or graph mode.
   --print-blocks INTEGER          Print side-by-side assertion probes for first N blocks.
   --debug-json / --no-debug-json  Save detailed per-sentence raw prompts and results to JSON (default: False).
   --max-examples INTEGER          Max discrepancy examples printed in table (default: 20).
@@ -240,7 +310,7 @@ Options:
 
 ---
 
-## 7. Next Steps
+## 8. Next Steps
 
 - 🔬 **[A/B Testing & Benchmarking](ab-tests.md)** — Use verification in automated regression tests.
 - 🏗️ **[Building the Knowledge Graph](building-graph.md)** — Graph extraction and options.

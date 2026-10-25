@@ -19,9 +19,11 @@ Bookkeeper includes an automated test harness (`scripts/ab_test.sh` and `scripts
 - [4. Session Directory & Reports](#4-session-directory--reports)
   - [Directory Structure](#directory-structure)
   - [Markdown Summary Report](#markdown-summary-report)
-- [5. Automated Post-Test Cross-Check Verification](#5-automated-post-test-cross-check-verification)
-- [6. Full CLI Reference](#6-full-cli-reference)
-- [7. Next Steps](#7-next-steps)
+- [5. Automated Post-Test Cross-Check Verification & Live Status Line](#5-automated-post-test-cross-check-verification--live-status-line)
+- [6. Phase 3 Dual-Level Query Execution & Keyword Extraction](#6-phase-3-dual-level-query-execution--keyword-extraction)
+- [7. Knowledge Graph Structural Topology Comparison](#7-knowledge-graph-structural-topology-comparison)
+- [8. Full CLI Reference](#8-full-cli-reference)
+- [9. Next Steps](#9-next-steps)
 
 ---
 
@@ -140,11 +142,14 @@ bookeeper ab-compare backups/baseline_prod.zip --mode stats
 # 3. Deep NLI Cross-Check audit (evaluates recall, seam integrity, and contradictions between backups):
 bookeeper ab-compare backups/baseline.zip backups/candidate.zip --mode cross-check --blocks 10
 
-# 4. Using the ab_test.py automation runner:
+# 4. Graph Embedding Space & Skipping Leverage comparative audit:
+bookeeper ab-compare backups/baseline.zip backups/candidate.zip --mode graph --tau 0.75
+
+# 5. Using the ab_test.py automation runner:
 python3 scripts/ab_test.py vs-backup backups/baseline.zip backups/candidate.zip --blocks 10
 python3 scripts/ab_test.py --vs-backup backups/baseline.zip
 
-# 5. Direct verification command accepting backup archives:
+# 6. Direct verification command accepting backup archives:
 bookeeper verify --graph-file backups/baseline.zip --compare-graph backups/candidate.zip --mode cross-check
 ```
 
@@ -152,6 +157,7 @@ bookeeper verify --graph-file backups/baseline.zip --compare-graph backups/candi
 - **Topological & Extraction Metrics**: Side-by-side comparison of Book counts, Section counts, hierarchical Chunks, extracted Ideas, total Edges, and Edge-to-Node Relational Density.
 - **Idea Set Overlap & Jaccard Similarity**: Exact intersection of extracted concepts, count and proportion of common ideas, ideas unique to Run A vs Run B, and Jaccard similarity coefficient.
 - **NLI Cross-Check Recall & Seam Integrity**: Evaluates atomic assertions from contiguous text spans against both graphs to compute comparative recall ($\Delta \text{Recall}$), seam integrity, and net semantic integrity $\Delta S_{net}$.
+- **Graph Embedding Space & Skipping Leverage (`--mode graph` / `--mode kg`)**: Side-by-side comparison of Chamfer coverage ($\mu$), regularity ($\sigma$), worst-decile blind spot ($p_{10}$), median proximity ($p_{50}$), threshold coverage ($\text{Cov}_\tau$), Hausdorff worst-case gap ($d_H$), Vendi extrinsic diversity score ($VS$), parent extraction ratio ($\rho_{\text{parent}}$), skipped chunk retention ($R_{\text{skipped}}$), generalization surplus ($\Delta_{\text{cov}}$), and compression leverage ratio ($L_{\text{comp}}$).
 - **Zero Disk Footprint**: Unpacked temporary files (`knowledge_graph.json`, `.book_states/`, `chunks/`) are strictly removed even if audits fail or are interrupted.
 
 ---
@@ -236,13 +242,26 @@ The generated `ab_test_summary.md` provides an instant side-by-side comparison:
 
 ---
 
-## 5. Automated Post-Test Cross-Check Verification
+## 5. Automated Post-Test Cross-Check Verification & Live Status Line
 
 At the conclusion of the verification phase, the A/B test harness automatically runs a **Cross-Check Audit** comparing Graph A against Graph B:
 - Selects contiguous chunk blocks clamped to exact raw document spans.
 - Decomposes the source passages into atomic factual assertions.
 - Evaluates whether assertions preserved in Graph A are also entailed by Graph B, and vice versa.
 - Emits atomic recall and seam integrity metrics into `cross_check_report.json`.
+
+### Live Dual-Line Progress & Real-Time Performance Status
+
+During long cross-check audits across dozens of blocks, Bookkeeper renders a **live dual-line progress monitor**:
+
+- **Line 1 (Comparative Performance Status)**:
+  Displays the live head-to-head performance of the candidate model vs. the baseline model:
+  ```text
+  [Status] Cand (llama3.1:8b): 78.4% fid (score 3.92) vs Base (qwen2.5:3b): 71.2% fid (score 3.56) | Δ +7.2% fid
+  ```
+  Reports current model names, rolling assertion fidelity percentage, mean evaluation score, and candidate advantage in real time.
+- **Line 2 (Rich Progress Bar & Adaptive ETA)**:
+  Renders an animated progress bar indicating evaluated blocks (`Block 14/50`), completion percentage, and dynamic ETA calculation based on average LLM verification latency per block.
 
 ---
 
@@ -313,10 +332,12 @@ Arguments:
   [TARGET_B]           Second backup archive or graph JSON (defaults to active output/knowledge_graph.json)
 
 Options:
-  -m, --mode [stats|cross-check|ideas]
+  -m, --mode [stats|cross-check|ideas|graph|kg]
                        Comparison mode: 'stats' (fast topological & Jaccard metrics),
-                       'cross-check' (NLI assertion audit), or 'ideas' (factual grounding) [default: stats]
+                       'cross-check' (NLI assertion audit), 'ideas' (factual grounding),
+                       or 'graph'/'kg' (embedding space coverage & skipping leverage) [default: stats]
   -b, --blocks INTEGER Number of contiguous chunk blocks to audit in cross-check mode [default: 10]
+  --tau FLOAT          Semantic proximity radius threshold for graph space mode [default: 0.75]
   -o, --output PATH    Destination path to save JSON comparison report
   -c, --config PATH    Path to config.yaml [default: config.yaml]
 ```

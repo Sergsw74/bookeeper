@@ -10,7 +10,8 @@ import random
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -3011,7 +3012,7 @@ def build_graph(
                                 for f in worker_futures:
                                     if not f.done():
                                         f.result(timeout=0.15)
-                            except (concurrent.futures.TimeoutError, TimeoutError):
+                            except (concurrent.futures.TimeoutError, TimeoutError, FuturesTimeoutError):
                                 pass
 
                     except KeyboardInterrupt:

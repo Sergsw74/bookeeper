@@ -183,3 +183,32 @@ def test_rebuild_graph_interrupted_bypasses_heavy_exports(tmp_path):
         mock_obs.assert_not_called()
         mock_gml.assert_not_called()
         mock_neo.assert_not_called()
+
+
+def test_cli_worker_polling_timeout_handling():
+    """Verify worker future polling handles TimeoutError without NameError on concurrent."""
+    import bookeeper.cli as cli
+
+    assert hasattr(cli, "concurrent")
+    assert hasattr(cli.concurrent, "futures")
+
+    # Simulate worker polling loop with a mock future that times out first then completes
+    mock_fut = MagicMock()
+    mock_fut.done.side_effect = [False, False, True]
+    mock_fut.result.side_effect = [concurrent.futures.TimeoutError(), "done"]
+
+    worker_futures = [mock_fut]
+    abort_event = threading.Event()
+
+    iterations = 0
+    while not abort_event.is_set() and any(not f.done() for f in worker_futures):
+        iterations += 1
+        try:
+            for f in worker_futures:
+                if not f.done():
+                    f.result(timeout=0.15)
+        except (concurrent.futures.TimeoutError, TimeoutError, cli.FuturesTimeoutError):
+            pass
+
+    assert iterations >= 1
+    mock_fut.result.assert_called()

@@ -872,6 +872,7 @@ class ConceptGraphStore:
                     TaskProgressColumn,
                     TextColumn,
                     TimeElapsedColumn,
+                    TimeRemainingColumn,
                 )
                 with Progress(
                     SpinnerColumn(),
@@ -880,6 +881,8 @@ class ConceptGraphStore:
                     TaskProgressColumn(),
                     MofNCompleteColumn(),
                     TimeElapsedColumn(),
+                    TextColumn("• ETA:"),
+                    TimeRemainingColumn(),
                     console=console,
                 ) as prog:
                     t_id = prog.add_task("ideas", total=len(missing_idea_nodes))
@@ -981,6 +984,7 @@ class ConceptGraphStore:
                     TaskProgressColumn,
                     TextColumn,
                     TimeElapsedColumn,
+                    TimeRemainingColumn,
                 )
                 with Progress(
                     SpinnerColumn(),
@@ -989,6 +993,8 @@ class ConceptGraphStore:
                     TaskProgressColumn(),
                     MofNCompleteColumn(),
                     TimeElapsedColumn(),
+                    TextColumn("• ETA:"),
+                    TimeRemainingColumn(),
                     console=console,
                 ) as prog:
                     t_id = prog.add_task("chunks", total=len(missing_chunk_nodes))

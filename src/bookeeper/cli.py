@@ -310,6 +310,27 @@ class IngestionRemainingColumn(ProgressColumn):
         return Text(f"ETA: {eta_str}", style=style)
 
 
+class StepRemainingColumn(ProgressColumn):
+    """Renders estimated processing step time remaining adaptively as (days, h, m), (h, m, s), or (m, s)."""
+
+    def render(self, task: "Task") -> Text:
+        if task.finished:
+            return Text("ETA: 0m 00s", style="dim")
+        eta_str = task.fields.get("eta_str")
+        if not eta_str:
+            rem = task.time_remaining
+            if rem is None or rem < 0:
+                eta_str = "--m --s"
+            elif rem >= 86400:
+                eta_str = format_eta_days_h_m(rem)
+            elif rem >= 3600:
+                eta_str = format_eta_h_min_sec(rem)
+            else:
+                eta_str = format_eta_min_sec(rem)
+        style = "dim" if str(eta_str).startswith("--") else "bold yellow"
+        return Text(f"ETA: {eta_str}", style=style)
+
+
 class CrossCheckProgressTracker:
     """
     Manages live status display and metrics tracking for Cross-Check A/B testing.
@@ -1014,21 +1035,36 @@ def clean_metadata(
             try:
                 total_bytes = client.db_path.stat().st_size
                 size_mb = total_bytes / (1024 * 1024)
+                t_stage_start = time.perf_counter()
                 with Progress(
                     SpinnerColumn(),
                     TextColumn("[progress.description]{task.description}"),
                     BarColumn(),
                     TaskProgressColumn(),
                     TextColumn("• {task.completed:.1f}/{task.total:.1f} MB"),
+                    TimeElapsedColumn(),
+                    StepRemainingColumn(),
                     console=console,
                 ) as stage_progress:
                     stage_task = stage_progress.add_task(
                         f"Downloading metadata.db ({size_mb:.1f} MB) locally for fast SSD transactions...",
                         total=size_mb,
+                        eta_str="--m --s",
                     )
 
                     def _on_stage_progress(copied_bytes: int, total_b: int):
-                        stage_progress.update(stage_task, completed=copied_bytes / (1024 * 1024))
+                        elapsed = time.perf_counter() - t_stage_start
+                        rate = (copied_bytes / elapsed) if elapsed > 0 else 0.0
+                        rem_sec = ((total_b - copied_bytes) / rate) if rate > 0 and total_b > copied_bytes else 0.0
+                        eta_str = format_eta_min_sec(rem_sec) if copied_bytes < total_b else "0m 00s"
+                        spd_mb = rate / (1024 * 1024)
+                        spd_badge = f" ({spd_mb:.1f} MB/s)" if spd_mb > 0 else ""
+                        stage_progress.update(
+                            stage_task,
+                            completed=copied_bytes / (1024 * 1024),
+                            eta_str=eta_str,
+                            description=f"Downloading metadata.db ({size_mb:.1f} MB){spd_badge}...",
+                        )
 
                     staged_file = client.stage_database(
                         staged_target,
@@ -1219,23 +1255,33 @@ def clean_metadata(
             "server_used": server_used,
         }
 
+    t_norm_start = time.perf_counter()
     try:
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            StepRemainingColumn(),
             console=console,
         ) as progress:
             task = progress.add_task(
                 f"Normalizing metadata across {num_servers} Ollama server(s)...",
                 total=len(books),
+                eta_str="--m --s",
             )
 
             def _update_progress_description():
                 avg_s, p80_s, fastest_s = _calc_stats()
                 with stats_lock:
                     cur_active = active_tasks_count
+                    done_cnt = len(durations)
+                elapsed = time.perf_counter() - t_norm_start
+                rate = (done_cnt / elapsed) if elapsed > 0 else 0.0
+                rem_sec = ((len(books) - done_cnt) / rate) if rate > 0 and len(books) > done_cnt else 0.0
+                eta_str = format_eta_min_sec(rem_sec) if done_cnt < len(books) else "0m 00s"
                 desc = (
                     f"Normalizing across {num_servers} server(s) | "
                     f"Active: [bold cyan]{cur_active}[/bold cyan]"
@@ -1246,7 +1292,7 @@ def clean_metadata(
                         f"p80: [bold yellow]{p80_s:.1f}s[/bold yellow] | "
                         f"fastest: [bold magenta]{fastest_s:.1f}s[/bold magenta]"
                     )
-                progress.update(task, description=desc)
+                progress.update(task, description=desc, eta_str=eta_str)
 
             _update_progress_description()
 
@@ -1403,21 +1449,36 @@ def clean_metadata(
                     console.print(
                         f"[bold blue]Syncing updated database ({success_count} newly modified book(s)) back to Calibre library...[/bold blue]"
                     )
+                    t_sync_start = time.perf_counter()
                     with Progress(
                         SpinnerColumn(),
                         TextColumn("[progress.description]{task.description}"),
                         BarColumn(),
                         TaskProgressColumn(),
                         TextColumn("• {task.completed:.1f}/{task.total:.1f} MB"),
+                        TimeElapsedColumn(),
+                        StepRemainingColumn(),
                         console=console,
                     ) as sync_progress:
                         sync_task = sync_progress.add_task(
                             "Uploading updated metadata.db to Calibre share...",
                             total=size_mb,
+                            eta_str="--m --s",
                         )
 
                         def _on_sync_progress(copied_bytes: int, total_b: int):
-                            sync_progress.update(sync_task, completed=copied_bytes / (1024 * 1024))
+                            elapsed = time.perf_counter() - t_sync_start
+                            rate = (copied_bytes / elapsed) if elapsed > 0 else 0.0
+                            rem_sec = ((total_b - copied_bytes) / rate) if rate > 0 and total_b > copied_bytes else 0.0
+                            eta_str = format_eta_min_sec(rem_sec) if copied_bytes < total_b else "0m 00s"
+                            spd_mb = rate / (1024 * 1024)
+                            spd_badge = f" ({spd_mb:.1f} MB/s)" if spd_mb > 0 else ""
+                            sync_progress.update(
+                                sync_task,
+                                completed=copied_bytes / (1024 * 1024),
+                                eta_str=eta_str,
+                                description=f"Uploading metadata.db ({size_mb:.1f} MB){spd_badge}...",
+                            )
 
                         client.sync_database(
                             create_backup=effective_backup_db,
@@ -1795,21 +1856,36 @@ def build_graph(
             try:
                 total_bytes = client.db_path.stat().st_size
                 size_mb = total_bytes / (1024 * 1024)
+                t_stage_start = time.perf_counter()
                 with Progress(
                     SpinnerColumn(),
                     TextColumn("[progress.description]{task.description}"),
                     BarColumn(),
                     TaskProgressColumn(),
                     TextColumn("• {task.completed:.1f}/{task.total:.1f} MB"),
+                    TimeElapsedColumn(),
+                    StepRemainingColumn(),
                     console=console,
                 ) as stage_progress:
                     stage_task = stage_progress.add_task(
                         f"Downloading metadata.db ({size_mb:.1f} MB) locally for fast SSD transactions...",
                         total=size_mb,
+                        eta_str="--m --s",
                     )
 
                     def _on_stage_progress(copied_bytes: int, total_b: int):
-                        stage_progress.update(stage_task, completed=copied_bytes / (1024 * 1024))
+                        elapsed = time.perf_counter() - t_stage_start
+                        rate = (copied_bytes / elapsed) if elapsed > 0 else 0.0
+                        rem_sec = ((total_b - copied_bytes) / rate) if rate > 0 and total_b > copied_bytes else 0.0
+                        eta_str = format_eta_min_sec(rem_sec) if copied_bytes < total_b else "0m 00s"
+                        spd_mb = rate / (1024 * 1024)
+                        spd_badge = f" ({spd_mb:.1f} MB/s)" if spd_mb > 0 else ""
+                        stage_progress.update(
+                            stage_task,
+                            completed=copied_bytes / (1024 * 1024),
+                            eta_str=eta_str,
+                            description=f"Downloading metadata.db ({size_mb:.1f} MB){spd_badge}...",
+                        )
 
                     staged_file = client.stage_database(
                         staged_target,
@@ -2998,7 +3074,7 @@ def build_graph(
                     )
                     progress.update(overall_task, completed=book_idx, eta_str=overall_eta_str)
 
-                # Transparent 4-step Book Finalization Progress Display
+                # Transparent 4-step Book Finalization Progress Display with detailed sub-step ETAs
                 with Progress(
                     SpinnerColumn(),
                     TextColumn("[bold cyan]{task.description}[/bold cyan]"),
@@ -3006,6 +3082,7 @@ def build_graph(
                     TaskProgressColumn(),
                     MofNCompleteColumn(),
                     TimeElapsedColumn(),
+                    StepRemainingColumn(),
                     console=console,
                     transient=False,
                 ) as fin_progress:
@@ -3013,14 +3090,35 @@ def build_graph(
                         f"  Finalizing Book #{bid} [1/4]: Resolving {len(all_book_concepts)} extracted idea(s)...",
                         total=4,
                         completed=0,
+                        eta_str="--m --s",
+                    )
+                    sub_task = fin_progress.add_task(
+                        f"    Resolving ideas...",
+                        total=max(1, len(all_book_concepts)),
+                        completed=0,
+                        eta_str="--m --s",
                     )
 
                     # Step 1/4: Resolve & deduplicate extracted concepts (embedding + HNSW + parallel LLM disambiguation)
                     t_step1 = time.perf_counter()
 
                     def _on_resolve_progress(stage: str, done_cnt: int, tot_cnt: int, detail: str) -> None:
+                        el = time.perf_counter() - t_step1
+                        rate = (done_cnt / el) if el > 0 else 0.0
+                        rem = ((tot_cnt - done_cnt) / rate) if rate > 0 and tot_cnt > done_cnt else 0.0
+                        sub_eta = format_eta_min_sec(rem) if done_cnt < tot_cnt else "0m 00s"
+                        spd_txt = f" ({rate:.1f}/s)" if rate > 0 else ""
+                        fin_progress.update(
+                            sub_task,
+                            total=tot_cnt,
+                            completed=done_cnt,
+                            eta_str=sub_eta,
+                            description=f"    {detail}{spd_txt}",
+                        )
+                        est_fin_rem = (rem if done_cnt < tot_cnt else 0.0) + max(1.0, el * 0.4)
                         fin_progress.update(
                             fin_task,
+                            eta_str=format_eta_min_sec(est_fin_rem),
                             description=f"  Finalizing Book #{bid} [1/4]: {detail}...",
                         )
 
@@ -3034,7 +3132,15 @@ def build_graph(
                     fin_progress.update(
                         fin_task,
                         completed=1,
+                        eta_str=format_eta_min_sec(max(1.0, dur_resolve * 0.3)),
                         description=f"  Finalizing Book #{bid} [2/4]: Integrating {len(successful_results)} chunk(s) & grounded quotes...",
+                    )
+                    fin_progress.update(
+                        sub_task,
+                        total=max(1, len(successful_results)),
+                        completed=0,
+                        eta_str="--m --s",
+                        description=f"    Integrating chunk 0/{len(successful_results)}...",
                     )
 
                     # Step 2/4: Integrate sections, chunks, concepts, and grounded quotes into Knowledge Graph
@@ -3043,7 +3149,8 @@ def build_graph(
                     resolved_concept_iter = iter(resolved_book_concepts)
                     upserted_ideas_for_neo4j: Dict[str, Dict[str, Any]] = {}
 
-                    for res in successful_results:
+                    tot_succ = len(successful_results)
+                    for res_idx, res in enumerate(successful_results, start=1):
                         chk = res["chunk"]
                         extraction = res["extraction"]
 
@@ -3127,11 +3234,32 @@ def build_graph(
                                 publication_date=bpubdate,
                             )
 
+                        if res_idx % 5 == 0 or res_idx == tot_succ:
+                            el2 = time.perf_counter() - t_step2
+                            rate2 = (res_idx / el2) if el2 > 0 else 0.0
+                            rem2 = ((tot_succ - res_idx) / rate2) if rate2 > 0 and tot_succ > res_idx else 0.0
+                            sub_eta2 = format_eta_min_sec(rem2) if res_idx < tot_succ else "0m 00s"
+                            spd_txt2 = f" ({rate2:.1f} chk/s)" if rate2 > 0 else ""
+                            fin_progress.update(
+                                sub_task,
+                                completed=res_idx,
+                                eta_str=sub_eta2,
+                                description=f"    Integrating chunk {res_idx}/{tot_succ} & grounded quotes{spd_txt2}...",
+                            )
+
                     dur_integrate = time.perf_counter() - t_step2
                     fin_progress.update(
                         fin_task,
                         completed=2,
+                        eta_str="0m 02s",
                         description=f"  Finalizing Book #{bid} [3/4]: Linking sequential chunks & syncing HNSW vectors...",
+                    )
+                    fin_progress.update(
+                        sub_task,
+                        total=1,
+                        completed=0,
+                        eta_str="--m --s",
+                        description="    Linking sequential chunks & syncing Neo4j HNSW index...",
                     )
 
                     # Step 3/4: Link sequential chunks for this book and upsert new idea vectors into Neo4j HNSW index
@@ -3146,7 +3274,15 @@ def build_graph(
                     fin_progress.update(
                         fin_task,
                         completed=3,
+                        eta_str="0m 01s",
                         description=f"  Finalizing Book #{bid} [4/4]: Saving Knowledge Graph checkpoint...",
+                    )
+                    fin_progress.update(
+                        sub_task,
+                        total=1,
+                        completed=0,
+                        eta_str="--m --s",
+                        description="    Persisting Knowledge Graph checkpoint to disk...",
                     )
 
                     # Step 4/4: Finalize book state & persist graph checkpoint (without redundant full-graph chunk re-linking)
@@ -3184,8 +3320,15 @@ def build_graph(
                     dur_save = time.perf_counter() - t_step4
                     total_fin_dur = time.perf_counter() - t_finalize_start
                     fin_progress.update(
+                        sub_task,
+                        completed=1,
+                        eta_str="0m 00s",
+                        description=f"    [bold green]✓ Sub-steps complete[/bold green] [dim]({dur_resolve:.1f}s resolve, {dur_integrate:.1f}s integrate, {dur_link:.1f}s link, {dur_save:.1f}s save)[/dim]",
+                    )
+                    fin_progress.update(
                         fin_task,
                         completed=4,
+                        eta_str="0m 00s",
                         description=(
                             f"  [bold green]✓ Book #{bid} finalized in {total_fin_dur:.2f}s[/bold green] "
                             f"[dim](resolve={dur_resolve:.2f}s, integrate={dur_integrate:.2f}s, link={dur_link:.2f}s, save={dur_save:.2f}s)[/dim]"
@@ -3197,9 +3340,37 @@ def build_graph(
                         valid_chunks = [r["chunk"] for r in successful_results]
                         if valid_chunks:
                             console.print(f"  [dim cyan]Indexing {len(valid_chunks)} chunk(s) into LightRAG engine...[/dim cyan]")
-                            with console.status(f"[cyan]Indexing LightRAG ({len(valid_chunks)} chunks)...[/cyan]") as lrag_status:
+                            with Progress(
+                                SpinnerColumn(),
+                                TextColumn("[bold cyan]{task.description}[/bold cyan]"),
+                                BarColumn(),
+                                TaskProgressColumn(),
+                                MofNCompleteColumn(),
+                                TimeElapsedColumn(),
+                                StepRemainingColumn(),
+                                console=console,
+                            ) as lrag_progress:
+                                lrag_task = lrag_progress.add_task(
+                                    f"  Indexing LightRAG chunks...",
+                                    total=len(valid_chunks),
+                                    completed=0,
+                                    eta_str="--m --s",
+                                )
+                                t_lrag_start = time.perf_counter()
+
                                 def _on_inline_progress(done: int, tot: int):
-                                    lrag_status.update(f"[cyan]Indexing LightRAG: {done}/{tot} chunks ({int(done/tot*100)}%)...[/cyan]")
+                                    elapsed = time.perf_counter() - t_lrag_start
+                                    rate = (done / elapsed) if elapsed > 0 else 0.0
+                                    rem_sec = ((tot - done) / rate) if rate > 0 and tot > done else 0.0
+                                    eta_str = format_eta_min_sec(rem_sec) if done < tot else "0m 00s"
+                                    spd_str = f" ({rate:.1f} chk/s)" if rate > 0 else ""
+                                    lrag_progress.update(
+                                        lrag_task,
+                                        completed=done,
+                                        total=tot,
+                                        eta_str=eta_str,
+                                        description=f"  Indexing LightRAG: [cyan]{done}/{tot}[/cyan] chunks{spd_str}",
+                                    )
 
                                 lightrag_engine.insert_chunks(
                                     valid_chunks,
@@ -3207,6 +3378,12 @@ def build_graph(
                                     book_id=bid,
                                     batch_size=getattr(cfg, "lightrag_max_parallel_insert", 6) * 2,
                                     on_progress=_on_inline_progress,
+                                )
+                                lrag_progress.update(
+                                    lrag_task,
+                                    completed=len(valid_chunks),
+                                    eta_str="0m 00s",
+                                    description=f"  [bold green]✓ Indexed {len(valid_chunks)} chunks into LightRAG[/bold green]",
                                 )
                             console.print(f"  [dim green]✓ Indexed into LightRAG.[/dim green]")
                     except Exception as e:
@@ -6637,12 +6814,14 @@ def rebuild_graph_command(
         TaskProgressColumn(),
         MofNCompleteColumn(),
         TimeElapsedColumn(),
+        StepRemainingColumn(),
         console=console,
     ) as progress:
         rebuild_task = progress.add_task(
             "Rebuilding Knowledge Graph...",
             total=len(candidate_states),
             completed=0,
+            eta_str="--m --s",
         )
 
         for bid, sf, s_data, extracted_count in candidate_states:
@@ -6745,7 +6924,11 @@ def rebuild_graph_command(
                 )
 
             rebuilt_books += 1
-            progress.advance(rebuild_task)
+            el_r = time.perf_counter() - t0
+            rate_r = (rebuilt_books / el_r) if el_r > 0 else 0.0
+            rem_r = ((len(candidate_states) - rebuilt_books) / rate_r) if rate_r > 0 and len(candidate_states) > rebuilt_books else 0.0
+            eta_r = format_eta_min_sec(rem_r) if rebuilt_books < len(candidate_states) else "0m 00s"
+            progress.update(rebuild_task, completed=rebuilt_books, eta_str=eta_r)
 
     elapsed = time.perf_counter() - t0
 
@@ -6929,16 +7112,22 @@ def backup_command(
         TaskProgressColumn(),
         MofNCompleteColumn(),
         TimeElapsedColumn(),
+        StepRemainingColumn(),
         console=console,
     ) as progress:
-        backup_task = progress.add_task("Archiving files...", total=1)
+        backup_task = progress.add_task("Archiving files...", total=1, eta_str="--m --s")
 
         def _on_progress(completed: int, total: int, fname: str):
             short_name = (fname[:32] + "...") if len(fname) > 35 else fname
+            el = time.perf_counter() - t0
+            rate = (completed / el) if el > 0 else 0.0
+            rem = ((total - completed) / rate) if rate > 0 and total > completed else 0.0
+            eta_str = format_eta_min_sec(rem) if completed < total else "0m 00s"
             progress.update(
                 backup_task,
                 total=total,
                 completed=completed,
+                eta_str=eta_str,
                 description=f"Archiving: [cyan]{short_name}[/cyan]",
             )
 
@@ -7109,16 +7298,22 @@ def restore_command(
         TaskProgressColumn(),
         MofNCompleteColumn(),
         TimeElapsedColumn(),
+        StepRemainingColumn(),
         console=console,
     ) as progress:
-        restore_task = progress.add_task("Restoring files...", total=1)
+        restore_task = progress.add_task("Restoring files...", total=1, eta_str="--m --s")
 
         def _on_progress(completed: int, total: int, fname: str):
             short_name = (fname[:32] + "...") if len(fname) > 35 else fname
+            el = time.perf_counter() - t0
+            rate = (completed / el) if el > 0 else 0.0
+            rem = ((total - completed) / rate) if rate > 0 and total > completed else 0.0
+            eta_str = format_eta_min_sec(rem) if completed < total else "0m 00s"
             progress.update(
                 restore_task,
                 total=total,
                 completed=completed,
+                eta_str=eta_str,
                 description=f"Restoring: [cyan]{short_name}[/cyan]",
             )
 
@@ -7291,6 +7486,7 @@ def sync_command(
     }
 
     try:
+        t_pack_start = time.perf_counter()
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -7298,16 +7494,22 @@ def sync_command(
             TaskProgressColumn(),
             MofNCompleteColumn(),
             TimeElapsedColumn(),
+            StepRemainingColumn(),
             console=console,
         ) as progress:
-            backup_task = progress.add_task("Archiving local books & graph...", total=1)
+            backup_task = progress.add_task("Archiving local books & graph...", total=1, eta_str="--m --s")
 
             def _on_sync_progress(completed: int, total: int, fname: str):
                 short_name = (fname[:32] + "...") if len(fname) > 35 else fname
+                el = time.perf_counter() - t_pack_start
+                rate = (completed / el) if el > 0 else 0.0
+                rem = ((total - completed) / rate) if rate > 0 and total > completed else 0.0
+                eta_str = format_eta_min_sec(rem) if completed < total else "0m 00s"
                 progress.update(
                     backup_task,
                     total=total,
                     completed=completed,
+                    eta_str=eta_str,
                     description=f"Packaging: [cyan]{short_name}[/cyan]",
                 )
 

@@ -9,6 +9,7 @@ from rich.text import Text
 from bookeeper.cli import (
     ChunkRemainingColumn,
     IngestionRemainingColumn,
+    StepRemainingColumn,
     compute_book_chunk_eta,
     compute_overall_library_eta,
     format_eta_days_h_m,
@@ -293,4 +294,28 @@ def test_cross_check_progress_tracker():
     tracker.completed = 10
     speed, elapsed, eta = tracker.compute_eta_and_speed()
     assert eta == "0m 00s"
+
+
+def test_step_remaining_column():
+    """Verify StepRemainingColumn renders adaptive ETA formatted text."""
+    col = StepRemainingColumn()
+
+    with Progress(col) as progress:
+        # Pending task with default string
+        t_id = progress.add_task("Step Task", total=10, completed=0, eta_str="--m --s")
+        task = progress.tasks[t_id]
+        rendered = col.render(task)
+        assert "ETA: --m --s" in rendered.plain
+
+        # In-progress task with custom eta_str
+        progress.update(t_id, completed=4, eta_str="1m 30s")
+        task = progress.tasks[t_id]
+        rendered = col.render(task)
+        assert "ETA: 1m 30s" in rendered.plain
+
+        # Finished task
+        progress.update(t_id, completed=10)
+        task = progress.tasks[t_id]
+        rendered = col.render(task)
+        assert "ETA: 0m 00s" in rendered.plain
 

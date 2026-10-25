@@ -12,6 +12,7 @@ from bookeeper.calibre.parser import format_idea_month
 from bookeeper.config import Settings
 from bookeeper.graph.store import ConceptGraphStore
 from bookeeper.processing.chunker import HierarchicalChunk
+from bookeeper.processing.ollama_pool import format_idea_for_embedding
 from bookeeper.processing.idea_postprocessor import (
     IdeaCluster,
     IdeaObservation,
@@ -1758,6 +1759,45 @@ def test_book_processing_state_recover_skipped_limbo_chunks(tmp_path: Path):
     assert state.is_chunk_processed("c1")
     assert not state.is_chunk_processed("c2")  # Successfully restored to unprocessed!
     assert state.is_chunk_processed("c3")
+
+
+def test_format_idea_for_embedding_all_fields():
+    """Verify format_idea_for_embedding incorporates name, description, and short_description."""
+    formatted = format_idea_for_embedding(
+        name="Zero-Knowledge Proof",
+        short_description="A cryptographic method proving possession of information without revealing it.",
+        description="A protocol enabling one party to prove to another that a statement is true without conveying additional information.",
+        detailed_explanation="Extensively used in modern zk-SNARKs and zk-STARKs for blockchain privacy.",
+    )
+    assert "Zero-Knowledge Proof: " in formatted
+    assert "A cryptographic method proving possession of information without revealing it." in formatted
+    assert "A protocol enabling one party to prove to another that a statement is true without conveying additional information." in formatted
+    assert "Extensively used in modern zk-SNARKs and zk-STARKs for blockchain privacy." in formatted
+    # Check that parts are joined by ' — '
+    assert " — " in formatted
+
+
+def test_format_idea_for_embedding_deduplication():
+    """Verify duplicate descriptions or matches to the name are omitted from embedding text."""
+    # When short_description and description are identical to brief_description
+    formatted = format_idea_for_embedding(
+        name="Consensus",
+        short_description="Agreement among distributed nodes.",
+        brief_description="Agreement among distributed nodes.",
+        description="Agreement among distributed nodes.",
+        detailed_explanation="Agreement among distributed nodes.",
+    )
+    # Should only appear once: "Consensus: Agreement among distributed nodes."
+    assert formatted == "Consensus: Agreement among distributed nodes."
+
+    # When description is identical to name
+    formatted2 = format_idea_for_embedding(
+        name="Consensus",
+        short_description="Consensus",
+        description="",
+    )
+    assert formatted2 == "Consensus"
+
 
 
 

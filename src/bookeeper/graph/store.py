@@ -838,14 +838,17 @@ class ConceptGraphStore:
                 clean_name = BookParser.repair_mojibake(raw_name).strip()
                 if not clean_name:
                     continue
-                brief = attrs.get("brief_description") or attrs.get("summary") or ""
+                brief = attrs.get("brief_description") or attrs.get("short_description") or attrs.get("summary") or ""
                 detailed = attrs.get("detailed_explanation") or ""
+                desc = attrs.get("description") or ""
                 summary = attrs.get("summary") or ""
                 text = format_idea_for_embedding(
                     clean_name,
                     brief_description=brief,
                     detailed_explanation=detailed,
                     summary=summary,
+                    description=desc,
+                    short_description=attrs.get("short_description", "") or brief,
                 )
                 missing_idea_nodes.append((node_id, text))
             elif ntype == "Chunk" and include_chunks:

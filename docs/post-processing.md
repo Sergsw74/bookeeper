@@ -83,6 +83,7 @@ For each resolved entity cluster:
 ### Step 4: Affected-Only Graph Upsert & Edge Rewiring
 - **Affected-Only Writes**: Only genuinely modified clusters and edges are updated in the graph store, preventing costly full-graph overwrites after each batch cycle.
 - **Upsert Canonical Node**: Overwrites the canonical `:Concept` node with the unified definitions and aggregate weight.
+- **Full Idea Semantic Embedding Recalculation**: Embeddings for updated and consolidated ideas are immediately recalculated against the full idea content (`name`, `description`/`detailed_explanation`, and `short_description`/`brief_description`) after each post-processing update, ensuring semantic search and graph verification use freshly consolidated representations.
 - **Redirect Aliases**: Redirects incoming and outgoing edges from redundant alias nodes to the canonical node, then removes the alias nodes.
 - **Provenance Edges**: Connects the canonical node to all source chunks via `[:SUPPORTED_BY]` and `[:MENTIONED_IN]` edges.
 - **Relational Edges**: Emits directed `[:RELATES_TO]` edges between the consolidated idea and newly identified co-occurring entities.

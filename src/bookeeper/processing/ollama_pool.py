@@ -1107,23 +1107,39 @@ def format_idea_for_embedding(
     brief_description: str = "",
     detailed_explanation: str = "",
     summary: str = "",
+    description: str = "",
+    short_description: str = "",
     max_chars: int = 2400,
+    **kwargs: Any,
 ) -> str:
     """
-    Format an idea (or full idea with brief and detailed explanations) into a single
-    text string for semantic embedding, avoiding duplicate text and respecting max_chars.
+    Format a full idea into a single text string for semantic embedding,
+    including name, description, and short description (or brief description/summary/detailed explanation),
+    avoiding duplicate text and respecting max_chars.
     """
     clean_name = (name or "").strip()
-    brief = (brief_description or summary or "").strip()
-    detailed = (detailed_explanation or "").strip()
+    short_desc = (short_description or brief_description or summary or "").strip()
+    main_desc = (description or "").strip()
+    detailed_desc = (detailed_explanation or "").strip()
 
     parts: List[str] = []
+    seen_lower: Set[str] = set()
+
     if clean_name:
         parts.append(clean_name)
-    if brief and brief.lower() != clean_name.lower():
-        parts.append(brief)
-    if detailed and detailed.lower() != brief.lower() and detailed.lower() != clean_name.lower():
-        parts.append(detailed)
+        seen_lower.add(clean_name.lower())
+
+    if short_desc and short_desc.lower() not in seen_lower:
+        parts.append(short_desc)
+        seen_lower.add(short_desc.lower())
+
+    if main_desc and main_desc.lower() not in seen_lower:
+        parts.append(main_desc)
+        seen_lower.add(main_desc.lower())
+
+    if detailed_desc and detailed_desc.lower() not in seen_lower:
+        parts.append(detailed_desc)
+        seen_lower.add(detailed_desc.lower())
 
     if not parts:
         return ""
@@ -1132,7 +1148,7 @@ def format_idea_for_embedding(
     elif len(parts) == 2:
         text = f"{parts[0]}: {parts[1]}"
     else:
-        text = f"{parts[0]}: {parts[1]} — {parts[2]}"
+        text = f"{parts[0]}: {' — '.join(parts[1:])}"
 
     if max_chars and max_chars > 0 and len(text) > max_chars:
         return text[:max_chars]

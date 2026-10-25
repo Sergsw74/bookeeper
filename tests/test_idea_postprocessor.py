@@ -962,3 +962,83 @@ def test_incremental_batch_cycles_at_most_once_refinement_and_affected_only_upse
     assert "concept:Write-Ahead Logging" in store.dirty_nodes
 
 
+def test_apply_consolidation_recalculates_embeddings_with_full_idea():
+    """Verify embeddings are recalculated against the full idea text on post-processing updates."""
+    store = ConceptGraphStore()
+    node_id = "concept:Event Sourcing"
+    old_emb = [0.1, 0.2, 0.3]
+    store.graph.add_node(
+        node_id,
+        name="Event Sourcing",
+        type="Concept",
+        is_idea=True,
+        brief_description="Old brief",
+        detailed_explanation="Old detailed",
+        embedding=old_emb,
+    )
+    store.clear_dirty()
+
+    cluster = IdeaCluster(canonical_name="Event Sourcing", normalized_name="event sourcing")
+    obs = IdeaObservation(
+        concept_name="Event Sourcing",
+        book_id=1,
+        chapter_idx=1,
+        chunk_idx=1,
+        chunk_id="c1",
+        quote="State is stored as events.",
+        local_brief="Local brief",
+        local_detailed="Local detailed",
+    )
+    cluster.add_observation(obs)
+
+    output = ConsolidatedIdeaOutput(
+        brief_description="Captures state transitions as an immutable stream of events.",
+        detailed_explanation="An architectural pattern in which every state change is recorded as a discrete event log.",
+        category="Architectural Pattern",
+        related_entities=["CQRS"],
+        weight=8,
+    )
+
+    embedded_texts = []
+    mock_embeddings = MagicMock()
+
+    def fake_embed_query(text: str):
+        embedded_texts.append(text)
+        return [0.6, 0.8, 0.0]
+
+    mock_embeddings.embed_query = MagicMock(side_effect=fake_embed_query)
+
+    pp = IdeaPostProcessor(
+        pool=MagicMock(),
+        embeddings=mock_embeddings,
+        min_occurrences=1,
+    )
+
+    pp.apply_consolidation_to_graph(store, cluster, output)
+
+    # 1. Verify embedder was called with full idea text (name, brief/short, detailed/description)
+    assert len(embedded_texts) == 1
+    call_text = embedded_texts[0]
+    assert "Event Sourcing" in call_text
+    assert "Captures state transitions as an immutable stream of events." in call_text
+    assert "An architectural pattern in which every state change is recorded as a discrete event log." in call_text
+
+    # 2. Verify graph node was updated with new normalized embedding
+    nd = store.graph.nodes[node_id]
+    new_emb = nd["embedding"]
+    assert new_emb is not None
+    assert new_emb != old_emb
+    # [0.6, 0.8, 0.0] normalized is [0.6, 0.8, 0.0]
+    assert np.isclose(new_emb[0], 0.6)
+    assert np.isclose(new_emb[1], 0.8)
+    assert np.isclose(new_emb[2], 0.0)
+
+    # 3. Verify fields were stored on node
+    assert nd["brief_description"] == output.brief_description
+    assert nd["short_description"] == output.brief_description
+    assert nd["detailed_explanation"] == output.detailed_explanation
+    assert nd["description"] == output.detailed_explanation
+    assert node_id in store.dirty_nodes
+
+
+

@@ -305,6 +305,8 @@ class EntityDeduplicator:
                 brief_description=getattr(c, "brief_description", "") or "",
                 detailed_explanation=getattr(c, "detailed_explanation", "") or "",
                 summary=getattr(c, "summary", "") or "",
+                description=getattr(c, "description", "") or "",
+                short_description=getattr(c, "short_description", "") or "",
             )
             concept_to_embed_text[raw_name] = embed_text
 

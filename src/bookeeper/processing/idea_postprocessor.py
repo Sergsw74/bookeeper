@@ -46,7 +46,7 @@ from rich.text import Text
 
 from bookeeper.calibre.parser import BookParser, format_idea_month
 from bookeeper.config import Settings
-from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings, OllamaPool
+from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings, OllamaPool, format_idea_for_embedding
 
 if TYPE_CHECKING:
     from bookeeper.graph.store import ConceptGraphStore
@@ -393,7 +393,10 @@ class IdeaPostProcessorState:
             rec = self.processed_ideas.get(name)
             if rec and isinstance(rec, dict) and rec.get("status") == "synthesized" and "output" in rec:
                 try:
-                    return ConsolidatedIdeaOutput.model_validate(rec["output"])
+                    res = ConsolidatedIdeaOutput.model_validate(rec["output"])
+                    if "embedding" in rec and (cluster.embedding is None or len(cluster.embedding) <= 1):
+                        cluster.embedding = np.array(rec["embedding"], dtype=np.float32)
+                    return res
                 except Exception as e:
                     logger.warning(f"Failed to validate cached synthesized output for '{name}': {e}")
         return None
@@ -405,7 +408,7 @@ class IdeaPostProcessorState:
         status: str = "synthesized",
     ) -> None:
         """Record a processed idea cluster and its consolidated output."""
-        self.processed_ideas[cluster.canonical_name] = {
+        rec: Dict[str, Any] = {
             "canonical_name": cluster.canonical_name,
             "normalized_name": cluster.normalized_name,
             "total_occurrences": cluster.total_occurrences,
@@ -413,6 +416,9 @@ class IdeaPostProcessorState:
             "output": output.model_dump(),
             "timestamp": time.time(),
         }
+        if cluster.embedding is not None and len(cluster.embedding) > 1:
+            rec["embedding"] = [round(float(x), 6) for x in cluster.embedding]
+        self.processed_ideas[cluster.canonical_name] = rec
 
     def clear(self) -> None:
         """Clear all in-memory and on-disk state."""
@@ -726,6 +732,9 @@ class IdeaPostProcessor:
                     clusters[idx].canonical_name,
                     brief_description=clusters[idx].get_representative_brief(),
                     detailed_explanation=clusters[idx].get_representative_detailed(),
+                    summary=clusters[idx].get_representative_brief(),
+                    description=clusters[idx].get_representative_detailed(),
+                    short_description=clusters[idx].get_representative_brief(),
                 )
                 for idx in missing_indices
             ]
@@ -1104,6 +1113,35 @@ class IdeaPostProcessor:
         if cluster.embedding is not None and len(cluster.embedding) > 1:
             emb_list = [round(float(x), 6) for x in cluster.embedding]
 
+        # Calculate or update embedding against the full synthesized idea
+        # (name, description, short description) after each post-processing update
+        if self.embeddings is not None:
+            full_embed_text = format_idea_for_embedding(
+                canonical_name,
+                brief_description=brief,
+                detailed_explanation=detailed,
+                summary=brief or detailed,
+                description=detailed,
+                short_description=brief,
+            )
+            try:
+                if hasattr(self.embeddings, "embed_query"):
+                    raw_vec = self.embeddings.embed_query(full_embed_text)
+                elif hasattr(self.embeddings, "embed_documents"):
+                    docs_embs = self.embeddings.embed_documents([full_embed_text])
+                    raw_vec = docs_embs[0] if docs_embs else None
+                else:
+                    raw_vec = None
+
+                if raw_vec and len(raw_vec) > 1:
+                    arr = np.array(raw_vec, dtype=np.float32)
+                    norm = float(np.linalg.norm(arr))
+                    unit = (arr / norm) if norm > 0 else arr
+                    emb_list = [round(float(x), 6) for x in unit]
+                    cluster.embedding = unit
+            except Exception as e:
+                logger.debug(f"Could not calculate updated post-processing embedding for '{canonical_name}': {e}")
+
         node_changed = False
         if not store.graph.has_node(canonical_nid):
             node_attrs: Dict[str, Any] = {
@@ -1114,7 +1152,9 @@ class IdeaPostProcessor:
                 "name": canonical_name,
                 "category": cat,
                 "brief_description": brief,
+                "short_description": brief,
                 "detailed_explanation": detailed,
+                "description": detailed,
                 "summary": brief or detailed,
                 "weight": weight,
                 "occurrences": occurrences,
@@ -1138,7 +1178,7 @@ class IdeaPostProcessor:
             prev_weight = int(nd.get("weight") or 0)
             prev_occ = int(nd.get("occurrences") or 0)
             prev_month = nd.get("first_occurrence_month") or nd.get("month")
-            prev_has_emb = bool(nd.get("embedding"))
+            prev_emb = nd.get("embedding")
             prev_refined = bool(nd.get("refined"))
 
             new_weight = max(prev_weight, weight)
@@ -1149,7 +1189,9 @@ class IdeaPostProcessor:
             nd["tag"] = "idea"
             nd["name"] = canonical_name
             nd["brief_description"] = brief
+            nd["short_description"] = brief
             nd["detailed_explanation"] = detailed
+            nd["description"] = detailed
             nd["summary"] = brief or detailed
             nd["category"] = cat
             nd["weight"] = new_weight
@@ -1163,7 +1205,7 @@ class IdeaPostProcessor:
                 if not curr_month or earliest_month < curr_month:
                     nd["first_occurrence_month"] = earliest_month
                     nd["month"] = earliest_month
-            if emb_list is not None and not prev_has_emb:
+            if emb_list is not None:
                 nd["embedding"] = emb_list
             if "tags" not in nd:
                 nd["tags"] = ["idea", cat.lower().replace(" ", "-")]
@@ -1175,7 +1217,7 @@ class IdeaPostProcessor:
                 or prev_weight != new_weight
                 or prev_occ != new_occ
                 or (nd.get("first_occurrence_month") or nd.get("month")) != prev_month
-                or (not prev_has_emb and emb_list is not None)
+                or prev_emb != emb_list
                 or prev_refined != bool(nd.get("refined"))
             ):
                 node_changed = True

@@ -266,9 +266,10 @@ class IdeaEmbeddingIndex:
                     clean_name = BookParser.repair_mojibake(raw_name).strip()
                     if not clean_name:
                         continue
-                    brief = attrs.get("brief_description") or attrs.get("summary") or ""
+                    brief = attrs.get("brief_description") or attrs.get("short_description") or attrs.get("summary") or ""
                     detailed = attrs.get("detailed_explanation") or ""
-                    summary = brief or detailed or clean_name
+                    desc = attrs.get("description") or ""
+                    summary = brief or detailed or desc or clean_name
                     month = format_idea_month(attrs.get("first_occurrence_month") or attrs.get("month"))
 
                     idx = len(names)
@@ -279,6 +280,8 @@ class IdeaEmbeddingIndex:
                             brief_description=brief,
                             detailed_explanation=detailed,
                             summary=summary,
+                            description=desc,
+                            short_description=attrs.get("short_description", "") or brief,
                         )
                     )
                     node_ids.append(node_id)

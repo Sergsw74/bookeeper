@@ -56,6 +56,25 @@ def compute_max_cosine_sim_batched(
     return results
 
 
+def compute_weighted_percentile(values: np.ndarray, weights: np.ndarray, percentile: float) -> float:
+    """
+    Computes weighted percentile (0-100) using cumulative weight distribution.
+    Falls back to unweighted percentile if weights are empty or uniform zero.
+    """
+    if len(values) == 0:
+        return 0.0
+    if len(weights) != len(values) or np.sum(weights) <= 0:
+        return float(np.percentile(values, percentile))
+    idx = np.argsort(values)
+    s_vals = values[idx]
+    s_weights = weights[idx]
+    cum_w = np.cumsum(s_weights)
+    total_w = cum_w[-1]
+    cutoff = (percentile / 100.0) * total_w
+    p_idx = int(np.searchsorted(cum_w, cutoff))
+    return float(s_vals[min(p_idx, len(s_vals) - 1)])
+
+
 # ==============================================================================
 # 1. Pydantic Models for Single Graph & Comparative Reports
 # ==============================================================================
@@ -68,11 +87,12 @@ class GraphSpaceMetrics(BaseModel):
 
     nodes_count: int = Field(..., description="Number of Idea/Concept nodes M in the graph.")
     universe_chunks_count: int = Field(0, description="Total number of corpus chunks N in the universe.")
-    chamfer_mean: float = Field(..., description="Mean Chamfer proximity: expected cosine similarity of arbitrary literature chunks to the graph.")
-    chamfer_std: float = Field(..., description="Regularity std dev: uniformity of coverage across topics.")
-    median_p50: float = Field(..., description="Median proximity (50th percentile): robust centrality unaffected by heavy tails.")
-    worst_decile_p10: float = Field(..., description="Worst-decile proximity (10th percentile): depth of semantic blind spots across hardest chunks.")
-    coverage_at_tau_pct: float = Field(..., description="Threshold coverage: percentage of literature corpus reachable within cosine radius tau.")
+    universe_total_chars: Optional[int] = Field(None, description="Total character weight of corpus chunks evaluated.")
+    chamfer_mean: float = Field(..., description="Size-weighted mean Chamfer proximity across literature chunks.")
+    chamfer_std: float = Field(..., description="Size-weighted regularity std dev.")
+    median_p50: float = Field(..., description="Size-weighted median proximity (50th percentile).")
+    worst_decile_p10: float = Field(..., description="Size-weighted worst-decile proximity (10th percentile).")
+    coverage_at_tau_pct: float = Field(..., description="Threshold coverage: percentage of literature text volume reachable within cosine radius tau.")
     worst_case_gap: float = Field(..., description="Directed Hausdorff gap (1.0 - min_sim): absolute worst-case gap to the most isolated chunk.")
     vendi_diversity_score: float = Field(..., description="Vendi score: effective number of orthogonal, non-redundant concept modes spanned by G.")
     coverage_per_node_efficiency: float = Field(..., description="Compression efficiency: coverage percentage retained per graph node.")
@@ -82,10 +102,10 @@ class GraphSpaceMetrics(BaseModel):
     # Skipping Leverage Metrics
     parent_chunks_count: Optional[int] = Field(None, description="Number of chunks from which ideas were extracted.")
     skipped_chunks_count: Optional[int] = Field(None, description="Number of chunks bypassed/skipped by heuristic.")
-    parent_chunk_ratio_pct: Optional[float] = Field(None, description="Extraction ratio rho_parent = N_parent / N (percentage).")
-    skipped_retention_pct: Optional[float] = Field(None, description="Skipped chunk retention rate R_skipped within tau radius.")
-    generalization_surplus_pct: Optional[float] = Field(None, description="Generalization surplus Delta_cov = Cov_tau - rho_parent.")
-    compression_leverage_factor: Optional[float] = Field(None, description="Compression leverage L_comp = Cov_tau / rho_parent.")
+    parent_chunk_ratio_pct: Optional[float] = Field(None, description="Extraction ratio rho_parent = W_parent / W_total (size-weighted percentage).")
+    skipped_retention_pct: Optional[float] = Field(None, description="Skipped text retention rate R_skipped within tau radius (size-weighted).")
+    generalization_surplus_pct: Optional[float] = Field(None, description="Generalization surplus Delta_cov = Cov_tau - rho_parent (size-weighted).")
+    compression_leverage_factor: Optional[float] = Field(None, description="Compression leverage L_comp = Cov_tau / rho_parent (size-weighted).")
 
 
 class GraphSpaceComparisonReport(BaseModel):
@@ -97,6 +117,9 @@ class GraphSpaceComparisonReport(BaseModel):
     universe_chunks_count: int
     universe_chunks_count_a: Optional[int] = None
     universe_chunks_count_b: Optional[int] = None
+    universe_total_chars: Optional[int] = None
+    universe_total_chars_a: Optional[int] = None
+    universe_total_chars_b: Optional[int] = None
     label_a: str = "Baseline (A)"
     label_b: str = "Candidate (B)"
     baseline_metrics: GraphSpaceMetrics
@@ -136,25 +159,27 @@ def evaluate_skipping_leverage(
     skipped_chunk_embeddings: np.ndarray,  # (N_s, D) chunks skipped by heuristic
     graph_embeddings: np.ndarray,          # (M, D) extracted idea nodes in G
     tau: float = 0.75,
+    parent_weights: Optional[np.ndarray] = None,   # (N_p,) chunk character weights
+    skipped_weights: Optional[np.ndarray] = None,  # (N_s,) chunk character weights
 ) -> Dict[str, Any]:
     """
-    Evaluates the compression leverage and semantic retention of the skipping mechanism.
-
-    Compares coverage of extracted ideas across chunks deliberately bypassed (skipped)
-    versus chunks that directly seeded ideas (parent chunks).
+    Evaluates the compression leverage and semantic retention of the skipping mechanism,
+    weighted by chunk size (character count) to avoid distortion from varied chunk sizes.
 
     Parameters:
         parent_chunk_embeddings: (N_p, D) vectors of chunks where ideas were extracted.
         skipped_chunk_embeddings: (N_s, D) vectors of chunks bypassed/skipped by heuristic.
         graph_embeddings: (M, D) vectors of extracted idea nodes in G.
         tau: Semantic relevance threshold (default: 0.75).
+        parent_weights: Optional (N_p,) float array of parent chunk sizes in characters.
+        skipped_weights: Optional (N_s,) float array of skipped chunk sizes in characters.
 
     Returns:
-        Dict containing:
-            parent_chunk_ratio_pct: fraction of corpus spent on compute (rho_parent).
-            total_coverage_pct: percentage of combined universe covered within tau radius.
-            skipped_retention_pct: percentage of bypassed chunks safely retained (R_skipped).
-            generalization_surplus_pct: excess coverage gained over extraction ratio (Delta_cov).
+        Dict containing size-weighted leverage indicators:
+            parent_chunk_ratio_pct: fraction of corpus text volume spent on compute (rho_parent).
+            total_coverage_pct: percentage of combined text volume covered within tau radius.
+            skipped_retention_pct: percentage of bypassed text volume safely retained (R_skipped).
+            generalization_surplus_pct: excess text volume coverage gained over extraction ratio (Delta_cov).
             compression_leverage_factor: coverage multiplier per compute unit (L_comp).
     """
     def norm(x: np.ndarray) -> np.ndarray:
@@ -172,6 +197,16 @@ def evaluate_skipping_leverage(
     n_s = len(U_skipped)
     n_total = n_p + n_s
 
+    # Size weights (in characters)
+    w_p = np.asarray(parent_weights, dtype=np.float64) if parent_weights is not None and len(parent_weights) == n_p else np.ones(n_p, dtype=np.float64)
+    w_s = np.asarray(skipped_weights, dtype=np.float64) if skipped_weights is not None and len(skipped_weights) == n_s else np.ones(n_s, dtype=np.float64)
+    w_p = np.where(w_p > 0, w_p, 1.0)
+    w_s = np.where(w_s > 0, w_s, 1.0)
+
+    tot_w_p = float(np.sum(w_p)) if n_p > 0 else 0.0
+    tot_w_s = float(np.sum(w_s)) if n_s > 0 else 0.0
+    tot_w = tot_w_p + tot_w_s
+
     # Max similarity to G for both sets using memory-safe batched projection
     if len(G) > 0:
         sim_parent = compute_max_cosine_sim_batched(U_parent, G) if n_p > 0 else np.array([], dtype=np.float32)
@@ -180,15 +215,15 @@ def evaluate_skipping_leverage(
         sim_parent = np.zeros(n_p, dtype=np.float32)
         sim_skipped = np.zeros(n_s, dtype=np.float32)
 
-    # Counts meeting threshold tau
-    covered_parent_count = int(np.sum(sim_parent >= tau))
-    covered_skipped_count = int(np.sum(sim_skipped >= tau))
-    total_covered_count = covered_parent_count + covered_skipped_count
+    # Size-weighted mass meeting threshold tau
+    cov_p_weight = float(np.sum(w_p[sim_parent >= tau])) if n_p > 0 else 0.0
+    cov_s_weight = float(np.sum(w_s[sim_skipped >= tau])) if n_s > 0 else 0.0
+    total_cov_weight = cov_p_weight + cov_s_weight
 
-    # Ratios
-    parent_ratio = (n_p / n_total) if n_total > 0 else 0.0
-    total_coverage = (total_covered_count / n_total) if n_total > 0 else 0.0
-    skipped_retention = (covered_skipped_count / n_s) if n_s > 0 else 1.0
+    # Size-weighted ratios
+    parent_ratio = (tot_w_p / tot_w) if tot_w > 0 else 0.0
+    total_coverage = (total_cov_weight / tot_w) if tot_w > 0 else 0.0
+    skipped_retention = (cov_s_weight / tot_w_s) if tot_w_s > 0 else 1.0
 
     # Leverage Metrics
     generalization_surplus = total_coverage - parent_ratio
@@ -212,10 +247,11 @@ def evaluate_graph_space(
     tau: float = 0.75,                # Semantic relevance threshold
     batch_size: int = 5000,
     parent_chunk_mask: Optional[np.ndarray] = None,  # (N,) bool array indicating parent chunks
+    chunk_weights: Optional[np.ndarray] = None,      # (N,) float array of chunk sizes (chars)
 ) -> Dict[str, Any]:
     """
     Evaluates how effectively Graph G covers and disperses across the 
-    semantic embedding space defined by Universe U.
+    semantic embedding space defined by Universe U, weighted by chunk character size.
 
     Parameters:
         universe_embeddings: (N, D) float array of chunk vectors.
@@ -223,6 +259,7 @@ def evaluate_graph_space(
         tau: Semantic proximity radius threshold (default: 0.75).
         batch_size: Chunk size for blockwise matrix multiplication to preserve RAM.
         parent_chunk_mask: Optional (N,) boolean mask marking chunks where ideas were extracted.
+        chunk_weights: Optional (N,) float array of chunk sizes in characters.
 
     Returns:
         Dict matching GraphSpaceMetrics schema.
@@ -233,6 +270,7 @@ def evaluate_graph_space(
         return {
             "nodes_count": len(graph_embeddings),
             "universe_chunks_count": len(universe_embeddings),
+            "universe_total_chars": 0,
             "chamfer_mean": 0.0,
             "chamfer_std": 0.0,
             "median_p50": 0.0,
@@ -262,15 +300,23 @@ def evaluate_graph_space(
     n_nodes = len(G)
     n_universe = len(U)
 
+    # Enforce chunk weights (character size)
+    if chunk_weights is not None and len(chunk_weights) == n_universe:
+        W = np.asarray(chunk_weights, dtype=np.float64)
+        W = np.where(W > 0, W, 1.0)
+    else:
+        W = np.ones(n_universe, dtype=np.float64)
+    tot_w = float(np.sum(W))
+
     # 2. Pairwise Cosine Projection (memory-bounded in float32 batches)
     max_sims = compute_max_cosine_sim_batched(U, G, max_batch_mem_bytes=64 * 1024 * 1024)
 
-    # 3. Distributional Metrics (Chamfer, Variance, Percentiles)
-    chamfer_mean = float(np.mean(max_sims))
-    chamfer_std = float(np.std(max_sims))
-    p10 = float(np.percentile(max_sims, 10))
-    p50 = float(np.median(max_sims))
-    coverage_tau = float(np.mean(max_sims >= tau) * 100.0)
+    # 3. Size-Weighted Distributional Metrics (Chamfer, Variance, Percentiles)
+    chamfer_mean = float(np.sum(W * max_sims) / tot_w) if tot_w > 0 else 0.0
+    chamfer_std = float(np.sqrt(np.sum(W * (max_sims - chamfer_mean) ** 2) / tot_w)) if tot_w > 0 else 0.0
+    p10 = compute_weighted_percentile(max_sims, W, 10.0)
+    p50 = compute_weighted_percentile(max_sims, W, 50.0)
+    coverage_tau = float(np.sum(W[max_sims >= tau]) / tot_w * 100.0) if tot_w > 0 else 0.0
 
     # 4. Extreme Blind Spot (Directed Hausdorff Distance in Cosine Distance)
     # Cosine distance = 1.0 - cosine_similarity
@@ -312,22 +358,27 @@ def evaluate_graph_space(
     efficiency = float(coverage_tau / n_nodes) if n_nodes > 0 else 0.0
     vendi_density = float(vendi_score / n_nodes) if n_nodes > 0 else 0.0
 
-    # 7. Skipping Leverage & Generalization Analysis
+    # 7. Skipping Leverage & Generalization Analysis (Size-Weighted)
     if parent_chunk_mask is not None and len(parent_chunk_mask) == n_universe:
         p_mask = np.asarray(parent_chunk_mask, dtype=bool)
         n_p = int(np.sum(p_mask))
         n_s = n_universe - n_p
 
+        W_p = W[p_mask]
+        W_s = W[~p_mask]
+        tot_w_p = float(np.sum(W_p))
+        tot_w_s = float(np.sum(W_s))
+
         sim_parent = max_sims[p_mask] if n_p > 0 else np.array([], dtype=np.float32)
         sim_skipped = max_sims[~p_mask] if n_s > 0 else np.array([], dtype=np.float32)
 
-        cov_p_count = int(np.sum(sim_parent >= tau))
-        cov_s_count = int(np.sum(sim_skipped >= tau))
-        tot_cov_count = cov_p_count + cov_s_count
+        cov_p_weight = float(np.sum(W_p[sim_parent >= tau])) if n_p > 0 else 0.0
+        cov_s_weight = float(np.sum(W_s[sim_skipped >= tau])) if n_s > 0 else 0.0
+        tot_cov_weight = cov_p_weight + cov_s_weight
 
-        p_ratio = (n_p / n_universe) if n_universe > 0 else 0.0
-        tot_cov = (tot_cov_count / n_universe) if n_universe > 0 else 0.0
-        s_retention = (cov_s_count / n_s) if n_s > 0 else 1.0
+        p_ratio = (tot_w_p / tot_w) if tot_w > 0 else 0.0
+        tot_cov = (tot_cov_weight / tot_w) if tot_w > 0 else 0.0
+        s_retention = (cov_s_weight / tot_w_s) if tot_w_s > 0 else 1.0
 
         gen_surplus = tot_cov - p_ratio
         comp_lev = (tot_cov / p_ratio) if p_ratio > 0 else 0.0
@@ -352,6 +403,7 @@ def evaluate_graph_space(
     return {
         "nodes_count": n_nodes,
         "universe_chunks_count": n_universe,
+        "universe_total_chars": int(tot_w),
         "chamfer_mean": round(chamfer_mean, 4),
         "chamfer_std": round(chamfer_std, 4),
         "median_p50": round(p50, 4),
@@ -386,14 +438,30 @@ def compare_graph_spaces(
     parent_mask_a: Optional[np.ndarray] = None,
     parent_mask_b: Optional[np.ndarray] = None,
     universe_embeddings_b: Optional[np.ndarray] = None,
+    chunk_weights: Optional[np.ndarray] = None,
+    chunk_weights_b: Optional[np.ndarray] = None,
 ) -> GraphSpaceComparisonReport:
     """
     Evaluates and compares Baseline (G1) vs Candidate (G2) against their respective chunk Universes
-    applying the multi-factor Practical Decision Matrix.
+    applying the multi-factor Practical Decision Matrix, weighted by chunk size in characters.
     """
     u_b = universe_embeddings_b if universe_embeddings_b is not None else universe_embeddings
-    raw_m1 = evaluate_graph_space(universe_embeddings, baseline_embeddings, tau=tau, parent_chunk_mask=parent_mask_a)
-    raw_m2 = evaluate_graph_space(u_b, candidate_embeddings, tau=tau, parent_chunk_mask=parent_mask_b)
+    w_b = chunk_weights_b if chunk_weights_b is not None else chunk_weights
+
+    raw_m1 = evaluate_graph_space(
+        universe_embeddings,
+        baseline_embeddings,
+        tau=tau,
+        parent_chunk_mask=parent_mask_a,
+        chunk_weights=chunk_weights,
+    )
+    raw_m2 = evaluate_graph_space(
+        u_b,
+        candidate_embeddings,
+        tau=tau,
+        parent_chunk_mask=parent_mask_b,
+        chunk_weights=w_b,
+    )
 
     m1 = GraphSpaceMetrics(**raw_m1)
     m2 = GraphSpaceMetrics(**raw_m2)
@@ -528,6 +596,9 @@ def compare_graph_spaces(
         universe_chunks_count=len(universe_embeddings) if universe_embeddings_b is None or len(universe_embeddings) == len(u_b) else len(u_b),
         universe_chunks_count_a=len(universe_embeddings),
         universe_chunks_count_b=len(u_b),
+        universe_total_chars=m2.universe_total_chars if universe_embeddings_b is not None else m1.universe_total_chars,
+        universe_total_chars_a=m1.universe_total_chars,
+        universe_total_chars_b=m2.universe_total_chars,
         label_a=label_a,
         label_b=label_b,
         baseline_metrics=m1,
@@ -606,12 +677,15 @@ def extract_concept_embeddings(store: ConceptGraphStore) -> Tuple[List[str], np.
     return names, np.vstack(vec_arrays)
 
 
-def extract_chunk_embeddings(store: ConceptGraphStore) -> Tuple[List[str], np.ndarray]:
+def extract_chunk_embeddings_and_weights(
+    store: ConceptGraphStore,
+) -> Tuple[List[str], np.ndarray, np.ndarray]:
     """
-    Extracts all Chunk node IDs and their stored vector embeddings.
+    Extracts all Chunk node IDs, their stored vector embeddings, and chunk character weights.
     """
     chunk_ids: List[str] = []
     vec_arrays: List[np.ndarray] = []
+    weights: List[float] = []
 
     for node_id, attrs in store.graph.nodes(data=True):
         if attrs.get("type") == "Chunk":
@@ -620,11 +694,25 @@ def extract_chunk_embeddings(store: ConceptGraphStore) -> Tuple[List[str], np.nd
                 cid = attrs.get("chunk_id") or str(node_id).replace("chunk:", "")
                 chunk_ids.append(str(cid))
                 vec_arrays.append(np.asarray(emb, dtype=np.float32))
+                c_len = attrs.get("char_count")
+                if c_len is not None and int(c_len) > 0:
+                    weights.append(float(c_len))
+                else:
+                    txt = attrs.get("text") or ""
+                    weights.append(float(len(txt)) if len(txt) > 0 else 1.0)
 
     if not vec_arrays:
-        return chunk_ids, np.empty((0, 0), dtype=np.float32)
+        return chunk_ids, np.empty((0, 0), dtype=np.float32), np.empty(0, dtype=np.float64)
 
-    return chunk_ids, np.vstack(vec_arrays)
+    return chunk_ids, np.vstack(vec_arrays), np.asarray(weights, dtype=np.float64)
+
+
+def extract_chunk_embeddings(store: ConceptGraphStore) -> Tuple[List[str], np.ndarray]:
+    """
+    Extracts all Chunk node IDs and their stored vector embeddings.
+    """
+    cids, mat, _ = extract_chunk_embeddings_and_weights(store)
+    return cids, mat
 
 
 def ensure_graph_embeddings(
@@ -675,7 +763,7 @@ def run_graph_space_evaluation(
     u_target = universe_store if universe_store is not None else store
     if universe_store is not None:
         ensure_graph_embeddings(universe_store, embeddings=embeddings, chunks_dir=chunks_dir, console=console)
-    u_ids, u_mat = extract_chunk_embeddings(u_target)
+    u_ids, u_mat, u_weights = extract_chunk_embeddings_and_weights(u_target)
 
     if len(u_mat) == 0:
         raise ValueError("Universe chunk embeddings are missing. Provide a graph with stored chunks or configure chunks_dir.")
@@ -690,6 +778,7 @@ def run_graph_space_evaluation(
         graph_embeddings=g_mat,
         tau=tau,
         parent_chunk_mask=parent_mask,
+        chunk_weights=u_weights,
     )
     return GraphSpaceMetrics(**raw)
 
@@ -713,15 +802,17 @@ def run_graph_space_comparison(
     _, g1_mat = extract_concept_embeddings(store_a)
     _, g2_mat = extract_concept_embeddings(store_b)
 
-    cids_a, u1_mat = extract_chunk_embeddings(store_a)
-    cids_b, u2_mat = extract_chunk_embeddings(store_b)
+    cids_a, u1_mat, w_a = extract_chunk_embeddings_and_weights(store_a)
+    cids_b, u2_mat, w_b = extract_chunk_embeddings_and_weights(store_b)
 
     if len(u1_mat) == 0 and len(u2_mat) > 0:
         u1_mat = u2_mat
         cids_a = cids_b
+        w_a = w_b
     elif len(u2_mat) == 0 and len(u1_mat) > 0:
         u2_mat = u1_mat
         cids_b = cids_a
+        w_b = w_a
 
     if len(u1_mat) == 0:
         raise ValueError("No chunk embeddings found in either Graph A or Graph B to construct universe.")
@@ -746,6 +837,8 @@ def run_graph_space_comparison(
         parent_mask_a=parent_mask_a,
         parent_mask_b=parent_mask_b,
         universe_embeddings_b=u2_mat,
+        chunk_weights=w_a,
+        chunk_weights_b=w_b,
     )
 
 
@@ -800,13 +893,15 @@ def format_graph_comparison_table(report: GraphSpaceComparisonReport) -> Table:
         return f"[{color}]{txt}[/{color}]"
 
     # Core Metric Rows
-    if m1.universe_chunks_count != m2.universe_chunks_count:
+    if m1.universe_chunks_count != m2.universe_chunks_count or (m1.universe_total_chars and m2.universe_total_chars and m1.universe_total_chars != m2.universe_total_chars):
+        a_u_str = f"{m1.universe_chunks_count:,} ({m1.universe_total_chars/1_000_000:.1f}M chars)" if m1.universe_total_chars else f"{m1.universe_chunks_count:,}"
+        b_u_str = f"{m2.universe_chunks_count:,} ({m2.universe_total_chars/1_000_000:.1f}M chars)" if m2.universe_total_chars else f"{m2.universe_chunks_count:,}"
         tbl.add_row(
             "Corpus Chunks Evaluated (|U|)",
-            f"{m1.universe_chunks_count:,}",
-            f"{m2.universe_chunks_count:,}",
+            a_u_str,
+            b_u_str,
             _delta_badge(m2.universe_chunks_count - m1.universe_chunks_count, decimals=0, higher_is_better=False),
-            "Total raw chunks in each model's corpus space",
+            "Total chunks & character mass in corpus space",
         )
     tbl.add_row(
         "Idea / Concept Nodes (|G|)",
@@ -820,35 +915,35 @@ def format_graph_comparison_table(report: GraphSpaceComparisonReport) -> Table:
         _fmt(m1.coverage_at_tau_pct, True),
         _fmt(m2.coverage_at_tau_pct, True),
         _delta_badge(report.delta_coverage_at_tau_pct, is_pct=True, higher_is_better=True),
-        "Corpus reachable within radius τ (Macro-coverage)",
+        "Text volume reachable within radius τ (Macro-coverage)",
     )
     tbl.add_row(
         "Chamfer Mean Coverage (μ)",
         _fmt(m1.chamfer_mean, decimals=4),
         _fmt(m2.chamfer_mean, decimals=4),
         _delta_badge(report.delta_chamfer_mean, decimals=4, higher_is_better=True),
-        "Expected semantic proximity across all chunks",
+        "Size-weighted expected semantic proximity",
     )
     tbl.add_row(
         "Coverage Std Dev (σ)",
         _fmt(m1.chamfer_std, decimals=4),
         _fmt(m2.chamfer_std, decimals=4),
         _delta_badge(report.delta_chamfer_std, decimals=4, higher_is_better=False),
-        "Regularity: lower σ means uniform coverage across topics",
+        "Size-weighted regularity across text volume",
     )
     tbl.add_row(
         "Worst-Decile Proximity (p10)",
         _fmt(m1.worst_decile_p10, decimals=4),
         _fmt(m2.worst_decile_p10, decimals=4),
         _delta_badge(report.delta_worst_decile_p10, decimals=4, higher_is_better=True),
-        "Tail risk: proximity depth of 10% hardest chunks",
+        "Tail risk: proximity depth of 10% hardest text mass",
     )
     tbl.add_row(
         "Median Proximity (p50)",
         _fmt(m1.median_p50, decimals=4),
         _fmt(m2.median_p50, decimals=4),
         _delta_badge(report.delta_median_p50, decimals=4, higher_is_better=True),
-        "Robust centrality of graph concepts",
+        "Size-weighted median proximity of corpus text",
     )
     tbl.add_row(
         "Directed Hausdorff Gap (dH)",
@@ -887,21 +982,21 @@ def format_graph_comparison_table(report: GraphSpaceComparisonReport) -> Table:
             _fmt(m1.parent_chunk_ratio_pct, True),
             _fmt(m2.parent_chunk_ratio_pct, True),
             _delta_badge(report.delta_parent_chunk_ratio_pct, is_pct=True, higher_is_better=False),
-            "Fraction of corpus compute spent on (Np / N)",
+            "Fraction of corpus text volume compute was spent on",
         )
         tbl.add_row(
             "Skipped Retention (R_skipped)",
             _fmt(m1.skipped_retention_pct, True),
             _fmt(m2.skipped_retention_pct, True),
             _delta_badge(report.delta_skipped_retention_pct, is_pct=True, higher_is_better=True),
-            "Bypassed chunks retained within radius τ (anti-orphan)",
+            "Bypassed text volume retained within radius τ",
         )
         tbl.add_row(
             "Generalization Surplus (Δ_cov)",
             _fmt(m1.generalization_surplus_pct, True),
             _fmt(m2.generalization_surplus_pct, True),
             _delta_badge(report.delta_generalization_surplus_pct, is_pct=True, higher_is_better=True),
-            "Coverage gained beyond extraction ratio (Cov_τ - ρ_parent)",
+            "Excess text coverage gained over extraction ratio",
         )
         tbl.add_row(
             "Compression Leverage (L_comp)",

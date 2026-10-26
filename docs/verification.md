@@ -203,33 +203,35 @@ bookeeper verify --mode graph --compare-graph ./output/knowledge_graph.json --ta
 
 #### Core Metric Suite for Knowledge Graph Space
 
-| Metric | Category | Formula / Definition | Operational Purpose |
+To eliminate distortion caused by chunk size variance (e.g. short 200-char transitional chunks vs dense 1,500-char technical explanations), all metrics are **size-weighted by chunk character length** $w_i = \text{char\_count}(c_i)$, measuring actual text volume rather than arbitrary chunk boundary counts:
+
+| Metric | Category | Size-Weighted Formula / Definition | Operational Purpose |
 | :--- | :--- | :--- | :--- |
-| **Chamfer Coverage ($\mu$)** | Global Coverage | $\frac{1}{\|U\|} \sum_{c \in U} \max_{v \in G} \cos(c, v)$ | Expected semantic proximity of arbitrary literature chunks to the graph concepts. |
-| **Coverage Std Dev ($\sigma$)** | Regularity | $\sqrt{\frac{1}{\|U\|} \sum (s_i - \mu)^2}$ | Detects whether coverage is uniform (low $\sigma$) or clumped in few topics while leaving gaps (high $\sigma$). |
-| **Worst-Decile ($p_{10}$)** | Tail Risk | 10th percentile of $\{s_i\}$ | Measures depth of semantic blind spots across the bottom 10% hardest chunks. |
-| **Median ($p_{50}$)** | Robust Centrality | 50th percentile of $\{s_i\}$ | Typical proximity unaffected by heavy tails or extreme outliers. |
-| **Threshold Coverage ($\text{Cov}_\tau$)** | Bounded Recall | $\frac{\|\{c \in U \mid \max_v \cos(c, v) \ge \tau\}\|}{\|U\|} \times 100$ | Percentage of the total literature corpus reachable within cosine radius $\tau$ (default: 0.75). |
+| **Chamfer Coverage ($\mu$)** | Global Coverage | $\frac{\sum_{c_i \in U} w_i \max_{v \in G} \cos(c_i, v)}{\sum w_i}$ | Size-weighted expected semantic proximity of literature text to graph concepts. |
+| **Coverage Std Dev ($\sigma$)** | Regularity | $\sqrt{\frac{\sum w_i (s_i - \mu)^2}{\sum w_i}}$ | Detects whether coverage is uniform (low $\sigma$) or clumped in few topics while leaving gaps (high $\sigma$). |
+| **Worst-Decile ($p_{10}$)** | Tail Risk | Weighted 10th percentile of $\{s_i\}$ | Depth of semantic blind spots across the bottom 10% hardest text volume. |
+| **Median ($p_{50}$)** | Robust Centrality | Weighted 50th percentile of $\{s_i\}$ | Typical proximity of text mass unaffected by heavy tails. |
+| **Threshold Coverage ($\text{Cov}_\tau$)** | Bounded Recall | $\frac{\sum_{s_i \ge \tau} w_i}{\sum w_i} \times 100$ | Percentage of the total literature text volume reachable within cosine radius $\tau$ (default: 0.75). |
 | **Directed Hausdorff ($d_H$)** | Maximum Blind Spot | $\max_{c \in U} \min_{v \in G} (1 - \cos(c, v))$ | Absolute worst-case gap in the graph (distance to the single most isolated chunk). |
 | **Vendi Score ($VS$)** | Extrinsic Diversity | $\exp\left(-\sum \lambda_i \ln \lambda_i\right)$ where $\lambda = \text{eig}(K / \|G\|)$ | Effective number of orthogonal, non-redundant concept directions spanned by $G$. |
 | **Compression Efficiency** | Node Economy | $\frac{\text{Cov}_\tau(G, U)}{\|V_G\|}$ | Percentage of total corpus space covered per node retained in the graph. |
 
 #### Skipping Mechanism Leverage Suite
 
-Comparing **Threshold Coverage ($\text{Cov}_\tau$)** against the **Extraction (Parent) Ratio ($\rho_{\text{parent}}$)** evaluates whether bypassed chunks are successfully represented:
+Comparing **Threshold Coverage ($\text{Cov}_\tau$)** against the **Extraction (Parent) Ratio ($\rho_{\text{parent}}$)** evaluates whether bypassed text volume is successfully represented:
 
-* Let $N = \|U\|$: Total chunks in the universe.
-* $N_{\text{parent}}$: Chunks from which an idea was extracted.
-* $N_{\text{skipped}} = N - N_{\text{parent}}$: Chunks deliberately bypassed.
-* **Extraction Ratio ($\rho_{\text{parent}} = \frac{N_{\text{parent}}}{N}$)**: Fraction of the corpus spent on LLM compute.
+* Let $W = \sum_{c \in U} w_c$: Total character volume of the universe.
+* $W_{\text{parent}} = \sum_{c \in U_{\text{parent}}} w_c$: Character volume of chunks from which an idea was extracted.
+* $W_{\text{skipped}} = W - W_{\text{parent}}$: Character volume of chunks deliberately bypassed.
+* **Extraction Ratio ($\rho_{\text{parent}} = \frac{W_{\text{parent}}}{W}$)**: Fraction of corpus text volume spent on LLM compute.
 * **Generalization Surplus ($\Delta_{\text{cov}} = \text{Cov}_\tau - \rho_{\text{parent}}$)**:
-  - $\Delta_{\text{cov}} > 0$: Skipping heuristic is working. Extracted ideas act as genuine semantic umbrellas covering skipped chunks for free.
-  - $\Delta_{\text{cov}} \approx 0$: Ideas are narrow and only cover their own immediate parent chunks.
+  - $\Delta_{\text{cov}} > 0$: Skipping heuristic is working. Extracted ideas act as genuine semantic umbrellas covering skipped text for free.
+  - $\Delta_{\text{cov}} \approx 0$: Ideas are narrow and only cover their own immediate parent text.
 * **Compression Leverage Ratio ($L_{\text{comp}} = \frac{\text{Cov}_\tau}{\rho_{\text{parent}}}$)**:
-  - Factor of concept space represented per unit of corpus processed (e.g. $L_{\text{comp}} = 2.5\times$ means each 1% of processed chunks represents 2.5% of total corpus concept space).
-* **Skipped Chunk Retention Rate ($R_{\text{skipped}}$)**:
-  $$R_{\text{skipped}} = \frac{\|\{c \in U_{\text{skipped}} \mid \max_{v \in G} \cos(c, v) \ge \tau\}\|}{\|U_{\text{skipped}}\|}$$
-  Direct percentage of deliberately ignored chunks that remain safely within semantic radius $\tau$.
+  - Factor of text space represented per unit of corpus processed (e.g. $L_{\text{comp}} = 2.5\times$ means each 1% of processed text mass represents 2.5% of total corpus concept space).
+* **Skipped Text Retention Rate ($R_{\text{skipped}}$)**:
+  $$R_{\text{skipped}} = \frac{\sum_{c \in U_{\text{skipped}}, \max_v \cos(c, v) \ge \tau} w_c}{W_{\text{skipped}}}$$
+  Direct percentage of deliberately ignored text volume that remains safely within semantic radius $\tau$.
 
 ---
 

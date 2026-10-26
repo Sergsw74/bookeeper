@@ -2683,6 +2683,13 @@ def build_graph(
                             if should_skip_limbo:
                                 for rc in routing.limbo:
                                     l_chk = rc.chunk
+                                    sec_node_id = store.add_section(
+                                        book_id=bid,
+                                        chapter_idx=l_chk.chapter_idx,
+                                        title=l_chk.section_title,
+                                        text=l_chk.text,
+                                    )
+                                    store.add_chunk(l_chk)
                                     book_state.mark_chunk_processed(
                                         chunk_id=l_chk.chunk_id,
                                         chunk_idx=l_chk.chunk_idx,
@@ -3134,6 +3141,19 @@ def build_graph(
                     # Step 2/4: Integrate sections, chunks, concepts, and grounded quotes into Knowledge Graph
                     t_step2 = time.perf_counter()
                     store.add_book(bid, title=btitle, author=bauthor, publication_date=bpubdate)
+
+                    # Ensure ALL chunks from the book exist in the graph (including skipped chunks)
+                    # so sequential NEXT/PREV edges and section hierarchies remain completely contiguous.
+                    if chunks:
+                        for b_chk in chunks:
+                            store.add_section(
+                                book_id=bid,
+                                chapter_idx=b_chk.chapter_idx,
+                                title=b_chk.section_title,
+                                text=b_chk.text,
+                            )
+                            store.add_chunk(b_chk)
+
                     resolved_concept_iter = iter(resolved_book_concepts)
                     upserted_ideas_for_neo4j: Dict[str, Dict[str, Any]] = {}
 

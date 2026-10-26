@@ -502,3 +502,63 @@ def test_compare_graph_spaces_skipping_gate_pass_and_fail():
     assert rep_fail.gate_checklist["skipping_generalization"]["passed"] is False
     assert rep_fail.decision_pass is False
     assert "Skipping Generalization & Retention" in rep_fail.pass_reason
+
+
+def test_evaluate_graph_space_chunk_weighting():
+    """Verify metrics properly apply chunk weights (character sizes) instead of uniform counts."""
+    # Chunk 1: perfectly matches G[0] (sim = 1.0), weight = 100 chars
+    # Chunk 2: orthogonal to G[0] (sim = 0.0), weight = 900 chars
+    u = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    g = np.array([[1.0, 0.0]], dtype=np.float32)
+    weights = np.array([100.0, 900.0], dtype=np.float64)
+
+    # 1. Unweighted evaluation (both chunks equal)
+    unweighted = evaluate_graph_space(u, g, tau=0.75, chunk_weights=None)
+    assert unweighted["chamfer_mean"] == 0.5
+    assert unweighted["coverage_at_tau_pct"] == 50.0
+
+    # 2. Weighted evaluation (large chunk dominates 90% of corpus mass)
+    weighted = evaluate_graph_space(u, g, tau=0.75, chunk_weights=weights)
+    # Expected weighted mean: (100*1.0 + 900*0.0) / 1000 = 0.10
+    assert np.isclose(weighted["chamfer_mean"], 0.10, atol=1e-3)
+    # Expected weighted coverage: only chunk 1 meets tau >= 0.75 -> 100 / 1000 = 10.0%
+    assert np.isclose(weighted["coverage_at_tau_pct"], 10.0, atol=1e-2)
+    assert weighted["universe_total_chars"] == 1000
+
+
+def test_extract_chunk_embeddings_and_weights():
+    """Verify extract_chunk_embeddings_and_weights returns character counts as weights."""
+    from bookeeper.processing.graph_evaluator import extract_chunk_embeddings_and_weights
+    from bookeeper.processing.chunker import HierarchicalChunk
+
+    store = ConceptGraphStore()
+    c1 = HierarchicalChunk(
+        chunk_id="c1",
+        book_id=1,
+        book_title="B",
+        section_title="S",
+        chapter_idx=1,
+        chunk_idx=1,
+        text="Hello world",
+        char_count=1200,
+        embedding=[0.1] * 16,
+    )
+    c2 = HierarchicalChunk(
+        chunk_id="c2",
+        book_id=1,
+        book_title="B",
+        section_title="S",
+        chapter_idx=1,
+        chunk_idx=2,
+        text="A" * 350,
+        char_count=0,  # Will fallback to len(text)
+        embedding=[0.2] * 16,
+    )
+    store.add_chunk(c1)
+    store.add_chunk(c2)
+
+    cids, mat, weights = extract_chunk_embeddings_and_weights(store)
+    assert len(cids) == 2
+    assert mat.shape == (2, 16)
+    assert list(weights) == [1200.0, 350.0]
+

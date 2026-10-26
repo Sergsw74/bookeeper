@@ -1799,6 +1799,164 @@ def test_format_idea_for_embedding_deduplication():
     assert formatted2 == "Consensus"
 
 
+def test_usearch_idea_embedding_index_dynamic_insertion_and_search():
+    """Verify IdeaEmbeddingIndex uses usearch for fast logarithmic search and dynamic updates."""
+    from bookeeper.processing.recent_ideas import IdeaEmbeddingIndex
+
+    idea_index = IdeaEmbeddingIndex()
+    assert idea_index.index is None
+
+    # Dynamically add first idea
+    idx0 = idea_index.add_idea(
+        name="Quantum Key Distribution",
+        summary="Cryptographic protocol using quantum mechanics",
+        vector=[1.0, 0.0, 0.0, 0.0],
+        month="2021-01",
+    )
+    assert idx0 == 0
+    assert len(idea_index.idea_names) == 1
+    assert idea_index.index is not None
+    assert len(idea_index.index) == 1
+
+    # Dynamically add second idea
+    idx1 = idea_index.add_idea(
+        name="Transformer Attention",
+        summary="Multi-head self-attention mechanism",
+        vector=[0.0, 1.0, 0.0, 0.0],
+        month="2021-06",
+    )
+    assert idx1 == 1
+    assert len(idea_index.index) == 2
+
+    # Query using find_best_match
+    best_name, sim, best_summary = idea_index.find_best_match(np.array([1.0, 0.0, 0.0, 0.0]))
+    assert best_name == "Quantum Key Distribution"
+    assert sim == pytest.approx(1.0, abs=1e-3)
+    assert "Cryptographic" in best_summary
+
+    best_name, sim, _ = idea_index.find_best_match(np.array([0.0, 1.0, 0.0, 0.0]))
+    assert best_name == "Transformer Attention"
+    assert sim == pytest.approx(1.0, abs=1e-3)
+
+    # Dynamic insertion on the fly: Add 3rd idea and search without rebuilding
+    idx2 = idea_index.add_idea(
+        name="Lattice Cryptography",
+        summary="Post-quantum cryptographic scheme",
+        vector=[0.0, 0.0, 1.0, 0.0],
+        month="2022-03",
+    )
+    assert idx2 == 2
+    assert len(idea_index.index) == 3
+
+    best_name, sim, _ = idea_index.find_best_match(np.array([0.0, 0.0, 1.0, 0.0]))
+    assert best_name == "Lattice Cryptography"
+    assert sim == pytest.approx(1.0, abs=1e-3)
+
+    # Update an existing idea (in-place replacement without duplicate keys)
+    idx_updated = idea_index.add_idea(
+        name="Transformer Attention",
+        summary="Updated multi-head self-attention mechanism description",
+        vector=[0.0, 0.7071, 0.7071, 0.0],
+    )
+    assert idx_updated == 1
+    assert len(idea_index.index) == 3
+    assert idea_index.idea_summaries[1] == "Updated multi-head self-attention mechanism description"
+
+
+def test_usearch_idea_embedding_index_query_batch():
+    """Verify IdeaEmbeddingIndex.query_batch uses usearch native batch search."""
+    from bookeeper.processing.recent_ideas import IdeaEmbeddingIndex
+
+    idea_index = IdeaEmbeddingIndex(
+        idea_names=["Idea A", "Idea B", "Idea C"],
+        idea_summaries=["Summary A", "Summary B", "Summary C"],
+        idea_months={"Idea A": "2020-01", "Idea B": "2021-01", "Idea C": "2022-01"},
+        vectors=np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float32),
+    )
+
+    queries = [
+        [1.0, 0.0, 0.0],     # Exact match Idea A
+        [0.0, 0.8, 0.6],     # Mix of Idea B (0.8) and Idea C (0.6)
+        [0.0, 0.0, 0.0],     # Zero vector
+    ]
+
+    results = idea_index.query_batch(queries, top_k=2)
+    assert len(results) == 3
+
+    # Query 0: Top match Idea A
+    assert len(results[0]) == 2
+    assert results[0][0]["name"] == "Idea A"
+    assert results[0][0]["score"] == pytest.approx(1.0, abs=1e-3)
+
+    # Query 1: Top match Idea B (~0.80), second Idea C (~0.60)
+    assert len(results[1]) == 2
+    assert results[1][0]["name"] == "Idea B"
+    assert results[1][0]["score"] == pytest.approx(0.80, abs=1e-2)
+    assert results[1][1]["name"] == "Idea C"
+    assert results[1][1]["score"] == pytest.approx(0.60, abs=1e-2)
+
+    # Query 2: Zero vector should return empty match list
+    assert len(results[2]) == 0
+
+
+def test_usearch_idea_embedding_index_save_and_load(tmp_path: Path):
+    """Verify IdeaEmbeddingIndex can be dumped to disk and reloaded with usearch."""
+    from bookeeper.processing.recent_ideas import IdeaEmbeddingIndex
+
+    save_base = tmp_path / "usearch_ideas"
+
+    original = IdeaEmbeddingIndex()
+    original.add_idea("Byzantine Fault Tolerance", "Consensus under arbitrary node failures", [1.0, 0.0, 0.0], "2020-05")
+    original.add_idea("Raft Consensus", "Leader-based consensus protocol", [0.0, 1.0, 0.0], "2021-07")
+
+    original.save(save_base)
+
+    assert (tmp_path / "usearch_ideas.usearch").exists()
+    assert (tmp_path / "usearch_ideas.json").exists()
+
+    loaded = IdeaEmbeddingIndex.load(save_base)
+    assert loaded.index is not None
+    assert len(loaded.index) == 2
+    assert loaded.idea_names == ["Byzantine Fault Tolerance", "Raft Consensus"]
+    assert loaded.idea_summaries == ["Consensus under arbitrary node failures", "Leader-based consensus protocol"]
+    assert loaded.idea_months["Byzantine Fault Tolerance"] == "2020-05"
+
+    best_name, sim, _ = loaded.find_best_match(np.array([1.0, 0.0, 0.0]))
+    assert best_name == "Byzantine Fault Tolerance"
+    assert sim == pytest.approx(1.0, abs=1e-3)
+
+
+def test_usearch_entity_deduplicator_integration():
+    """Verify EntityDeduplicator uses usearch for fast in-memory candidate lookup and deduplication."""
+    from bookeeper.processing.deduplicator import EntityDeduplicator
+    from bookeeper.processing.extractor import Concept
+    from bookeeper.processing.recent_ideas import IdeaEmbeddingIndex
+
+    idea_index = IdeaEmbeddingIndex()
+    idea_index.add_idea("Graph Convolutional Network", "Deep learning on graph structures", [1.0, 0.0, 0.0])
+
+    dedup = EntityDeduplicator()
+    seeded = dedup.seed_from_idea_index(idea_index)
+    assert seeded == 1
+    assert dedup._usearch_index is not None
+    assert len(dedup._usearch_index) == 1
+
+    # Incoming concept with high similarity (0.98) should directly merge using usearch index
+    concept = Concept(
+        name="Graph Convolution Networks",
+        brief_description="GCN model over graphs",
+    )
+    concept.embedding = [0.98, 0.1989, 0.0]  # unit norm ≈ 1.0, cosine sim with [1,0,0] = 0.98 >= 0.95
+
+    resolved = dedup.resolve_concept(concept)
+    assert resolved.name == "Graph Convolutional Network"
+
+
+
 
 
 

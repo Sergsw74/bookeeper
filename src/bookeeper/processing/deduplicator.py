@@ -75,6 +75,9 @@ class EntityDeduplicator:
         self._norm_to_canon: Dict[str, str] = {}
         # Cache of LLM disambiguation decisions: (norm_name_a, norm_name_b) -> decision
         self._disambiguation_cache: Dict[Tuple[str, str], ConceptDeduplicationDecision] = {}
+        # Native C++ HNSW usearch index for logarithmic vector similarity search
+        self._usearch_index: Optional[Any] = None
+        self._cached_canon_order: List[str] = []
 
     def _register_in_cache(
         self,
@@ -82,11 +85,31 @@ class EntityDeduplicator:
         vec: Optional[np.ndarray],
         concept: Concept,
     ) -> None:
-        """Register or update a concept in _cache and maintain _norm_to_canon index."""
+        """Register or update a concept in _cache and maintain _norm_to_canon index and usearch index."""
         self._cache[canon_name] = (vec, concept)
         norm_key = self._normalize_name(canon_name)
         if norm_key:
             self._norm_to_canon[norm_key] = canon_name
+
+        if vec is not None and isinstance(vec, np.ndarray) and vec.ndim == 1 and len(vec) > 1:
+            arr = vec.astype(np.float32)
+            norm = float(np.linalg.norm(arr))
+            unit_v = (arr / norm) if norm > 0.0 else arr
+
+            if self._usearch_index is None:
+                from usearch.index import Index
+
+                self._usearch_index = Index(ndim=int(unit_v.shape[0]), metric="cos")
+
+            if canon_name in self._cached_canon_order:
+                idx = self._cached_canon_order.index(canon_name)
+                if idx in self._usearch_index:
+                    self._usearch_index.remove(idx)
+                self._usearch_index.add(idx, unit_v)
+            else:
+                idx = len(self._cached_canon_order)
+                self._cached_canon_order.append(canon_name)
+                self._usearch_index.add(idx, unit_v)
 
     @classmethod
     def from_settings(
@@ -180,6 +203,37 @@ class EntityDeduplicator:
             seeded += 1
         return seeded
 
+    def seed_from_idea_index(self, idea_index: Any) -> int:
+        """
+        Seed the deduplicator cache and usearch index from an existing IdeaEmbeddingIndex.
+        """
+        if not getattr(idea_index, "idea_names", None):
+            return 0
+        names = idea_index.idea_names
+        summaries = getattr(idea_index, "idea_summaries", [])
+        vectors = getattr(idea_index, "vectors", None)
+        seeded = 0
+        for idx, name in enumerate(names):
+            clean_name = BookParser.repair_mojibake(name).strip()
+            if not clean_name:
+                continue
+            summary = summaries[idx] if idx < len(summaries) else ""
+            vec_arr = None
+            if vectors is not None and idx < len(vectors):
+                vec_arr = np.asarray(vectors[idx], dtype=np.float32)
+            concept_obj = Concept(
+                name=clean_name,
+                category="Idea",
+                brief_description=summary,
+                detailed_explanation=summary,
+                summary=summary,
+            )
+            if vec_arr is not None:
+                concept_obj.embedding = vec_arr.tolist()
+            self._register_in_cache(clean_name, vec_arr, concept_obj)
+            seeded += 1
+        return seeded
+
     def resolve_concept(self, concept: Concept) -> Concept:
         """
         Compare incoming concept against existing graph concepts.
@@ -222,13 +276,28 @@ class EntityDeduplicator:
             best_match: Optional[Concept] = None
             best_canon_name: Optional[str] = None
 
-            for canon_name, (cached_vec, existing_concept) in self._cache.items():
-                if cached_vec is not None and cached_vec.shape == concept_vec.shape:
-                    sim = float(np.dot(concept_vec, cached_vec))
-                    if sim > best_sim:
-                        best_sim = sim
-                        best_match = existing_concept
-                        best_canon_name = canon_name
+            # Fast in-memory native C++ HNSW usearch lookup
+            if self._usearch_index is not None and len(self._usearch_index) > 0:
+                matches = self._usearch_index.search(concept_vec, 1)
+                if len(matches.keys) > 0 and len(matches.distances) > 0:
+                    d = float(matches.distances[0])
+                    if not np.isnan(d):
+                        sim = float(max(-1.0, min(1.0, 1.0 - d)))
+                        k_idx = int(matches.keys[0])
+                        if 0 <= k_idx < len(self._cached_canon_order):
+                            c_canon = self._cached_canon_order[k_idx]
+                            if c_canon in self._cache:
+                                best_sim = sim
+                                best_match = self._cache[c_canon][1]
+                                best_canon_name = c_canon
+            else:
+                for canon_name, (cached_vec, existing_concept) in self._cache.items():
+                    if cached_vec is not None and cached_vec.shape == concept_vec.shape:
+                        sim = float(np.dot(concept_vec, cached_vec))
+                        if sim > best_sim:
+                            best_sim = sim
+                            best_match = existing_concept
+                            best_canon_name = canon_name
 
             # Case A: High Confidence (>= 0.95) -> Definitive match, merge directly
             if best_match is not None and best_sim >= self.high_similarity_threshold:
@@ -474,7 +543,21 @@ class EntityDeduplicator:
                         best_sim = cand_score
                         best_match = existing_c
 
-                if concept_vec is not None and cached_matrix is not None and concept_vec.shape[0] == cached_matrix.shape[1]:
+                if concept_vec is not None and self._usearch_index is not None and len(self._usearch_index) > 0:
+                    matches = self._usearch_index.search(concept_vec, 1)
+                    if len(matches.keys) > 0 and len(matches.distances) > 0:
+                        d = float(matches.distances[0])
+                        if not np.isnan(d):
+                            sim_val = float(max(-1.0, min(1.0, 1.0 - d)))
+                            k_idx = int(matches.keys[0])
+                            if 0 <= k_idx < len(self._cached_canon_order):
+                                cand_canon = self._cached_canon_order[k_idx]
+                                if cand_canon in self._cache:
+                                    cand_concept = self._cache[cand_canon][1]
+                                    if sim_val > best_sim:
+                                        best_sim = sim_val
+                                        best_match = cand_concept
+                elif concept_vec is not None and cached_matrix is not None and concept_vec.shape[0] == cached_matrix.shape[1]:
                     sims = np.dot(cached_matrix, concept_vec)
                     max_i = int(np.argmax(sims))
                     sim_val = float(sims[max_i])
@@ -581,9 +664,24 @@ class EntityDeduplicator:
                     best_match = existing_c
                     best_canon_name = cand_name
 
-            # Also check in-memory _cache vectors
+            # Also check in-memory _cache vectors via fast usearch HNSW index
             if concept_vec is not None and self._cache:
-                if cached_matrix is not None and concept_vec.shape[0] == cached_matrix.shape[1]:
+                if self._usearch_index is not None and len(self._usearch_index) > 0:
+                    matches = self._usearch_index.search(concept_vec, 1)
+                    if len(matches.keys) > 0 and len(matches.distances) > 0:
+                        d = float(matches.distances[0])
+                        if not np.isnan(d):
+                            sim_val = float(max(-1.0, min(1.0, 1.0 - d)))
+                            k_idx = int(matches.keys[0])
+                            if 0 <= k_idx < len(self._cached_canon_order):
+                                cand_canon = self._cached_canon_order[k_idx]
+                                if cand_canon in self._cache:
+                                    cand_concept = self._cache[cand_canon][1]
+                                    if sim_val > best_sim:
+                                        best_sim = sim_val
+                                        best_match = cand_concept
+                                        best_canon_name = cand_canon
+                elif cached_matrix is not None and concept_vec.shape[0] == cached_matrix.shape[1]:
                     sims = np.dot(cached_matrix, concept_vec)
                     max_i = int(np.argmax(sims))
                     sim_val = float(sims[max_i])
@@ -591,8 +689,8 @@ class EntityDeduplicator:
                         best_sim = sim_val
                         best_match = cached_concepts[max_i]
                         best_canon_name = cached_names[max_i]
-                # Also check any newly added concepts in _cache during this loop beyond cached_matrix
-                if len(self._cache) > len(cached_names):
+                # Also check any newly added concepts in _cache during this loop beyond cached_matrix if usearch is not present
+                if self._usearch_index is None and len(self._cache) > len(cached_names):
                     for canon_name, (cached_vec, existing_concept) in list(self._cache.items())[len(cached_names) :]:
                         if cached_vec is not None and cached_vec.shape == concept_vec.shape:
                             sim = float(np.dot(concept_vec, cached_vec))

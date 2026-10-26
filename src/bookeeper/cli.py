@@ -8280,6 +8280,14 @@ def simulate_thresholds_command(
         )
     )
 
+    # Initialize embeddings client so all concepts are accurately embedded with genuine vectors
+    embeddings_client = None
+    try:
+        from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings
+        embeddings_client = FailoverOllamaEmbeddings.from_settings(cfg)
+    except Exception as e:
+        logger.debug(f"Could not initialize FailoverOllamaEmbeddings for simulation: {e}")
+
     try:
         suite_report = run_threshold_simulation_suite(
             pairs=threshold_pairs,
@@ -8289,6 +8297,7 @@ def simulate_thresholds_command(
             tau=tau,
             skip_limbo=skip_limbo,
             max_books=max_books,
+            embeddings_client=embeddings_client,
             console=console,
         )
     except Exception as e:

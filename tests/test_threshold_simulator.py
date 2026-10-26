@@ -265,8 +265,21 @@ def test_cli_simulate_thresholds(tmp_path):
     chunks_dir = tmp_path / "chunks"
     chunks_dir.mkdir(parents=True)
 
-    dim = 8
+    dim = 16
     v0 = (np.ones(dim, dtype=np.float32) / np.sqrt(dim)).tolist()
+
+    # Create dummy KG file with matching 16-dim vectors
+    dummy_kg = tmp_path / "dummy_kg.json"
+    dummy_kg_data = {
+        "nodes": [
+            {
+                "type": "Concept",
+                "name": "Mock Concept",
+                "embedding": v0,
+            }
+        ]
+    }
+    dummy_kg.write_text(json.dumps(dummy_kg_data), encoding="utf-8")
 
     # Create dummy state file
     state_file = state_dir / "book_99_state.json"
@@ -313,6 +326,8 @@ def test_cli_simulate_thresholds(tmp_path):
             str(state_dir),
             "--chunks-dir",
             str(chunks_dir),
+            "--graph-path",
+            str(dummy_kg),
             "--output-report",
             str(out_report),
         ],

@@ -356,6 +356,7 @@ def preload_simulation_data(
     chunks_dir: Optional[Path | str] = None,
     graph_path: Optional[Path | str] = None,
     max_books: Optional[int] = None,
+    embeddings_client: Optional[Any] = None,
 ) -> Tuple[List[PreloadedBookData], Dict[str, List[float]]]:
     """
     Scan and load book state files, companion chunks, and precomputed concept embeddings
@@ -367,6 +368,7 @@ def preload_simulation_data(
         chunks_dir: Optional directory containing book_*_chunks.json files.
         graph_path: Optional path to output/knowledge_graph.json to extract existing concept embeddings.
         max_books: Optional cap on number of books to preload for quick testing.
+        embeddings_client: Optional embeddings client to pre-embed any extracted concepts missing from graph.
 
     Returns:
         Tuple of (preloaded_books, concept_embedding_map).
@@ -495,6 +497,31 @@ def preload_simulation_data(
 
     # Sort books chronologically by publication date, tie-breaking on book ID
     loaded_books.sort(key=lambda b: (b.publication_date, b.book_id))
+
+    # 3. If embeddings_client is provided, batch-embed any extracted concepts missing from concept_map
+    if embeddings_client is not None and loaded_books:
+        missing_names = set()
+        for b in loaded_books:
+            for cid, clist in b.extractions.items():
+                for c in clist:
+                    cname = str(c.get("name") or "").strip()
+                    if cname and cname.lower() not in concept_map:
+                        missing_names.add(cname)
+        if missing_names:
+            logger.info(f"Computing embeddings for {len(missing_names)} extracted concepts missing from knowledge graph...")
+            missing_list = list(missing_names)
+            try:
+                new_vecs = embeddings_client.embed_documents(missing_list, batch_size=32)
+                for name, v in zip(missing_list, new_vecs):
+                    if v and len(v) > 1:
+                        arr = np.asarray(v, dtype=np.float32)
+                        norm = float(np.linalg.norm(arr))
+                        unit_v = (arr / norm).tolist() if norm > 0 else arr.tolist()
+                        concept_map[name.lower()] = unit_v
+                logger.info(f"Successfully embedded and cached {len(missing_names)} concepts into simulation index.")
+            except Exception as e:
+                logger.warning(f"Failed to batch-embed missing concepts: {e}")
+
     logger.info(f"Preloaded {len(loaded_books)} books with {sum(len(b.chunks) for b in loaded_books):,} chunks for simulation.")
     return (loaded_books, concept_map)
 
@@ -599,14 +626,19 @@ def simulate_variation(
                         try:
                             emb_res = embeddings_client.embed_query(c_summary)
                             if emb_res and len(emb_res) > 1:
-                                c_emb = emb_res
+                                arr_e = np.asarray(emb_res, dtype=np.float32)
+                                norm_e = float(np.linalg.norm(arr_e))
+                                c_emb = (arr_e / norm_e).tolist() if norm_e > 0 else arr_e.tolist()
                                 local_concept_map[c_norm] = c_emb
                         except Exception:
                             pass
 
-                    # High-fidelity fallback: proxy with the triggering chunk's unit embedding
+                    # NEVER fall back to raw chunk_vec as a concept embedding!
+                    # Raw paragraph vectors act as artificial 1.0 self-anchors that distort
+                    # cosine proximity and inflate coverage metrics. Skip if un-embedded.
                     if c_emb is None:
-                        c_emb = chunk_vec
+                        logger.debug(f"Skipping un-embedded concept '{c_name}' in simulation")
+                        continue
 
                     index.add_idea(name=c_name, summary=c_summary, vector=c_emb)
                     store.add_concept(
@@ -636,7 +668,21 @@ def simulate_variation(
                             continue
                         c_norm = c_name.lower()
                         c_summary = str(c.get("summary") or c.get("brief_description") or c_name)
-                        c_emb = local_concept_map.get(c_norm) or chunk_vec
+                        c_emb = local_concept_map.get(c_norm)
+                        if c_emb is None and embeddings_client is not None:
+                            try:
+                                emb_res = embeddings_client.embed_query(c_summary)
+                                if emb_res and len(emb_res) > 1:
+                                    arr_e = np.asarray(emb_res, dtype=np.float32)
+                                    norm_e = float(np.linalg.norm(arr_e))
+                                    c_emb = (arr_e / norm_e).tolist() if norm_e > 0 else arr_e.tolist()
+                                    local_concept_map[c_norm] = c_emb
+                            except Exception:
+                                pass
+
+                        if c_emb is None:
+                            continue
+
                         index.add_idea(name=c_name, summary=c_summary, vector=c_emb)
                         store.add_concept(
                             Concept(name=c_name, summary=c_summary, brief_description=c_summary),
@@ -730,6 +776,7 @@ def run_threshold_simulation_suite(
         chunks_dir=chunks_dir,
         graph_path=graph_path,
         max_books=max_books,
+        embeddings_client=embeddings_client,
     )
 
     if not preloaded_books:

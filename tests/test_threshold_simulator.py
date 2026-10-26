@@ -186,6 +186,32 @@ def test_simulate_variation_no_skip_limbo(mock_simulation_corpus):
     assert res.nodes_count == 3
 
 
+def test_simulate_variation_clean_start_between_runs(mock_simulation_corpus):
+    """
+    Explicitly verify that each variation starts with a 100% clean, empty graph and index,
+    and that no concepts, chunks, or metrics leak between consecutive variations.
+    """
+    books, concept_map = mock_simulation_corpus
+
+    # Run 1: High low threshold (0.75) -> extracts 3 concepts (A, B, D)
+    pair_high = ThresholdPair(low=0.75, high=0.90, label="High-Run")
+    res_high = simulate_variation(pair_high, books, concept_map, tau=0.75, skip_limbo=True)
+    assert res_high.nodes_count == 3
+
+    # Run 2: Immediately run low threshold (0.65) -> must extract exactly 2 concepts (A, B)
+    # If state leaked from Run 1, nodes_count would be >= 3
+    pair_mid = ThresholdPair(low=0.65, high=0.90, label="Mid-Run")
+    res_mid = simulate_variation(pair_mid, books, concept_map, tau=0.75, skip_limbo=True)
+    assert res_mid.nodes_count == 2
+    assert res_mid.unassigned_count == 2
+    assert res_mid.parent_chunks_count == 2
+
+    # Run 3: Run again to ensure complete determinism and clean start
+    res_mid_repeat = simulate_variation(pair_mid, books, concept_map, tau=0.75, skip_limbo=True)
+    assert res_mid_repeat.nodes_count == 2
+    assert res_mid_repeat.coverage_at_tau_pct == res_mid.coverage_at_tau_pct
+
+
 # ==============================================================================
 # 3. Report Generation & Mermaid Charts
 # ==============================================================================

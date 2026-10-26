@@ -25,6 +25,7 @@ from rich.table import Table
 from bookeeper.graph.store import ConceptGraphStore
 from bookeeper.processing.extractor import Concept
 from bookeeper.processing.graph_evaluator import GraphSpaceMetrics, evaluate_graph_space
+from bookeeper.processing.memory_guard import cleanup_memory
 from bookeeper.processing.recent_ideas import IdeaEmbeddingIndex, normalize_sort_date
 
 logger = logging.getLogger(__name__)
@@ -228,6 +229,7 @@ class SimulationSuiteReport(BaseModel):
         lines.append(f"> **Corpus Text Weight**: `{self.total_corpus_chars:,}` characters  ")
         lines.append(f"> **Books Simulated**: `{self.total_books}`  ")
         lines.append(f"> **Limbo Policy**: `{'Bypass / Skip Limbo' if self.skip_limbo else 'LLM Extraction'}`  ")
+        lines.append(f"> **Clean Start**: Each variation is constructed from scratch with an empty graph store and isolated vector index (zero state leakage).  ")
         lines.append("")
 
         # 1. Comparative Table
@@ -513,6 +515,8 @@ def simulate_variation(
     """
     Execute an isolated simulation of chunk routing and knowledge graph generation
     for a specific (low, high) threshold pair using in-memory native C++ usearch index.
+    Guarantees a 100% clean start from scratch: previous graph nodes, indexes, and
+    allocations are forcefully cleaned before and after the run.
 
     Parameters:
         pair: ThresholdPair (unassigned lower bound, high-confidence upper bound).
@@ -525,10 +529,19 @@ def simulate_variation(
     Returns:
         SimulationVariationResult containing full graph space & leverage metrics.
     """
+    # 1. Enforce pristine memory & state clean start before beginning variation
+    cleanup_memory()
+
     t_start = time.perf_counter()
 
-    # Initialize clean in-memory HNSW index
+    # Initialize brand-new, completely isolated in-memory graph store and HNSW index from scratch
+    store = ConceptGraphStore()
     index = IdeaEmbeddingIndex()
+
+    # Strict invariant verification: must be 100% clean and empty
+    assert store.graph.number_of_nodes() == 0, "Graph store must have 0 nodes at variation start"
+    assert len(index.idea_names) == 0, "Idea index names must be empty at variation start"
+    assert index.index is None or len(index.index) == 0, "Index must be empty at variation start"
 
     total_chunks = 0
     unassigned_count = 0
@@ -539,8 +552,8 @@ def simulate_variation(
     all_universe_weights: List[int] = []
     parent_mask: List[bool] = []
 
-    # Dynamic concept embedding cache local to this simulation run
-    local_concept_map = dict(concept_embedding_map)
+    # Dynamic concept embedding cache local to this simulation run (isolated deep copy)
+    local_concept_map: Dict[str, List[float]] = {k: list(v) for k, v in concept_embedding_map.items()}
 
     # Replay books in chronological sequence
     for book in preloaded_books:
@@ -596,6 +609,10 @@ def simulate_variation(
                         c_emb = chunk_vec
 
                     index.add_idea(name=c_name, summary=c_summary, vector=c_emb)
+                    store.add_concept(
+                        Concept(name=c_name, summary=c_summary, brief_description=c_summary),
+                        embedding=c_emb,
+                    )
 
             elif sim >= pair.high:
                 # Priority 2: HIGH CONFIDENCE (At or above upper threshold)
@@ -621,6 +638,10 @@ def simulate_variation(
                         c_summary = str(c.get("summary") or c.get("brief_description") or c_name)
                         c_emb = local_concept_map.get(c_norm) or chunk_vec
                         index.add_idea(name=c_name, summary=c_summary, vector=c_emb)
+                        store.add_concept(
+                            Concept(name=c_name, summary=c_summary, brief_description=c_summary),
+                            embedding=c_emb,
+                        )
 
     # 4. Evaluate Embedding Space against Universe
     U_arr = np.array(all_universe_vectors, dtype=np.float32) if all_universe_vectors else np.empty((0, 0), dtype=np.float32)
@@ -638,7 +659,7 @@ def simulate_variation(
 
     duration = time.perf_counter() - t_start
 
-    return SimulationVariationResult(
+    result = SimulationVariationResult(
         pair=pair,
         label=pair.label,
         tau=tau,
@@ -662,6 +683,20 @@ def simulate_variation(
         compression_leverage_factor=float(raw_metrics.get("compression_leverage_factor") or 0.0),
         duration_seconds=round(duration, 3),
     )
+
+    # 5. Clean up graph and index memory to guarantee absolute cleanliness for next variation
+    del store
+    del index
+    del all_universe_vectors
+    del all_universe_weights
+    del parent_mask
+    del U_arr
+    del G_arr
+    del W_arr
+    del P_mask
+    cleanup_memory()
+
+    return result
 
 
 # ==============================================================================
@@ -711,7 +746,7 @@ def run_threshold_simulation_suite(
 
     results: List[SimulationVariationResult] = []
     for idx, p in enumerate(parsed_pairs, start=1):
-        con.print(f"  [cyan][{idx}/{len(parsed_pairs)}][/cyan] Simulating variation [bold]{p.label}[/bold] (low={p.low:.2f}, high={p.high:.2f})...", end=" ")
+        con.print(f"  [cyan][{idx}/{len(parsed_pairs)}][/cyan] [bold]Clean start from scratch[/bold] for variation [bold]{p.label}[/bold] (low={p.low:.2f}, high={p.high:.2f})...", end=" ")
         t0 = time.perf_counter()
         res = simulate_variation(
             pair=p,

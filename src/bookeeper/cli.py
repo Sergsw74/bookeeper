@@ -6883,6 +6883,18 @@ def rebuild_graph_command(
                 rebuild_pubdate = s_data.get("publication_date")
                 store.add_book(bid, title=btitle, author=bauthor, publication_date=rebuild_pubdate)
 
+                # Ensure ALL chunks from the book exist in the graph (including skipped chunks)
+                # so sequential NEXT/PREV edges and section hierarchies remain completely contiguous.
+                if chunks:
+                    for b_chk in chunks:
+                        store.add_section(
+                            book_id=bid,
+                            chapter_idx=b_chk.chapter_idx,
+                            title=b_chk.section_title,
+                            text=b_chk.text,
+                        )
+                        store.add_chunk(b_chk)
+
                 for res in extracted_items:
                     chk_id = res["chunk_id"]
                     chk = chunks_map.get(chk_id)

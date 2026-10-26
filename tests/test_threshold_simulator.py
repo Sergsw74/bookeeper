@@ -238,7 +238,12 @@ def test_simulation_suite_report_markdown_and_rich(mock_simulation_corpus):
     # 1. Rich Table test
     rich_table = suite.to_rich_table()
     assert rich_table is not None
-    assert len(rich_table.columns) == 12
+    # When postprocessing drift metrics are computed, columns include Post (Mp), Ret, Fid, Centroid
+    assert len(rich_table.columns) == 16
+    assert res1.postprocessed_nodes_count is not None
+    assert res1.forward_retention is not None
+    assert res1.backward_fidelity is not None
+    assert res1.centroid_cosine_alignment is not None
 
     # 2. Markdown output test
     md = suite.to_markdown()

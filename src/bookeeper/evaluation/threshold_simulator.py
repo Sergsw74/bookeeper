@@ -24,7 +24,12 @@ from rich.table import Table
 
 from bookeeper.graph.store import ConceptGraphStore
 from bookeeper.processing.extractor import Concept
-from bookeeper.processing.graph_evaluator import GraphSpaceMetrics, evaluate_graph_space
+from bookeeper.processing.graph_evaluator import (
+    GraphSpaceMetrics,
+    PostProcessingDriftMetrics,
+    calculate_postprocessing_drift,
+    evaluate_graph_space,
+)
 from bookeeper.processing.memory_guard import cleanup_memory
 from bookeeper.processing.recent_ideas import IdeaEmbeddingIndex, normalize_sort_date
 
@@ -158,6 +163,18 @@ class SimulationVariationResult(BaseModel):
     generalization_surplus_pct: float = Field(0.0, description="Generalization surplus Delta_cov %.")
     compression_leverage_factor: float = Field(0.0, description="Compression leverage L_comp.")
 
+    # Post-Processing Idea Drift Metrics (RAW vs POST Ideas)
+    postprocessed_nodes_count: Optional[int] = Field(None, description="Number of surviving concepts after post-processing deduplication.")
+    forward_retention: Optional[float] = Field(None, description="Forward retention S_{R -> P}: average cosine similarity of nearest surviving post idea.")
+    backward_fidelity: Optional[float] = Field(None, description="Backward fidelity S_{P -> R}: average cosine similarity of nearest original raw idea.")
+    symmetric_idea_drift_score: Optional[float] = Field(None, description="Harmonic mean of retention and fidelity in [0, 1].")
+    weighted_retention: Optional[float] = Field(None, description="Evidence-weighted forward retention.")
+    centroid_cosine_alignment: Optional[float] = Field(None, description="Macro centroid cosine alignment between RAW and POST ideas.")
+    p10_retention: Optional[float] = Field(None, description="Bottom 10% worst-preserved raw ideas similarity.")
+    min_retention: Optional[float] = Field(None, description="Minimum cosine similarity observed for any raw idea.")
+    dropped_raw_count: Optional[int] = Field(None, description="Count of raw ideas whose best post match falls below tau_loss.")
+    dropped_raw_ratio_pct: Optional[float] = Field(None, description="Percentage of raw ideas dropped below tau_loss.")
+
     duration_seconds: float = 0.0
 
 
@@ -182,8 +199,12 @@ class SimulationSuiteReport(BaseModel):
             border_style="dim",
         )
 
+        has_drift = any(v.forward_retention is not None for v in self.variations)
+
         table.add_column("Variation (Low : High)", justify="left", style="bold")
         table.add_column("Nodes (M)", justify="right")
+        if has_drift:
+            table.add_column("Post (Mp)", justify="right")
         table.add_column("Parent (Np)", justify="right")
         table.add_column("Skipped (Ns)", justify="right")
         table.add_column("Compute (ρp)", justify="right", style="cyan")
@@ -191,14 +212,22 @@ class SimulationSuiteReport(BaseModel):
         table.add_column("Mean (μ)", justify="right")
         table.add_column("Std (σ)", justify="right")
         table.add_column("Decile (p10)", justify="right", style="yellow")
+        if has_drift:
+            table.add_column("Ret (S_R→P)", justify="right", style="green")
+            table.add_column("Fid (S_P→R)", justify="right", style="green")
+            table.add_column("Centroid", justify="right", style="cyan")
         table.add_column("Leverage (Lcomp)", justify="right", style="magenta")
         table.add_column("Vendi", justify="right")
         table.add_column("Time", justify="right", style="dim")
 
         for v in self.variations:
-            table.add_row(
+            row_items = [
                 v.label,
                 f"{v.nodes_count:,}",
+            ]
+            if has_drift:
+                row_items.append(f"{v.postprocessed_nodes_count:,}" if v.postprocessed_nodes_count is not None else "-")
+            row_items.extend([
                 f"{v.parent_chunks_count:,}",
                 f"{v.skipped_chunks_count:,}",
                 f"{v.parent_chunk_ratio_pct:.2f}%",
@@ -206,10 +235,19 @@ class SimulationSuiteReport(BaseModel):
                 f"{v.chamfer_mean:.4f}",
                 f"{v.chamfer_std:.4f}",
                 f"{v.worst_decile_p10:.4f}",
+            ])
+            if has_drift:
+                row_items.extend([
+                    f"{v.forward_retention:.4f}" if v.forward_retention is not None else "-",
+                    f"{v.backward_fidelity:.4f}" if v.backward_fidelity is not None else "-",
+                    f"{v.centroid_cosine_alignment:.4f}" if v.centroid_cosine_alignment is not None else "-",
+                ])
+            row_items.extend([
                 f"{v.compression_leverage_factor:.2f}x",
                 f"{v.vendi_diversity_score:.1f}",
                 f"{v.duration_seconds:.2f}s",
-            )
+            ])
+            table.add_row(*row_items)
 
         return table
 
@@ -235,16 +273,33 @@ class SimulationSuiteReport(BaseModel):
         # 1. Comparative Table
         lines.append("## 1. Threshold Variation Comparative Summary")
         lines.append("")
-        lines.append("| Threshold Variation | Nodes ($M$) | Parent Chunks ($N_p$) | Skipped ($N_s$) | Compute Ratio ($\\rho_p$) | Coverage ($\\text{Cov}_\\tau$) | Mean ($\\mu$) | Regularity ($\\sigma$) | Worst-Decile ($p_{10}$) | Leverage ($L_{\\text{comp}}$) | Vendi Score | Sim Time |")
-        lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+        has_drift = any(v.forward_retention is not None for v in self.variations)
 
-        for v in self.variations:
-            lines.append(
-                f"| **{v.label}** | {v.nodes_count:,} | {v.parent_chunks_count:,} | {v.skipped_chunks_count:,} | "
-                f"{v.parent_chunk_ratio_pct:.2f}% | **{v.coverage_at_tau_pct:.2f}%** | {v.chamfer_mean:.4f} | "
-                f"{v.chamfer_std:.4f} | {v.worst_decile_p10:.4f} | **{v.compression_leverage_factor:.2f}x** | "
-                f"{v.vendi_diversity_score:.1f} | {v.duration_seconds:.2f}s |"
-            )
+        if has_drift:
+            lines.append("| Threshold Variation | Nodes ($M$) | Post ($M_p$) | Parent ($N_p$) | Skipped ($N_s$) | Compute ($\\rho_p$) | Coverage ($\\text{Cov}_\\tau$) | Mean ($\\mu$) | $p_{10}$ | Ret ($S_{R\\to P}$) | Fid ($S_{P\\to R}$) | Centroid | Leverage ($L_{\\text{comp}}$) | Vendi | Time |")
+            lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+            for v in self.variations:
+                mp_str = f"{v.postprocessed_nodes_count:,}" if v.postprocessed_nodes_count is not None else "-"
+                ret_str = f"{v.forward_retention:.4f}" if v.forward_retention is not None else "-"
+                fid_str = f"{v.backward_fidelity:.4f}" if v.backward_fidelity is not None else "-"
+                cen_str = f"{v.centroid_cosine_alignment:.4f}" if v.centroid_cosine_alignment is not None else "-"
+                lines.append(
+                    f"| **{v.label}** | {v.nodes_count:,} | {mp_str} | {v.parent_chunks_count:,} | {v.skipped_chunks_count:,} | "
+                    f"{v.parent_chunk_ratio_pct:.2f}% | **{v.coverage_at_tau_pct:.2f}%** | {v.chamfer_mean:.4f} | "
+                    f"{v.worst_decile_p10:.4f} | {ret_str} | {fid_str} | {cen_str} | **{v.compression_leverage_factor:.2f}x** | "
+                    f"{v.vendi_diversity_score:.1f} | {v.duration_seconds:.2f}s |"
+                )
+        else:
+            lines.append("| Threshold Variation | Nodes ($M$) | Parent Chunks ($N_p$) | Skipped ($N_s$) | Compute Ratio ($\\rho_p$) | Coverage ($\\text{Cov}_\\tau$) | Mean ($\\mu$) | Regularity ($\\sigma$) | Worst-Decile ($p_{10}$) | Leverage ($L_{\\text{comp}}$) | Vendi Score | Sim Time |")
+            lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+
+            for v in self.variations:
+                lines.append(
+                    f"| **{v.label}** | {v.nodes_count:,} | {v.parent_chunks_count:,} | {v.skipped_chunks_count:,} | "
+                    f"{v.parent_chunk_ratio_pct:.2f}% | **{v.coverage_at_tau_pct:.2f}%** | {v.chamfer_mean:.4f} | "
+                    f"{v.chamfer_std:.4f} | {v.worst_decile_p10:.4f} | **{v.compression_leverage_factor:.2f}x** | "
+                    f"{v.vendi_diversity_score:.1f} | {v.duration_seconds:.2f}s |"
+                )
 
         lines.append("")
 
@@ -538,12 +593,18 @@ def simulate_variation(
     tau: float = 0.75,
     skip_limbo: bool = True,
     embeddings_client: Optional[Any] = None,
+    postprocess: bool = True,
+    postprocess_threshold: float = 0.92,
+    tau_loss: float = 0.70,
 ) -> SimulationVariationResult:
     """
     Execute an isolated simulation of chunk routing and knowledge graph generation
     for a specific (low, high) threshold pair using in-memory native C++ usearch index.
     Guarantees a 100% clean start from scratch: previous graph nodes, indexes, and
     allocations are forcefully cleaned before and after the run.
+    When postprocess is True, applies semantic deduplication to generated concepts
+    and evaluates idea drift (forward retention, backward fidelity, symmetric score,
+    weighted retention, and macro centroid alignment) comparing RAW vs POST ideas.
 
     Parameters:
         pair: ThresholdPair (unassigned lower bound, high-confidence upper bound).
@@ -552,6 +613,9 @@ def simulate_variation(
         tau: Semantic relevance threshold for graph space evaluation (default: 0.75).
         skip_limbo: If True, limbo chunks are bypassed/skipped; if False, extracted.
         embeddings_client: Optional LangChain embeddings client for any missing concept embeddings.
+        postprocess: If True, performs postprocessing deduplication and drift calculation.
+        postprocess_threshold: Cosine similarity cutoff for merging redundant concepts (default 0.92).
+        tau_loss: Cosine similarity threshold below which a raw idea is considered dropped (default 0.70).
 
     Returns:
         SimulationVariationResult containing full graph space & leverage metrics.
@@ -703,6 +767,47 @@ def simulate_variation(
         chunk_weights=W_arr,
     )
 
+    # 4. Optional Post-Processing Step & Drift Metrics Calculation
+    post_nodes_cnt: Optional[int] = None
+    drift_dict: Optional[Dict[str, Any]] = None
+
+    if postprocess and G_arr.shape[0] > 0:
+        # Deduplicate vectors with cosine similarity >= postprocess_threshold
+        # Fast greedy incremental clustering
+        g_norms = np.linalg.norm(G_arr, axis=1, keepdims=True)
+        g_unit = G_arr / np.clip(g_norms, 1e-12, None)
+
+        surviving_clusters: List[List[int]] = []
+        cluster_heads: List[np.ndarray] = []
+
+        for idx_g in range(len(g_unit)):
+            curr_vec = g_unit[idx_g]
+            matched_c = -1
+            for c_idx, head in enumerate(cluster_heads):
+                if float(np.dot(curr_vec, head)) >= postprocess_threshold:
+                    matched_c = c_idx
+                    break
+            if matched_c >= 0:
+                surviving_clusters[matched_c].append(idx_g)
+            else:
+                surviving_clusters.append([idx_g])
+                cluster_heads.append(curr_vec)
+
+        # Average vectors per cluster and re-normalize
+        post_vectors = np.array([
+            np.mean(g_unit[members], axis=0) / np.clip(np.linalg.norm(np.mean(g_unit[members], axis=0)), 1e-12, None)
+            for members in surviving_clusters
+        ], dtype=np.float32)
+
+        post_nodes_cnt = len(post_vectors)
+
+        # Compute post-processing idea drift (RAW = G_arr vs POST = post_vectors)
+        drift_dict = calculate_postprocessing_drift(
+            raw_embeddings=G_arr,
+            post_embeddings=post_vectors,
+            tau_loss=tau_loss,
+        )
+
     duration = time.perf_counter() - t_start
 
     result = SimulationVariationResult(
@@ -727,6 +832,16 @@ def simulate_variation(
         skipped_retention_pct=float(raw_metrics.get("skipped_retention_pct") or 0.0),
         generalization_surplus_pct=float(raw_metrics.get("generalization_surplus_pct") or 0.0),
         compression_leverage_factor=float(raw_metrics.get("compression_leverage_factor") or 0.0),
+        postprocessed_nodes_count=post_nodes_cnt,
+        forward_retention=float(drift_dict["forward_retention"]) if drift_dict else None,
+        backward_fidelity=float(drift_dict["backward_fidelity"]) if drift_dict else None,
+        symmetric_idea_drift_score=float(drift_dict["symmetric_idea_drift_score"]) if drift_dict else None,
+        weighted_retention=float(drift_dict["weighted_retention"]) if drift_dict else None,
+        centroid_cosine_alignment=float(drift_dict["centroid_cosine_alignment"]) if drift_dict else None,
+        p10_retention=float(drift_dict["p10_retention"]) if drift_dict else None,
+        min_retention=float(drift_dict["min_retention"]) if drift_dict else None,
+        dropped_raw_count=int(drift_dict["dropped_raw_count"]) if drift_dict else None,
+        dropped_raw_ratio_pct=float(drift_dict["dropped_raw_ratio_pct"]) if drift_dict else None,
         duration_seconds=round(duration, 3),
     )
 
@@ -760,6 +875,9 @@ def run_threshold_simulation_suite(
     max_books: Optional[int] = None,
     embeddings_client: Optional[Any] = None,
     console: Optional[Console] = None,
+    postprocess: bool = True,
+    postprocess_threshold: float = 0.92,
+    tau_loss: float = 0.70,
 ) -> SimulationSuiteReport:
     """
     Orchestrate full multi-variation threshold sweep:
@@ -802,6 +920,9 @@ def run_threshold_simulation_suite(
             tau=tau,
             skip_limbo=skip_limbo,
             embeddings_client=embeddings_client,
+            postprocess=postprocess,
+            postprocess_threshold=postprocess_threshold,
+            tau_loss=tau_loss,
         )
         elapsed = time.perf_counter() - t0
         con.print(f"[green]Done in {elapsed:.2f}s[/green] (Nodes: {res.nodes_count:,}, Cov: {res.coverage_at_tau_pct:.1f}%, Leverage: {res.compression_leverage_factor:.2f}x)")

@@ -204,6 +204,7 @@ dual_pass:
 ## 7. Next Steps
 
 - 🏗️ **[Building the Knowledge Graph](building-graph.md)** — Core single-pass knowledge graph extraction.
+- ⚡ **[Threshold Simulation & Sweep Engine](threshold-simulator.md)** — Test routing and post-processing drift across thresholds in milliseconds.
+- 🛡️ **[Factual Verification & Auditing](verification.md)** — Audit factual grounding and post-processing drift (`--mode drift`).
 - 🔬 **[A/B Testing & Benchmarking](ab-tests.md)** — Benchmark single-pass vs dual-pass quality and runtime.
-- 🛡️ **[Factual Verification & Auditing](verification.md)** — Audit factual grounding across idea nodes.
 - 🏠 **[Return to Documentation Index](../README.md)**

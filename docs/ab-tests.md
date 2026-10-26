@@ -404,6 +404,8 @@ Options:
 ## 9. Next Steps
 
 - 🛡️ **[Factual Verification & Auditing](verification.md)** — Detailed breakdown of verification modes and NLI cross-checking.
+- ⚡ **[Threshold Simulation & Sweep Engine](threshold-simulator.md)** — Sweep routing thresholds and simulate idea drift offline in seconds.
+- 💾 **[Backup & Restore Subsystem](backup-restore.md)** — Create milestone archives and run A/B audits vs historical backups.
 - 🏗️ **[Building the Knowledge Graph](building-graph.md)** — Core graph extraction options and rebuilds.
 - 🧪 **[Two-Pass Idea Post-Processing (Experimental POC)](post-processing.md)** — Experimental synthesis details.
 - 🏠 **[Return to Documentation Index](../README.md)**

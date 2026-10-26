@@ -278,6 +278,14 @@ class SingleVerifierConfig(BaseModel):
         default=None,
         description="Optional path to save standalone statistics JSON file.",
     )
+    states_dir: Optional[str] = Field(
+        default=None,
+        description="Directory containing book state files (book_*_state.json) for post-processing drift verification.",
+    )
+    tau_loss: Optional[float] = Field(
+        default=0.70,
+        description="Cosine similarity cutoff below which a raw idea is considered dropped in drift verification (default: 0.70).",
+    )
 
     @property
     def resolved_distance_threshold(self) -> Optional[float]:
@@ -333,6 +341,14 @@ class VerificationConfig(BaseModel):
     stats_output: Optional[str] = Field(
         default=None,
         description="Optional path to save standalone statistics JSON file.",
+    )
+    states_dir: Optional[str] = Field(
+        default=None,
+        description="Directory containing book state files (book_*_state.json) for post-processing drift verification.",
+    )
+    tau_loss: Optional[float] = Field(
+        default=0.70,
+        description="Cosine similarity cutoff below which a raw idea is considered dropped in drift verification (default: 0.70).",
     )
     verifiers: List[SingleVerifierConfig] = Field(
         default_factory=list,

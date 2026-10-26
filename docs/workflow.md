@@ -172,6 +172,8 @@ bookeeper query "What are the core consensus mechanisms and tradeoffs in Paxos v
 ## 🏠 Navigation
 
 - 🚀 **[Getting Started](get-started.md)**
+- 💾 **[Backup & Restore Subsystem](backup-restore.md)**
+- ⚡ **[Threshold Simulation & Sweep Engine](threshold-simulator.md)**
 - 🏗️ **[Building the Knowledge Graph](building-graph.md)**
 - 🔍 **[Decoupled Hybrid RAG](rag.md)**
 - 🧪 **[Two-Pass Idea Post-Processing (Experimental POC)](post-processing.md)**

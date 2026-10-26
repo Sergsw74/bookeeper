@@ -562,3 +562,206 @@ def test_extract_chunk_embeddings_and_weights():
     assert mat.shape == (2, 16)
     assert list(weights) == [1200.0, 350.0]
 
+
+def test_calculate_postprocessing_drift_identity():
+    """Verify calculate_postprocessing_drift on identical sets yields 1.0 (zero drift)."""
+    from bookeeper.processing.graph_evaluator import calculate_postprocessing_drift
+
+    # R == P
+    vecs = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float32)
+
+    res = calculate_postprocessing_drift(vecs, vecs, raw_weights=[100, 200, 300], tau_loss=0.70)
+    assert np.isclose(res["forward_retention"], 1.0, atol=1e-4)
+    assert np.isclose(res["backward_fidelity"], 1.0, atol=1e-4)
+    assert np.isclose(res["symmetric_idea_drift_score"], 1.0, atol=1e-4)
+    assert np.isclose(res["weighted_retention"], 1.0, atol=1e-4)
+    assert np.isclose(res["centroid_cosine_alignment"], 1.0, atol=1e-4)
+    assert np.isclose(res["p10_retention"], 1.0, atol=1e-4)
+    assert np.isclose(res["min_retention"], 1.0, atol=1e-4)
+    assert res["dropped_raw_count"] == 0
+    assert res["dropped_raw_ratio_pct"] == 0.0
+    assert res["raw_ideas_count"] == 3
+    assert res["post_ideas_count"] == 3
+
+
+def test_calculate_postprocessing_drift_orthogonal_and_dropped():
+    """Verify orthogonal or dropped ideas trigger low scores and drop counts."""
+    from bookeeper.processing.graph_evaluator import calculate_postprocessing_drift
+
+    R = np.array([
+        [1.0, 0.0],
+        [0.0, 1.0],
+    ], dtype=np.float32)
+
+    # P has only [1.0, 0.0], dropped second idea [0.0, 1.0]
+    P = np.array([
+        [1.0, 0.0],
+    ], dtype=np.float32)
+
+    res = calculate_postprocessing_drift(R, P, raw_weights=[100, 100], tau_loss=0.70)
+    # R[0] matches P[0] (sim=1.0), R[1] matches P[0] (sim=0.0) -> mean forward = 0.5
+    assert np.isclose(res["forward_retention"], 0.50, atol=1e-4)
+    # P[0] matches R[0] (sim=1.0) -> mean backward = 1.0
+    assert np.isclose(res["backward_fidelity"], 1.0, atol=1e-4)
+    # Harmonic mean: 2 * (0.5 * 1.0) / (0.5 + 1.0) = 1.0 / 1.5 = 0.6667
+    assert np.isclose(res["symmetric_idea_drift_score"], 0.6667, atol=1e-3)
+    # Dropped: R[1] has sim 0.0 < 0.70 -> 1 dropped out of 2
+    assert res["dropped_raw_count"] == 1
+    assert np.isclose(res["dropped_raw_ratio_pct"], 50.0, atol=1e-2)
+    assert np.isclose(res["min_retention"], 0.0, atol=1e-4)
+
+
+def test_load_raw_ideas_and_run_drift_evaluation(tmp_path: Path):
+    """Test loading raw ideas from book state files and running drift evaluation end-to-end."""
+    from bookeeper.processing.graph_evaluator import (
+        load_raw_ideas_from_states,
+        run_postprocessing_drift_evaluation,
+        format_postprocessing_drift_table,
+    )
+
+    states_dir = tmp_path / ".book_states"
+    states_dir.mkdir(parents=True, exist_ok=True)
+
+    state_content = {
+        "book_id": "1",
+        "book_title": "Test Book",
+        "processed_chunks": {
+            "c1": {
+                "chunk_id": "c1",
+                "extraction": {
+                    "concepts": [
+                        {
+                            "name": "Machine Learning",
+                            "brief_description": "Algorithms that learn patterns from data.",
+                            "detailed_explanation": "Statistical model optimization.",
+                            "supporting_quote": "A very long detailed quote about ML algorithms...",
+                            "embedding": [1.0, 0.0, 0.0],
+                        },
+                        {
+                            "name": "Neural Networks",
+                            "brief_description": "Layered computation models.",
+                            "detailed_explanation": "Backpropagation learning.",
+                            "supporting_quote": "Short quote",
+                            "embedding": [0.0, 1.0, 0.0],
+                        },
+                    ]
+                }
+            }
+        }
+    }
+    with open(states_dir / "book_1_state.json", "w", encoding="utf-8") as f:
+        json.dump(state_content, f)
+
+    concepts, weights = load_raw_ideas_from_states(states_dir)
+    assert len(concepts) == 2
+    assert len(weights) == 2
+    assert weights[0] > weights[1]
+
+    # Create ConceptGraphStore with post-processed ideas
+    from bookeeper.processing.extractor import Concept
+
+    store = ConceptGraphStore()
+    c1 = Concept(
+        name="Machine Learning",
+        brief_description="Algorithms that learn patterns from data.",
+        detailed_explanation="Statistical model optimization.",
+        category="Definition",
+    )
+    c2 = Concept(
+        name="Deep Neural Networks",
+        brief_description="Deep multi-layer networks.",
+        detailed_explanation="Deep learning architectures.",
+        category="Definition",
+    )
+    store.add_concept(c1, embedding=[0.95, 0.05, 0.0])
+    store.add_concept(c2, embedding=[0.1, 0.95, 0.0])
+
+    drift = run_postprocessing_drift_evaluation(
+        store=store,
+        states_dir=states_dir,
+        tau_loss=0.70,
+    )
+    assert drift.raw_ideas_count == 2
+    assert drift.post_ideas_count == 2
+    assert drift.forward_retention > 0.90
+    assert drift.backward_fidelity > 0.90
+    assert drift.symmetric_idea_drift_score > 0.90
+    assert drift.centroid_cosine_alignment > 0.95
+    assert drift.dropped_raw_count == 0
+
+    tbl = format_postprocessing_drift_table(drift)
+    assert tbl is not None
+    cell_texts = [str(cell) for col in tbl.columns for cell in col._cells]
+    assert any("Forward Retention (S_R→P)" in c for c in cell_texts)
+    assert any("Backward Fidelity (S_P→R)" in c for c in cell_texts)
+    assert any("Centroid Alignment" in c for c in cell_texts)
+
+
+def test_cli_verify_mode_drift(tmp_path: Path):
+    """Verify `bookeeper verify --mode drift` executes through the CLI."""
+    from bookeeper.processing.extractor import Concept
+
+    states_dir = tmp_path / ".book_states"
+    states_dir.mkdir(parents=True, exist_ok=True)
+
+    state_content = {
+        "book_id": "1",
+        "book_title": "Test Book",
+        "processed_chunks": {
+            "c1": {
+                "chunk_id": "c1",
+                "extraction": {
+                    "concepts": [
+                        {
+                            "name": "Distributed Systems",
+                            "brief_description": "Consensus and partitioning.",
+                            "detailed_explanation": "Paxos and Raft protocols.",
+                            "supporting_quote": "Consensus in distributed systems requires quorum.",
+                            "embedding": [0.0, 1.0, 0.0],
+                        }
+                    ]
+                }
+            }
+        }
+    }
+    with open(states_dir / "book_1_state.json", "w", encoding="utf-8") as f:
+        json.dump(state_content, f)
+
+    store = ConceptGraphStore()
+    c = Concept(
+        name="Distributed Systems",
+        brief_description="Consensus and partitioning.",
+        detailed_explanation="Paxos and Raft protocols.",
+        category="Definition",
+    )
+    store.add_concept(c, embedding=[0.0, 1.0, 0.0])
+    kg_path = tmp_path / "knowledge_graph.json"
+    store.save(kg_path)
+
+    out_rep = tmp_path / "drift_report.json"
+    res = runner.invoke(app, [
+        "verify",
+        "--graph-file", str(kg_path),
+        "--states-dir", str(states_dir),
+        "--mode", "drift",
+        "--output", str(out_rep),
+    ])
+
+    assert res.exit_code == 0, f"Error: {res.stdout}"
+    assert "Post-Processing Idea Drift & Semantic Alignment" in res.stdout
+    assert "Forward Retention" in res.stdout
+    assert out_rep.is_file()
+
+    with open(out_rep, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert "forward_retention" in data
+    assert "backward_fidelity" in data
+    assert "symmetric_idea_drift_score" in data
+    assert "centroid_cosine_alignment" in data
+    assert data["forward_retention"] >= 0.99
+
+

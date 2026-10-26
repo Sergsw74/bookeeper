@@ -14,6 +14,7 @@ Bookkeeper incorporates a comprehensive, multi-mode verification framework to au
   - [Mode 3: Dual-KG Cross-Check Audit (`--mode cross-check`)](#mode-3-dual-kg-cross-check-audit---mode-cross-check)
   - [Mode 4: Chunk Oracle Alignment (`--mode chunk`)](#mode-4-chunk-oracle-alignment---mode-chunk)
   - [Mode 5: Graph Embedding Space & Skipping Leverage (`--mode graph` / `--mode kg`)](#mode-5-graph-embedding-space--skipping-leverage---mode-graph----mode-kg)
+  - [Mode 6: Post-Processing Idea Drift & Semantic Alignment (`--mode drift`)](#mode-6-post-processing-idea-drift--semantic-alignment---mode-drift)
 - [4. Memory Guard Architecture (10 GB Ceiling)](#4-memory-guard-architecture-10-gb-ceiling)
 - [5. Debug JSON Logging (`--debug-json`)](#5-debug-json-logging---debug-json)
 - [6. Automated Test-Run Pipeline (`test-run`)](#6-automated-test-run-pipeline-test-run)
@@ -41,6 +42,7 @@ flowchart TD
         D -->|--mode cross-check| G["NLI Cross-Check Audit\nAtomic Assertion Entailment\nRecall & Seam Integrity"]
         D -->|--mode chunk| H["Chunk Oracle Audit\n3-nary QA Generation\nIdea Context Verification"]
         D -->|--mode graph / kg| L["Graph Space & Skipping Leverage\nChamfer & Vendi Spectral Diversity\nHausdorff Gap & Skipping Surplus"]
+        D -->|--mode drift| N["Post-Processing Idea Drift\nRAW vs POST Chamfer & Fidelity\nCentroid Cosine Alignment"]
     end
 
     subgraph Outputs ["Reports & Diagnostics"]
@@ -49,6 +51,7 @@ flowchart TD
         G --> J["cross_check_report.json"]
         H --> K["Debug JSON Logs (Optional)"]
         L --> M["graph_space_report.json"]
+        N --> O["drift_verification_report.json"]
     end
 ```
 
@@ -235,6 +238,38 @@ Comparing **Threshold Coverage ($\text{Cov}_\tau$)** against the **Extraction (P
 
 ---
 
+### Mode 6: Post-Processing Idea Drift & Semantic Alignment (`--mode drift`)
+
+When post-processing (deduplication, clustering, synthesis, pruning) transforms RAW extracted ideas ($R = \{r_1, \dots, r_{N_R}\}$ from per-book state checkpoints) into POST knowledge graph ideas ($P = \{p_1, \dots, p_{N_P}\}$), $N_R \ne N_P$. You cannot perform point-to-point comparisons.
+
+Mode `drift` measures the deformation, alignment, and information retention across both vector spaces strictly in Cosine Similarity space $[0, 1]$:
+
+```bash
+# Verify post-processing idea drift on the active knowledge graph:
+bookeeper verify --mode drift
+
+# Audit drift for a specific book against a custom state checkpoints directory:
+bookeeper verify --mode drift --states-dir ./output/.book_states --book-id 1 --tau-loss 0.70
+
+# Save detailed drift verification report:
+bookeeper verify --mode drift -o ./output/drift_report.json
+```
+
+#### Core Metric Suite for Post-Processing Idea Drift
+
+| Metric | Space | Formula / Definition | Benchmark Interpretation |
+| :--- | :---: | :--- | :--- |
+| **Forward Retention ($S_{R \to P}$)** | $[0, 1]$ | $\frac{1}{N_R} \sum_{i=1}^{N_R} \max_{j} \cos(r_i, p_j)$ | **$>0.85$**: Lossless deduplication.<br>**$<0.75$**: Over-merging or semantic loss. |
+| **Backward Fidelity ($S_{P \to R}$)** | $[0, 1]$ | $\frac{1}{N_P} \sum_{j=1}^{N_P} \max_{i} \cos(p_j, r_i)$ | **$>0.88$**: Strictly anchored to raw source statements.<br>**$<0.75$**: Hallucination / unwarranted synthesis drift. |
+| **Symmetric Idea Drift Score ($F_{1, \text{sim}}$)** | $[0, 1]$ | $2 \cdot \frac{S_{R \to P} \cdot S_{P \to R}}{S_{R \to P} + S_{P \to R}}$ | Harmonic mean balancing retention and fidelity. |
+| **Weighted Retention ($S_{R \to P}^{\text{weighted}}$)** | $[0, 1]$ | $\sum_{i=1}^{N_R} \frac{w_i}{\sum w_k} \max_j \cos(r_i, p_j)$ | Retention weighted by evidence quote character length $w_i = \text{len}(\text{quote}_i)$. |
+| **Centroid Cosine Alignment** | $[-1, 1]$ | $\cos(\bar{R}, \bar{P}) = \frac{\bar{r} \cdot \bar{p}}{\|\bar{r}\| \|\bar{p}\|}$ | **$\ge 0.96$**: Global theme preserved.<br>**$<0.96$**: Macro topic shift or systemic pruning bias. |
+| **Worst-Decile Retention ($p_{10}$)** | $[0, 1]$ | 10th percentile of $\{\max_j \cos(r_i, p_j)\}$ | Tail risk: proximity for bottom 10% worst-preserved raw ideas. |
+| **Minimum Retention ($\min_{\text{sim}}$)** | $[0, 1]$ | $\min_i \max_j \cos(r_i, p_j)$ | Single most distorted or abandoned raw idea. |
+| **Dropped Raw Ideas ($< \tau_{\text{loss}}$)** | Count / % | $\sum_{i=1}^{N_R} \mathbb{I}(\max_j \cos(r_i, p_j) < \tau_{\text{loss}})$ | Raw ideas whose nearest post match falls below cutoff $\tau_{\text{loss}}$ (default: 0.70). |
+
+---
+
 ## 4. Memory Guard Architecture (10 GB Ceiling)
 
 Evaluating tens of thousands of chunks and concept embeddings can quickly consume tens of gigabytes of RAM if implemented naively. Bookkeeper enforces an engineered memory budget keeping total process RSS strictly within **10.0 GB**:
@@ -296,18 +331,33 @@ bookeeper test-run 10 --timeout 60 --percent 2.0 --mode ideas
 Usage: bookeeper verify [OPTIONS]
 
 Options:
-  -m, --mode [ideas|chunking|cross-check|chunk|graph|kg]
-                                  Verification mode (default: ideas).
-  -p, --percent FLOAT             Sample percentage of ideas to audit (default: 1.0).
-  --tau FLOAT                     Semantic proximity radius threshold for graph space mode (default: 0.75).
+  -c, --config PATH               Path to config.yaml file.
+  --graph-file PATH               Path to knowledge_graph.json or backup archive.
+  -p, --percent FLOAT             Percentage of ideas to randomly verify (default: 1.0).
+  -m, --mode [ideas|chunking|chunk|cross-check|graph|kg|drift]
+                                  Verification mode (default: from config.yaml or 'ideas').
+  --compare-graph PATH            Candidate graph or historical backup archive for cross-check / graph mode.
+  --blocks INTEGER                Number of contiguous chunk blocks in cross-check mode (default: 20).
+  --tau FLOAT                     Semantic proximity radius for graph space mode (default: 0.75).
+  -b, --book-id INTEGER           Specific book ID to audit.
+  --all                           Verify chunking across all stored books.
+  --threshold FLOAT               Cosine distance threshold for chunk expansion (default: 0.20).
+  --embedding-model TEXT          Dedicated embedding model name.
+  --embedding-url TEXT            Ollama server URL dedicated for embeddings.
+  --chunks-dir PATH               Directory containing stored book chunks.
   --model TEXT                    Dedicated LLM model for verification.
-  --blocks INTEGER                Number of chunk blocks to evaluate in cross-check or chunk mode.
-  --compare-graph PATH            Candidate knowledge graph path for cross-check or graph mode.
-  --print-blocks INTEGER          Print side-by-side assertion probes for first N blocks.
-  --debug-json / --no-debug-json  Save detailed per-sentence raw prompts and results to JSON (default: False).
-  --max-examples INTEGER          Max discrepancy examples printed in table (default: 20).
-  -o, --output PATH               Destination JSON report path.
-  --seed INTEGER                  Random seed for deterministic sampling.
+  --temperature FLOAT             Sampling temperature for verifier model (default: 0.0).
+  --max-examples INTEGER          Max discrepancy examples displayed (default: 20).
+  -o, --output PATH               Optional path to save JSON verification report.
+  --seed INTEGER                  Random seed for reproducible sampling.
+  --print-chunks INTEGER          Print text & QA probes for up to X blocks (cross-check mode).
+  -t, --max-tasks INTEGER         Max concurrent worker tasks across Ollama servers.
+  --cooldown INTEGER              Failover cooldown in seconds for verification tasks.
+  --debug / --no-debug            Generate detailed debug JSON with raw prompts & responses.
+  --debug-output PATH             Optional path to save debug JSON report.
+  --stats-output PATH             Optional path to save standalone statistics JSON file.
+  --states-dir PATH               Directory containing book state files for drift verification.
+  --tau-loss FLOAT                Cosine similarity cutoff for dropped ideas in drift mode (default: 0.70).
 ```
 
 ---

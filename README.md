@@ -36,8 +36,9 @@ Bookkeeper provides a rich set of CLI commands. Below is a high-level overview o
 | **`query`** | `bookeeper query "Explain Paxos"` | Queries the library using LightRAG hybrid retrieval (local entity graphs + global summaries). | [Hybrid RAG](docs/rag.md) |
 | **`build-rag`** | `bookeeper build-rag` | Indexes pre-computed SSD chunks into LightRAG independently from book ingestion. | [Hybrid RAG](docs/rag.md) |
 | **`postprocess-ideas`** | `bookeeper postprocess-ideas` | **(Experimental POC)** At-most-once LLM synthesis of multi-occurrence ideas with untouched cluster skipping and state checkpointing. | [Post-Processing](docs/post-processing.md) |
-| **`verify`** | `bookeeper verify --mode graph --tau 0.75` | Audits factual grounding of ideas, chunk boundary coherence, cross-KG NLI entailment, or graph embedding space & skipping leverage (`--mode graph` / `kg`) under 10 GB memory guard. | [Verification](docs/verification.md) |
+| **`verify`** | `bookeeper verify --mode graph --tau 0.75` | Audits factual grounding of ideas, chunk boundary coherence, cross-KG NLI entailment, graph embedding space (`--mode graph`), or post-processing idea drift (`--mode drift`) under 10 GB memory guard. | [Verification](docs/verification.md) |
 | **`verifiers`** | `bookeeper verifiers` | Runs all configured verification suites from `config.yaml` concurrently. | [Verification](docs/verification.md) |
+| **`simulate-thresholds`** | `bookeeper simulate-thresholds -p "0.60:0.90,0.65:0.90"` | Fast offline simulation of chunk routing, graph space metrics, and post-processing drift across threshold pairs (<0.2s/run) with Mermaid charts. | [Threshold Simulator](docs/threshold-simulator.md) |
 | **`test-run`** | `bookeeper test-run 5` | End-to-end integration test: builds a clean graph for $N$ books, then automatically verifies grounding. | [Verification](docs/verification.md) |
 | **`export`** | `bookeeper export --clean --backfill-embeddings` | Exports Knowledge Graph to Obsidian, GraphML, and Neo4j, with optional automatic embedding backfill. | [Building Graph](docs/building-graph.md) |
 | **`export-obsidian`** | `bookeeper export-obsidian` | Exports graph to an Obsidian Markdown vault with Wikilinks, tags, and significance index. | [Building Graph](docs/building-graph.md) |
@@ -48,8 +49,8 @@ Bookkeeper provides a rich set of CLI commands. Below is a high-level overview o
 | **`status`** | `bookeeper status` | Displays progress checkpoints, completed book counts, assigned fast-path chunks, and skipped limbo chunks. | [Get Started](docs/get-started.md) |
 | **`stats`** | `bookeeper stats` | Displays graph metrics (node counts, edge counts, categories, significance weights). | [Get Started](docs/get-started.md) |
 | **`config`** | `bookeeper config` | Displays active settings, resolved server pool, and node capabilities. | [Get Started](docs/get-started.md) |
-| **`backup`** | `bookeeper backup -o backup.zip` | Creates a compressed archive (`.zip` / `.7z`) of the graph, vault, chunks, and book states. | [Get Started](docs/get-started.md) |
-| **`restore`** | `bookeeper restore backup.zip --clean` | Restores knowledge graph, vault, chunks, and checkpoints from an archive. | [Get Started](docs/get-started.md) |
+| **`backup`** | `bookeeper backup --full -o backup.zip` | Creates a compressed archive (`.zip` / `.7z`) of the graph, vault, chunks, book states, and optionally source books. | [Backup & Restore](docs/backup-restore.md) |
+| **`restore`** | `bookeeper restore backup.zip --clean` | Restores knowledge graph, vault, chunks, checkpoints, and source books from an archive with safety audits. | [Backup & Restore](docs/backup-restore.md) |
 | **`ab-compare`** | `bookeeper ab-compare backup_a.zip [backup_b.zip]` | Instant comparative A/B evaluation (topology, cross-check NLI, or embedding space) between archived backups or active graph with live performance status. | [A/B Testing](docs/ab-tests.md) |
 
 ---

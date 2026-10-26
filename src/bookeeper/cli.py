@@ -102,14 +102,19 @@ from bookeeper.processing.verifier import (
 from bookeeper.processing.graph_evaluator import (
     GraphSpaceComparisonReport,
     GraphSpaceMetrics,
+    PostProcessingDriftMetrics,
+    calculate_postprocessing_drift,
     compare_graph_spaces,
     evaluate_graph_space,
     evaluate_skipping_leverage,
-    get_parent_chunk_ids,
     format_graph_comparison_table,
     format_graph_space_table,
+    format_postprocessing_drift_table,
+    get_parent_chunk_ids,
+    load_raw_ideas_from_states,
     run_graph_space_comparison,
     run_graph_space_evaluation,
+    run_postprocessing_drift_evaluation,
 )
 from bookeeper.backup import (
     clean_knowledge_artifacts,
@@ -4410,6 +4415,8 @@ def _execute_single_verification(
     debug_output: Optional[str] = None,
     stats_output: Optional[str] = None,
     tau: Optional[float] = None,
+    states_dir: Optional[str] = None,
+    tau_loss: Optional[float] = None,
     cfg: Optional[Settings] = None,
 ) -> Optional[Dict[str, Any]]:
     """
@@ -4424,6 +4431,8 @@ def _execute_single_verification(
     all_books = _resolve_opt(all_books, False)
     threshold = _resolve_opt(threshold)
     tau = _resolve_opt(tau)
+    states_dir = _resolve_opt(states_dir)
+    tau_loss = _resolve_opt(tau_loss)
     chunks_dir = _resolve_opt(chunks_dir)
     model = _resolve_opt(model)
     temperature = _resolve_opt(temperature)
@@ -4437,6 +4446,8 @@ def _execute_single_verification(
     debug_output = _resolve_opt(debug_output)
     stats_output = _resolve_opt(stats_output)
     tau = _resolve_opt(tau)
+    states_dir = _resolve_opt(states_dir)
+    tau_loss = _resolve_opt(tau_loss)
 
     if cfg is None:
         cfg = _get_effective_settings(
@@ -5440,6 +5451,91 @@ def _execute_single_verification(
             for bt in temp_backup_targets:
                 bt.cleanup()
 
+    # Mode: 'drift', 'idea-drift', or 'postprocess-drift' (RAW vs KG Ideas Drift & Alignment)
+    if effective_mode in ("drift", "idea-drift", "idea_drift", "postprocess-drift", "postprocess_drift"):
+        effective_tau_loss = float(tau_loss if tau_loss is not None else getattr(cfg.verification, "tau_loss", 0.70))
+        target_graph_file = Path(graph_file).expanduser().resolve() if graph_file else cfg.resolved_output_dir / "knowledge_graph.json"
+
+        temp_drift_target: Optional[ResolvedBackupTarget] = None
+        if target_graph_file.is_file() and any(target_graph_file.name.lower().endswith(s) for s in (".zip", ".7z", ".tar", ".gz", ".tgz")):
+            temp_drift_target = resolve_backup_target(target_graph_file, label_fallback="Target", console=console)
+            target_graph_file = temp_drift_target.graph_file
+
+        if not target_graph_file.is_file():
+            console.print(
+                f"[bold red]Knowledge graph file not found at {target_graph_file}[/bold red]\n"
+                f"[yellow]Please run 'bookeeper build-graph' first to generate knowledge_graph.json.[/yellow]"
+            )
+            if temp_drift_target:
+                temp_drift_target.cleanup()
+            raise typer.Exit(1)
+
+        store = ConceptGraphStore()
+        with console.status(f"[bold cyan]Loading graph from {target_graph_file}...[/bold cyan]"):
+            try:
+                store.load(target_graph_file)
+            except Exception as e:
+                if temp_drift_target:
+                    temp_drift_target.cleanup()
+                console.print(f"[bold red]Failed to load knowledge graph:[/bold red] {e}")
+                raise typer.Exit(1)
+
+        # Resolve state cache directory (containing book_*_state.json)
+        cand_states_dirs = []
+        if states_dir:
+            cand_states_dirs.append(Path(states_dir).expanduser().resolve())
+        if getattr(cfg, "state_cache_dir", None):
+            cand_states_dirs.append(Path(cfg.state_cache_dir).expanduser().resolve())
+        cand_states_dirs.extend([
+            target_graph_file.parent / ".book_states",
+            target_graph_file.parent,
+            cfg.resolved_output_dir / ".book_states",
+            cfg.resolved_output_dir,
+        ])
+
+        resolved_states_dir: Optional[Path] = None
+        for cdir in cand_states_dirs:
+            if cdir.is_dir() and (list(cdir.glob("book_*_state.json")) or (cdir / ".book_states").is_dir()):
+                resolved_states_dir = cdir
+                break
+
+        if not resolved_states_dir:
+            resolved_states_dir = cfg.resolved_output_dir / ".book_states"
+
+        # Initialize embeddings provider if needed
+        embeddings = None
+        try:
+            embedding_model_name = getattr(cfg, "embedding_model", "nomic-embed-text")
+            verifier_servers = cfg.resolved_verification_servers
+            pool = OllamaPool(servers=verifier_servers, cooldown_seconds=0, max_tasks_per_server=2)
+            embeddings = FailoverOllamaEmbeddings(model=embedding_model_name, pool=pool)
+        except Exception as e:
+            logger.debug(f"Could not initialize FailoverOllamaEmbeddings: {e}")
+
+        try:
+            with console.status(f"[bold cyan]Evaluating Post-Processing Idea Drift (τ_loss = {effective_tau_loss:.2f})...[/bold cyan]"):
+                drift_metrics = run_postprocessing_drift_evaluation(
+                    store=store,
+                    states_dir=resolved_states_dir,
+                    book_id=book_id,
+                    tau_loss=effective_tau_loss,
+                    embeddings=embeddings,
+                    console=console,
+                )
+            console.print(format_postprocessing_drift_table(drift_metrics))
+            drift_dict = drift_metrics.model_dump()
+
+            # Save report
+            out_dest = Path(output_report) if output_report else cfg.resolved_output_dir / "drift_verification_report.json"
+            out_dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_dest, "w", encoding="utf-8") as f:
+                json.dump(drift_dict, f, indent=2, ensure_ascii=False)
+            console.print(f"[bold green]✓ Report saved to:[/bold green] [bold cyan]{out_dest}[/bold cyan]")
+            return drift_dict
+        finally:
+            if temp_drift_target:
+                temp_drift_target.cleanup()
+
     # Mode: 'ideas'
     target_graph_file = Path(graph_file).expanduser().resolve() if graph_file else cfg.resolved_output_dir / "knowledge_graph.json"
     temp_ideas_target: Optional[ResolvedBackupTarget] = None
@@ -5708,7 +5804,7 @@ def verify_command(
         None, "--percent", "-p", help="Percentage of ideas to randomly verify (default: 1.0 for 1%)."
     ),
     mode: Optional[str] = typer.Option(
-        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', 'chunk', 'cross-check', 'graph', or 'kg' (default: from config.yaml or 'ideas')."
+        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', 'chunk', 'cross-check', 'graph'/'kg', or 'drift' (default: from config.yaml or 'ideas')."
     ),
     compare_graph: Optional[str] = typer.Option(
         None,
@@ -5780,6 +5876,16 @@ def verify_command(
         "--stats-output",
         help="Optional path to save standalone statistics JSON file (default: output_dir/verification_stats.json).",
     ),
+    states_dir: Optional[str] = typer.Option(
+        None,
+        "--states-dir",
+        help="Directory containing book state files (book_*_state.json) for post-processing drift verification.",
+    ),
+    tau_loss: Optional[float] = typer.Option(
+        0.70,
+        "--tau-loss",
+        help="Cosine similarity cutoff below which a raw idea is considered dropped in drift verification (default: 0.70).",
+    ),
 ):
     """
     Verify Knowledge Graph factual integrity, chunking correctness, or chunk Oracle alignment.
@@ -5806,6 +5912,8 @@ def verify_command(
     debug_output = _resolve_opt(debug_output)
     stats_output = _resolve_opt(stats_output)
     tau = _resolve_opt(tau)
+    states_dir = _resolve_opt(states_dir)
+    tau_loss = _resolve_opt(tau_loss)
 
     cfg = _get_effective_settings(
         config_path=config_path,
@@ -5893,6 +6001,8 @@ def verify_command(
                 debug_output=v_debug_file,
                 stats_output=v_stats,
                 tau=getattr(v, "tau", tau),
+                states_dir=getattr(v, "states_dir", states_dir),
+                tau_loss=getattr(v, "tau_loss", tau_loss),
             )
             reports.append((v_mode, v_report, rep))
 
@@ -5957,6 +6067,8 @@ def verify_command(
         debug_output=debug_output,
         stats_output=stats_output,
         tau=tau,
+        states_dir=states_dir,
+        tau_loss=tau_loss,
     )
 
 
@@ -5970,7 +6082,7 @@ def verifiers_command(
         None, "--percent", "-p", help="Percentage of ideas to randomly verify (default: 1.0 for 1%)."
     ),
     mode: Optional[str] = typer.Option(
-        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', 'chunk', 'cross-check', 'graph', or 'kg' (default: from config.yaml or 'ideas')."
+        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', 'chunk', 'cross-check', 'graph'/'kg', or 'drift' (default: from config.yaml or 'ideas')."
     ),
     compare_graph: Optional[str] = typer.Option(
         None,
@@ -8213,6 +8325,21 @@ def simulate_thresholds_command(
         "--skip-limbo/--no-skip-limbo",
         help="Whether to bypass/skip limbo chunks in simulation (default: True).",
     ),
+    postprocess: bool = typer.Option(
+        True,
+        "--postprocess/--no-postprocess",
+        help="Whether to run post-processing deduplication and calculate idea drift metrics (default: True).",
+    ),
+    postprocess_threshold: float = typer.Option(
+        0.92,
+        "--postprocess-threshold",
+        help="Cosine similarity threshold for postprocessing concept deduplication (default: 0.92).",
+    ),
+    tau_loss: float = typer.Option(
+        0.70,
+        "--tau-loss",
+        help="Cosine similarity cutoff below which a raw idea is considered dropped in drift calculation (default: 0.70).",
+    ),
     max_books: Optional[int] = typer.Option(
         None,
         "--max-books",
@@ -8299,6 +8426,9 @@ def simulate_thresholds_command(
             max_books=max_books,
             embeddings_client=embeddings_client,
             console=console,
+            postprocess=postprocess,
+            postprocess_threshold=postprocess_threshold,
+            tau_loss=tau_loss,
         )
     except Exception as e:
         console.print(f"[bold red]Simulation suite failed: {e}[/bold red]")

@@ -8176,6 +8176,148 @@ def ab_benchmark_command(
         )
 
 
+@app.command("simulate-thresholds")
+@app.command("sweep-thresholds")
+def simulate_thresholds_command(
+    threshold_pairs: str = typer.Option(
+        "0.60:0.90,0.65:0.90,0.70:0.90,0.75:0.90,0.65:0.95",
+        "--threshold-pairs",
+        "--pairs",
+        "-p",
+        help="Comma-separated list of low:high threshold pairs (e.g. '0.60:0.90,0.65:0.90,0.70:0.90,0.75:0.90,0.65:0.95').",
+    ),
+    state_cache_dir: Optional[str] = typer.Option(
+        None,
+        "--state-cache-dir",
+        "--cache-dir",
+        help="Path to state cache directory containing book_*_state.json files (default: output_dir/.book_states or output_dir).",
+    ),
+    chunks_dir: Optional[str] = typer.Option(
+        None,
+        "--chunks-dir",
+        help="Path to chunks directory containing book_*_chunks.json files (default: output_dir/chunks).",
+    ),
+    graph_path: Optional[str] = typer.Option(
+        None,
+        "--graph-path",
+        "--kg",
+        help="Path to knowledge_graph.json to extract concept embeddings (default: output_dir/knowledge_graph.json).",
+    ),
+    tau: float = typer.Option(
+        0.75,
+        "--tau",
+        help="Semantic proximity radius threshold for coverage evaluation (default: 0.75).",
+    ),
+    skip_limbo: bool = typer.Option(
+        True,
+        "--skip-limbo/--no-skip-limbo",
+        help="Whether to bypass/skip limbo chunks in simulation (default: True).",
+    ),
+    max_books: Optional[int] = typer.Option(
+        None,
+        "--max-books",
+        help="Optional cap on number of books to simulate for rapid testing.",
+    ),
+    output_report: Optional[str] = typer.Option(
+        None,
+        "--output-report",
+        "--output",
+        "-o",
+        help="Path to write the Markdown comparative report (default: output_dir/threshold_simulation_report.md).",
+    ),
+    config_path: Optional[str] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to config.yaml file.",
+    ),
+):
+    """
+    Simulate Knowledge Base generation across an array of (low, high) threshold pairs.
+    Replays chunk routing over the book chunk & state cache from scratch for each variation,
+    computes embedding space verification metrics (μ, σ, p10, Cov_τ, L_comp, Vendi),
+    prints a comparative summary table, and generates a visual Markdown report with plotting charts.
+    """
+    from bookeeper.evaluation.threshold_simulator import run_threshold_simulation_suite
+
+    cfg = _get_effective_settings(config_path)
+
+    # Resolve state cache directory
+    if state_cache_dir:
+        resolved_state_dir = Path(state_cache_dir).expanduser().resolve()
+    else:
+        # Check output/.book_states first, then output
+        cand = cfg.resolved_output_dir / ".book_states"
+        if cand.is_dir() and any(cand.glob("book_*_state.json")):
+            resolved_state_dir = cand
+        else:
+            resolved_state_dir = cfg.resolved_output_dir
+
+    # Resolve companion chunks dir
+    resolved_chunks_dir = Path(chunks_dir).expanduser().resolve() if chunks_dir else (cfg.resolved_output_dir / "chunks")
+
+    # Resolve knowledge graph path
+    resolved_graph_path = Path(graph_path).expanduser().resolve() if graph_path else (cfg.resolved_output_dir / "knowledge_graph.json")
+
+    # Resolve output report path
+    resolved_report_path = (
+        Path(output_report).expanduser().resolve()
+        if output_report
+        else (cfg.resolved_output_dir / "threshold_simulation_report.md")
+    )
+
+    console.print(
+        Panel.fit(
+            f"[bold cyan]Knowledge Base Threshold Simulation & Optimization Suite[/bold cyan]\n"
+            f"• State Cache Dir: [bold]{resolved_state_dir}[/bold]\n"
+            f"• Chunks Dir: [bold]{resolved_chunks_dir}[/bold]\n"
+            f"• Graph Path: [bold]{resolved_graph_path}[/bold]\n"
+            f"• Threshold Pairs: [bold green]{threshold_pairs}[/bold green]\n"
+            f"• Radius (τ): [bold]{tau:.2f}[/bold] | Skip Limbo: [bold]{skip_limbo}[/bold]\n"
+            f"• Output Report: [bold cyan]{resolved_report_path}[/bold cyan]",
+            title="Threshold Simulator",
+            border_style="cyan",
+        )
+    )
+
+    try:
+        suite_report = run_threshold_simulation_suite(
+            pairs=threshold_pairs,
+            state_cache_dir=resolved_state_dir,
+            chunks_dir=resolved_chunks_dir,
+            graph_path=resolved_graph_path,
+            tau=tau,
+            skip_limbo=skip_limbo,
+            max_books=max_books,
+            console=console,
+        )
+    except Exception as e:
+        console.print(f"[bold red]Simulation suite failed: {e}[/bold red]")
+        raise typer.Exit(1)
+
+    # 1. Print comparative terminal table
+    console.print()
+    console.print(suite_report.to_rich_table())
+    console.print()
+
+    # 2. Write Markdown visual report
+    md_content = suite_report.to_markdown()
+    resolved_report_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_report_path.write_text(md_content, encoding="utf-8")
+
+    console.print(
+        Panel.fit(
+            f"[bold green]✓ Threshold Simulation Benchmark Complete[/bold green]\n"
+            f"• Variations Simulated: [bold cyan]{len(suite_report.variations)}[/bold cyan]\n"
+            f"• Markdown Visual Report: [bold underline cyan]{resolved_report_path}[/bold underline cyan]\n"
+            f"  (Includes comparative summary table and Mermaid xychart-beta visual plots)",
+            title="Simulation Finished",
+            border_style="green",
+        )
+    )
+
+
+
 if __name__ == "__main__":
     app()
 

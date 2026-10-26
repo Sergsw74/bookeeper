@@ -82,7 +82,7 @@ from bookeeper.processing.ollama_pool import (
     aggregate_server_statistics,
     format_server_stats_table,
 )
-from bookeeper.processing.state import BookProcessingState, ProgressTracker
+from bookeeper.processing.state import BookProcessingState, BookStateCache, ProgressTracker
 from bookeeper.processing.verifier import (
     IdeaVerifier,
     VerificationItem,
@@ -529,6 +529,7 @@ def _get_effective_settings(
     similarity_high_confidence: Optional[float] = None,
     skip_limbo_chunks: Optional[bool] = None,
     max_batch_chunk_size: Optional[int] = None,
+    state_cache_dir: Optional[str] = None,
 ) -> Settings:
     """Retrieve settings and merge explicit CLI arguments with highest precedence."""
     config_path = _resolve_opt(config_path)
@@ -550,9 +551,12 @@ def _get_effective_settings(
     similarity_high_confidence = _resolve_opt(similarity_high_confidence)
     skip_limbo_chunks = _resolve_opt(skip_limbo_chunks)
     max_batch_chunk_size = _resolve_opt(max_batch_chunk_size)
+    state_cache_dir = _resolve_opt(state_cache_dir)
 
     cfg = get_settings(config_path)
     overrides = {}
+    if state_cache_dir:
+        overrides["state_cache_dir"] = str(state_cache_dir)
     if calibre_path:
         overrides["calibre_library_path"] = str(calibre_path)
     if books_dir:
@@ -1660,6 +1664,11 @@ def build_graph(
         "--max-batch-chunk-size",
         help="Maximum batch chunk size threshold (in characters): if a limbo chunk is this size or bigger, recover it to unprocessed LLM queue.",
     ),
+    state_cache_dir: Optional[str] = typer.Option(
+        None,
+        "--state-cache-dir",
+        help="Directory containing existing book state files (book_*_state.json) to use as read-only local cache for chunking and raw chunk analysis.",
+    ),
 ):
     """
     Ingest sections, perform semantic chunking, extract concepts via Ollama,
@@ -1700,6 +1709,7 @@ def build_graph(
     similarity_high_confidence = _resolve_opt(similarity_high_confidence)
     skip_limbo_chunks = _resolve_opt(skip_limbo_chunks)
     max_batch_chunk_size = _resolve_opt(max_batch_chunk_size)
+    state_cache_dir = _resolve_opt(state_cache_dir)
 
     cfg = _get_effective_settings(
         config_path,
@@ -1721,6 +1731,7 @@ def build_graph(
         similarity_high_confidence=similarity_high_confidence,
         skip_limbo_chunks=skip_limbo_chunks,
         max_batch_chunk_size=max_batch_chunk_size,
+        state_cache_dir=state_cache_dir,
     )
     output_dir = cfg.resolved_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1731,6 +1742,14 @@ def build_graph(
     should_export_neo4j = cfg.neo4j.enabled if export_neo4j is None else export_neo4j
     has_cleaned = False
     has_cleaned_neo4j = False
+
+    effective_state_cache = state_cache_dir or cfg.state_cache_dir
+    state_cache = BookStateCache(effective_state_cache)
+    if state_cache.is_enabled():
+        console.print(
+            f"[dim]Local State Cache Directory: [bold cyan]{state_cache.cache_dir}[/bold cyan] "
+            f"({len(state_cache._id_to_file)} book state file(s) indexed)[/dim]"
+        )
 
     tracker_path = Path(state_file) if state_file else cfg.resolved_state_file
     tracker = ProgressTracker(tracker_path)
@@ -1763,6 +1782,15 @@ def build_graph(
             output_dir / ".book_states",
             getattr(cfg, "resolved_output_dir", output_dir) / ".book_states",
         }
+        # Explicit protection: ensure state_cache_dir is never included or purged during cleanups
+        if state_cache.is_enabled():
+            sc_dir = state_cache.cache_dir
+            candidate_state_dirs = {
+                d for d in candidate_state_dirs
+                if d != sc_dir and not (sc_dir and d.is_relative_to(sc_dir))
+            }
+            console.print(f"[dim green]Preserving external state cache directory: {sc_dir}[/dim green]")
+
         total_purged_states = 0
         for b_sdir in candidate_state_dirs:
             total_purged_states += BookProcessingState.clean_all(b_sdir)
@@ -2297,9 +2325,21 @@ def build_graph(
 
             t_book_start = time.perf_counter()
             try:
-                # Check if chunks already exist in local ChunkStore
+                # Check if chunks already exist in local state cache or ChunkStore
                 chunks = None
-                if chunk_store.has_chunks(bid) and not rechunk:
+                if state_cache.is_enabled():
+                    chunks = state_cache.get_cached_chunks(bid, btitle)
+                    if chunks:
+                        console.print(
+                            f"  [bold green]⚡ Reused {len(chunks)} cached atomic chunks from state cache ({state_cache.cache_dir.name}).[/bold green]"
+                        )
+                        try:
+                            chunk_store.save_chunks(bid, btitle, chunks)
+                            book_state.set_chunks(chunks)
+                        except Exception:
+                            pass
+
+                if not chunks and chunk_store.has_chunks(bid) and not rechunk:
                     chunks = chunk_store.load_chunks(bid)
                     if chunks:
                         console.print(f"  Loaded [bold green]{len(chunks)} cached atomic chunks[/bold green] from local storage.")
@@ -2424,8 +2464,9 @@ def build_graph(
 
                     console.print(f"  Created [bold green]{len(chunks)} atomic thematic chunks[/bold green]{speed_detail}.")
 
-                    # Persist chunks to local storage immediately
+                    # Persist chunks to local storage and book state immediately
                     chunk_store.save_chunks(bid, btitle, chunks)
+                    book_state.set_chunks(chunks)
                     console.print(f"  [dim]Saved chunks to local storage: {chunk_store._chunk_file(bid).name}[/dim]")
 
                 t_book_extract_start = time.perf_counter()
@@ -2526,7 +2567,15 @@ def build_graph(
 
                     book_state.set_total_chunks(len(chunks))
 
-                    # 1. Restore any already processed or failed chunks from previous run
+                    # Seed active book_state from state_cache if available
+                    if state_cache.is_enabled():
+                        cached_extractions_seeded = state_cache.populate_state_from_cache(book_state)
+                        if cached_extractions_seeded > 0:
+                            console.print(
+                                f"  [bold green]⚡ Reused {cached_extractions_seeded} raw chunk analyses from state cache ({state_cache.cache_dir.name}).[/bold green]"
+                            )
+
+                    # 1. Restore any already processed or failed chunks from previous run (or state cache)
                     restored_from_state = 0
                     restored_failed = 0
                     for chk in chunks:
@@ -3616,12 +3665,23 @@ def build_graph(
 
     # Display final graph statistics
     st = store.stats()
+    cache_info = ""
+    if state_cache.is_enabled():
+        c_stats = state_cache.stats()
+        cache_info = (
+            f"\n\n[bold cyan]Local State Cache Statistics ({state_cache.cache_dir.name}):[/bold cyan]\n"
+            f"  • Books Reused from Cache: [bold green]{c_stats['reused_books_count']}[/bold green]\n"
+            f"  • Atomic Chunks Reused (Chunking Bypassed): [bold green]{c_stats['reused_chunks_count']}[/bold green]\n"
+            f"  • Raw Chunk Analyses Reused (LLM Bypassed): [bold green]{c_stats['reused_extractions_count']}[/bold green]"
+        )
+
     console.print(
         Panel.fit(
             f"[bold]Total Nodes:[/bold] {st['total_nodes']}\n"
             f"[bold]Total Edges:[/bold] {st['total_edges']}\n"
             f"[bold]Assigned Chunks (Fast-Path):[/bold] {session_assigned_chunks}\n"
-            f"[bold]Skipped Chunks (Limbo):[/bold] {session_skipped_chunks}\n\n"
+            f"[bold]Skipped Chunks (Limbo):[/bold] {session_skipped_chunks}"
+            f"{cache_info}\n\n"
             f"[bold green]Node Types:[/bold green]\n"
             + "\n".join(f"  • {k}: {v}" for k, v in st["node_types"].items())
             + "\n\n[bold green]Relationship Types:[/bold green]\n"
@@ -6726,6 +6786,11 @@ def rebuild_graph_command(
     dedup: bool = typer.Option(
         True, "--dedup/--no-dedup", help="Apply entity deduplication (default: True)."
     ),
+    state_cache_dir: Optional[str] = typer.Option(
+        None,
+        "--state-cache-dir",
+        help="Directory containing existing book state files (book_*_state.json) to use as source state directory.",
+    ),
 ):
     """
     Fast, offline rebuild of the Knowledge Graph directly from existing per-book state checkpoints (.book_states).
@@ -6745,6 +6810,7 @@ def rebuild_graph_command(
     clean_export = _resolve_opt(clean_export, True)
     dedup = _resolve_opt(dedup, True)
     books_dir = _resolve_opt(books_dir)
+    state_cache_dir = _resolve_opt(state_cache_dir)
 
     cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir)
     output_dir = cfg.resolved_output_dir
@@ -6753,7 +6819,8 @@ def rebuild_graph_command(
     graphml_dest = output_dir / "knowledge_graph.graphml"
     vault_dest = Path(export_obsidian) if export_obsidian else output_dir / "obsidian_vault"
 
-    resolved_states_dir = Path(states_dir) if states_dir else output_dir / ".book_states"
+    effective_states = states_dir or state_cache_dir or cfg.state_cache_dir
+    resolved_states_dir = Path(effective_states) if effective_states else output_dir / ".book_states"
     resolved_chunks_dir = Path(chunks_dir) if chunks_dir else output_dir / "chunks"
     tracker_path = Path(state_file) if state_file else cfg.resolved_state_file
     tracker = ProgressTracker(tracker_path)

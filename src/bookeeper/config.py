@@ -845,6 +845,20 @@ class Settings(BaseSettings):
         p.mkdir(parents=True, exist_ok=True)
         return p
 
+    state_cache_dir: Optional[str] = Field(
+        default=None,
+        description="Optional directory containing book state files (book_*_state.json) to use as read-only local cache for chunking and raw analysis.",
+    )
+
+    @property
+    def resolved_state_cache_dir(self) -> Optional[Path]:
+        """Return expanded Path for read-only book state cache directory if configured and existing."""
+        if self.state_cache_dir:
+            p = Path(self.state_cache_dir).expanduser().resolve()
+            if p.is_dir():
+                return p
+        return None
+
     # LightRAG Engine settings
     enable_lightrag: bool = Field(
         default=False,

@@ -373,6 +373,59 @@ class SimulationSuiteReport(BaseModel):
             lines.append("> **Std Dev ($\\sigma$)**: Lower standard deviation indicates tighter, more uniform semantic coverage without clustering holes.")
             lines.append("")
 
+            # Charts 5 & 6: Post-Processing Drift & Concept Degradation
+            if has_drift:
+                ret_vals = [round(v.forward_retention, 4) if v.forward_retention is not None else 0.0 for v in self.variations]
+                fid_vals = [round(v.backward_fidelity, 4) if v.backward_fidelity is not None else 0.0 for v in self.variations]
+                min_drift = max(0.0, min(ret_vals + fid_vals, default=0.5) - 0.05)
+                max_drift = min(1.0, max(ret_vals + fid_vals, default=1.0) + 0.02)
+
+                # Chart 5: Retention vs Fidelity
+                lines.append("### Post-Processing Semantic Retention ($S_{R\\to P}$) vs Backward Fidelity ($S_{P\\to R}$)")
+                lines.append("```mermaid")
+                lines.append("xychart-beta")
+                lines.append('    title "Semantic Retention vs Backward Fidelity Across Variations"')
+                lines.append(f"    x-axis {labels_json}")
+                lines.append(f'    y-axis "Cosine Similarity" {round(min_drift, 2)} --> {round(max_drift, 2)}')
+                lines.append(f"    line {ret_vals}")
+                lines.append(f"    line {fid_vals}")
+                lines.append("```")
+                lines.append("> **Line 1 (Top/Blue)**: Forward Retention $S_{R\\to P}$ (how faithfully original raw ideas are preserved in deduplicated KG).  ")
+                lines.append("> **Line 2**: Backward Fidelity $S_{P\\to R}$ (how strictly KG ideas remain grounded in original raw literature extractions).  ")
+                lines.append("")
+
+                # Chart 6: Concept Nodes Count: Raw (M) vs Surviving Post-Processed (Mp)
+                m_vals = [v.nodes_count for v in self.variations]
+                mp_vals = [v.postprocessed_nodes_count if v.postprocessed_nodes_count is not None else v.nodes_count for v in self.variations]
+                max_m = max(m_vals + mp_vals, default=10)
+
+                lines.append("### Concept Compression: Raw Extracted ($M$) vs Surviving Post ($M_p$) Nodes")
+                lines.append("```mermaid")
+                lines.append("xychart-beta")
+                lines.append('    title "Raw Concepts (M) vs Post-Processed Concepts (Mp)"')
+                lines.append(f"    x-axis {labels_json}")
+                lines.append(f'    y-axis "Concept Count" 0 --> {int(np.ceil(max_m * 1.15))}')
+                lines.append(f"    bar {m_vals}")
+                lines.append(f"    bar {mp_vals}")
+                lines.append("```")
+                lines.append("> **Bar 1**: Raw Ideas Count $M$ extracted from parent chunks before deduplication.  ")
+                lines.append("> **Bar 2**: Surviving Knowledge Graph Ideas $M_p$ after post-processing deduplication.  ")
+                lines.append("")
+
+                if any((v.dropped_raw_count or 0) > 0 for v in self.variations):
+                    drop_ratios = [round(v.dropped_raw_ratio_pct or 0.0, 2) for v in self.variations]
+                    max_dr = max(5.0, max(drop_ratios, default=5.0) * 1.2)
+                    lines.append("### Dropped Raw Ideas Ratio Below $\\tau_{\\text{loss}}$ (%)")
+                    lines.append("```mermaid")
+                    lines.append("xychart-beta")
+                    lines.append('    title "Dropped Raw Ideas Ratio Below tau_loss (%)"')
+                    lines.append(f"    x-axis {labels_json}")
+                    lines.append(f'    y-axis "Dropped (%)" 0 --> {round(max_dr, 1)}')
+                    lines.append(f"    bar {drop_ratios}")
+                    lines.append("```")
+                    lines.append("> **Dropped Ratio**: Percentage of raw extracted ideas whose nearest surviving concept falls below the semantic cutoff $\\tau_{\\text{loss}}$.")
+                    lines.append("")
+
         # 3. Pareto Analysis & Insights
         lines.append("## 3. Comparative Observations & Pareto Analysis")
         lines.append("")
@@ -381,10 +434,28 @@ class SimulationSuiteReport(BaseModel):
             best_lev = max(self.variations, key=lambda x: x.compression_leverage_factor)
             best_p10 = max(self.variations, key=lambda x: x.worst_decile_p10)
 
+            lines.append("### Graph Space & Compression Observations")
             lines.append(f"- **Maximum Semantic Coverage**: Variation `{best_cov.label}` achieved the highest coverage at **{best_cov.coverage_at_tau_pct:.2f}%** (with compute ratio $\\rho_p = {best_cov.parent_chunk_ratio_pct:.2f}\\%$).")
             lines.append(f"- **Maximum Compression Leverage**: Variation `{best_lev.label}` delivered the highest leverage at **{best_lev.compression_leverage_factor:.2f}x** (covering {best_lev.coverage_at_tau_pct:.2f}% while requiring only {best_lev.parent_chunk_ratio_pct:.2f}% extraction compute).")
             lines.append(f"- **Best Tail Robustness**: Variation `{best_p10.label}` provided the strongest worst-decile floor with $p_{{10}} = {best_p10.worst_decile_p10:.4f}$.")
             lines.append("")
+
+            if has_drift:
+                best_ret = max(self.variations, key=lambda x: x.forward_retention or 0.0)
+                best_fid = max(self.variations, key=lambda x: x.backward_fidelity or 0.0)
+                best_f1 = max(self.variations, key=lambda x: x.symmetric_idea_drift_score or 0.0)
+
+                lines.append("### Post-Processing Idea Drift & Semantic Degradation Observations")
+                lines.append(f"- **Highest Forward Retention**: Variation `{best_ret.label}` achieved $S_{{R\\to P}} = {best_ret.forward_retention:.4f}$ (indicating lossless semantic preservation of raw ideas).")
+                lines.append(f"- **Highest Backward Fidelity**: Variation `{best_fid.label}` achieved $S_{{P\\to R}} = {best_fid.backward_fidelity:.4f}$ (strictly anchored to ground-truth raw concepts without hallucination drift).")
+                lines.append(f"- **Best Symmetric Alignment ($F_1$)**: Variation `{best_f1.label}` scored $F_1 = {best_f1.symmetric_idea_drift_score:.4f}$ harmonic drift score.")
+
+                if any((v.dropped_raw_count or 0) > 0 for v in self.variations):
+                    worst_drop = max(self.variations, key=lambda x: x.dropped_raw_ratio_pct or 0.0)
+                    lines.append(f"- **Concept Attrition Alert**: Variation `{worst_drop.label}` dropped {worst_drop.dropped_raw_count} raw ideas ({worst_drop.dropped_raw_ratio_pct:.1f}% below $\\tau_{{\\text{{loss}}}}$).")
+                else:
+                    lines.append("- **Zero Concept Loss**: Across all simulated variations, 0% of raw ideas were dropped below the $\\tau_{\\text{loss}}$ semantic threshold.")
+                lines.append("")
 
         return "\n".join(lines)
 

@@ -765,3 +765,81 @@ def test_cli_verify_mode_drift(tmp_path: Path):
     assert data["forward_retention"] >= 0.99
 
 
+def test_cli_verify_mode_kg_with_states(tmp_path: Path):
+    """Verify that `bookeeper verify --mode kg` automatically includes drift metrics when states exist."""
+    states_dir = tmp_path / ".book_states"
+    states_dir.mkdir(parents=True)
+
+    state_content = {
+        "book_id": "1",
+        "processed_chunks": {
+            "chunk_0": {
+                "extraction": {
+                    "concepts": [
+                        {
+                            "name": "Distributed Systems",
+                            "brief_description": "Consensus and partitioning.",
+                            "detailed_explanation": "Paxos and Raft protocols.",
+                            "supporting_quote": "Consensus in distributed systems requires quorum.",
+                            "embedding": [0.0, 1.0, 0.0],
+                        }
+                    ]
+                }
+            }
+        }
+    }
+    with open(states_dir / "book_1_state.json", "w", encoding="utf-8") as f:
+        json.dump(state_content, f)
+
+    store = ConceptGraphStore()
+    c = Concept(
+        name="Distributed Systems",
+        brief_description="Consensus and partitioning.",
+        detailed_explanation="Paxos and Raft protocols.",
+        category="Definition",
+    )
+    store.add_concept(c, embedding=[0.0, 1.0, 0.0])
+    chk = HierarchicalChunk(
+        chunk_id="chunk_0",
+        chunk_idx=0,
+        book_id=1,
+        book_title="Book 1",
+        chapter_idx=1,
+        chapter_title="Chapter 1",
+        section_title="Section 1",
+        subtitle="",
+        breadcrumb="Ch 1",
+        text="Consensus in distributed systems requires quorum.",
+        char_count=50,
+        word_count=8,
+        embedding=[0.0, 1.0, 0.0],
+    )
+    store.add_chunk(chk)
+    kg_path = tmp_path / "knowledge_graph.json"
+    store.save(kg_path)
+
+    out_rep = tmp_path / "kg_report_with_drift.json"
+    res = runner.invoke(app, [
+        "verify",
+        "--graph-file", str(kg_path),
+        "--states-dir", str(states_dir),
+        "--mode", "kg",
+        "--tau", "0.70",
+        "--output", str(out_rep),
+    ])
+
+    assert res.exit_code == 0, f"Error: {res.stdout}"
+    assert "Knowledge Graph Embedding Space Metrics" in res.stdout
+    assert "Post-Processing Idea Drift & Semantic Alignment" in res.stdout
+    assert "Forward Retention" in res.stdout
+    assert out_rep.is_file()
+
+    with open(out_rep, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert "chamfer_mean" in data
+    assert "postprocessing_drift" in data
+    assert data["postprocessing_drift"]["forward_retention"] >= 0.99
+    assert data["postprocessing_drift"]["backward_fidelity"] >= 0.99
+
+
+

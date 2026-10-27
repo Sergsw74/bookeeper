@@ -204,6 +204,9 @@ bookeeper verify --mode kg --tau 0.75
 bookeeper verify --mode graph --compare-graph ./output/knowledge_graph.json --tau 0.75
 ```
 
+> [!NOTE]
+> Whenever book state checkpoints exist in `output/.book_states` (or when `--states-dir` is provided), `bookeeper verify --mode graph` / `kg` automatically executes **Post-Processing Idea Drift & Semantic Alignment** alongside the graph space metrics, displaying both tables and embedding the drift metrics into `graph_space_report.json`.
+
 #### Core Metric Suite for Knowledge Graph Space
 
 To eliminate distortion caused by chunk size variance (e.g. short 200-char transitional chunks vs dense 1,500-char technical explanations), all metrics are **size-weighted by chunk character length** $w_i = \text{char\_count}(c_i)$, measuring actual text volume rather than arbitrary chunk boundary counts:

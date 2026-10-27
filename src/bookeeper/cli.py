@@ -5400,12 +5400,45 @@ def _execute_single_verification(
                 logger.debug(f"Could not initialize FailoverOllamaEmbeddings: {e}")
 
             chunks_dir_resolved = Path(chunks_dir).expanduser().resolve() if chunks_dir else cfg.resolved_output_dir / "chunks"
+            effective_tau_loss = float(tau_loss if tau_loss is not None else getattr(cfg.verification, "tau_loss", 0.70))
+
+            # Resolve state cache directory (containing book_*_state.json)
+            cand_states_dirs = []
+            if states_dir:
+                cand_states_dirs.append(Path(states_dir).expanduser().resolve())
+            elif getattr(cfg, "state_cache_dir", None):
+                cand_states_dirs.append(Path(cfg.state_cache_dir).expanduser().resolve())
+            else:
+                if target_graph_a and target_graph_a.is_file():
+                    cand_states_dirs.append(target_graph_a.parent / ".book_states")
+                    cand_states_dirs.append(target_graph_a.parent)
+                if not graph_file or (target_graph_a and target_graph_a.parent == cfg.resolved_output_dir):
+                    cand_states_dirs.extend([
+                        cfg.resolved_output_dir / ".book_states",
+                        cfg.resolved_output_dir,
+                    ])
+
+            resolved_states_dir: Optional[Path] = None
+            for cdir in cand_states_dirs:
+                if cdir.is_dir() and (list(cdir.glob("book_*_state.json")) or (cdir / ".book_states").is_dir()):
+                    resolved_states_dir = cdir
+                    break
 
             if target_graph_b and target_graph_b.is_file():
                 # Comparative Mode (A/B)
                 store_b = ConceptGraphStore()
                 with console.status(f"[bold cyan]Loading Graph B from {target_graph_b}...[/bold cyan]"):
                     store_b.load(target_graph_b)
+
+                cand_states_dirs_b = []
+                if target_graph_b.is_file():
+                    cand_states_dirs_b.append(target_graph_b.parent / ".book_states")
+                    cand_states_dirs_b.append(target_graph_b.parent)
+                resolved_states_dir_b: Optional[Path] = None
+                for cdir in cand_states_dirs_b:
+                    if cdir.is_dir() and (list(cdir.glob("book_*_state.json")) or (cdir / ".book_states").is_dir()):
+                        resolved_states_dir_b = cdir
+                        break
 
                 with console.status(f"[bold cyan]Evaluating Graph Embedding Space Comparison (τ = {effective_tau:.2f})...[/bold cyan]"):
                     kg_report = run_graph_space_comparison(
@@ -5417,6 +5450,9 @@ def _execute_single_verification(
                         embeddings=embeddings,
                         chunks_dir=chunks_dir_resolved,
                         console=console,
+                        states_dir_a=resolved_states_dir,
+                        states_dir_b=resolved_states_dir_b or resolved_states_dir,
+                        tau_loss=effective_tau_loss,
                     )
                 console.print(format_graph_comparison_table(kg_report))
                 report_dict = kg_report.model_dump()
@@ -5429,8 +5465,13 @@ def _execute_single_verification(
                         embeddings=embeddings,
                         chunks_dir=chunks_dir_resolved,
                         console=console,
+                        states_dir=resolved_states_dir,
+                        tau_loss=effective_tau_loss,
+                        book_id=book_id,
                     )
                 console.print(format_graph_space_table(metrics))
+                if metrics.postprocessing_drift:
+                    console.print(format_postprocessing_drift_table(metrics.postprocessing_drift))
                 report_dict = metrics.model_dump()
 
             # Clean up temporary folders immediately after verification to spare memory

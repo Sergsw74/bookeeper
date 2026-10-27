@@ -255,7 +255,10 @@ def test_simulation_suite_report_markdown_and_rich(mock_simulation_corpus):
     assert 'title "Compression Leverage Multiplier Across Variations"' in md
     assert 'title "Mean Proximity (mu) vs Worst-Decile (p10)"' in md
     assert 'title "Embedding Space Dispersion Regularity (sigma)"' in md
+    assert 'title "Semantic Retention vs Backward Fidelity Across Variations"' in md
+    assert 'title "Raw Concepts (M) vs Post-Processed Concepts (Mp)"' in md
     assert "## 3. Comparative Observations & Pareto Analysis" in md
+    assert "Post-Processing Idea Drift & Semantic Degradation Observations" in md
 
 
 # ==============================================================================

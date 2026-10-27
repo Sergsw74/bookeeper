@@ -80,6 +80,26 @@ def compute_weighted_percentile(values: np.ndarray, weights: np.ndarray, percent
 # ==============================================================================
 
 
+class PostProcessingDriftMetrics(BaseModel):
+    """
+    Evaluation metrics for post-processing idea deformation and semantic alignment
+    comparing RAW idea space (from book states) vs POST Knowledge Graph ideas.
+    """
+
+    raw_ideas_count: int = Field(..., description="Number of raw ideas/concepts N_R extracted in book states.")
+    post_ideas_count: int = Field(..., description="Number of surviving post-processed ideas N_P in Knowledge Graph.")
+    forward_retention: float = Field(..., description="Forward retention S_{R -> P}: average cosine similarity of nearest surviving post idea for each raw idea.")
+    backward_fidelity: float = Field(..., description="Backward fidelity S_{P -> R}: average cosine similarity of nearest original raw idea for each post idea.")
+    symmetric_idea_drift_score: float = Field(..., description="Harmonic mean of forward retention and backward fidelity in [0, 1].")
+    weighted_retention: float = Field(..., description="Evidence-weighted forward retention (weighted by character length of supporting quote/context).")
+    centroid_cosine_alignment: float = Field(..., description="Cosine alignment of normalized mean centroids between RAW and POST idea spaces.")
+    p10_retention: float = Field(..., description="10th percentile worst-decile retention among raw ideas.")
+    min_retention: float = Field(..., description="Minimum cosine similarity observed across all raw ideas.")
+    dropped_raw_count: int = Field(0, description="Number of raw ideas whose best post match falls below tau_loss.")
+    dropped_raw_ratio_pct: float = Field(0.0, description="Percentage of raw ideas dropped below tau_loss.")
+    tau_loss: float = Field(0.70, description="Cosine similarity cutoff below which a raw idea is considered dropped.")
+
+
 class GraphSpaceMetrics(BaseModel):
     """
     Evaluation metrics for a Knowledge Graph's dispersion and coverage over corpus space.
@@ -107,25 +127,10 @@ class GraphSpaceMetrics(BaseModel):
     generalization_surplus_pct: Optional[float] = Field(None, description="Generalization surplus Delta_cov = Cov_tau - rho_parent (size-weighted).")
     compression_leverage_factor: Optional[float] = Field(None, description="Compression leverage L_comp = Cov_tau / rho_parent (size-weighted).")
 
-
-class PostProcessingDriftMetrics(BaseModel):
-    """
-    Evaluation metrics for post-processing idea deformation and semantic alignment
-    comparing RAW idea space (from book states) vs POST Knowledge Graph ideas.
-    """
-
-    raw_ideas_count: int = Field(..., description="Number of raw ideas/concepts N_R extracted in book states.")
-    post_ideas_count: int = Field(..., description="Number of surviving post-processed ideas N_P in Knowledge Graph.")
-    forward_retention: float = Field(..., description="Forward retention S_{R -> P}: average cosine similarity of nearest surviving post idea for each raw idea.")
-    backward_fidelity: float = Field(..., description="Backward fidelity S_{P -> R}: average cosine similarity of nearest original raw idea for each post idea.")
-    symmetric_idea_drift_score: float = Field(..., description="Harmonic mean of forward retention and backward fidelity in [0, 1].")
-    weighted_retention: float = Field(..., description="Evidence-weighted forward retention (weighted by character length of supporting quote/context).")
-    centroid_cosine_alignment: float = Field(..., description="Cosine alignment of normalized mean centroids between RAW and POST idea spaces.")
-    p10_retention: float = Field(..., description="10th percentile worst-decile retention among raw ideas.")
-    min_retention: float = Field(..., description="Minimum cosine similarity observed across all raw ideas.")
-    dropped_raw_count: int = Field(0, description="Number of raw ideas whose best post match falls below tau_loss.")
-    dropped_raw_ratio_pct: float = Field(0.0, description="Percentage of raw ideas dropped below tau_loss.")
-    tau_loss: float = Field(0.70, description="Cosine similarity cutoff below which a raw idea is considered dropped.")
+    # Post-Processing Idea Drift Metrics
+    postprocessing_drift: Optional[PostProcessingDriftMetrics] = Field(
+        None, description="Post-processing idea drift and semantic alignment metrics."
+    )
 
 
 class GraphSpaceComparisonReport(BaseModel):
@@ -162,6 +167,13 @@ class GraphSpaceComparisonReport(BaseModel):
     delta_skipped_retention_pct: Optional[float] = Field(None, description="Delta skipped retention rate (B - A).")
     delta_generalization_surplus_pct: Optional[float] = Field(None, description="Delta generalization surplus (B - A).")
     delta_compression_leverage_factor: Optional[float] = Field(None, description="Delta compression leverage (B - A).")
+
+    # Post-Processing Idea Drift A/B Metrics
+    baseline_drift: Optional[PostProcessingDriftMetrics] = Field(None, description="Drift metrics for Baseline (A).")
+    candidate_drift: Optional[PostProcessingDriftMetrics] = Field(None, description="Drift metrics for Candidate (B).")
+    delta_forward_retention: Optional[float] = Field(None, description="Delta forward retention (B - A).")
+    delta_backward_fidelity: Optional[float] = Field(None, description="Delta backward fidelity (B - A).")
+    delta_symmetric_drift_score: Optional[float] = Field(None, description="Delta symmetric drift score (B - A).")
 
     # Decision Matrix Evaluation
     decision_pass: bool
@@ -877,9 +889,13 @@ def run_graph_space_evaluation(
     embeddings: Optional[Any] = None,
     chunks_dir: Optional[Union[Path, str]] = None,
     console: Optional[Any] = None,
+    states_dir: Optional[Union[Path, str]] = None,
+    tau_loss: float = 0.70,
+    book_id: Optional[Union[int, str]] = None,
 ) -> GraphSpaceMetrics:
     """
     Executes a single Graph Space evaluation on a Knowledge Graph.
+    If states_dir is provided or book states are found, also calculates post-processing idea drift metrics.
     """
     ensure_graph_embeddings(store, embeddings=embeddings, chunks_dir=chunks_dir, console=console)
     _, g_mat = extract_concept_embeddings(store)
@@ -904,6 +920,27 @@ def run_graph_space_evaluation(
         parent_chunk_mask=parent_mask,
         chunk_weights=u_weights,
     )
+
+    # Calculate post-processing idea drift if state cache directory is available
+    post_drift: Optional[PostProcessingDriftMetrics] = None
+    if states_dir:
+        resolved_sdir = Path(states_dir).expanduser().resolve()
+        sub_sdir = resolved_sdir / ".book_states"
+        target_sdir = sub_sdir if (sub_sdir.is_dir() and any(sub_sdir.glob("book_*_state.json"))) else resolved_sdir
+        if target_sdir.is_dir() and any(target_sdir.glob("book_*_state.json")):
+            try:
+                post_drift = run_postprocessing_drift_evaluation(
+                    store=store,
+                    states_dir=target_sdir,
+                    book_id=book_id,
+                    tau_loss=tau_loss,
+                    embeddings=embeddings,
+                    console=console,
+                )
+            except Exception as e:
+                logger.warning(f"Could not compute post-processing drift in graph space evaluation: {e}")
+
+    raw["postprocessing_drift"] = post_drift
     return GraphSpaceMetrics(**raw)
 
 
@@ -916,9 +953,13 @@ def run_graph_space_comparison(
     embeddings: Optional[Any] = None,
     chunks_dir: Optional[Union[Path, str]] = None,
     console: Optional[Any] = None,
+    states_dir_a: Optional[Union[Path, str]] = None,
+    states_dir_b: Optional[Union[Path, str]] = None,
+    tau_loss: float = 0.70,
 ) -> GraphSpaceComparisonReport:
     """
     Runs end-to-end Graph Space Comparison between Store A and Store B over their combined Universe.
+    If states_dir_a / states_dir_b are provided, also calculates and compares post-processing idea drift.
     """
     ensure_graph_embeddings(store_a, embeddings=embeddings, chunks_dir=chunks_dir, console=console)
     ensure_graph_embeddings(store_b, embeddings=embeddings, chunks_dir=chunks_dir, console=console)
@@ -951,7 +992,7 @@ def run_graph_space_comparison(
     parent_mask_a = np.array([cid in parent_cids_a for cid in cids_a], dtype=bool) if parent_cids_a else None
     parent_mask_b = np.array([cid in parent_cids_b for cid in cids_b], dtype=bool) if parent_cids_b else None
 
-    return compare_graph_spaces(
+    report = compare_graph_spaces(
         universe_embeddings=u1_mat,
         baseline_embeddings=g1_mat,
         candidate_embeddings=g2_mat,
@@ -964,6 +1005,43 @@ def run_graph_space_comparison(
         chunk_weights=w_a,
         chunk_weights_b=w_b,
     )
+
+    # Optional drift evaluation for A and B
+    drift_a: Optional[PostProcessingDriftMetrics] = None
+    drift_b: Optional[PostProcessingDriftMetrics] = None
+
+    if states_dir_a:
+        s_a = Path(states_dir_a).expanduser().resolve()
+        sub_a = s_a / ".book_states"
+        t_a = sub_a if (sub_a.is_dir() and any(sub_a.glob("book_*_state.json"))) else s_a
+        if t_a.is_dir() and any(t_a.glob("book_*_state.json")):
+            try:
+                drift_a = run_postprocessing_drift_evaluation(
+                    store=store_a, states_dir=t_a, tau_loss=tau_loss, embeddings=embeddings, console=console
+                )
+            except Exception as e:
+                logger.warning(f"Could not compute drift for Baseline (A): {e}")
+
+    if states_dir_b:
+        s_b = Path(states_dir_b).expanduser().resolve()
+        sub_b = s_b / ".book_states"
+        t_b = sub_b if (sub_b.is_dir() and any(sub_b.glob("book_*_state.json"))) else s_b
+        if t_b.is_dir() and any(t_b.glob("book_*_state.json")):
+            try:
+                drift_b = run_postprocessing_drift_evaluation(
+                    store=store_b, states_dir=t_b, tau_loss=tau_loss, embeddings=embeddings, console=console
+                )
+            except Exception as e:
+                logger.warning(f"Could not compute drift for Candidate (B): {e}")
+
+    report.baseline_drift = drift_a
+    report.candidate_drift = drift_b
+    if drift_a and drift_b:
+        report.delta_forward_retention = drift_b.forward_retention - drift_a.forward_retention
+        report.delta_backward_fidelity = drift_b.backward_fidelity - drift_a.backward_fidelity
+        report.delta_symmetric_drift_score = drift_b.symmetric_idea_drift_score - drift_a.symmetric_idea_drift_score
+
+    return report
 
 
 def load_raw_ideas_from_states(
@@ -1346,6 +1424,41 @@ def format_graph_comparison_table(report: GraphSpaceComparisonReport) -> Table:
             _delta_badge(report.delta_compression_leverage_factor, decimals=2, higher_is_better=True),
             "Coverage multiplier per unit compute (Cov_τ / ρ_parent)",
         )
+
+    # Post-Processing Idea Drift Comparison Section
+    if report.baseline_drift is not None or report.candidate_drift is not None:
+        tbl.add_section()
+        b_d = report.baseline_drift
+        c_d = report.candidate_drift
+        tbl.add_row(
+            "Forward Retention (S_R→P)",
+            f"{b_d.forward_retention:.4f}" if b_d else "-",
+            f"{c_d.forward_retention:.4f}" if c_d else "-",
+            _delta_badge(report.delta_forward_retention, decimals=4, higher_is_better=True) if report.delta_forward_retention is not None else "-",
+            "Semantic preservation of raw extracted ideas in KG",
+        )
+        tbl.add_row(
+            "Backward Fidelity (S_P→R)",
+            f"{b_d.backward_fidelity:.4f}" if b_d else "-",
+            f"{c_d.backward_fidelity:.4f}" if c_d else "-",
+            _delta_badge(report.delta_backward_fidelity, decimals=4, higher_is_better=True) if report.delta_backward_fidelity is not None else "-",
+            "Factual anchoring: resistance to hallucination / drift",
+        )
+        tbl.add_row(
+            "Symmetric Drift Score (F1_sim)",
+            f"{b_d.symmetric_idea_drift_score:.4f}" if b_d else "-",
+            f"{c_d.symmetric_idea_drift_score:.4f}" if c_d else "-",
+            _delta_badge(report.delta_symmetric_drift_score, decimals=4, higher_is_better=True) if report.delta_symmetric_drift_score is not None else "-",
+            "Harmonic mean of retention and fidelity",
+        )
+        if (b_d and b_d.dropped_raw_count) or (c_d and c_d.dropped_raw_count):
+            tbl.add_row(
+                "Dropped Raw Ideas Count",
+                f"{b_d.dropped_raw_count:,}" if b_d else "-",
+                f"{c_d.dropped_raw_count:,}" if c_d else "-",
+                _delta_badge(float((c_d.dropped_raw_count if c_d else 0) - (b_d.dropped_raw_count if b_d else 0)), decimals=0, higher_is_better=False),
+                "Raw ideas abandoned below tau_loss threshold",
+            )
 
     tbl.add_section()
     # Decision Matrix Checklist Rows

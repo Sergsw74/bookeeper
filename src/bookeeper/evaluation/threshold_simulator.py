@@ -187,14 +187,23 @@ class SimulationSuiteReport(BaseModel):
     total_corpus_chunks: int = 0
     total_corpus_chars: int = 0
     total_books: int = 0
+    total_raw_concepts: int = 0
     skip_limbo: bool = True
     variations: List[SimulationVariationResult] = Field(default_factory=list)
 
     def to_rich_table(self) -> Table:
         """Render a comparative Rich terminal table displaying one row per threshold pair."""
+        caption_items = [
+            f"Total Universe Chunks: {self.total_corpus_chunks:,}",
+            f"Total Text Volume: {self.total_corpus_chars:,} chars",
+            f"Books: {self.total_books}",
+        ]
+        if self.total_raw_concepts > 0:
+            caption_items.append(f"Corpus Raw Concepts: {self.total_raw_concepts:,}")
+
         table = Table(
             title=f"Knowledge Base Threshold Simulation Benchmark (τ = {self.tau:.2f}, Skip Limbo = {self.skip_limbo})",
-            caption=f"Total Universe Chunks: {self.total_corpus_chunks:,} | Total Text Volume: {self.total_corpus_chars:,} chars | Books: {self.total_books}",
+            caption=" | ".join(caption_items),
             header_style="bold cyan",
             border_style="dim",
         )
@@ -216,6 +225,7 @@ class SimulationSuiteReport(BaseModel):
             table.add_column("Ret (S_R→P)", justify="right", style="green")
             table.add_column("Fid (S_P→R)", justify="right", style="green")
             table.add_column("Centroid", justify="right", style="cyan")
+            table.add_column("Drop (%)", justify="right", style="red")
         table.add_column("Leverage (Lcomp)", justify="right", style="magenta")
         table.add_column("Vendi", justify="right")
         table.add_column("Time", justify="right", style="dim")
@@ -241,6 +251,7 @@ class SimulationSuiteReport(BaseModel):
                     f"{v.forward_retention:.4f}" if v.forward_retention is not None else "-",
                     f"{v.backward_fidelity:.4f}" if v.backward_fidelity is not None else "-",
                     f"{v.centroid_cosine_alignment:.4f}" if v.centroid_cosine_alignment is not None else "-",
+                    f"{v.dropped_raw_ratio_pct:.1f}%" if v.dropped_raw_ratio_pct is not None else "-",
                 ])
             row_items.extend([
                 f"{v.compression_leverage_factor:.2f}x",
@@ -266,6 +277,8 @@ class SimulationSuiteReport(BaseModel):
         lines.append(f"> **Corpus Chunks Universe (N)**: `{self.total_corpus_chunks:,}`  ")
         lines.append(f"> **Corpus Text Weight**: `{self.total_corpus_chars:,}` characters  ")
         lines.append(f"> **Books Simulated**: `{self.total_books}`  ")
+        if self.total_raw_concepts > 0:
+            lines.append(f"> **Corpus Raw Concepts**: `{self.total_raw_concepts:,}`  ")
         lines.append(f"> **Limbo Policy**: `{'Bypass / Skip Limbo' if self.skip_limbo else 'LLM Extraction'}`  ")
         lines.append(f"> **Clean Start**: Each variation is constructed from scratch with an empty graph store and isolated vector index (zero state leakage).  ")
         lines.append("")
@@ -276,17 +289,18 @@ class SimulationSuiteReport(BaseModel):
         has_drift = any(v.forward_retention is not None for v in self.variations)
 
         if has_drift:
-            lines.append("| Threshold Variation | Nodes ($M$) | Post ($M_p$) | Parent ($N_p$) | Skipped ($N_s$) | Compute ($\\rho_p$) | Coverage ($\\text{Cov}_\\tau$) | Mean ($\\mu$) | $p_{10}$ | Ret ($S_{R\\to P}$) | Fid ($S_{P\\to R}$) | Centroid | Leverage ($L_{\\text{comp}}$) | Vendi | Time |")
-            lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+            lines.append("| Threshold Variation | Nodes ($M$) | Post ($M_p$) | Parent ($N_p$) | Skipped ($N_s$) | Compute ($\\rho_p$) | Coverage ($\\text{Cov}_\\tau$) | Mean ($\\mu$) | $p_{10}$ | Ret ($S_{R\\to P}$) | Fid ($S_{P\\to R}$) | Centroid | Drop (%) | Leverage ($L_{\\text{comp}}$) | Vendi | Time |")
+            lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
             for v in self.variations:
                 mp_str = f"{v.postprocessed_nodes_count:,}" if v.postprocessed_nodes_count is not None else "-"
                 ret_str = f"{v.forward_retention:.4f}" if v.forward_retention is not None else "-"
                 fid_str = f"{v.backward_fidelity:.4f}" if v.backward_fidelity is not None else "-"
                 cen_str = f"{v.centroid_cosine_alignment:.4f}" if v.centroid_cosine_alignment is not None else "-"
+                drop_str = f"{v.dropped_raw_ratio_pct:.1f}%" if v.dropped_raw_ratio_pct is not None else "-"
                 lines.append(
                     f"| **{v.label}** | {v.nodes_count:,} | {mp_str} | {v.parent_chunks_count:,} | {v.skipped_chunks_count:,} | "
                     f"{v.parent_chunk_ratio_pct:.2f}% | **{v.coverage_at_tau_pct:.2f}%** | {v.chamfer_mean:.4f} | "
-                    f"{v.worst_decile_p10:.4f} | {ret_str} | {fid_str} | {cen_str} | **{v.compression_leverage_factor:.2f}x** | "
+                    f"{v.worst_decile_p10:.4f} | {ret_str} | {fid_str} | {cen_str} | {drop_str} | **{v.compression_leverage_factor:.2f}x** | "
                     f"{v.vendi_diversity_score:.1f} | {v.duration_seconds:.2f}s |"
                 )
         else:
@@ -652,6 +666,29 @@ def preload_simulation_data(
     return (loaded_books, concept_map)
 
 
+def extract_corpus_raw_vectors_and_weights(
+    preloaded_books: List[PreloadedBookData],
+    concept_embedding_map: Dict[str, List[float]],
+) -> Tuple[np.ndarray, List[int]]:
+    """
+    Extract all raw concept embeddings and evidence quote weights across all preloaded corpus state files.
+    """
+    raw_vecs: List[List[float]] = []
+    raw_weights: List[int] = []
+    for b in preloaded_books:
+        for cid, clist in b.extractions.items():
+            for c in clist:
+                c_name = str(c.get("name") or "").strip().lower()
+                c_emb = concept_embedding_map.get(c_name)
+                if c_emb:
+                    raw_vecs.append(c_emb)
+                    q = str(c.get("supporting_quote") or c.get("source_quote") or "")
+                    raw_weights.append(len(q) if q else 100)
+    if raw_vecs:
+        return np.asarray(raw_vecs, dtype=np.float32), raw_weights
+    return np.empty((0, 0), dtype=np.float32), []
+
+
 # ==============================================================================
 # 4. Single Variation Simulation Runner
 # ==============================================================================
@@ -667,6 +704,8 @@ def simulate_variation(
     postprocess: bool = True,
     postprocess_threshold: float = 0.92,
     tau_loss: float = 0.70,
+    corpus_raw_embeddings: Optional[np.ndarray] = None,
+    corpus_raw_weights: Optional[List[int]] = None,
 ) -> SimulationVariationResult:
     """
     Execute an isolated simulation of chunk routing and knowledge graph generation
@@ -842,40 +881,48 @@ def simulate_variation(
     post_nodes_cnt: Optional[int] = None
     drift_dict: Optional[Dict[str, Any]] = None
 
-    if postprocess and G_arr.shape[0] > 0:
-        # Deduplicate vectors with cosine similarity >= postprocess_threshold
-        # Fast greedy incremental clustering
-        g_norms = np.linalg.norm(G_arr, axis=1, keepdims=True)
-        g_unit = G_arr / np.clip(g_norms, 1e-12, None)
+    if G_arr.shape[0] > 0:
+        if postprocess:
+            # Deduplicate vectors with cosine similarity >= postprocess_threshold
+            # Fast greedy incremental clustering
+            g_norms = np.linalg.norm(G_arr, axis=1, keepdims=True)
+            g_unit = G_arr / np.clip(g_norms, 1e-12, None)
 
-        surviving_clusters: List[List[int]] = []
-        cluster_heads: List[np.ndarray] = []
+            surviving_clusters: List[List[int]] = []
+            cluster_heads: List[np.ndarray] = []
 
-        for idx_g in range(len(g_unit)):
-            curr_vec = g_unit[idx_g]
-            matched_c = -1
-            for c_idx, head in enumerate(cluster_heads):
-                if float(np.dot(curr_vec, head)) >= postprocess_threshold:
-                    matched_c = c_idx
-                    break
-            if matched_c >= 0:
-                surviving_clusters[matched_c].append(idx_g)
-            else:
-                surviving_clusters.append([idx_g])
-                cluster_heads.append(curr_vec)
+            for idx_g in range(len(g_unit)):
+                curr_vec = g_unit[idx_g]
+                matched_c = -1
+                for c_idx, head in enumerate(cluster_heads):
+                    if float(np.dot(curr_vec, head)) >= postprocess_threshold:
+                        matched_c = c_idx
+                        break
+                if matched_c >= 0:
+                    surviving_clusters[matched_c].append(idx_g)
+                else:
+                    surviving_clusters.append([idx_g])
+                    cluster_heads.append(curr_vec)
 
-        # Average vectors per cluster and re-normalize
-        post_vectors = np.array([
-            np.mean(g_unit[members], axis=0) / np.clip(np.linalg.norm(np.mean(g_unit[members], axis=0)), 1e-12, None)
-            for members in surviving_clusters
-        ], dtype=np.float32)
+            # Average vectors per cluster and re-normalize
+            post_vectors = np.array([
+                np.mean(g_unit[members], axis=0) / np.clip(np.linalg.norm(np.mean(g_unit[members], axis=0)), 1e-12, None)
+                for members in surviving_clusters
+            ], dtype=np.float32)
 
-        post_nodes_cnt = len(post_vectors)
+            post_nodes_cnt = len(post_vectors)
+        else:
+            post_vectors = G_arr
+            post_nodes_cnt = len(G_arr)
 
-        # Compute post-processing idea drift (RAW = G_arr vs POST = post_vectors)
+        # Compute post-processing idea drift comparing corpus RAW ideas vs POST KG concepts
+        raw_target = corpus_raw_embeddings if (corpus_raw_embeddings is not None and len(corpus_raw_embeddings) > 0) else G_arr
+        raw_w_target = corpus_raw_weights if (corpus_raw_embeddings is not None and len(corpus_raw_embeddings) > 0) else None
+
         drift_dict = calculate_postprocessing_drift(
-            raw_embeddings=G_arr,
+            raw_embeddings=raw_target,
             post_embeddings=post_vectors,
+            raw_weights=raw_w_target,
             tau_loss=tau_loss,
         )
 
@@ -974,9 +1021,13 @@ def run_threshold_simulation_suite(
     total_chunks = sum(len(b.chunks) for b in preloaded_books)
     total_chars = sum(sum(c["char_count"] for c in b.chunks) for b in preloaded_books)
 
+    corpus_raw_vectors, corpus_raw_weights = extract_corpus_raw_vectors_and_weights(preloaded_books, concept_map)
+    total_raw_concepts = len(corpus_raw_vectors)
+
     con.print(
         f"[green]✓ Preloaded [bold]{len(preloaded_books)}[/bold] books ([bold]{total_chunks:,}[/bold] chunks, "
-        f"[bold]{total_chars:,}[/bold] chars, [bold]{len(concept_map):,}[/bold] concept embeddings).[/green]"
+        f"[bold]{total_chars:,}[/bold] chars, [bold]{total_raw_concepts:,}[/bold] raw concepts, "
+        f"[bold]{len(concept_map):,}[/bold] concept embeddings).[/green]"
     )
     con.print(f"[dim]Executing {len(parsed_pairs)} threshold variation simulation(s)...[/dim]")
 
@@ -994,9 +1045,12 @@ def run_threshold_simulation_suite(
             postprocess=postprocess,
             postprocess_threshold=postprocess_threshold,
             tau_loss=tau_loss,
+            corpus_raw_embeddings=corpus_raw_vectors,
+            corpus_raw_weights=corpus_raw_weights,
         )
         elapsed = time.perf_counter() - t0
-        con.print(f"[green]Done in {elapsed:.2f}s[/green] (Nodes: {res.nodes_count:,}, Cov: {res.coverage_at_tau_pct:.1f}%, Leverage: {res.compression_leverage_factor:.2f}x)")
+        ret_msg = f", Ret: {res.forward_retention:.3f}, Drop: {res.dropped_raw_ratio_pct:.1f}%" if res.forward_retention is not None else ""
+        con.print(f"[green]Done in {elapsed:.2f}s[/green] (Nodes: {res.nodes_count:,}, Cov: {res.coverage_at_tau_pct:.1f}%, Leverage: {res.compression_leverage_factor:.2f}x{ret_msg})")
         results.append(res)
 
     report = SimulationSuiteReport(
@@ -1004,6 +1058,7 @@ def run_threshold_simulation_suite(
         total_corpus_chunks=total_chunks,
         total_corpus_chars=total_chars,
         total_books=len(preloaded_books),
+        total_raw_concepts=total_raw_concepts,
         skip_limbo=skip_limbo,
         variations=results,
     )

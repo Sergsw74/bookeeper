@@ -769,7 +769,7 @@ class RecentIdeaChunkRouter:
         cached_vecs: Dict[int, List[float]] = {}
         missing_indices: List[int] = []
         for idx, chk in enumerate(chunks):
-            existing_emb = getattr(chk, "embedding", None)
+            existing_emb = chk.get("embedding") if isinstance(chk, dict) else getattr(chk, "embedding", None)
             if isinstance(existing_emb, (list, np.ndarray)) and len(existing_emb) > 1:
                 cached_vecs[idx] = [float(x) for x in existing_emb]
             else:
@@ -796,7 +796,10 @@ class RecentIdeaChunkRouter:
             if self.embeddings is not None:
                 from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings
 
-                missing_texts = [getattr(chunks[idx], "text", "") or "" for idx in missing_indices]
+                missing_texts = [
+                    ((chunks[idx].get("text", "") if isinstance(chunks[idx], dict) else getattr(chunks[idx], "text", "")) or "")
+                    for idx in missing_indices
+                ]
                 computed_raw: List[List[float]] = []
                 if isinstance(self.embeddings, FailoverOllamaEmbeddings):
                     try:
@@ -829,10 +832,13 @@ class RecentIdeaChunkRouter:
                         norm_v = float(np.linalg.norm(arr_v))
                         unit_v = (arr_v / norm_v).tolist() if norm_v > 0.0 else arr_v.tolist()
                         newly_embedded[idx] = unit_v
-                        try:
-                            setattr(chunks[idx], "embedding", unit_v)
-                        except Exception:
-                            pass
+                        if isinstance(chunks[idx], dict):
+                            chunks[idx]["embedding"] = unit_v
+                        else:
+                            try:
+                                setattr(chunks[idx], "embedding", unit_v)
+                            except Exception:
+                                pass
 
         result.computed_embeddings_count = len(newly_embedded)
 
@@ -935,3 +941,228 @@ class RecentIdeaChunkRouter:
                     )
 
         return result
+
+
+# ==============================================================================
+# Semantic Routing & Ingestion Engine API
+# ==============================================================================
+
+
+class SemanticRoutingEngine:
+    """
+    Unified semantic chunk routing, graph integration, and inter-batch post-processing engine.
+    Shared across both production book ingestion (cli.py) and threshold simulation suites (threshold_simulator.py).
+    Guarantees that chunk routing, idea-support linking, inter-batch consolidation, and index rebuilding
+    stay 100% in sync without code duplication.
+    """
+
+    def __init__(
+        self,
+        store: Any,
+        idea_index: Optional[IdeaEmbeddingIndex] = None,
+        router: Optional[RecentIdeaChunkRouter] = None,
+        postprocessor: Optional[Any] = None,
+        embeddings: Optional[Any] = None,
+        unassigned_threshold: float = 0.65,
+        high_confidence_threshold: float = 0.90,
+        batch_size: int = 10,
+        skip_limbo: bool = True,
+        neo4j_exporter: Optional[Any] = None,
+        max_batch_chunk_size: Optional[int] = None,
+    ):
+        self.store = store
+        self.embeddings = embeddings
+        self.postprocessor = postprocessor
+        self.unassigned_threshold = unassigned_threshold
+        self.high_confidence_threshold = high_confidence_threshold
+        self.batch_size = max(1, batch_size)
+        self.skip_limbo = skip_limbo
+        self.neo4j_exporter = neo4j_exporter
+        self.max_batch_chunk_size = max_batch_chunk_size
+
+        if idea_index is not None:
+            self.idea_index = idea_index
+        else:
+            self.idea_index = IdeaEmbeddingIndex.build_from_graph(self.store, embeddings=self.embeddings)
+
+        if router is not None:
+            self.router = router
+        else:
+            self.router = RecentIdeaChunkRouter(
+                idea_index=self.idea_index,
+                embeddings=self.embeddings,
+                unassigned_threshold=self.unassigned_threshold,
+                high_confidence_threshold=self.high_confidence_threshold,
+                neo4j_exporter=self.neo4j_exporter,
+                max_batch_chunk_size=self.max_batch_chunk_size,
+            )
+
+    def route_chunks(self, chunks: Sequence[Any], batch_size: int = 64) -> BatchRoutingResult:
+        """Route chunks into UNASSIGNED, HIGH_CONFIDENCE, or LIMBO priorities."""
+        return self.router.route_chunks(chunks, batch_size=batch_size)
+
+    def integrate_high_confidence_chunk(
+        self,
+        rc: RoutedChunk,
+        book_id: int | str = 0,
+        publication_date: Optional[str] = None,
+    ) -> None:
+        """Connect high-confidence chunk directly to matched canonical idea in graph."""
+        h_chk = rc.chunk
+        h_idea = rc.matched_idea
+        if not h_idea:
+            return
+
+        text = h_chk.get("text", "") if isinstance(h_chk, dict) else getattr(h_chk, "text", "")
+        quote = text[:200] if text else ""
+        summary = rc.matched_idea_summary or ""
+
+        # 1. Direct idea support link
+        self.store.add_idea_support_link(
+            concept_name=h_idea,
+            chunk=h_chk,
+            quote=quote,
+            brief_description=summary,
+            publication_date=publication_date,
+        )
+
+        # 2. Book-idea link if book_id is provided
+        if book_id:
+            self.store.add_book_idea_link(
+                book_id=book_id,
+                concept_name=h_idea,
+                publication_date=publication_date,
+            )
+
+    def integrate_extracted_concepts(
+        self,
+        chunk: Any,
+        concepts: Sequence[Dict[str, Any] | Any],
+        concept_embedding_map: Optional[Dict[str, List[float]]] = None,
+        book_id: int | str = 0,
+        publication_date: Optional[str] = None,
+    ) -> List[Tuple[str, List[float]]]:
+        """
+        Integrate newly extracted raw concepts from an unassigned (or validated limbo) chunk:
+        - Upserts Concept in store.graph
+        - Links (:Concept) <-> (:Chunk) via SUPPORTED_BY / SUPPORTS_IDEA
+        - Adds to internal router IdeaEmbeddingIndex
+        Returns list of (normalized_name, embedding_vector) added.
+        """
+        from bookeeper.processing.extractor import Concept
+
+        added: List[Tuple[str, List[float]]] = []
+        for c in concepts:
+            c_name = str((c.get("name") if isinstance(c, dict) else getattr(c, "name", "")) or "").strip()
+            if not c_name:
+                continue
+            c_norm = c_name.lower()
+            c_summary = str(
+                (c.get("summary") or c.get("brief_description") or c_name)
+                if isinstance(c, dict)
+                else (getattr(c, "summary", "") or getattr(c, "brief_description", "") or c_name)
+            )
+
+            c_emb: Optional[List[float]] = None
+            if concept_embedding_map is not None:
+                c_emb = concept_embedding_map.get(c_norm)
+
+            if c_emb is None and self.embeddings is not None:
+                try:
+                    emb_res = self.embeddings.embed_query(c_summary)
+                    if emb_res and len(emb_res) > 1:
+                        arr_e = np.asarray(emb_res, dtype=np.float32)
+                        norm_e = float(np.linalg.norm(arr_e))
+                        c_emb = (arr_e / norm_e).tolist() if norm_e > 0 else arr_e.tolist()
+                        if concept_embedding_map is not None:
+                            concept_embedding_map[c_norm] = c_emb
+                except Exception:
+                    pass
+
+            if c_emb is None:
+                continue
+
+            brief = str(
+                (c.get("brief_description") or c_summary)
+                if isinstance(c, dict)
+                else (getattr(c, "brief_description", "") or c_summary)
+            )
+            detailed = str(
+                (c.get("detailed_explanation") or c_summary)
+                if isinstance(c, dict)
+                else (getattr(c, "detailed_explanation", "") or c_summary)
+            )
+            cat = str(
+                (c.get("category") or "Idea")
+                if isinstance(c, dict)
+                else (getattr(c, "category", "") or "Idea")
+            )
+            weight = int(
+                (c.get("weight") or 5)
+                if isinstance(c, dict)
+                else (getattr(c, "weight", 5) or 5)
+            )
+            sq = str(
+                (c.get("supporting_quote") or c.get("quote") or "")
+                if isinstance(c, dict)
+                else (getattr(c, "supporting_quote", "") or getattr(c, "quote", "") or "")
+            )
+
+            # Add to store
+            self.store.add_concept(
+                Concept(
+                    name=c_name,
+                    summary=c_summary,
+                    brief_description=brief,
+                    detailed_explanation=detailed,
+                    category=cat,
+                    weight=weight,
+                ),
+                embedding=c_emb,
+            )
+
+            # Link Chunk <-> Concept
+            self.store.add_idea_support_link(
+                concept_name=c_name,
+                chunk=chunk,
+                quote=sq,
+                brief_description=brief,
+                detailed_explanation=detailed,
+                publication_date=publication_date,
+            )
+
+            if book_id:
+                self.store.add_book_idea_link(
+                    book_id=book_id,
+                    concept_name=c_name,
+                    publication_date=publication_date,
+                )
+
+            # Update index
+            self.idea_index.add_idea(name=c_name, summary=c_summary, vector=c_emb)
+            added.append((c_norm, c_emb))
+
+        return added
+
+    def on_book_completed(
+        self,
+        completed_count: int,
+        total_count: int,
+        force_postprocess: bool = False,
+        console: Optional[Any] = None,
+    ) -> Optional[Any]:
+        """
+        Hook called at the end of each book.
+        Executes inter-batch post-processing at batch boundary or corpus completion.
+        Synchronizes the search router index with newly synthesized canonical ideas.
+        """
+        is_batch_end = (completed_count % self.batch_size == 0) or (completed_count == total_count) or force_postprocess
+        if is_batch_end and self.postprocessor is not None and self.store.graph.number_of_nodes() > 0:
+            report = self.postprocessor.process_graph(self.store, console=console)
+            # Synchronize router index from consolidated canonical graph
+            self.idea_index = IdeaEmbeddingIndex.build_from_graph(self.store, embeddings=self.embeddings)
+            self.router.idea_index = self.idea_index
+            self.store.dirty_nodes.clear()
+            self.store.dirty_edges.clear()
+            return report
+        return None

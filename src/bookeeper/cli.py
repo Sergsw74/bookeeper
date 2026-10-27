@@ -70,6 +70,7 @@ from bookeeper.processing.recent_ideas import (
     IdeaEmbeddingIndex,
     RecentIdeaChunkRouter,
     RoutedChunk,
+    SemanticRoutingEngine,
     get_chunk_size,
     normalize_sort_date,
     partition_books_into_batches,
@@ -2660,7 +2661,8 @@ def build_graph(
                     if cfg.recent_ideas.enabled and unprocessed_fresh and embeddings is not None:
                         idea_index = IdeaEmbeddingIndex.build_from_graph(store, embeddings=embeddings)
                         if (idea_index.vectors is not None and len(idea_index.idea_names) > 0) or active_neo4j_exporter is not None:
-                            router = RecentIdeaChunkRouter(
+                            routing_engine = SemanticRoutingEngine(
+                                store=store,
                                 idea_index=idea_index,
                                 embeddings=embeddings,
                                 unassigned_threshold=cfg.similarity_unassigned_threshold,
@@ -2668,7 +2670,7 @@ def build_graph(
                                 neo4j_exporter=active_neo4j_exporter,
                                 max_batch_chunk_size=recovery_th,
                             )
-                            routing = router.route_chunks(unprocessed_fresh)
+                            routing = routing_engine.route_chunks(unprocessed_fresh)
                             if routing.embeddings_updated:
                                 try:
                                     chunk_store.save_chunks(bid, btitle, chunks)
@@ -2680,16 +2682,9 @@ def build_graph(
                                 h_chk = rc.chunk
                                 h_idea = rc.matched_idea
                                 if h_idea:
-                                    store.add_idea_support_link(
-                                        concept_name=h_idea,
-                                        chunk=h_chk,
-                                        quote=h_chk.text[:200] if h_chk.text else "",
-                                        brief_description=rc.matched_idea_summary,
-                                        publication_date=bpubdate,
-                                    )
-                                    store.add_book_idea_link(
+                                    routing_engine.integrate_high_confidence_chunk(
+                                        rc,
                                         book_id=bid,
-                                        concept_name=h_idea,
                                         publication_date=bpubdate,
                                     )
                                     sec_node_id = store.add_section(
@@ -8382,9 +8377,15 @@ def simulate_thresholds_command(
         help="Cosine similarity cutoff below which a raw idea is considered dropped in drift calculation (default: 0.70).",
     ),
     llm_pool: bool = typer.Option(
-        False,
+        True,
         "--llm-pool/--no-llm-pool",
-        help="Whether to initialize and use LLM server pool for multi-occurrence idea synthesis during postprocessing (default: False).",
+        help="Whether to initialize and use LLM server pool for multi-occurrence idea synthesis during postprocessing (default: True).",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        "-m",
+        help="Dedicated LLM model for idea consolidation (default: from config.yaml dual_pass.model or llm_model).",
     ),
     batch_size: int = typer.Option(
         10,
@@ -8480,6 +8481,8 @@ def simulate_thresholds_command(
         except Exception as e:
             logger.warning(f"Could not initialize OllamaPool for simulation: {e}")
 
+    eff_model = model or getattr(cfg, "resolved_dual_pass_model", "qwen2.5:7b-instruct-q4_K_M")
+
     try:
         suite_report = run_threshold_simulation_suite(
             pairs=threshold_pairs,
@@ -8496,6 +8499,7 @@ def simulate_thresholds_command(
             postprocess_threshold=postprocess_threshold,
             tau_loss=tau_loss,
             batch_size=batch_size,
+            model_name=eff_model,
         )
     except Exception as e:
         console.print(f"[bold red]Simulation suite failed: {e}[/bold red]")

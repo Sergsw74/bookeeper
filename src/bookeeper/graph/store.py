@@ -285,21 +285,29 @@ class ConceptGraphStore:
 
     def add_chunk(self, chunk: Any) -> str:
         """Add a Chunk node (preserving its embedding) and connect (:Section) -[:HAS_CHUNK]-> (:Chunk)."""
-        chunk_node_id = f"chunk:{chunk.chunk_id}"
-        section_node_id = f"section:{chunk.book_id}:{chunk.chapter_idx}"
+        def _get(key: str, default: Any = None) -> Any:
+            if isinstance(chunk, dict):
+                return chunk.get(key, default)
+            return getattr(chunk, key, default)
+
+        cid = str(_get("chunk_id", "") or "")
+        bid = _get("book_id", 0)
+        cidx = int(_get("chapter_idx", 0) or 0)
+        chunk_node_id = f"chunk:{cid}"
+        section_node_id = f"section:{bid}:{cidx}"
 
         # Ensure Section exists in graph
         if not self.graph.has_node(section_node_id):
             self.add_section(
-                book_id=chunk.book_id,
-                chapter_idx=chunk.chapter_idx,
-                title=chunk.section_title,
+                book_id=bid,
+                chapter_idx=cidx,
+                title=_get("section_title", ""),
             )
 
-        chunk_idx = getattr(chunk, "chunk_idx", 0)
-        prev_chunk_id = getattr(chunk, "prev_chunk_id", None)
-        next_chunk_id = getattr(chunk, "next_chunk_id", None)
-        emb = getattr(chunk, "embedding", None)
+        chunk_idx = int(_get("chunk_idx", 0) or 0)
+        prev_chunk_id = _get("prev_chunk_id", None)
+        next_chunk_id = _get("next_chunk_id", None)
+        emb = _get("embedding", None)
         existing_emb = (
             self.graph.nodes[chunk_node_id].get("embedding")
             if self.graph.has_node(chunk_node_id)
@@ -308,18 +316,18 @@ class ConceptGraphStore:
 
         chunk_attrs: Dict[str, Any] = {
             "type": "Chunk",
-            "chunk_id": chunk.chunk_id,
-            "book_id": chunk.book_id,
-            "book_title": chunk.book_title,
-            "chapter_idx": chunk.chapter_idx,
-            "chapter_title": getattr(chunk, "chapter_title", chunk.section_title),
-            "section_title": chunk.section_title,
-            "subtitle": getattr(chunk, "subtitle", chunk.section_title),
-            "breadcrumb": chunk.breadcrumb,
-            "text": chunk.text,
-            "char_count": chunk.char_count,
-            "parent_chunk_id": getattr(chunk, "parent_chunk_id", None),
-            "hierarchy_level": getattr(chunk, "hierarchy_level", "child"),
+            "chunk_id": cid,
+            "book_id": bid,
+            "book_title": _get("book_title", ""),
+            "chapter_idx": cidx,
+            "chapter_title": _get("chapter_title", _get("section_title", "")),
+            "section_title": _get("section_title", ""),
+            "subtitle": _get("subtitle", _get("section_title", "")),
+            "breadcrumb": _get("breadcrumb", _get("section_title", "")),
+            "text": _get("text", ""),
+            "char_count": int(_get("char_count", 0) or 0),
+            "parent_chunk_id": _get("parent_chunk_id", None),
+            "hierarchy_level": _get("hierarchy_level", "child"),
             "chunk_idx": chunk_idx,
             "prev_chunk_id": prev_chunk_id,
             "next_chunk_id": next_chunk_id,
@@ -467,14 +475,24 @@ class ConceptGraphStore:
         brief_description = BookParser.repair_mojibake(brief_description) if brief_description else ""
         detailed_explanation = BookParser.repair_mojibake(detailed_explanation) if detailed_explanation else ""
 
+        def _get(key: str, default: Any = None) -> Any:
+            if isinstance(chunk, dict):
+                return chunk.get(key, default)
+            return getattr(chunk, key, default)
+
         concept_node_id = f"concept:{concept_name}"
         chunk_node_id = self.add_chunk(chunk)
 
-        book_nid = f"book:{getattr(chunk, 'book_id', 0)}"
-        pub_date = publication_date or getattr(chunk, "publication_date", None)
+        book_nid = f"book:{_get('book_id', 0)}"
+        pub_date = publication_date or _get("publication_date", None)
         if not pub_date and self.graph.has_node(book_nid):
             pub_date = self.graph.nodes[book_nid].get("publication_date")
         month = format_idea_month(pub_date)
+
+        existing_supporting_chunks = [
+            tgt for _, tgt, edata in (self.graph.out_edges(concept_node_id, data=True) if self.graph.has_node(concept_node_id) else [])
+            if edata.get("relation") == "SUPPORTED_BY"
+        ]
 
         if not self.graph.has_node(concept_node_id):
             node_attrs = {
@@ -494,8 +512,15 @@ class ConceptGraphStore:
                 node_attrs["first_occurrence_month"] = month
                 node_attrs["month"] = month
             self.graph.add_node(concept_node_id, **node_attrs)
-        elif month:
-            self.update_idea_occurrence_month(concept_name, month)
+            self.mark_node_dirty(concept_node_id)
+        else:
+            if chunk_node_id not in existing_supporting_chunks and len(existing_supporting_chunks) >= 1:
+                self.graph.nodes[concept_node_id]["occurrences"] = (
+                    self.graph.nodes[concept_node_id].get("occurrences", 1) + 1
+                )
+                self.mark_node_dirty(concept_node_id)
+            if month:
+                self.update_idea_occurrence_month(concept_name, month)
 
         # Edge: (:Concept/Idea) -[:SUPPORTED_BY]-> (:Chunk)
         self.graph.add_edge(
@@ -505,10 +530,10 @@ class ConceptGraphStore:
             quote=quote,
             brief_description=brief_description,
             detailed_explanation=detailed_explanation,
-            breadcrumb=chunk.breadcrumb,
-            chapter_title=getattr(chunk, "chapter_title", chunk.section_title),
-            subtitle=getattr(chunk, "subtitle", chunk.section_title),
-            chunk_id=chunk.chunk_id,
+            breadcrumb=_get("breadcrumb", _get("section_title", "")),
+            chapter_title=_get("chapter_title", _get("section_title", "")),
+            subtitle=_get("subtitle", _get("section_title", "")),
+            chunk_id=_get("chunk_id", ""),
         )
 
         # Edge: (:Chunk) -[:SUPPORTS_IDEA]-> (:Concept/Idea)

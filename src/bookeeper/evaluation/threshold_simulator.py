@@ -32,7 +32,7 @@ from bookeeper.processing.graph_evaluator import (
     evaluate_graph_space,
 )
 from bookeeper.processing.memory_guard import cleanup_memory
-from bookeeper.processing.recent_ideas import IdeaEmbeddingIndex, normalize_sort_date
+from bookeeper.processing.recent_ideas import IdeaEmbeddingIndex, SemanticRoutingEngine, normalize_sort_date
 
 logger = logging.getLogger(__name__)
 
@@ -860,6 +860,8 @@ def simulate_variation(
     corpus_raw_embeddings: Optional[np.ndarray] = None,
     corpus_raw_weights: Optional[List[int]] = None,
     batch_size: int = 10,
+    model_name: Optional[str] = None,
+    console: Optional[Console] = None,
 ) -> SimulationVariationResult:
     """
     Execute an isolated simulation of chunk routing and knowledge graph generation
@@ -923,13 +925,25 @@ def simulate_variation(
     postprocessor: Optional[IdeaPostProcessor] = None
     if postprocess:
         postprocessor = IdeaPostProcessor(
-            similarity_threshold=postprocess_threshold,
-            embeddings=embeddings_client,
             pool=pool,
+            embeddings=embeddings_client,
+            model_name=model_name or "qwen2.5:7b-instruct-q4_K_M",
+            similarity_threshold=postprocess_threshold,
             resume=True,
         )
 
-    # Replay books in chronological sequence
+    engine = SemanticRoutingEngine(
+        store=store,
+        idea_index=index,
+        embeddings=embeddings_client,
+        postprocessor=postprocessor,
+        unassigned_threshold=pair.low,
+        high_confidence_threshold=pair.high,
+        batch_size=batch_size,
+        skip_limbo=skip_limbo,
+    )
+
+    # Replay books in chronological sequence using shared SemanticRoutingEngine
     for book_idx, book in enumerate(preloaded_books, 1):
         if not store.graph.has_node(f"book:{book.book_id}"):
             store.graph.add_node(
@@ -942,208 +956,68 @@ def simulate_variation(
         for chk in book.chunks:
             total_chunks += 1
             chunk_vec = chk["embedding"]
-            chunk_weight = max(1, chk["char_count"])
-            chunk_id = chk["chunk_id"]
+            chunk_weight = max(1, chk.get("char_count", 0))
 
             all_universe_vectors.append(chunk_vec)
             all_universe_weights.append(chunk_weight)
 
-            # Route chunk against current graph state
-            sim = 0.0
-            best_idea = None
-            best_summary = ""
-
-            if index.index is not None and len(index.index) > 0 and len(index.idea_names) > 0:
-                matches = index.query_batch([chunk_vec], top_k=1)
-                if matches and matches[0]:
-                    top_m = matches[0][0]
-                    sim = float(top_m.get("score") or 0.0)
-                    best_idea = top_m.get("name")
-                    best_summary = top_m.get("summary") or ""
-
-            # Routing Decision Matrix
-            if sim < pair.low:
-                # Priority 1: UNASSIGNED (Below lower threshold)
+            # Route chunk through shared SemanticRoutingEngine
+            routing = engine.route_chunks([chk])
+            if routing.unassigned:
+                rc = routing.unassigned[0]
                 unassigned_count += 1
                 parent_mask.append(True)
 
-                # Retrieve raw extraction concepts from state cache
-                c_list = book.extractions.get(chunk_id, [])
-                for c in c_list:
-                    c_name = str(c.get("name") or "").strip()
-                    if not c_name:
-                        continue
-                    c_norm = c_name.lower()
-                    c_summary = str(c.get("summary") or c.get("brief_description") or c_name)
-
-                    c_emb = local_concept_map.get(c_norm)
-                    if c_emb is None and embeddings_client is not None:
-                        try:
-                            emb_res = embeddings_client.embed_query(c_summary)
-                            if emb_res and len(emb_res) > 1:
-                                arr_e = np.asarray(emb_res, dtype=np.float32)
-                                norm_e = float(np.linalg.norm(arr_e))
-                                c_emb = (arr_e / norm_e).tolist() if norm_e > 0 else arr_e.tolist()
-                                local_concept_map[c_norm] = c_emb
-                        except Exception:
-                            pass
-
-                    # NEVER fall back to raw chunk_vec as a concept embedding!
-                    # Raw paragraph vectors act as artificial 1.0 self-anchors that distort
-                    # cosine proximity and inflate coverage metrics. Skip if un-embedded.
-                    if c_emb is None:
-                        logger.debug(f"Skipping un-embedded concept '{c_name}' in simulation")
-                        continue
-
+                c_list = book.extractions.get(chk["chunk_id"], [])
+                added = engine.integrate_extracted_concepts(
+                    chunk=chk,
+                    concepts=c_list,
+                    concept_embedding_map=local_concept_map,
+                    book_id=book.book_id,
+                    publication_date=book.publication_date,
+                )
+                for c_norm, c_emb in added:
                     if c_norm not in raw_concepts_dict:
                         raw_concepts_dict[c_norm] = c_emb
 
-                    brief = str(c.get("brief_description") or c_summary)
-                    detailed = str(c.get("detailed_explanation") or c_summary)
-                    cat = str(c.get("category") or "Idea")
-                    weight = int(c.get("weight") or 5)
-                    sq = str(c.get("supporting_quote") or c.get("quote") or "")
-
-                    index.add_idea(name=c_name, summary=c_summary, vector=c_emb)
-                    store.add_concept(
-                        Concept(name=c_name, summary=c_summary, brief_description=brief, detailed_explanation=detailed, category=cat, weight=weight),
-                        embedding=c_emb,
-                    )
-                    chunk_nid = f"chunk:{chunk_id}"
-                    if not store.graph.has_node(chunk_nid):
-                        store.graph.add_node(
-                            chunk_nid,
-                            type="Chunk",
-                            chunk_id=chunk_id,
-                            char_count=chunk_weight,
-                            book_id=book.book_id,
-                            section_title=chk.get("section_title", ""),
-                            breadcrumb=f"{chk.get('section_title', '')}",
-                        )
-                    store.graph.add_edge(f"concept:{c_name}", chunk_nid, relation="SUPPORTED_BY", quote=sq, chunk_id=chunk_id)
-                    store.graph.add_edge(chunk_nid, f"concept:{c_name}", relation="SUPPORTS_IDEA", quote=sq, chunk_id=chunk_id)
-
-            elif sim >= pair.high:
-                # Priority 2: HIGH CONFIDENCE (At or above upper threshold)
+            elif routing.high_confidence:
+                rc = routing.high_confidence[0]
                 high_confidence_count += 1
                 parent_mask.append(False)
 
-                # Direct assignment: associate chunk with matched canonical idea in graph
-                if best_idea:
-                    chk_text = str(chk.get("text") or "")
-                    chk_quote = chk_text[:200] if chk_text else (best_summary[:200] if best_summary else "")
-
-                    chunk_nid = f"chunk:{chunk_id}"
-                    if not store.graph.has_node(chunk_nid):
-                        store.graph.add_node(
-                            chunk_nid,
-                            type="Chunk",
-                            chunk_id=chunk_id,
-                            char_count=chunk_weight,
-                            book_id=book.book_id,
-                            section_title=chk.get("section_title", ""),
-                            breadcrumb=f"{chk.get('section_title', '')}",
-                        )
-
-                    best_concept_nid = f"concept:{best_idea}"
-                    if not store.graph.has_node(best_concept_nid):
-                        # Case-insensitive resolution
-                        for nid, attrs in store.graph.nodes(data=True):
-                            if (attrs.get("type") == "Concept" or attrs.get("is_idea")) and (
-                                attrs.get("name", "").lower() == best_idea.lower()
-                                or nid.lower() == best_concept_nid.lower()
-                            ):
-                                best_concept_nid = nid
-                                break
-
-                    if store.graph.has_node(best_concept_nid):
-                        store.graph.add_edge(
-                            best_concept_nid,
-                            chunk_nid,
-                            relation="SUPPORTED_BY",
-                            quote=chk_quote,
-                            brief_description=best_summary,
-                            chunk_id=chunk_id,
-                        )
-                        store.graph.add_edge(
-                            chunk_nid,
-                            best_concept_nid,
-                            relation="SUPPORTS_IDEA",
-                            quote=chk_quote,
-                            brief_description=best_summary,
-                            chunk_id=chunk_id,
-                        )
-                        store.graph.nodes[best_concept_nid]["occurrences"] = (
-                            store.graph.nodes[best_concept_nid].get("occurrences", 1) + 1
-                        )
-                        store.mark_node_dirty(best_concept_nid)
+                engine.integrate_high_confidence_chunk(
+                    rc,
+                    book_id=book.book_id,
+                    publication_date=book.publication_date,
+                )
 
             else:
-                # Priority 3: LIMBO [low, high)
+                rc = routing.limbo[0]
                 limbo_count += 1
                 if skip_limbo:
-                    # Bypassed/skipped by heuristic
                     parent_mask.append(False)
                 else:
-                    # Processed / validated via LLM
                     parent_mask.append(True)
-                    c_list = book.extractions.get(chunk_id, [])
-                    for c in c_list:
-                        c_name = str(c.get("name") or "").strip()
-                        if not c_name:
-                            continue
-                        c_norm = c_name.lower()
-                        c_summary = str(c.get("summary") or c.get("brief_description") or c_name)
-                        c_emb = local_concept_map.get(c_norm)
-                        if c_emb is None and embeddings_client is not None:
-                            try:
-                                emb_res = embeddings_client.embed_query(c_summary)
-                                if emb_res and len(emb_res) > 1:
-                                    arr_e = np.asarray(emb_res, dtype=np.float32)
-                                    norm_e = float(np.linalg.norm(arr_e))
-                                    c_emb = (arr_e / norm_e).tolist() if norm_e > 0 else arr_e.tolist()
-                                    local_concept_map[c_norm] = c_emb
-                            except Exception:
-                                pass
-
-                        if c_emb is None:
-                            continue
-
+                    c_list = book.extractions.get(chk["chunk_id"], [])
+                    added = engine.integrate_extracted_concepts(
+                        chunk=chk,
+                        concepts=c_list,
+                        concept_embedding_map=local_concept_map,
+                        book_id=book.book_id,
+                        publication_date=book.publication_date,
+                    )
+                    for c_norm, c_emb in added:
                         if c_norm not in raw_concepts_dict:
                             raw_concepts_dict[c_norm] = c_emb
 
-                        brief = str(c.get("brief_description") or c_summary)
-                        detailed = str(c.get("detailed_explanation") or c_summary)
-                        cat = str(c.get("category") or "Idea")
-                        weight = int(c.get("weight") or 5)
-                        sq = str(c.get("supporting_quote") or c.get("quote") or "")
+        # Trigger shared inter-batch post-processing and index synchronization
+        engine.on_book_completed(
+            completed_count=book_idx,
+            total_count=len(preloaded_books),
+            console=console,
+        )
 
-                        index.add_idea(name=c_name, summary=c_summary, vector=c_emb)
-                        store.add_concept(
-                            Concept(name=c_name, summary=c_summary, brief_description=brief, detailed_explanation=detailed, category=cat, weight=weight),
-                            embedding=c_emb,
-                        )
-                        chunk_nid = f"chunk:{chunk_id}"
-                        if not store.graph.has_node(chunk_nid):
-                            store.graph.add_node(
-                                chunk_nid,
-                                type="Chunk",
-                                chunk_id=chunk_id,
-                                char_count=chunk_weight,
-                                book_id=book.book_id,
-                                section_title=chk.get("section_title", ""),
-                                breadcrumb=f"{chk.get('section_title', '')}",
-                            )
-                        store.graph.add_edge(f"concept:{c_name}", chunk_nid, relation="SUPPORTED_BY", quote=sq, chunk_id=chunk_id)
-                        store.graph.add_edge(chunk_nid, f"concept:{c_name}", relation="SUPPORTS_IDEA", quote=sq, chunk_id=chunk_id)
-
-        # Inter-batch post-processing at batch boundary (mimicking real ingestion pipeline)
-        is_batch_end = (book_idx % batch_size == 0) or (book_idx == len(preloaded_books))
-        if postprocess and postprocessor is not None and is_batch_end and store.graph.number_of_nodes() > 0:
-            postprocessor.process_graph(store, console=None)
-            index = IdeaEmbeddingIndex.build_from_graph(store, embeddings=embeddings_client)
-            store.dirty_nodes.clear()
-            store.dirty_edges.clear()
+    index = engine.idea_index
 
     # 4. Evaluate Embedding Space against Universe
     U_arr = np.array(all_universe_vectors, dtype=np.float32) if all_universe_vectors else np.empty((0, 0), dtype=np.float32)
@@ -1312,6 +1186,7 @@ def run_threshold_simulation_suite(
     postprocess_threshold: float = 0.92,
     tau_loss: float = 0.70,
     batch_size: int = 10,
+    model_name: Optional[str] = None,
 ) -> SimulationSuiteReport:
     """
     Orchestrate full multi-variation threshold sweep:
@@ -1365,6 +1240,8 @@ def run_threshold_simulation_suite(
             corpus_raw_embeddings=corpus_raw_vectors,
             corpus_raw_weights=corpus_raw_weights,
             batch_size=batch_size,
+            model_name=model_name,
+            console=con,
         )
         elapsed = time.perf_counter() - t0
         ret_msg = f", Ret: {res.forward_retention:.3f}, Drop: {res.dropped_raw_ratio_pct:.1f}%" if res.forward_retention is not None else ""

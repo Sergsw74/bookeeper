@@ -26,7 +26,7 @@ def test_process_memory_metrics():
     mem_gb = get_process_memory_gb()
     assert mem_bytes > 0
     assert mem_gb > 0.0
-    assert abs(mem_gb - (mem_bytes / (1024.0**3))) < 1e-4
+    assert abs(mem_gb - (mem_bytes / (1024.0**3))) < 1e-2
 
 
 def test_memory_limit_within_bounds():

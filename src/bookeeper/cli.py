@@ -8381,6 +8381,11 @@ def simulate_thresholds_command(
         "--tau-loss",
         help="Cosine similarity cutoff below which a raw idea is considered dropped in drift calculation (default: 0.70).",
     ),
+    llm_pool: bool = typer.Option(
+        False,
+        "--llm-pool/--no-llm-pool",
+        help="Whether to initialize and use LLM server pool for multi-occurrence idea synthesis during postprocessing (default: False).",
+    ),
     max_books: Optional[int] = typer.Option(
         None,
         "--max-books",
@@ -8456,6 +8461,20 @@ def simulate_thresholds_command(
     except Exception as e:
         logger.debug(f"Could not initialize FailoverOllamaEmbeddings for simulation: {e}")
 
+    pool = None
+    if llm_pool:
+        try:
+            from bookeeper.processing.ollama_pool import OllamaPool
+            servers = getattr(cfg, "resolved_llm_servers", None) or cfg.resolved_ollama_servers
+            cooldown = getattr(cfg, "resolved_analysis_cooldown_seconds", getattr(cfg, "failover_cooldown_seconds", 600))
+            pool = OllamaPool(
+                servers=servers,
+                cooldown_seconds=cooldown,
+                max_tasks_per_server=1,
+            )
+        except Exception as e:
+            logger.warning(f"Could not initialize OllamaPool for simulation: {e}")
+
     try:
         suite_report = run_threshold_simulation_suite(
             pairs=threshold_pairs,
@@ -8466,6 +8485,7 @@ def simulate_thresholds_command(
             skip_limbo=skip_limbo,
             max_books=max_books,
             embeddings_client=embeddings_client,
+            pool=pool,
             console=console,
             postprocess=postprocess,
             postprocess_threshold=postprocess_threshold,

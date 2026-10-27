@@ -24,6 +24,7 @@ from rich.table import Table
 
 from bookeeper.graph.store import ConceptGraphStore
 from bookeeper.processing.extractor import Concept
+from bookeeper.processing.idea_postprocessor import IdeaPostProcessor
 from bookeeper.processing.graph_evaluator import (
     GraphSpaceMetrics,
     PostProcessingDriftMetrics,
@@ -701,6 +702,7 @@ def simulate_variation(
     tau: float = 0.75,
     skip_limbo: bool = True,
     embeddings_client: Optional[Any] = None,
+    pool: Optional[Any] = None,
     postprocess: bool = True,
     postprocess_threshold: float = 0.92,
     tau_loss: float = 0.70,
@@ -814,11 +816,21 @@ def simulate_variation(
                         logger.debug(f"Skipping un-embedded concept '{c_name}' in simulation")
                         continue
 
+                    brief = str(c.get("brief_description") or c_summary)
+                    detailed = str(c.get("detailed_explanation") or c_summary)
+                    cat = str(c.get("category") or "Idea")
+                    weight = int(c.get("weight") or 5)
+                    sq = str(c.get("supporting_quote") or c.get("quote") or "")
+
                     index.add_idea(name=c_name, summary=c_summary, vector=c_emb)
                     store.add_concept(
-                        Concept(name=c_name, summary=c_summary, brief_description=c_summary),
+                        Concept(name=c_name, summary=c_summary, brief_description=brief, detailed_explanation=detailed, category=cat, weight=weight),
                         embedding=c_emb,
                     )
+                    if not store.graph.has_node(f"chunk:{chunk_id}"):
+                        store.graph.add_node(f"chunk:{chunk_id}", type="Chunk", chunk_id=chunk_id)
+                    store.graph.add_edge(f"concept:{c_name}", f"chunk:{chunk_id}", relation="SUPPORTED_BY", quote=sq)
+                    store.graph.add_edge(f"chunk:{chunk_id}", f"concept:{c_name}", relation="SUPPORTS_IDEA", quote=sq)
 
             elif sim >= pair.high:
                 # Priority 2: HIGH CONFIDENCE (At or above upper threshold)
@@ -857,11 +869,21 @@ def simulate_variation(
                         if c_emb is None:
                             continue
 
+                        brief = str(c.get("brief_description") or c_summary)
+                        detailed = str(c.get("detailed_explanation") or c_summary)
+                        cat = str(c.get("category") or "Idea")
+                        weight = int(c.get("weight") or 5)
+                        sq = str(c.get("supporting_quote") or c.get("quote") or "")
+
                         index.add_idea(name=c_name, summary=c_summary, vector=c_emb)
                         store.add_concept(
-                            Concept(name=c_name, summary=c_summary, brief_description=c_summary),
+                            Concept(name=c_name, summary=c_summary, brief_description=brief, detailed_explanation=detailed, category=cat, weight=weight),
                             embedding=c_emb,
                         )
+                        if not store.graph.has_node(f"chunk:{chunk_id}"):
+                            store.graph.add_node(f"chunk:{chunk_id}", type="Chunk", chunk_id=chunk_id)
+                        store.graph.add_edge(f"concept:{c_name}", f"chunk:{chunk_id}", relation="SUPPORTED_BY", quote=sq)
+                        store.graph.add_edge(f"chunk:{chunk_id}", f"concept:{c_name}", relation="SUPPORTS_IDEA", quote=sq)
 
     # 4. Evaluate Embedding Space against Universe
     U_arr = np.array(all_universe_vectors, dtype=np.float32) if all_universe_vectors else np.empty((0, 0), dtype=np.float32)
@@ -883,34 +905,29 @@ def simulate_variation(
 
     if G_arr.shape[0] > 0:
         if postprocess:
-            # Deduplicate vectors with cosine similarity >= postprocess_threshold
-            # Fast greedy incremental clustering
-            g_norms = np.linalg.norm(G_arr, axis=1, keepdims=True)
-            g_unit = G_arr / np.clip(g_norms, 1e-12, None)
+            # Execute IdeaPostProcessor on the simulated graph store
+            postprocessor = IdeaPostProcessor(
+                similarity_threshold=postprocess_threshold,
+                embeddings=embeddings_client,
+                pool=pool,
+                resume=False,
+            )
+            postprocessor.process_graph(store, console=None)
 
-            surviving_clusters: List[List[int]] = []
-            cluster_heads: List[np.ndarray] = []
+            # Collect surviving post-processed concept vectors directly from the graph store
+            post_vec_list: List[np.ndarray] = []
+            for nid, attrs in store.graph.nodes(data=True):
+                if (attrs.get("type") == "Concept" or attrs.get("is_idea")) and attrs.get("embedding"):
+                    v = np.asarray(attrs["embedding"], dtype=np.float32)
+                    norm = float(np.linalg.norm(v))
+                    post_vec_list.append((v / norm) if norm > 0 else v)
 
-            for idx_g in range(len(g_unit)):
-                curr_vec = g_unit[idx_g]
-                matched_c = -1
-                for c_idx, head in enumerate(cluster_heads):
-                    if float(np.dot(curr_vec, head)) >= postprocess_threshold:
-                        matched_c = c_idx
-                        break
-                if matched_c >= 0:
-                    surviving_clusters[matched_c].append(idx_g)
-                else:
-                    surviving_clusters.append([idx_g])
-                    cluster_heads.append(curr_vec)
-
-            # Average vectors per cluster and re-normalize
-            post_vectors = np.array([
-                np.mean(g_unit[members], axis=0) / np.clip(np.linalg.norm(np.mean(g_unit[members], axis=0)), 1e-12, None)
-                for members in surviving_clusters
-            ], dtype=np.float32)
-
-            post_nodes_cnt = len(post_vectors)
+            if post_vec_list:
+                post_vectors = np.array(post_vec_list, dtype=np.float32)
+                post_nodes_cnt = len(post_vectors)
+            else:
+                post_vectors = G_arr
+                post_nodes_cnt = len(G_arr)
         else:
             post_vectors = G_arr
             post_nodes_cnt = len(G_arr)
@@ -992,6 +1009,7 @@ def run_threshold_simulation_suite(
     skip_limbo: bool = True,
     max_books: Optional[int] = None,
     embeddings_client: Optional[Any] = None,
+    pool: Optional[Any] = None,
     console: Optional[Console] = None,
     postprocess: bool = True,
     postprocess_threshold: float = 0.92,
@@ -1042,6 +1060,7 @@ def run_threshold_simulation_suite(
             tau=tau,
             skip_limbo=skip_limbo,
             embeddings_client=embeddings_client,
+            pool=pool,
             postprocess=postprocess,
             postprocess_threshold=postprocess_threshold,
             tau_loss=tau_loss,

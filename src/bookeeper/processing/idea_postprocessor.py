@@ -808,12 +808,17 @@ class IdeaPostProcessor:
                 if console is not None:
                     console.print(f"[yellow]⚠ Semantic embedding skipped: {e}[/yellow]")
                 return clusters
+        elif missing_indices and self.embeddings is None:
+            logger.warning(
+                f"Missing embeddings for {len(missing_indices)} clusters and no embeddings client provided. Skipping semantic merge."
+            )
+            if console is not None:
+                console.print(f"[yellow]⚠ Semantic embedding skipped: no embeddings client[/yellow]")
+            return clusters
         elif not missing_indices and console is not None:
             console.print(
                 f"[bold green]✓[/bold green] [dim]Reused cached semantic embeddings for all {len(clusters)} clusters[/dim]"
             )
-        elif self.embeddings is None:
-            return clusters
 
         merged: List[IdeaCluster] = []
         consumed_indices: Set[int] = set()
@@ -1115,7 +1120,7 @@ class IdeaPostProcessor:
 
         # Calculate or update embedding against the full synthesized idea
         # (name, description, short description) after each post-processing update
-        if self.embeddings is not None:
+        if self.embeddings is not None and (emb_list is None or (is_refined and self.pool is not None)):
             full_embed_text = format_idea_for_embedding(
                 canonical_name,
                 brief_description=brief,

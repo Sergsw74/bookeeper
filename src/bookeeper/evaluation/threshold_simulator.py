@@ -816,15 +816,19 @@ def simulate_variation(
     tau_loss: float = 0.70,
     corpus_raw_embeddings: Optional[np.ndarray] = None,
     corpus_raw_weights: Optional[List[int]] = None,
+    batch_size: int = 10,
 ) -> SimulationVariationResult:
     """
     Execute an isolated simulation of chunk routing and knowledge graph generation
     for a specific (low, high) threshold pair using in-memory native C++ usearch index.
     Guarantees a 100% clean start from scratch: previous graph nodes, indexes, and
     allocations are forcefully cleaned before and after the run.
-    When postprocess is True, applies semantic deduplication to generated concepts
-    and evaluates idea drift (forward retention, backward fidelity, symmetric score,
-    weighted retention, and macro centroid alignment) comparing RAW vs POST ideas.
+    When postprocess is True, mimics the real pipeline ingestion behavior by executing
+    inter-batch post-processing at batch boundaries (every batch_size books) on affected
+    ideas, and synchronizes the router index with consolidated canonical ideas.
+    Evaluates degradation metrics comparing RAW extracted concepts vs POST graph space
+    (DeltaCov, Deltamu, Deltap10, post-leverage) and idea drift (forward retention,
+    backward fidelity, F1, centroid alignment, dropped raw count & ratio).
 
     Parameters:
         pair: ThresholdPair (unassigned lower bound, high-confidence upper bound).
@@ -833,9 +837,13 @@ def simulate_variation(
         tau: Semantic relevance threshold for graph space evaluation (default: 0.75).
         skip_limbo: If True, limbo chunks are bypassed/skipped; if False, extracted.
         embeddings_client: Optional LangChain embeddings client for any missing concept embeddings.
+        pool: Optional OllamaPool for multi-occurrence synthesis.
         postprocess: If True, performs postprocessing deduplication and drift calculation.
         postprocess_threshold: Cosine similarity cutoff for merging redundant concepts (default 0.92).
         tau_loss: Cosine similarity threshold below which a raw idea is considered dropped (default 0.70).
+        corpus_raw_embeddings: Optional full corpus raw ideas array for macro drift evaluation.
+        corpus_raw_weights: Optional evidence char weights for corpus raw ideas.
+        batch_size: Number of books per batch before running inter-batch post-processing (default: 10).
 
     Returns:
         SimulationVariationResult containing full graph space & leverage metrics.
@@ -866,8 +874,20 @@ def simulate_variation(
     # Dynamic concept embedding cache local to this simulation run (isolated deep copy)
     local_concept_map: Dict[str, List[float]] = {k: list(v) for k, v in concept_embedding_map.items()}
 
+    # Track all unique raw concepts extracted during this variation before post-processing consolidation
+    raw_concepts_dict: Dict[str, List[float]] = {}
+
+    postprocessor: Optional[IdeaPostProcessor] = None
+    if postprocess:
+        postprocessor = IdeaPostProcessor(
+            similarity_threshold=postprocess_threshold,
+            embeddings=embeddings_client,
+            pool=pool,
+            resume=True,
+        )
+
     # Replay books in chronological sequence
-    for book in preloaded_books:
+    for book_idx, book in enumerate(preloaded_books, 1):
         for chk in book.chunks:
             total_chunks += 1
             chunk_vec = chk["embedding"]
@@ -924,6 +944,9 @@ def simulate_variation(
                         logger.debug(f"Skipping un-embedded concept '{c_name}' in simulation")
                         continue
 
+                    if c_norm not in raw_concepts_dict:
+                        raw_concepts_dict[c_norm] = c_emb
+
                     brief = str(c.get("brief_description") or c_summary)
                     detailed = str(c.get("detailed_explanation") or c_summary)
                     cat = str(c.get("category") or "Idea")
@@ -977,6 +1000,9 @@ def simulate_variation(
                         if c_emb is None:
                             continue
 
+                        if c_norm not in raw_concepts_dict:
+                            raw_concepts_dict[c_norm] = c_emb
+
                         brief = str(c.get("brief_description") or c_summary)
                         detailed = str(c.get("detailed_explanation") or c_summary)
                         cat = str(c.get("category") or "Idea")
@@ -993,65 +1019,62 @@ def simulate_variation(
                         store.graph.add_edge(f"concept:{c_name}", f"chunk:{chunk_id}", relation="SUPPORTED_BY", quote=sq)
                         store.graph.add_edge(f"chunk:{chunk_id}", f"concept:{c_name}", relation="SUPPORTS_IDEA", quote=sq)
 
+        # Inter-batch post-processing at batch boundary (mimicking real ingestion pipeline)
+        is_batch_end = (book_idx % batch_size == 0) or (book_idx == len(preloaded_books))
+        if postprocess and postprocessor is not None and is_batch_end and store.graph.number_of_nodes() > 0:
+            postprocessor.process_graph(store, console=None)
+            index = IdeaEmbeddingIndex.build_from_graph(store, embeddings=embeddings_client)
+            store.dirty_nodes.clear()
+            store.dirty_edges.clear()
+
     # 4. Evaluate Embedding Space against Universe
     U_arr = np.array(all_universe_vectors, dtype=np.float32) if all_universe_vectors else np.empty((0, 0), dtype=np.float32)
-    G_arr = index.vectors if (index.vectors is not None and len(index.vectors) > 0) else np.empty((0, 0), dtype=np.float32)
+    G_raw_arr = np.array(list(raw_concepts_dict.values()), dtype=np.float32) if raw_concepts_dict else (
+        index.vectors if (index.vectors is not None and len(index.vectors) > 0) else np.empty((0, 0), dtype=np.float32)
+    )
     W_arr = np.array(all_universe_weights, dtype=np.float64) if all_universe_weights else np.empty(0, dtype=np.float64)
     P_mask = np.array(parent_mask, dtype=bool) if parent_mask else np.empty(0, dtype=bool)
 
     raw_metrics = evaluate_graph_space(
         universe_embeddings=U_arr,
-        graph_embeddings=G_arr,
+        graph_embeddings=G_raw_arr,
         tau=tau,
         parent_chunk_mask=P_mask,
         chunk_weights=W_arr,
     )
 
-    # 4. Optional Post-Processing Step & Drift Metrics Calculation
+    # 5. Extract Surviving Post-Processed Concept Vectors & Evaluate Space Degradation
     post_nodes_cnt: Optional[int] = None
     drift_dict: Optional[Dict[str, Any]] = None
+    post_space_metrics = raw_metrics
 
-    if G_arr.shape[0] > 0:
-        if postprocess:
-            # Execute IdeaPostProcessor on the simulated graph store
-            postprocessor = IdeaPostProcessor(
-                similarity_threshold=postprocess_threshold,
-                embeddings=embeddings_client,
-                pool=pool,
-                resume=False,
-            )
-            postprocessor.process_graph(store, console=None)
+    # Collect surviving post-processed concept vectors directly from the graph store
+    post_vec_list: List[np.ndarray] = []
+    for nid, attrs in store.graph.nodes(data=True):
+        if (attrs.get("type") == "Concept" or attrs.get("is_idea")) and attrs.get("embedding"):
+            v = np.asarray(attrs["embedding"], dtype=np.float32)
+            norm = float(np.linalg.norm(v))
+            post_vec_list.append((v / norm) if norm > 0 else v)
 
-            # Collect surviving post-processed concept vectors directly from the graph store
-            post_vec_list: List[np.ndarray] = []
-            for nid, attrs in store.graph.nodes(data=True):
-                if (attrs.get("type") == "Concept" or attrs.get("is_idea")) and attrs.get("embedding"):
-                    v = np.asarray(attrs["embedding"], dtype=np.float32)
-                    norm = float(np.linalg.norm(v))
-                    post_vec_list.append((v / norm) if norm > 0 else v)
+    if post_vec_list:
+        post_vectors = np.array(post_vec_list, dtype=np.float32)
+        post_nodes_cnt = len(post_vectors)
+    else:
+        post_vectors = G_raw_arr
+        post_nodes_cnt = len(G_raw_arr)
 
-            if post_vec_list:
-                post_vectors = np.array(post_vec_list, dtype=np.float32)
-                post_nodes_cnt = len(post_vectors)
-            else:
-                post_vectors = G_arr
-                post_nodes_cnt = len(G_arr)
-
-            # Evaluate embedding space of the POST-PROCESSED graph against the chunk universe
-            post_space_metrics = evaluate_graph_space(
-                universe_embeddings=U_arr,
-                graph_embeddings=post_vectors,
-                tau=tau,
-                parent_chunk_mask=P_mask,
-                chunk_weights=W_arr,
-            )
-        else:
-            post_vectors = G_arr
-            post_nodes_cnt = len(G_arr)
-            post_space_metrics = raw_metrics
+    if post_vectors.shape[0] > 0 and postprocess:
+        # Evaluate embedding space of the POST-PROCESSED graph against the chunk universe
+        post_space_metrics = evaluate_graph_space(
+            universe_embeddings=U_arr,
+            graph_embeddings=post_vectors,
+            tau=tau,
+            parent_chunk_mask=P_mask,
+            chunk_weights=W_arr,
+        )
 
         # Compute post-processing idea drift comparing corpus RAW ideas vs POST KG concepts
-        raw_target = corpus_raw_embeddings if (corpus_raw_embeddings is not None and len(corpus_raw_embeddings) > 0) else G_arr
+        raw_target = corpus_raw_embeddings if (corpus_raw_embeddings is not None and len(corpus_raw_embeddings) > 0) else G_raw_arr
         raw_w_target = corpus_raw_weights if (corpus_raw_embeddings is not None and len(corpus_raw_embeddings) > 0) else None
 
         drift_dict = calculate_postprocessing_drift(
@@ -1128,8 +1151,10 @@ def simulate_variation(
     del all_universe_vectors
     del all_universe_weights
     del parent_mask
+    del raw_concepts_dict
     del U_arr
-    del G_arr
+    del G_raw_arr
+    del post_vectors
     del W_arr
     del P_mask
     cleanup_memory()
@@ -1156,6 +1181,7 @@ def run_threshold_simulation_suite(
     postprocess: bool = True,
     postprocess_threshold: float = 0.92,
     tau_loss: float = 0.70,
+    batch_size: int = 10,
 ) -> SimulationSuiteReport:
     """
     Orchestrate full multi-variation threshold sweep:
@@ -1208,6 +1234,7 @@ def run_threshold_simulation_suite(
             tau_loss=tau_loss,
             corpus_raw_embeddings=corpus_raw_vectors,
             corpus_raw_weights=corpus_raw_weights,
+            batch_size=batch_size,
         )
         elapsed = time.perf_counter() - t0
         ret_msg = f", Ret: {res.forward_retention:.3f}, Drop: {res.dropped_raw_ratio_pct:.1f}%" if res.forward_retention is not None else ""

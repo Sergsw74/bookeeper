@@ -8386,6 +8386,11 @@ def simulate_thresholds_command(
         "--llm-pool/--no-llm-pool",
         help="Whether to initialize and use LLM server pool for multi-occurrence idea synthesis during postprocessing (default: False).",
     ),
+    batch_size: int = typer.Option(
+        10,
+        "--batch-size",
+        help="Number of books per processing batch before triggering inter-batch idea post-processing (default: 10).",
+    ),
     max_books: Optional[int] = typer.Option(
         None,
         "--max-books",
@@ -8490,6 +8495,7 @@ def simulate_thresholds_command(
             postprocess=postprocess,
             postprocess_threshold=postprocess_threshold,
             tau_loss=tau_loss,
+            batch_size=batch_size,
         )
     except Exception as e:
         console.print(f"[bold red]Simulation suite failed: {e}[/bold red]")

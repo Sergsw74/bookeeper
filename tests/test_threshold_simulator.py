@@ -212,6 +212,64 @@ def test_simulate_variation_clean_start_between_runs(mock_simulation_corpus):
     assert res_mid_repeat.coverage_at_tau_pct == res_mid.coverage_at_tau_pct
 
 
+def test_simulate_variation_inter_batch_postprocessing():
+    """
+    Verify that inter-batch post-processing triggers at batch boundaries (e.g. batch_size=2),
+    consolidates affected ideas, updates the router index, and calculates degradation deltas.
+    """
+    dim = 16
+    np.random.seed(123)
+    v0 = np.random.randn(dim).astype(np.float32)
+    v0 /= np.linalg.norm(v0)
+
+    # Similar vector (sim = 0.96) to v0 that should be merged during post-processing (threshold 0.92)
+    noise = np.random.randn(dim).astype(np.float32)
+    noise -= np.dot(noise, v0) * v0
+    noise /= np.linalg.norm(noise)
+    v_similar = v0 * 0.96 + noise * np.sqrt(1 - 0.96**2)
+    v_similar /= np.linalg.norm(v_similar)
+
+    # Book 1: extracts Concept 1 (v0)
+    b1 = PreloadedBookData(
+        book_id="1",
+        book_title="Book 1",
+        chunks=[{"chunk_id": "c1", "chunk_idx": 0, "section_title": "S1", "char_count": 500, "embedding": v0.tolist()}],
+        extractions={"c1": [{"name": "Quantum Computing", "summary": "Quantum physics based computation"}]},
+    )
+    # Book 2: extracts Concept 2 (v_similar, sim 0.94 >= 0.92 cutoff)
+    b2 = PreloadedBookData(
+        book_id="2",
+        book_title="Book 2",
+        chunks=[{"chunk_id": "c2", "chunk_idx": 0, "section_title": "S2", "char_count": 500, "embedding": v_similar.tolist()}],
+        extractions={"c2": [{"name": "Quantum Computers", "summary": "Physical quantum computing machines"}]},
+    )
+
+    concept_map = {
+        "quantum computing": v0.tolist(),
+        "quantum computers": v_similar.tolist(),
+    }
+
+    # Run with postprocess=True, batch_size=2, postprocess_threshold=0.92
+    pair = ThresholdPair(low=0.98, high=0.99)  # High low-threshold forces extraction of both
+    res = simulate_variation(
+        pair=pair,
+        preloaded_books=[b1, b2],
+        concept_embedding_map=concept_map,
+        tau=0.75,
+        postprocess=True,
+        postprocess_threshold=0.92,
+        batch_size=2,
+    )
+
+    # Raw extracted nodes = 2
+    assert res.nodes_count == 2
+    # After inter-batch consolidation at batch 2, the two concepts merged into 1 canonical concept
+    assert res.postprocessed_nodes_count == 1
+    assert res.delta_coverage_pct is not None
+    assert res.forward_retention is not None
+    assert res.forward_retention > 0.90
+
+
 # ==============================================================================
 # 3. Report Generation & Mermaid Charts
 # ==============================================================================

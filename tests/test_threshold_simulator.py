@@ -235,12 +235,17 @@ def test_simulation_suite_report_markdown_and_rich(mock_simulation_corpus):
         variations=[res1, res2],
     )
 
-    # 1. Rich Table test
+    # 1. Rich Table tests
     rich_table = suite.to_rich_table()
     assert rich_table is not None
-    # When postprocessing drift metrics are computed, columns include Post (Mp), Ret, Fid, Centroid, Drop (%)
-    assert len(rich_table.columns) == 17
+    assert len(rich_table.columns) == 14
+    drift_table = suite.to_drift_rich_table()
+    assert drift_table is not None
+    assert len(drift_table.columns) == 11
+
     assert res1.postprocessed_nodes_count is not None
+    assert res1.post_coverage_at_tau_pct is not None
+    assert res1.delta_coverage_pct is not None
     assert res1.forward_retention is not None
     assert res1.backward_fidelity is not None
     assert res1.centroid_cosine_alignment is not None
@@ -249,16 +254,19 @@ def test_simulation_suite_report_markdown_and_rich(mock_simulation_corpus):
     # 2. Markdown output test
     md = suite.to_markdown()
     assert "# Knowledge Base Threshold Simulation & Optimization Report" in md
+    assert "## 1. Threshold Variation Compute & Performance Tradeoff Summary" in md
+    assert "## 2. Post-Processing Idea Degradation & Drift Benchmark" in md
     assert "| **0.60:0.90** |" in md
     assert "| **0.70:0.90** |" in md
     assert "xychart-beta" in md
     assert 'title "Coverage vs Compute Ratio Across Variations"' in md
+    assert 'title "Raw vs Post-Processed Coverage (tau=0.75)"' in md
     assert 'title "Compression Leverage Multiplier Across Variations"' in md
     assert 'title "Mean Proximity (mu) vs Worst-Decile (p10)"' in md
     assert 'title "Embedding Space Dispersion Regularity (sigma)"' in md
     assert 'title "Semantic Retention vs Backward Fidelity Across Variations"' in md
     assert 'title "Raw Concepts (M) vs Post-Processed Concepts (Mp)"' in md
-    assert "## 3. Comparative Observations & Pareto Analysis" in md
+    assert "Comparative Observations & Pareto Analysis" in md
     assert "Post-Processing Idea Drift & Semantic Degradation Observations" in md
 
 
@@ -343,7 +351,8 @@ def test_cli_simulate_thresholds(tmp_path):
     )
 
     assert res.exit_code == 0
-    assert "Knowledge Base Threshold Simulation Benchmark" in res.output
+    assert "Threshold Simulation" in res.output
+    assert "Post-Processing Idea Degradation & Drift Benchmark" in res.output
     assert "Simulation Finished" in res.output
     assert out_report.is_file()
     report_text = out_report.read_text(encoding="utf-8")

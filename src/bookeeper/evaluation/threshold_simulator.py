@@ -164,6 +164,16 @@ class SimulationVariationResult(BaseModel):
     generalization_surplus_pct: float = Field(0.0, description="Generalization surplus Delta_cov %.")
     compression_leverage_factor: float = Field(0.0, description="Compression leverage L_comp.")
 
+    # Post-Processed Graph Space Metrics (POST concepts vs chunk universe)
+    post_coverage_at_tau_pct: Optional[float] = Field(None, description="Post-processed graph coverage of universe text volume %.")
+    delta_coverage_pct: Optional[float] = Field(None, description="Coverage delta Delta_Cov = Cov_post - Cov_raw % (negative indicates degradation).")
+    post_chamfer_mean: Optional[float] = Field(None, description="Post-processed size-weighted mean Chamfer proximity.")
+    delta_chamfer_mean: Optional[float] = Field(None, description="Chamfer mean delta mu_post - mu_raw.")
+    post_worst_decile_p10: Optional[float] = Field(None, description="Post-processed worst-decile proximity.")
+    delta_worst_decile_p10: Optional[float] = Field(None, description="Worst-decile delta p10_post - p10_raw.")
+    post_compression_leverage: Optional[float] = Field(None, description="Post-processed leverage factor Cov_post / rho_p.")
+    post_vendi_score: Optional[float] = Field(None, description="Post-processed Vendi spectral diversity score.")
+
     # Post-Processing Idea Drift Metrics (RAW vs POST Ideas)
     postprocessed_nodes_count: Optional[int] = Field(None, description="Number of surviving concepts after post-processing deduplication.")
     forward_retention: Optional[float] = Field(None, description="Forward retention S_{R -> P}: average cosine similarity of nearest surviving post idea.")
@@ -193,7 +203,7 @@ class SimulationSuiteReport(BaseModel):
     variations: List[SimulationVariationResult] = Field(default_factory=list)
 
     def to_rich_table(self) -> Table:
-        """Render a comparative Rich terminal table displaying one row per threshold pair."""
+        """Render a comparative Rich terminal table displaying compute tradeoff and performance."""
         caption_items = [
             f"Total Universe Chunks: {self.total_corpus_chunks:,}",
             f"Total Text Volume: {self.total_corpus_chars:,} chars",
@@ -203,30 +213,27 @@ class SimulationSuiteReport(BaseModel):
             caption_items.append(f"Corpus Raw Concepts: {self.total_raw_concepts:,}")
 
         table = Table(
-            title=f"Knowledge Base Threshold Simulation Benchmark (τ = {self.tau:.2f}, Skip Limbo = {self.skip_limbo})",
+            title=f"Knowledge Base Threshold Simulation: Compute Tradeoff (τ = {self.tau:.2f}, Skip Limbo = {self.skip_limbo})",
             caption=" | ".join(caption_items),
             header_style="bold cyan",
             border_style="dim",
         )
 
-        has_drift = any(v.forward_retention is not None for v in self.variations)
+        has_post = any(v.postprocessed_nodes_count is not None for v in self.variations)
 
         table.add_column("Variation (Low : High)", justify="left", style="bold")
         table.add_column("Nodes (M)", justify="right")
-        if has_drift:
+        if has_post:
             table.add_column("Post (Mp)", justify="right")
         table.add_column("Parent (Np)", justify="right")
         table.add_column("Skipped (Ns)", justify="right")
         table.add_column("Compute (ρp)", justify="right", style="cyan")
-        table.add_column("Cov (Cov_τ)", justify="right", style="bold green")
+        table.add_column("Raw Cov", justify="right")
+        if has_post:
+            table.add_column("Post Cov", justify="right", style="bold green")
+            table.add_column("ΔCov", justify="right")
         table.add_column("Mean (μ)", justify="right")
-        table.add_column("Std (σ)", justify="right")
         table.add_column("Decile (p10)", justify="right", style="yellow")
-        if has_drift:
-            table.add_column("Ret (S_R→P)", justify="right", style="green")
-            table.add_column("Fid (S_P→R)", justify="right", style="green")
-            table.add_column("Centroid", justify="right", style="cyan")
-            table.add_column("Drop (%)", justify="right", style="red")
         table.add_column("Leverage (Lcomp)", justify="right", style="magenta")
         table.add_column("Vendi", justify="right")
         table.add_column("Time", justify="right", style="dim")
@@ -236,30 +243,85 @@ class SimulationSuiteReport(BaseModel):
                 v.label,
                 f"{v.nodes_count:,}",
             ]
-            if has_drift:
+            if has_post:
                 row_items.append(f"{v.postprocessed_nodes_count:,}" if v.postprocessed_nodes_count is not None else "-")
             row_items.extend([
                 f"{v.parent_chunks_count:,}",
                 f"{v.skipped_chunks_count:,}",
                 f"{v.parent_chunk_ratio_pct:.2f}%",
                 f"{v.coverage_at_tau_pct:.2f}%",
-                f"{v.chamfer_mean:.4f}",
-                f"{v.chamfer_std:.4f}",
-                f"{v.worst_decile_p10:.4f}",
             ])
-            if has_drift:
-                row_items.extend([
-                    f"{v.forward_retention:.4f}" if v.forward_retention is not None else "-",
-                    f"{v.backward_fidelity:.4f}" if v.backward_fidelity is not None else "-",
-                    f"{v.centroid_cosine_alignment:.4f}" if v.centroid_cosine_alignment is not None else "-",
-                    f"{v.dropped_raw_ratio_pct:.1f}%" if v.dropped_raw_ratio_pct is not None else "-",
-                ])
+            if has_post:
+                p_cov_str = f"{v.post_coverage_at_tau_pct:.2f}%" if v.post_coverage_at_tau_pct is not None else f"{v.coverage_at_tau_pct:.2f}%"
+                d_cov = v.delta_coverage_pct if v.delta_coverage_pct is not None else 0.0
+                d_color = "green" if d_cov >= 0 else ("cyan" if d_cov >= -1.0 else ("yellow" if d_cov >= -3.0 else "red"))
+                d_cov_str = f"[{d_color}]{d_cov:+.2f}%[/{d_color}]"
+                row_items.extend([p_cov_str, d_cov_str])
+
+            eff_mu = v.post_chamfer_mean if v.post_chamfer_mean is not None else v.chamfer_mean
+            eff_p10 = v.post_worst_decile_p10 if v.post_worst_decile_p10 is not None else v.worst_decile_p10
+            eff_lev = v.post_compression_leverage if v.post_compression_leverage is not None else v.compression_leverage_factor
+            eff_vendi = v.post_vendi_score if v.post_vendi_score is not None else v.vendi_diversity_score
+
             row_items.extend([
-                f"{v.compression_leverage_factor:.2f}x",
-                f"{v.vendi_diversity_score:.1f}",
+                f"{eff_mu:.4f}",
+                f"{eff_p10:.4f}",
+                f"{eff_lev:.2f}x",
+                f"{eff_vendi:.1f}",
                 f"{v.duration_seconds:.2f}s",
             ])
             table.add_row(*row_items)
+
+        return table
+
+    def to_drift_rich_table(self) -> Table:
+        """Render a comparative Rich terminal table displaying post-processing degradation & idea drift metrics matching KG verification."""
+        table = Table(
+            title="Post-Processing Idea Degradation & Drift Benchmark (RAW Literature vs KG Concepts)",
+            header_style="bold magenta",
+            border_style="dim",
+        )
+
+        table.add_column("Variation (Low : High)", justify="left", style="bold")
+        table.add_column("Raw (NR)", justify="right")
+        table.add_column("Post (NP)", justify="right")
+        table.add_column("Forward Ret (S_R→P)", justify="right", style="green")
+        table.add_column("Backward Fid (S_P→R)", justify="right", style="green")
+        table.add_column("Symmetric Drift (F1)", justify="right", style="bold cyan")
+        table.add_column("Centroid", justify="right", style="cyan")
+        table.add_column("p10 Ret", justify="right")
+        table.add_column("Min Ret", justify="right")
+        table.add_column("Drop % (< τ_loss)", justify="right", style="red")
+        table.add_column("Coverage Δ (ΔCov)", justify="right")
+
+        for v in self.variations:
+            nr_str = f"{self.total_raw_concepts:,}" if self.total_raw_concepts > 0 else f"{v.nodes_count:,}"
+            np_str = f"{v.postprocessed_nodes_count:,}" if v.postprocessed_nodes_count is not None else f"{v.nodes_count:,}"
+            ret_str = f"{v.forward_retention:.4f}" if v.forward_retention is not None else "-"
+            fid_str = f"{v.backward_fidelity:.4f}" if v.backward_fidelity is not None else "-"
+            f1_str = f"{v.symmetric_idea_drift_score:.4f}" if v.symmetric_idea_drift_score is not None else "-"
+            cen_str = f"{v.centroid_cosine_alignment:.4f}" if v.centroid_cosine_alignment is not None else "-"
+            p10_str = f"{v.p10_retention:.4f}" if v.p10_retention is not None else "-"
+            min_str = f"{v.min_retention:.4f}" if v.min_retention is not None else "-"
+            drop_str = f"{v.dropped_raw_ratio_pct:.1f}%" if v.dropped_raw_ratio_pct is not None else "-"
+
+            d_cov = v.delta_coverage_pct if v.delta_coverage_pct is not None else 0.0
+            d_color = "green" if d_cov >= 0 else ("cyan" if d_cov >= -1.0 else ("yellow" if d_cov >= -3.0 else "red"))
+            dcov_str = f"[{d_color}]{d_cov:+.2f}%[/{d_color}]"
+
+            table.add_row(
+                v.label,
+                nr_str,
+                np_str,
+                ret_str,
+                fid_str,
+                f1_str,
+                cen_str,
+                p10_str,
+                min_str,
+                drop_str,
+                dcov_str,
+            )
 
         return table
 
@@ -284,25 +346,55 @@ class SimulationSuiteReport(BaseModel):
         lines.append(f"> **Clean Start**: Each variation is constructed from scratch with an empty graph store and isolated vector index (zero state leakage).  ")
         lines.append("")
 
-        # 1. Comparative Table
-        lines.append("## 1. Threshold Variation Comparative Summary")
+        # 1. Comparative Performance & Tradeoff Table
+        lines.append("## 1. Threshold Variation Compute & Performance Tradeoff Summary")
         lines.append("")
         has_drift = any(v.forward_retention is not None for v in self.variations)
 
         if has_drift:
-            lines.append("| Threshold Variation | Nodes ($M$) | Post ($M_p$) | Parent ($N_p$) | Skipped ($N_s$) | Compute ($\\rho_p$) | Coverage ($\\text{Cov}_\\tau$) | Mean ($\\mu$) | $p_{10}$ | Ret ($S_{R\\to P}$) | Fid ($S_{P\\to R}$) | Centroid | Drop (%) | Leverage ($L_{\\text{comp}}$) | Vendi | Time |")
-            lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+            lines.append("| Threshold Variation | Nodes ($M$) | Post ($M_p$) | Parent ($N_p$) | Skipped ($N_s$) | Compute ($\\rho_p$) | Raw Cov ($\\text{Cov}_{\\text{raw}}$) | Post Cov ($\\text{Cov}_{\\text{post}}$) | $\\Delta\\text{Cov}$ | Mean ($\\mu$) | $p_{10}$ | Leverage ($L_{\\text{comp}}$) | Vendi | Time |")
+            lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
             for v in self.variations:
+                mp_str = f"{v.postprocessed_nodes_count:,}" if v.postprocessed_nodes_count is not None else "-"
+                raw_cov_str = f"{v.coverage_at_tau_pct:.2f}%"
+                post_cov_val = v.post_coverage_at_tau_pct if v.post_coverage_at_tau_pct is not None else v.coverage_at_tau_pct
+                post_cov_str = f"**{post_cov_val:.2f}%**"
+                dcov = v.delta_coverage_pct if v.delta_coverage_pct is not None else 0.0
+                dcov_str = f"{dcov:+.2f}%"
+                eff_mu = v.post_chamfer_mean if v.post_chamfer_mean is not None else v.chamfer_mean
+                eff_p10 = v.post_worst_decile_p10 if v.post_worst_decile_p10 is not None else v.worst_decile_p10
+                eff_lev = v.post_compression_leverage if v.post_compression_leverage is not None else v.compression_leverage_factor
+                eff_vendi = v.post_vendi_score if v.post_vendi_score is not None else v.vendi_diversity_score
+
+                lines.append(
+                    f"| **{v.label}** | {v.nodes_count:,} | {mp_str} | {v.parent_chunks_count:,} | {v.skipped_chunks_count:,} | "
+                    f"{v.parent_chunk_ratio_pct:.2f}% | {raw_cov_str} | {post_cov_str} | {dcov_str} | {eff_mu:.4f} | "
+                    f"{eff_p10:.4f} | **{eff_lev:.2f}x** | {eff_vendi:.1f} | {v.duration_seconds:.2f}s |"
+                )
+            lines.append("")
+
+            # 2. Dedicated Post-Processing Degradation & Drift Table (Matching KG Verification)
+            lines.append("## 2. Post-Processing Idea Degradation & Drift Benchmark (Matching KG Verification)")
+            lines.append("")
+            lines.append("| Threshold Variation | Raw Ideas ($N_R$) | Post Ideas ($N_P$) | Forward Ret ($S_{R\\to P}$) | Backward Fid ($S_{P\\to R}$) | Symmetric Drift ($F_{1\\text{, sim}}$) | Centroid Alignment | Worst-Decile ($p_{10}$) | Min Retention | Dropped Ideas ($< \\tau_{\\text{loss}}$) | Coverage $\\Delta\\text{Cov}$ |")
+            lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+            for v in self.variations:
+                nr_str = f"{self.total_raw_concepts:,}" if self.total_raw_concepts > 0 else f"{v.nodes_count:,}"
                 mp_str = f"{v.postprocessed_nodes_count:,}" if v.postprocessed_nodes_count is not None else "-"
                 ret_str = f"{v.forward_retention:.4f}" if v.forward_retention is not None else "-"
                 fid_str = f"{v.backward_fidelity:.4f}" if v.backward_fidelity is not None else "-"
+                f1_str = f"{v.symmetric_idea_drift_score:.4f}" if v.symmetric_idea_drift_score is not None else "-"
                 cen_str = f"{v.centroid_cosine_alignment:.4f}" if v.centroid_cosine_alignment is not None else "-"
-                drop_str = f"{v.dropped_raw_ratio_pct:.1f}%" if v.dropped_raw_ratio_pct is not None else "-"
+                p10_str = f"{v.p10_retention:.4f}" if v.p10_retention is not None else "-"
+                min_str = f"{v.min_retention:.4f}" if v.min_retention is not None else "-"
+                drop_cnt = v.dropped_raw_count or 0
+                drop_pct = v.dropped_raw_ratio_pct or 0.0
+                drop_str = f"{drop_cnt:,} ({drop_pct:.1f}%)"
+                dcov = v.delta_coverage_pct if v.delta_coverage_pct is not None else 0.0
+                dcov_str = f"{dcov:+.2f}%"
+
                 lines.append(
-                    f"| **{v.label}** | {v.nodes_count:,} | {mp_str} | {v.parent_chunks_count:,} | {v.skipped_chunks_count:,} | "
-                    f"{v.parent_chunk_ratio_pct:.2f}% | **{v.coverage_at_tau_pct:.2f}%** | {v.chamfer_mean:.4f} | "
-                    f"{v.worst_decile_p10:.4f} | {ret_str} | {fid_str} | {cen_str} | {drop_str} | **{v.compression_leverage_factor:.2f}x** | "
-                    f"{v.vendi_diversity_score:.1f} | {v.duration_seconds:.2f}s |"
+                    f"| **{v.label}** | {nr_str} | {mp_str} | {ret_str} | {fid_str} | {f1_str} | {cen_str} | {p10_str} | {min_str} | {drop_str} | {dcov_str} |"
                 )
         else:
             lines.append("| Threshold Variation | Nodes ($M$) | Parent Chunks ($N_p$) | Skipped ($N_s$) | Compute Ratio ($\\rho_p$) | Coverage ($\\text{Cov}_\\tau$) | Mean ($\\mu$) | Regularity ($\\sigma$) | Worst-Decile ($p_{10}$) | Leverage ($L_{\\text{comp}}$) | Vendi Score | Sim Time |")
@@ -318,18 +410,19 @@ class SimulationSuiteReport(BaseModel):
 
         lines.append("")
 
-        # 2. Mermaid Visual Plots (xychart-beta)
-        lines.append("## 2. Visual Metric Plots Across Threshold Variations")
+        # 3. Mermaid Visual Plots (xychart-beta)
+        lines.append("## 3. Visual Metric Plots Across Threshold Variations")
         lines.append("")
 
         if self.variations:
             labels_json = json.dumps([f"{v.pair.low:.2f}:{v.pair.high:.2f}" for v in self.variations])
-            cov_vals = [round(v.coverage_at_tau_pct, 2) for v in self.variations]
+            cov_vals = [round(v.post_coverage_at_tau_pct if v.post_coverage_at_tau_pct is not None else v.coverage_at_tau_pct, 2) for v in self.variations]
+            raw_cov_vals = [round(v.coverage_at_tau_pct, 2) for v in self.variations]
             comp_vals = [round(v.parent_chunk_ratio_pct, 2) for v in self.variations]
-            mu_vals = [round(v.chamfer_mean, 4) for v in self.variations]
+            mu_vals = [round(v.post_chamfer_mean if v.post_chamfer_mean is not None else v.chamfer_mean, 4) for v in self.variations]
             sigma_vals = [round(v.chamfer_std, 4) for v in self.variations]
-            p10_vals = [round(v.worst_decile_p10, 4) for v in self.variations]
-            lev_vals = [round(v.compression_leverage_factor, 2) for v in self.variations]
+            p10_vals = [round(v.post_worst_decile_p10 if v.post_worst_decile_p10 is not None else v.worst_decile_p10, 4) for v in self.variations]
+            lev_vals = [round(v.post_compression_leverage if v.post_compression_leverage is not None else v.compression_leverage_factor, 2) for v in self.variations]
 
             max_pct = max(100.0, max(cov_vals + comp_vals, default=100.0))
             max_lev = max(3.0, max(lev_vals, default=2.0) * 1.2)
@@ -346,11 +439,26 @@ class SimulationSuiteReport(BaseModel):
             lines.append(f"    bar {cov_vals}")
             lines.append(f"    line {comp_vals}")
             lines.append("```")
-            lines.append("> **Bar**: Coverage $\\text{Cov}_\\tau$ (% literature text volume within $\\tau=0.75$)  ")
+            lines.append("> **Bar**: Post-Processed Coverage $\\text{Cov}_\\tau$ (% literature text volume within $\\tau=0.75$)  ")
             lines.append("> **Line**: Compute Extraction Ratio $\\rho_p$ (% text volume sent for LLM extraction)  ")
             lines.append("")
 
-            # Chart 2: Compression Leverage Multiplier
+            # Chart 2: Post-Processing Coverage Degradation (Raw vs Post Coverage)
+            if has_drift:
+                lines.append("### Post-Processing Coverage Degradation: Raw vs Post-Processed Coverage")
+                lines.append("```mermaid")
+                lines.append("xychart-beta")
+                lines.append('    title "Raw vs Post-Processed Coverage (tau=0.75)"')
+                lines.append(f"    x-axis {labels_json}")
+                lines.append(f'    y-axis "Coverage (%)" 0 --> {int(np.ceil(max(raw_cov_vals + cov_vals, default=100.0)))}')
+                lines.append(f"    bar {raw_cov_vals}")
+                lines.append(f"    bar {cov_vals}")
+                lines.append("```")
+                lines.append("> **Bar 1**: Raw Knowledge Graph Coverage $\\text{Cov}_{\\text{raw}}$ before deduplication.  ")
+                lines.append("> **Bar 2**: Post-Processed Knowledge Graph Coverage $\\text{Cov}_{\\text{post}}$ after consolidation.  ")
+                lines.append("")
+
+            # Chart 3: Compression Leverage Multiplier
             lines.append("### Compression Leverage Factor ($L_{\\text{comp}} = \\text{Cov}_\\tau / \\rho_p$)")
             lines.append("```mermaid")
             lines.append("xychart-beta")
@@ -928,9 +1036,19 @@ def simulate_variation(
             else:
                 post_vectors = G_arr
                 post_nodes_cnt = len(G_arr)
+
+            # Evaluate embedding space of the POST-PROCESSED graph against the chunk universe
+            post_space_metrics = evaluate_graph_space(
+                universe_embeddings=U_arr,
+                graph_embeddings=post_vectors,
+                tau=tau,
+                parent_chunk_mask=P_mask,
+                chunk_weights=W_arr,
+            )
         else:
             post_vectors = G_arr
             post_nodes_cnt = len(G_arr)
+            post_space_metrics = raw_metrics
 
         # Compute post-processing idea drift comparing corpus RAW ideas vs POST KG concepts
         raw_target = corpus_raw_embeddings if (corpus_raw_embeddings is not None and len(corpus_raw_embeddings) > 0) else G_arr
@@ -943,6 +1061,22 @@ def simulate_variation(
             tau_loss=tau_loss,
         )
 
+    # Compute degradation deltas comparing RAW graph space vs POST graph space
+    raw_cov = float(raw_metrics.get("coverage_at_tau_pct") or 0.0)
+    post_cov = float(post_space_metrics.get("coverage_at_tau_pct") or 0.0) if post_space_metrics else raw_cov
+    delta_cov = round(post_cov - raw_cov, 2)
+
+    raw_mu = float(raw_metrics.get("chamfer_mean") or 0.0)
+    post_mu = float(post_space_metrics.get("chamfer_mean") or 0.0) if post_space_metrics else raw_mu
+    delta_mu = round(post_mu - raw_mu, 4)
+
+    raw_p10 = float(raw_metrics.get("worst_decile_p10") or 0.0)
+    post_p10 = float(post_space_metrics.get("worst_decile_p10") or 0.0) if post_space_metrics else raw_p10
+    delta_p10 = round(post_p10 - raw_p10, 4)
+
+    post_lev = float(post_space_metrics.get("compression_leverage_factor") or 0.0) if post_space_metrics else float(raw_metrics.get("compression_leverage_factor") or 0.0)
+    post_vendi = float(post_space_metrics.get("vendi_diversity_score") or 0.0) if post_space_metrics else float(raw_metrics.get("vendi_diversity_score") or 0.0)
+
     duration = time.perf_counter() - t_start
 
     result = SimulationVariationResult(
@@ -954,11 +1088,11 @@ def simulate_variation(
         high_confidence_count=high_confidence_count,
         limbo_count=limbo_count,
         nodes_count=int(raw_metrics.get("nodes_count") or 0),
-        chamfer_mean=float(raw_metrics.get("chamfer_mean") or 0.0),
+        chamfer_mean=raw_mu,
         chamfer_std=float(raw_metrics.get("chamfer_std") or 0.0),
         median_p50=float(raw_metrics.get("median_p50") or 0.0),
-        worst_decile_p10=float(raw_metrics.get("worst_decile_p10") or 0.0),
-        coverage_at_tau_pct=float(raw_metrics.get("coverage_at_tau_pct") or 0.0),
+        worst_decile_p10=raw_p10,
+        coverage_at_tau_pct=raw_cov,
         worst_case_gap=float(raw_metrics.get("worst_case_gap") or 1.0),
         vendi_diversity_score=float(raw_metrics.get("vendi_diversity_score") or 0.0),
         parent_chunks_count=int(raw_metrics.get("parent_chunks_count") or 0),
@@ -968,6 +1102,14 @@ def simulate_variation(
         generalization_surplus_pct=float(raw_metrics.get("generalization_surplus_pct") or 0.0),
         compression_leverage_factor=float(raw_metrics.get("compression_leverage_factor") or 0.0),
         postprocessed_nodes_count=post_nodes_cnt,
+        post_coverage_at_tau_pct=post_cov,
+        delta_coverage_pct=delta_cov,
+        post_chamfer_mean=post_mu,
+        delta_chamfer_mean=delta_mu,
+        post_worst_decile_p10=post_p10,
+        delta_worst_decile_p10=delta_p10,
+        post_compression_leverage=post_lev,
+        post_vendi_score=post_vendi,
         forward_retention=float(drift_dict["forward_retention"]) if drift_dict else None,
         backward_fidelity=float(drift_dict["backward_fidelity"]) if drift_dict else None,
         symmetric_idea_drift_score=float(drift_dict["symmetric_idea_drift_score"]) if drift_dict else None,

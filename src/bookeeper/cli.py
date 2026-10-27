@@ -8495,9 +8495,12 @@ def simulate_thresholds_command(
         console.print(f"[bold red]Simulation suite failed: {e}[/bold red]")
         raise typer.Exit(1)
 
-    # 1. Print comparative terminal table
+    # 1. Print comparative terminal tables: compute tradeoff and post-processing degradation
     console.print()
     console.print(suite_report.to_rich_table())
+    if any(v.forward_retention is not None for v in suite_report.variations):
+        console.print()
+        console.print(suite_report.to_drift_rich_table())
     console.print()
 
     # 2. Write Markdown visual report

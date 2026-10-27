@@ -146,6 +146,7 @@ class SimulationVariationResult(BaseModel):
     high_confidence_count: int = 0
     limbo_count: int = 0
     nodes_count: int = 0
+    associated_chunks_count: int = Field(0, description="Chunks directly associated to existing ideas via high-confidence upper threshold.")
 
     # Graph Space Distributional Metrics
     chamfer_mean: float = Field(..., description="Size-weighted mean Chamfer proximity (mu).")
@@ -176,6 +177,9 @@ class SimulationVariationResult(BaseModel):
 
     # Post-Processing Idea Drift Metrics (RAW vs POST Ideas)
     postprocessed_nodes_count: Optional[int] = Field(None, description="Number of surviving concepts after post-processing deduplication.")
+    post_multi_occurrence_count: Optional[int] = Field(None, description="Surviving concepts supported by >= 2 chunks.")
+    post_single_occurrence_count: Optional[int] = Field(None, description="Surviving concepts with single chunk occurrence.")
+    post_graph_edges_count: Optional[int] = Field(None, description="Total edges in post-processed knowledge graph.")
     forward_retention: Optional[float] = Field(None, description="Forward retention S_{R -> P}: average cosine similarity of nearest surviving post idea.")
     backward_fidelity: Optional[float] = Field(None, description="Backward fidelity S_{P -> R}: average cosine similarity of nearest original raw idea.")
     symmetric_idea_drift_score: Optional[float] = Field(None, description="Harmonic mean of retention and fidelity in [0, 1].")
@@ -226,6 +230,7 @@ class SimulationSuiteReport(BaseModel):
         if has_post:
             table.add_column("Post (Mp)", justify="right")
         table.add_column("Parent (Np)", justify="right")
+        table.add_column("Assoc (Na)", justify="right", style="green")
         table.add_column("Skipped (Ns)", justify="right")
         table.add_column("Compute (ρp)", justify="right", style="cyan")
         table.add_column("Raw Cov", justify="right")
@@ -247,6 +252,7 @@ class SimulationSuiteReport(BaseModel):
                 row_items.append(f"{v.postprocessed_nodes_count:,}" if v.postprocessed_nodes_count is not None else "-")
             row_items.extend([
                 f"{v.parent_chunks_count:,}",
+                f"{v.associated_chunks_count:,}",
                 f"{v.skipped_chunks_count:,}",
                 f"{v.parent_chunk_ratio_pct:.2f}%",
                 f"{v.coverage_at_tau_pct:.2f}%",
@@ -285,6 +291,8 @@ class SimulationSuiteReport(BaseModel):
         table.add_column("Variation (Low : High)", justify="left", style="bold")
         table.add_column("Raw (NR)", justify="right")
         table.add_column("Post (NP)", justify="right")
+        table.add_column("Multi (N≥2)", justify="right", style="magenta")
+        table.add_column("Edges (E)", justify="right")
         table.add_column("Forward Ret (S_R→P)", justify="right", style="green")
         table.add_column("Backward Fid (S_P→R)", justify="right", style="green")
         table.add_column("Symmetric Drift (F1)", justify="right", style="bold cyan")
@@ -297,6 +305,8 @@ class SimulationSuiteReport(BaseModel):
         for v in self.variations:
             nr_str = f"{self.total_raw_concepts:,}" if self.total_raw_concepts > 0 else f"{v.nodes_count:,}"
             np_str = f"{v.postprocessed_nodes_count:,}" if v.postprocessed_nodes_count is not None else f"{v.nodes_count:,}"
+            multi_str = f"{v.post_multi_occurrence_count:,}" if v.post_multi_occurrence_count is not None else "-"
+            edges_str = f"{v.post_graph_edges_count:,}" if v.post_graph_edges_count is not None else "-"
             ret_str = f"{v.forward_retention:.4f}" if v.forward_retention is not None else "-"
             fid_str = f"{v.backward_fidelity:.4f}" if v.backward_fidelity is not None else "-"
             f1_str = f"{v.symmetric_idea_drift_score:.4f}" if v.symmetric_idea_drift_score is not None else "-"
@@ -313,6 +323,8 @@ class SimulationSuiteReport(BaseModel):
                 v.label,
                 nr_str,
                 np_str,
+                multi_str,
+                edges_str,
                 ret_str,
                 fid_str,
                 f1_str,
@@ -352,8 +364,8 @@ class SimulationSuiteReport(BaseModel):
         has_drift = any(v.forward_retention is not None for v in self.variations)
 
         if has_drift:
-            lines.append("| Threshold Variation | Nodes ($M$) | Post ($M_p$) | Parent ($N_p$) | Skipped ($N_s$) | Compute ($\\rho_p$) | Raw Cov ($\\text{Cov}_{\\text{raw}}$) | Post Cov ($\\text{Cov}_{\\text{post}}$) | $\\Delta\\text{Cov}$ | Mean ($\\mu$) | $p_{10}$ | Leverage ($L_{\\text{comp}}$) | Vendi | Time |")
-            lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+            lines.append("| Threshold Variation | Nodes ($M$) | Post ($M_p$) | Parent ($N_p$) | Assoc ($N_a$) | Skipped ($N_s$) | Compute ($\\rho_p$) | Raw Cov ($\\text{Cov}_{\\text{raw}}$) | Post Cov ($\\text{Cov}_{\\text{post}}$) | $\\Delta\\text{Cov}$ | Mean ($\\mu$) | $p_{10}$ | Leverage ($L_{\\text{comp}}$) | Vendi | Time |")
+            lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
             for v in self.variations:
                 mp_str = f"{v.postprocessed_nodes_count:,}" if v.postprocessed_nodes_count is not None else "-"
                 raw_cov_str = f"{v.coverage_at_tau_pct:.2f}%"
@@ -367,7 +379,7 @@ class SimulationSuiteReport(BaseModel):
                 eff_vendi = v.post_vendi_score if v.post_vendi_score is not None else v.vendi_diversity_score
 
                 lines.append(
-                    f"| **{v.label}** | {v.nodes_count:,} | {mp_str} | {v.parent_chunks_count:,} | {v.skipped_chunks_count:,} | "
+                    f"| **{v.label}** | {v.nodes_count:,} | {mp_str} | {v.parent_chunks_count:,} | {v.associated_chunks_count:,} | {v.skipped_chunks_count:,} | "
                     f"{v.parent_chunk_ratio_pct:.2f}% | {raw_cov_str} | {post_cov_str} | {dcov_str} | {eff_mu:.4f} | "
                     f"{eff_p10:.4f} | **{eff_lev:.2f}x** | {eff_vendi:.1f} | {v.duration_seconds:.2f}s |"
                 )
@@ -376,11 +388,13 @@ class SimulationSuiteReport(BaseModel):
             # 2. Dedicated Post-Processing Degradation & Drift Table (Matching KG Verification)
             lines.append("## 2. Post-Processing Idea Degradation & Drift Benchmark (Matching KG Verification)")
             lines.append("")
-            lines.append("| Threshold Variation | Raw Ideas ($N_R$) | Post Ideas ($N_P$) | Forward Ret ($S_{R\\to P}$) | Backward Fid ($S_{P\\to R}$) | Symmetric Drift ($F_{1\\text{, sim}}$) | Centroid Alignment | Worst-Decile ($p_{10}$) | Min Retention | Dropped Ideas ($< \\tau_{\\text{loss}}$) | Coverage $\\Delta\\text{Cov}$ |")
-            lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+            lines.append("| Threshold Variation | Raw Ideas ($N_R$) | Post Ideas ($N_P$) | Multi ($N_{\\ge 2}$) | Edges ($E$) | Forward Ret ($S_{R\\to P}$) | Backward Fid ($S_{P\\to R}$) | Symmetric Drift ($F_{1\\text{, sim}}$) | Centroid Alignment | Worst-Decile ($p_{10}$) | Min Retention | Dropped Ideas ($< \\tau_{\\text{loss}}$) | Coverage $\\Delta\\text{Cov}$ |")
+            lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
             for v in self.variations:
                 nr_str = f"{self.total_raw_concepts:,}" if self.total_raw_concepts > 0 else f"{v.nodes_count:,}"
                 mp_str = f"{v.postprocessed_nodes_count:,}" if v.postprocessed_nodes_count is not None else "-"
+                multi_str = f"{v.post_multi_occurrence_count:,}" if v.post_multi_occurrence_count is not None else "-"
+                edges_str = f"{v.post_graph_edges_count:,}" if v.post_graph_edges_count is not None else "-"
                 ret_str = f"{v.forward_retention:.4f}" if v.forward_retention is not None else "-"
                 fid_str = f"{v.backward_fidelity:.4f}" if v.backward_fidelity is not None else "-"
                 f1_str = f"{v.symmetric_idea_drift_score:.4f}" if v.symmetric_idea_drift_score is not None else "-"
@@ -394,15 +408,15 @@ class SimulationSuiteReport(BaseModel):
                 dcov_str = f"{dcov:+.2f}%"
 
                 lines.append(
-                    f"| **{v.label}** | {nr_str} | {mp_str} | {ret_str} | {fid_str} | {f1_str} | {cen_str} | {p10_str} | {min_str} | {drop_str} | {dcov_str} |"
+                    f"| **{v.label}** | {nr_str} | {mp_str} | {multi_str} | {edges_str} | {ret_str} | {fid_str} | {f1_str} | {cen_str} | {p10_str} | {min_str} | {drop_str} | {dcov_str} |"
                 )
         else:
-            lines.append("| Threshold Variation | Nodes ($M$) | Parent Chunks ($N_p$) | Skipped ($N_s$) | Compute Ratio ($\\rho_p$) | Coverage ($\\text{Cov}_\\tau$) | Mean ($\\mu$) | Regularity ($\\sigma$) | Worst-Decile ($p_{10}$) | Leverage ($L_{\\text{comp}}$) | Vendi Score | Sim Time |")
-            lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+            lines.append("| Threshold Variation | Nodes ($M$) | Parent Chunks ($N_p$) | Assoc ($N_a$) | Skipped ($N_s$) | Compute Ratio ($\\rho_p$) | Coverage ($\\text{Cov}_\\tau$) | Mean ($\\mu$) | Regularity ($\\sigma$) | Worst-Decile ($p_{10}$) | Leverage ($L_{\\text{comp}}$) | Vendi Score | Sim Time |")
+            lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
 
             for v in self.variations:
                 lines.append(
-                    f"| **{v.label}** | {v.nodes_count:,} | {v.parent_chunks_count:,} | {v.skipped_chunks_count:,} | "
+                    f"| **{v.label}** | {v.nodes_count:,} | {v.parent_chunks_count:,} | {v.associated_chunks_count:,} | {v.skipped_chunks_count:,} | "
                     f"{v.parent_chunk_ratio_pct:.2f}% | **{v.coverage_at_tau_pct:.2f}%** | {v.chamfer_mean:.4f} | "
                     f"{v.chamfer_std:.4f} | {v.worst_decile_p10:.4f} | **{v.compression_leverage_factor:.2f}x** | "
                     f"{v.vendi_diversity_score:.1f} | {v.duration_seconds:.2f}s |"
@@ -549,8 +563,27 @@ class SimulationSuiteReport(BaseModel):
                     lines.append("> **Dropped Ratio**: Percentage of raw extracted ideas whose nearest surviving concept falls below the semantic cutoff $\\tau_{\\text{loss}}$.")
                     lines.append("")
 
-        # 3. Pareto Analysis & Insights
-        lines.append("## 3. Comparative Observations & Pareto Analysis")
+            # Chart: Upper Bound Chunk Association vs Extraction
+            if any(v.associated_chunks_count > 0 for v in self.variations):
+                p_cnts = [v.parent_chunks_count for v in self.variations]
+                a_cnts = [v.associated_chunks_count for v in self.variations]
+                max_pa = max(p_cnts + a_cnts, default=10)
+
+                lines.append("### High-Confidence Chunk Association ($N_a$) vs Extraction ($N_p$)")
+                lines.append("```mermaid")
+                lines.append("xychart-beta")
+                lines.append('    title "Parent Extractions (Np) vs Associated Chunks (Na)"')
+                lines.append(f"    x-axis {labels_json}")
+                lines.append(f'    y-axis "Chunks Count" 0 --> {int(np.ceil(max_pa * 1.15))}')
+                lines.append(f"    bar {p_cnts}")
+                lines.append(f"    bar {a_cnts}")
+                lines.append("```")
+                lines.append("> **Bar 1**: Parent Chunks $N_p$ sent for LLM extraction below the lower threshold.  ")
+                lines.append("> **Bar 2**: Associated Chunks $N_a$ directly assigned to canonical ideas above the upper threshold without LLM extraction.  ")
+                lines.append("")
+
+        # 4. Pareto Analysis & Insights
+        lines.append("## 4. Comparative Observations & Pareto Analysis")
         lines.append("")
         if self.variations:
             best_cov = max(self.variations, key=lambda x: x.coverage_at_tau_pct)
@@ -562,6 +595,15 @@ class SimulationSuiteReport(BaseModel):
             lines.append(f"- **Maximum Compression Leverage**: Variation `{best_lev.label}` delivered the highest leverage at **{best_lev.compression_leverage_factor:.2f}x** (covering {best_lev.coverage_at_tau_pct:.2f}% while requiring only {best_lev.parent_chunk_ratio_pct:.2f}% extraction compute).")
             lines.append(f"- **Best Tail Robustness**: Variation `{best_p10.label}` provided the strongest worst-decile floor with $p_{{10}} = {best_p10.worst_decile_p10:.4f}$.")
             lines.append("")
+
+            # Upper bound threshold association dynamics
+            has_assoc = any(v.associated_chunks_count > 0 for v in self.variations)
+            if has_assoc:
+                best_assoc = max(self.variations, key=lambda x: x.associated_chunks_count)
+                lines.append("### Upper Bound Chunk Association Dynamics")
+                lines.append(f"- **Highest High-Confidence Association**: Variation `{best_assoc.label}` directly associated **{best_assoc.associated_chunks_count:,} chunks** ($N_a$) with canonical ideas without LLM extraction.")
+                lines.append("- **Upper Bound Tradeoff**: Lowering the upper bound promotes more chunks to high-confidence direct association, which enriches idea clusters with supporting quotes and multi-occurrence evidence in post-processing. Raising the upper bound shifts chunks into limbo, requiring either LLM verification or bypassing.")
+                lines.append("")
 
             if has_drift:
                 best_ret = max(self.variations, key=lambda x: x.forward_retention or 0.0)
@@ -727,6 +769,7 @@ def preload_simulation_data(
                     "chunk_idx": int(c.get("chunk_idx") or 0),
                     "section_title": str(c.get("section_title") or ""),
                     "char_count": int(c.get("char_count") or len(str(c.get("text") or ""))),
+                    "text": str(c.get("text") or ""),
                     "embedding": unit_emb,
                 }
                 valid_chunks.append(c_dict)
@@ -888,6 +931,14 @@ def simulate_variation(
 
     # Replay books in chronological sequence
     for book_idx, book in enumerate(preloaded_books, 1):
+        if not store.graph.has_node(f"book:{book.book_id}"):
+            store.graph.add_node(
+                f"book:{book.book_id}",
+                type="Book",
+                book_id=book.book_id,
+                publication_date=book.publication_date,
+            )
+
         for chk in book.chunks:
             total_chunks += 1
             chunk_vec = chk["embedding"]
@@ -958,16 +1009,74 @@ def simulate_variation(
                         Concept(name=c_name, summary=c_summary, brief_description=brief, detailed_explanation=detailed, category=cat, weight=weight),
                         embedding=c_emb,
                     )
-                    if not store.graph.has_node(f"chunk:{chunk_id}"):
-                        store.graph.add_node(f"chunk:{chunk_id}", type="Chunk", chunk_id=chunk_id)
-                    store.graph.add_edge(f"concept:{c_name}", f"chunk:{chunk_id}", relation="SUPPORTED_BY", quote=sq)
-                    store.graph.add_edge(f"chunk:{chunk_id}", f"concept:{c_name}", relation="SUPPORTS_IDEA", quote=sq)
+                    chunk_nid = f"chunk:{chunk_id}"
+                    if not store.graph.has_node(chunk_nid):
+                        store.graph.add_node(
+                            chunk_nid,
+                            type="Chunk",
+                            chunk_id=chunk_id,
+                            char_count=chunk_weight,
+                            book_id=book.book_id,
+                            section_title=chk.get("section_title", ""),
+                            breadcrumb=f"{chk.get('section_title', '')}",
+                        )
+                    store.graph.add_edge(f"concept:{c_name}", chunk_nid, relation="SUPPORTED_BY", quote=sq, chunk_id=chunk_id)
+                    store.graph.add_edge(chunk_nid, f"concept:{c_name}", relation="SUPPORTS_IDEA", quote=sq, chunk_id=chunk_id)
 
             elif sim >= pair.high:
                 # Priority 2: HIGH CONFIDENCE (At or above upper threshold)
                 high_confidence_count += 1
                 parent_mask.append(False)
-                # Direct assignment: no new concepts added to index
+
+                # Direct assignment: associate chunk with matched canonical idea in graph
+                if best_idea:
+                    chk_text = str(chk.get("text") or "")
+                    chk_quote = chk_text[:200] if chk_text else (best_summary[:200] if best_summary else "")
+
+                    chunk_nid = f"chunk:{chunk_id}"
+                    if not store.graph.has_node(chunk_nid):
+                        store.graph.add_node(
+                            chunk_nid,
+                            type="Chunk",
+                            chunk_id=chunk_id,
+                            char_count=chunk_weight,
+                            book_id=book.book_id,
+                            section_title=chk.get("section_title", ""),
+                            breadcrumb=f"{chk.get('section_title', '')}",
+                        )
+
+                    best_concept_nid = f"concept:{best_idea}"
+                    if not store.graph.has_node(best_concept_nid):
+                        # Case-insensitive resolution
+                        for nid, attrs in store.graph.nodes(data=True):
+                            if (attrs.get("type") == "Concept" or attrs.get("is_idea")) and (
+                                attrs.get("name", "").lower() == best_idea.lower()
+                                or nid.lower() == best_concept_nid.lower()
+                            ):
+                                best_concept_nid = nid
+                                break
+
+                    if store.graph.has_node(best_concept_nid):
+                        store.graph.add_edge(
+                            best_concept_nid,
+                            chunk_nid,
+                            relation="SUPPORTED_BY",
+                            quote=chk_quote,
+                            brief_description=best_summary,
+                            chunk_id=chunk_id,
+                        )
+                        store.graph.add_edge(
+                            chunk_nid,
+                            best_concept_nid,
+                            relation="SUPPORTS_IDEA",
+                            quote=chk_quote,
+                            brief_description=best_summary,
+                            chunk_id=chunk_id,
+                        )
+                        store.graph.nodes[best_concept_nid]["occurrences"] = (
+                            store.graph.nodes[best_concept_nid].get("occurrences", 1) + 1
+                        )
+                        store.mark_node_dirty(best_concept_nid)
 
             else:
                 # Priority 3: LIMBO [low, high)
@@ -1014,10 +1123,19 @@ def simulate_variation(
                             Concept(name=c_name, summary=c_summary, brief_description=brief, detailed_explanation=detailed, category=cat, weight=weight),
                             embedding=c_emb,
                         )
-                        if not store.graph.has_node(f"chunk:{chunk_id}"):
-                            store.graph.add_node(f"chunk:{chunk_id}", type="Chunk", chunk_id=chunk_id)
-                        store.graph.add_edge(f"concept:{c_name}", f"chunk:{chunk_id}", relation="SUPPORTED_BY", quote=sq)
-                        store.graph.add_edge(f"chunk:{chunk_id}", f"concept:{c_name}", relation="SUPPORTS_IDEA", quote=sq)
+                        chunk_nid = f"chunk:{chunk_id}"
+                        if not store.graph.has_node(chunk_nid):
+                            store.graph.add_node(
+                                chunk_nid,
+                                type="Chunk",
+                                chunk_id=chunk_id,
+                                char_count=chunk_weight,
+                                book_id=book.book_id,
+                                section_title=chk.get("section_title", ""),
+                                breadcrumb=f"{chk.get('section_title', '')}",
+                            )
+                        store.graph.add_edge(f"concept:{c_name}", chunk_nid, relation="SUPPORTED_BY", quote=sq, chunk_id=chunk_id)
+                        store.graph.add_edge(chunk_nid, f"concept:{c_name}", relation="SUPPORTS_IDEA", quote=sq, chunk_id=chunk_id)
 
         # Inter-batch post-processing at batch boundary (mimicking real ingestion pipeline)
         is_batch_end = (book_idx % batch_size == 0) or (book_idx == len(preloaded_books))
@@ -1062,6 +1180,14 @@ def simulate_variation(
     else:
         post_vectors = G_raw_arr
         post_nodes_cnt = len(G_raw_arr)
+
+    # Count multi-occurrence clusters (>= 2 supporting chunks) and total edges in post-processed graph
+    post_multi_occ = sum(
+        1 for nid, attrs in store.graph.nodes(data=True)
+        if (attrs.get("type") == "Concept" or attrs.get("is_idea")) and int(attrs.get("occurrences") or 1) >= 2
+    )
+    post_single_occ = max(0, post_nodes_cnt - post_multi_occ) if post_nodes_cnt else 0
+    post_edges = store.graph.number_of_edges()
 
     if post_vectors.shape[0] > 0 and postprocess:
         # Evaluate embedding space of the POST-PROCESSED graph against the chunk universe
@@ -1111,6 +1237,7 @@ def simulate_variation(
         high_confidence_count=high_confidence_count,
         limbo_count=limbo_count,
         nodes_count=int(raw_metrics.get("nodes_count") or 0),
+        associated_chunks_count=high_confidence_count,
         chamfer_mean=raw_mu,
         chamfer_std=float(raw_metrics.get("chamfer_std") or 0.0),
         median_p50=float(raw_metrics.get("median_p50") or 0.0),
@@ -1125,6 +1252,9 @@ def simulate_variation(
         generalization_surplus_pct=float(raw_metrics.get("generalization_surplus_pct") or 0.0),
         compression_leverage_factor=float(raw_metrics.get("compression_leverage_factor") or 0.0),
         postprocessed_nodes_count=post_nodes_cnt,
+        post_multi_occurrence_count=post_multi_occ,
+        post_single_occurrence_count=post_single_occ,
+        post_graph_edges_count=post_edges,
         post_coverage_at_tau_pct=post_cov,
         delta_coverage_pct=delta_cov,
         post_chamfer_mean=post_mu,

@@ -270,6 +270,35 @@ def test_simulate_variation_inter_batch_postprocessing():
     assert res.forward_retention > 0.90
 
 
+def test_simulate_variation_upper_bound_association(mock_simulation_corpus):
+    """
+    Verify that the upper bound threshold (pair.high) controls chunk association to ideas:
+    - Lower high boundary (0.90) associates chunk c2 (sim ~ 0.95) to Concept A,
+      elevating it to a multi-occurrence idea (>= 2 chunks).
+    - Higher high boundary (0.98) fails to associate c2, leaving Concept A as single-occurrence.
+    """
+    books, concept_map = mock_simulation_corpus
+
+    # Run with high=0.90: c2 has similarity ~0.95 >= 0.90, so it associates with Concept A
+    pair_assoc = ThresholdPair(low=0.65, high=0.90)
+    res_assoc = simulate_variation(pair_assoc, books, concept_map, tau=0.75, skip_limbo=True)
+
+    assert res_assoc.associated_chunks_count == 1
+    assert res_assoc.high_confidence_count == 1
+    # Concept A has occurrences = 2 (c0 extraction + c2 association), so multi-occurrence count >= 1
+    assert res_assoc.post_multi_occurrence_count == 1
+    assert res_assoc.post_graph_edges_count > 0
+
+    # Run with high=0.98: c2 has similarity ~0.95 < 0.98, so it falls into limbo (bypassed)
+    pair_no_assoc = ThresholdPair(low=0.65, high=0.98)
+    res_no_assoc = simulate_variation(pair_no_assoc, books, concept_map, tau=0.75, skip_limbo=True)
+
+    assert res_no_assoc.associated_chunks_count == 0
+    assert res_no_assoc.high_confidence_count == 0
+    # Concept A only has 1 occurrence (c0 extraction), so multi-occurrence count is 0
+    assert res_no_assoc.post_multi_occurrence_count == 0
+
+
 # ==============================================================================
 # 3. Report Generation & Mermaid Charts
 # ==============================================================================
@@ -296,10 +325,10 @@ def test_simulation_suite_report_markdown_and_rich(mock_simulation_corpus):
     # 1. Rich Table tests
     rich_table = suite.to_rich_table()
     assert rich_table is not None
-    assert len(rich_table.columns) == 14
+    assert len(rich_table.columns) == 15
     drift_table = suite.to_drift_rich_table()
     assert drift_table is not None
-    assert len(drift_table.columns) == 11
+    assert len(drift_table.columns) == 13
 
     assert res1.postprocessed_nodes_count is not None
     assert res1.post_coverage_at_tau_pct is not None

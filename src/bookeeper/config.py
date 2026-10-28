@@ -278,6 +278,14 @@ class SingleVerifierConfig(BaseModel):
         default=None,
         description="Optional path to save standalone statistics JSON file.",
     )
+    states_dir: Optional[str] = Field(
+        default=None,
+        description="Directory containing book state files (book_*_state.json) for post-processing drift verification.",
+    )
+    tau_loss: Optional[float] = Field(
+        default=0.70,
+        description="Cosine similarity cutoff below which a raw idea is considered dropped in drift verification (default: 0.70).",
+    )
 
     @property
     def resolved_distance_threshold(self) -> Optional[float]:
@@ -333,6 +341,14 @@ class VerificationConfig(BaseModel):
     stats_output: Optional[str] = Field(
         default=None,
         description="Optional path to save standalone statistics JSON file.",
+    )
+    states_dir: Optional[str] = Field(
+        default=None,
+        description="Directory containing book state files (book_*_state.json) for post-processing drift verification.",
+    )
+    tau_loss: Optional[float] = Field(
+        default=0.70,
+        description="Cosine similarity cutoff below which a raw idea is considered dropped in drift verification (default: 0.70).",
     )
     verifiers: List[SingleVerifierConfig] = Field(
         default_factory=list,
@@ -395,6 +411,41 @@ class DualPassConfig(BaseModel):
         default=100,
         description="Save postprocessing state checkpoint every N ideas (default: 100).",
     )
+
+
+class RecentIdeasConfig(BaseModel):
+    """Configuration for publication date sorting, batching, and embedding-based chunk routing."""
+
+    enabled: bool = Field(
+        default=True,
+        description="Whether to enable publication date sorting and batch-based chronological chunk routing.",
+    )
+    batch_books: int = Field(
+        default=10,
+        description="Number of books grouped into an ingestion batch for chronological processing (default: 10).",
+    )
+    similarity_unassigned_threshold: float = Field(
+        default=0.65,
+        description="Cosine similarity threshold below which a chunk is classified as unassigned (brand new idea, default: 0.65).",
+    )
+    similarity_high_confidence_threshold: float = Field(
+        default=0.90,
+        description="Cosine similarity threshold above which a chunk is directly assigned to an existing idea without LLM extraction (default: 0.90).",
+    )
+    skip_limbo_chunks: bool = Field(
+        default=False,
+        description="Whether to skip limbo chunks (similarity between unassigned and high-confidence thresholds) completely from LLM processing (default: False).",
+    )
+    max_batch_chunk_size: Optional[int] = Field(
+        default=None,
+        description="Maximum batch chunk size threshold (in characters). If a limbo chunk is this size or bigger, recover it from limbo and restore it to the unprocessed LLM queue.",
+    )
+
+    @property
+    def effective_limbo_recovery_size(self) -> Optional[int]:
+        if self.max_batch_chunk_size is not None and int(self.max_batch_chunk_size) > 0:
+            return int(self.max_batch_chunk_size)
+        return None
 
 
 class Settings(BaseSettings):
@@ -568,6 +619,38 @@ class Settings(BaseSettings):
         default=3,
         description="Top limit on the number of chunks combined in a single extraction task (default: 3).",
     )
+    batch_books: int = Field(
+        default=10,
+        description="Number of books grouped into an ingestion batch for chronological processing (default: 10).",
+    )
+    recent_ideas: RecentIdeasConfig = Field(
+        default_factory=RecentIdeasConfig,
+        description="Configuration for chronological batch idea ingestion and chunk routing.",
+    )
+    similarity_unassigned_threshold: float = Field(
+        default=0.65,
+        description="Cosine similarity threshold below which a chunk is classified as unassigned (brand new idea, default: 0.65).",
+    )
+    similarity_high_confidence_threshold: float = Field(
+        default=0.90,
+        description="Cosine similarity threshold above which a chunk is directly assigned to an existing idea without LLM extraction (default: 0.90).",
+    )
+    skip_limbo_chunks: bool = Field(
+        default=False,
+        description="Whether to skip limbo chunks (similarity between unassigned and high-confidence thresholds) completely from LLM processing (default: False).",
+    )
+    max_batch_chunk_size: Optional[int] = Field(
+        default=None,
+        description="Maximum batch chunk size threshold (in characters). If a limbo chunk is this size or bigger, recover it from limbo and restore it to the unprocessed LLM queue.",
+    )
+
+    @property
+    def effective_limbo_recovery_size(self) -> Optional[int]:
+        if self.max_batch_chunk_size is not None and int(self.max_batch_chunk_size) > 0:
+            return int(self.max_batch_chunk_size)
+        if hasattr(self, "recent_ideas") and self.recent_ideas is not None:
+            return self.recent_ideas.effective_limbo_recovery_size
+        return None
 
     @field_validator("max_chunk_batch", mode="before")
     @classmethod
@@ -578,6 +661,17 @@ class Settings(BaseSettings):
             return int(v)
         except (ValueError, TypeError):
             return 3
+
+    @field_validator("batch_books", mode="before")
+    @classmethod
+    def parse_batch_books(cls, v: Any) -> int:
+        if v is None:
+            return 10
+        try:
+            val = int(v)
+            return val if val > 0 else 10
+        except (ValueError, TypeError):
+            return 10
 
     @field_validator("max_context_size", mode="before")
     @classmethod
@@ -766,6 +860,20 @@ class Settings(BaseSettings):
             p = self.resolved_output_dir / "chunks"
         p.mkdir(parents=True, exist_ok=True)
         return p
+
+    state_cache_dir: Optional[str] = Field(
+        default=None,
+        description="Optional directory containing book state files (book_*_state.json) to use as read-only local cache for chunking and raw analysis.",
+    )
+
+    @property
+    def resolved_state_cache_dir(self) -> Optional[Path]:
+        """Return expanded Path for read-only book state cache directory if configured and existing."""
+        if self.state_cache_dir:
+            p = Path(self.state_cache_dir).expanduser().resolve()
+            if p.is_dir():
+                return p
+        return None
 
     # LightRAG Engine settings
     enable_lightrag: bool = Field(

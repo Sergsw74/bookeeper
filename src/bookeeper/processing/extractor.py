@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 from bookeeper.calibre.parser import BookParser
 from bookeeper.config import Settings
@@ -88,6 +88,16 @@ class Concept(BaseModel):
             "9-10: highly specific, novel, or deep architectural/philosophical concepts (e.g. 'SmartRAG', weight=9; 'Deterministic Simulation Testing', weight=10)."
         ),
     )
+    _embedding: Optional[List[float]] = PrivateAttr(default=None)
+
+    @property
+    def embedding(self) -> Optional[List[float]]:
+        """Cached vector embedding for this idea/concept (excluded from LLM schema)."""
+        return self._embedding
+
+    @embedding.setter
+    def embedding(self, val: Optional[List[float]]) -> None:
+        self._embedding = [float(x) for x in val] if val is not None else None
 
     @model_validator(mode="before")
     @classmethod

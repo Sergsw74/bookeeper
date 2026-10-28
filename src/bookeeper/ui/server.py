@@ -199,6 +199,36 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"books": books, "count": len(books)})
             return
 
+        # 2e-2. API: Ideas List & Search (Exact / Embedded + Month/Year Range Filter)
+        if path in ("/api/ideas", "/api/ideas/search"):
+            qs = parse_qs(parsed.query)
+            q_str = qs.get("q", [""])[0] or qs.get("query", [""])[0]
+            search_type = qs.get("search_type", ["exact"])[0] or qs.get("mode", ["exact"])[0]
+            month_from = qs.get("month_from", [""])[0] or qs.get("from", [""])[0] or None
+            month_to = qs.get("month_to", [""])[0] or qs.get("to", [""])[0] or None
+            category = qs.get("category", [""])[0] or None
+            sort_by = qs.get("sort_by", ["month_desc"])[0] or "month_desc"
+            limit_str = qs.get("limit", ["500"])[0]
+            limit = int(limit_str) if limit_str.isdigit() else 500
+            sim_str = qs.get("similarity_threshold", ["0.45"])[0]
+            try:
+                sim_thresh = float(sim_str)
+            except ValueError:
+                sim_thresh = 0.45
+
+            res = self.backend.get_ideas_list_and_search(
+                query=q_str,
+                search_type=search_type,
+                month_from=month_from,
+                month_to=month_to,
+                category=category,
+                sort_by=sort_by,
+                limit=limit,
+                similarity_threshold=sim_thresh,
+            )
+            self._send_json(res)
+            return
+
         # 2f. API: Backup Streaming & Direct Download
         if path == "/api/backup/download":
             qs = parse_qs(parsed.query)
@@ -383,6 +413,37 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(res)
             except Exception as e:
                 logger.error(f"Failed to prepare backup: {e}", exc_info=True)
+                self._send_json({"error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        # Ideas List & Search API (/api/ideas and /api/ideas/search)
+        if path in ("/api/ideas", "/api/ideas/search"):
+            q_str = str(body.get("query") or body.get("q") or "").strip()
+            search_type = str(body.get("search_type") or body.get("mode") or "exact").strip()
+            month_from = body.get("month_from") or body.get("from") or None
+            month_to = body.get("month_to") or body.get("to") or None
+            category = body.get("category") or None
+            sort_by = str(body.get("sort_by") or "month_desc").strip()
+            limit = int(body.get("limit") or 500)
+            try:
+                sim_thresh = float(body.get("similarity_threshold", 0.45))
+            except (TypeError, ValueError):
+                sim_thresh = 0.45
+
+            try:
+                res = self.backend.get_ideas_list_and_search(
+                    query=q_str,
+                    search_type=search_type,
+                    month_from=month_from,
+                    month_to=month_to,
+                    category=category,
+                    sort_by=sort_by,
+                    limit=limit,
+                    similarity_threshold=sim_thresh,
+                )
+                self._send_json(res)
+            except Exception as e:
+                logger.error(f"Ideas search API error: {e}", exc_info=True)
                 self._send_json({"error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 

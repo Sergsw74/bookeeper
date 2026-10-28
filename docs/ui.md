@@ -8,9 +8,10 @@ Bookkeeper features a native web-based Idea Search Engine and Knowledge Explorer
 
 - [1. Architecture Overview](#1-architecture-overview)
 - [2. UI Layout & Features](#2-ui-layout--features)
-  - [Header Navigation Menu (Search, Books, Backup & Restore, Debug)](#header-navigation-menu)
+  - [Header Navigation Menu (Search, Ideas, Books, Backup & Restore, Debug)](#header-navigation-menu)
   - [Central Search Bar & Denoise Controls](#central-search-bar--denoise-controls)
   - [Two-Column Results Pane](#two-column-results-pane)
+  - [Dedicated Ideas List & Modernity Search Page](#dedicated-ideas-list--modernity-search-page)
   - [Dedicated Indexed Books & Literature Page](#dedicated-indexed-books--literature-page)
   - [Dedicated Backup & Restore Management Page](#dedicated-backup--restore-management-page)
   - [Debug & Observability Tab](#debug--observability-tab)
@@ -109,6 +110,20 @@ flowchart TD
       - Features **[ 📋 Copy Excerpt ]** and **[ 🎯 Center on Graph ]** buttons that immediately focus, unhide (if hidden), and zoom directly to that evidence node on the canvas.
     - Displays linked books, related concepts, and citation quotes with source breadcrumbs.
 
+### Dedicated Ideas List & Modernity Search Page
+- Access directly via the **💡 Ideas** navigation menu item or `?tab=ideas`.
+- **Ideas Overview Table**:
+  - Displays all extracted canonical ideas and concepts with columns for **Idea Name**, **Category**, **Significance Weight** (0–10 score badge), **Mentions** (occurrence count), and **First Occurrence Month** (`YYYY-MM`).
+  - Sortable by Modernity (newest or oldest), Significance Weight, Occurrences, or Name.
+- **Dual Search Modes**:
+  - **Exact Search**: Instant substring and verbatim text match across idea names, brief descriptions, and detailed explanations.
+  - **Embedded Semantic Vector Search**: Embeds natural language queries using the configured Ollama embedding model (`nomic-embed-text`) and performs cosine vector similarity search against Neo4j's native `idea_idx` vector index (`CALL db.index.vector.queryNodes('idea_idx', ...)`). Matches display a color-coded cosine similarity score badge (e.g. `0.88`).
+- **Modernity Range Filtering (Month + Year)**:
+  - Precise chronological filtering using **Month from** and **Month to** inputs in standard `YYYY-MM` format (e.g. `2021-01` to `2024-06`).
+  - Filters ideas based on their recorded `first_occurrence_month`, allowing users to explore which ideas originated in specific historical periods.
+- **Direct Graph Exploration**:
+  - Every row includes a **[ 🎯 Center on Graph ]** action that immediately navigates to the visual Cytoscape graph canvas centered on the selected idea, unfolding the Obsidian note details.
+
 ### Dedicated Indexed Books & Literature Page
 - Access directly via the **📚 Books** navigation menu item or `?tab=books`.
 - **Chronological Overview**: Lists all indexed books and literature sorted in descending order of ingestion/indexing.
@@ -199,6 +214,7 @@ The Bookkeeper UI server provides both the native Web UI API and a **LightRAG-co
 | `/health` / `/api/health` | `GET` | Health check returning service status and Neo4j connection details. |
 | `/query` / `/api/query` | `POST` | **LightRAG-compatible Query API**. Accepts `{"query": "...", "mode": "...", "include_references": true}` and returns `{response, references, response_time, llm_generated, graph}`. |
 | `/api/search` | `POST` | Native Web UI Search endpoint returning query synthesis, graph elements, and telemetry. |
+| `/api/ideas` / `/api/ideas/search` | `GET`, `POST` | **Ideas Search & Filter API**. Supports exact or embedded vector search with `month_from` and `month_to` range filters (`YYYY-MM`). |
 | `/api/books` / `/api/books/indexed` | `GET` | Returns list of indexed books in descending chronological order, including highlighted top ideas scored by `occurrences * weight`. |
 | `/api/backup/prepare` | `POST` | Packages and creates a full or knowledge backup archive (`{"type": "full", "format": "zip"}`). |
 | `/api/backup/download` | `GET` | Downloads generated backup archive directly via attachment streaming (`?filename=...`). |

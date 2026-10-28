@@ -147,7 +147,7 @@ bookeeper list-books --books-dir archive_downloader/downloads --limit 15
 ### Inspecting System Status & Configuration (`status`, `stats`, `config`)
 
 ```bash
-# View active checkpoint state, completed books, and skipped formats:
+# View active checkpoint state, completed books, assigned fast-path chunks, and skipped limbo chunks:
 bookeeper status
 
 # Inspect existing Knowledge Graph metrics (nodes, edges, categories, relationships):
@@ -171,21 +171,26 @@ bookeeper clean-metadata --limit 50
 
 ### Creating Backups & Restoring Knowledge Bases (`backup`, `restore`)
 
-Bookkeeper includes a standalone backup engine that packages your Knowledge Graph, Obsidian vault, per-book state checkpoints, pre-computed chunks, and verification reports into portable archives:
+Bookkeeper includes an enterprise-grade standalone backup engine that packages your Knowledge Graph, Obsidian vault, per-book state checkpoints, pre-computed chunks, verification reports, and optionally source books into portable archives:
 
 ```bash
 # 1. Create a timestamped ZIP backup in current directory:
 bookeeper backup
 
-# 2. Create a high-compression 7-Zip backup (.7z):
+# 2. Create a full backup including indexed source PDFs/EPUBs:
+bookeeper backup --full -o ./backups/full_archive.zip
+
+# 3. Create a high-compression 7-Zip backup (.7z):
 bookeeper backup --format 7z -o ./backups/my_knowledge.7z
 
-# 3. Dry-run inspect a backup archive:
+# 4. Dry-run inspect a backup archive:
 bookeeper restore ./backups/my_knowledge.7z --dry-run
 
-# 4. Clean restore into a new directory:
+# 5. Clean restore into a new directory:
 bookeeper restore ./backups/my_knowledge.7z --output-dir ./restored_output --clean
 ```
+
+*(For full options and flags, see the **[Backup & Restore Subsystem Guide](backup-restore.md)**).*
 
 ---
 
@@ -210,9 +215,11 @@ You can monitor real-time extraction progress in the terminal:
 Dive deeper into specific subsystems:
 
 - 🔄 **[Recommended Workflow](workflow.md)** — Start here: Calibration via small A/B tests, full graph build, exports, and optional POC post-processing.
+- 💾 **[Backup & Restore Subsystem](backup-restore.md)** — Standalone backup engine, full vs knowledge scopes, integrity audits, and A/B evaluations against archives.
+- ⚡ **[Threshold Simulation & Sweep Engine](threshold-simulator.md)** — Offline replay of chunk routing across threshold pairs with graph space metrics and idea drift in milliseconds.
 - 🏗️ **[Building the Knowledge Graph](building-graph.md)** — Comprehensive options for `build-graph`, instant offline rebuilds via `rebuild-graph`, concept significance weighting, and Neo4j exports.
 - 🔍 **[Decoupled Hybrid RAG](rag.md)** — Indexing cached chunks with LightRAG and interactive querying across local and global modes.
 - 🧪 **[Two-Pass Idea Post-Processing (Experimental POC)](post-processing.md)** — Secondary synthesis pass over multi-occurrence ideas, clustering, and state checkpointing.
 - 🔬 **[A/B Testing & Benchmarking](ab-tests.md)** — Automated regression test harness, same-branch vs branch-to-branch comparisons, and config overlays.
-- 🛡️ **[Factual Verification & Auditing](verification.md)** — Multi-mode verification audits (Ideas Grounding, Chunking Coherence, and Dual-KG Cross-Checking).
+- 🛡️ **[Factual Verification & Auditing](verification.md)** — Multi-mode verification audits (Ideas Grounding, Chunking Coherence, Graph Space Coverage, and Post-Processing Idea Drift).
 - 🏠 **[Return to Documentation Index](../README.md)**

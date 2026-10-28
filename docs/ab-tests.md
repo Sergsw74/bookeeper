@@ -11,15 +11,19 @@ Bookkeeper includes an automated test harness (`scripts/ab_test.sh` and `scripts
   - [Mode 1: Same-Branch Mode (Config A vs Config B)](#mode-1-same-branch-mode-config-a-vs-config-b)
   - [Mode 2: Branch vs Branch Mode](#mode-2-branch-vs-branch-mode)
   - [Mode 3: Baseline Comparison Mode](#mode-3-baseline-comparison-mode)
+  - [Mode 4: Bookkeeper Knowledge Graph vs. LightRAG Benchmark](#mode-4-bookkeeper-knowledge-graph-vs-lightrag-benchmark)
+  - [Mode 5: A/B Testing vs Archived Backups (`ab-compare`)](#mode-5-ab-testing-vs-archived-backups-ab-compare)
 - [3. Configuration Overlays (`config-a.yaml` & `config-b.yaml`)](#3-configuration-overlays-config-a-yaml--config-b-yaml)
   - [Deep-Merge Semantics](#deep-merge-semantics)
   - [Overlay Example](#overlay-example)
 - [4. Session Directory & Reports](#4-session-directory--reports)
   - [Directory Structure](#directory-structure)
   - [Markdown Summary Report](#markdown-summary-report)
-- [5. Automated Post-Test Cross-Check Verification](#5-automated-post-test-cross-check-verification)
-- [6. Full CLI Reference](#6-full-cli-reference)
-- [7. Next Steps](#7-next-steps)
+- [5. Automated Post-Test Cross-Check Verification & Live Status Line](#5-automated-post-test-cross-check-verification--live-status-line)
+- [6. Phase 3 Dual-Level Query Execution & Keyword Extraction](#6-phase-3-dual-level-query-execution--keyword-extraction)
+- [7. Knowledge Graph Structural Topology Comparison](#7-knowledge-graph-structural-topology-comparison)
+- [8. Full CLI Reference](#8-full-cli-reference)
+- [9. Next Steps](#9-next-steps)
 
 ---
 
@@ -122,6 +126,40 @@ bookeeper lightrag-ui
 bookeeper lightrag-ui --lightrag-dir ab_test_runs/run_20261014_144807
 ```
 
+### Mode 5: A/B Testing vs Archived Backups (`ab-compare`)
+
+Re-indexing books from scratch to run comparative evaluations can take tens of minutes of LLM inference time. If you maintain regular compressed backups (`.zip` or `.7z` generated via `bookeeper backup`), you can run instant A/B comparative evaluations directly against archived runs.
+
+The automated backup resolver unpacks archives into isolated temporal directories (`tempfile.TemporaryDirectory(prefix="bk_ab_")`), loads the graph topologies, runs audits, and guarantees clean purging of temporal directories on exit:
+
+```bash
+# 1. Topological & overlap metrics between two historical backups (instant, offline):
+bookeeper ab-compare backups/backup_run_oct10.zip backups/backup_run_oct20.zip --mode stats
+
+# 2. Compare a historical backup against your currently active knowledge graph:
+bookeeper ab-compare backups/baseline_prod.zip --mode stats
+
+# 3. Deep NLI Cross-Check audit (evaluates recall, seam integrity, and contradictions between backups):
+bookeeper ab-compare backups/baseline.zip backups/candidate.zip --mode cross-check --blocks 10
+
+# 4. Graph Embedding Space & Skipping Leverage comparative audit:
+bookeeper ab-compare backups/baseline.zip backups/candidate.zip --mode graph --tau 0.75
+
+# 5. Using the ab_test.py automation runner:
+python3 scripts/ab_test.py vs-backup backups/baseline.zip backups/candidate.zip --blocks 10
+python3 scripts/ab_test.py --vs-backup backups/baseline.zip
+
+# 6. Direct verification command accepting backup archives:
+bookeeper verify --graph-file backups/baseline.zip --compare-graph backups/candidate.zip --mode cross-check
+```
+
+#### What is Evaluated:
+- **Topological & Extraction Metrics**: Side-by-side comparison of Book counts, Section counts, hierarchical Chunks, extracted Ideas, total Edges, and Edge-to-Node Relational Density.
+- **Idea Set Overlap & Jaccard Similarity**: Exact intersection of extracted concepts, count and proportion of common ideas, ideas unique to Run A vs Run B, and Jaccard similarity coefficient.
+- **NLI Cross-Check Recall & Seam Integrity**: Evaluates atomic assertions from contiguous text spans against both graphs to compute comparative recall ($\Delta \text{Recall}$), seam integrity, and net semantic integrity $\Delta S_{net}$.
+- **Graph Embedding Space & Skipping Leverage (`--mode graph` / `--mode kg`)**: Side-by-side comparison of Chamfer coverage ($\mu$), regularity ($\sigma$), worst-decile blind spot ($p_{10}$), median proximity ($p_{50}$), threshold coverage ($\text{Cov}_\tau$), Hausdorff worst-case gap ($d_H$), Vendi extrinsic diversity score ($VS$), parent extraction ratio ($\rho_{\text{parent}}$), skipped chunk retention ($R_{\text{skipped}}$), generalization surplus ($\Delta_{\text{cov}}$), and compression leverage ratio ($L_{\text{comp}}$).
+- **Zero Disk Footprint**: Unpacked temporary files (`knowledge_graph.json`, `.book_states/`, `chunks/`) are strictly removed even if audits fail or are interrupted.
+
 ---
 
 ## 3. Configuration Overlays (`config-a.yaml` & `config-b.yaml`)
@@ -204,13 +242,26 @@ The generated `ab_test_summary.md` provides an instant side-by-side comparison:
 
 ---
 
-## 5. Automated Post-Test Cross-Check Verification
+## 5. Automated Post-Test Cross-Check Verification & Live Status Line
 
 At the conclusion of the verification phase, the A/B test harness automatically runs a **Cross-Check Audit** comparing Graph A against Graph B:
 - Selects contiguous chunk blocks clamped to exact raw document spans.
 - Decomposes the source passages into atomic factual assertions.
 - Evaluates whether assertions preserved in Graph A are also entailed by Graph B, and vice versa.
 - Emits atomic recall and seam integrity metrics into `cross_check_report.json`.
+
+### Live Dual-Line Progress & Real-Time Performance Status
+
+During long cross-check audits across dozens of blocks, Bookkeeper renders a **live dual-line progress monitor**:
+
+- **Line 1 (Comparative Performance Status)**:
+  Displays the live head-to-head performance of the candidate model vs. the baseline model:
+  ```text
+  [Status] Cand (llama3.1:8b): 78.4% fid (score 3.92) vs Base (qwen2.5:3b): 71.2% fid (score 3.56) | Δ +7.2% fid
+  ```
+  Reports current model names, rolling assertion fidelity percentage, mean evaluation score, and candidate advantage in real time.
+- **Line 2 (Rich Progress Bar & Adaptive ETA)**:
+  Renders an animated progress bar indicating evaluated blocks (`Block 14/50`), completion percentage, and dynamic ETA calculation based on average LLM verification latency per block.
 
 ---
 
@@ -268,7 +319,30 @@ options:
   --questions-per-book Questions to generate per book if synthesizing library (default: 5)
 ```
 
-### 8.2 `bookeeper ab-benchmark`
+### 8.2 `bookeeper ab-compare` (alias `bookeeper ab-backup`)
+```text
+Usage: bookeeper ab-compare [OPTIONS] TARGET_A [TARGET_B]
+
+  Perform automated A/B comparative evaluation between archived backups (.zip, .7z)
+  or against the active knowledge graph. Automatically recovers targets to temporal
+  directories and guarantees full cleanup on exit.
+
+Arguments:
+  TARGET_A             First backup archive (.zip, .7z, .tar.gz) or graph JSON
+  [TARGET_B]           Second backup archive or graph JSON (defaults to active output/knowledge_graph.json)
+
+Options:
+  -m, --mode [stats|cross-check|ideas|graph|kg]
+                       Comparison mode: 'stats' (fast topological & Jaccard metrics),
+                       'cross-check' (NLI assertion audit), 'ideas' (factual grounding),
+                       or 'graph'/'kg' (embedding space coverage & skipping leverage) [default: stats]
+  -b, --blocks INTEGER Number of contiguous chunk blocks to audit in cross-check mode [default: 10]
+  --tau FLOAT          Semantic proximity radius threshold for graph space mode [default: 0.75]
+  -o, --output PATH    Destination path to save JSON comparison report
+  -c, --config PATH    Path to config.yaml [default: config.yaml]
+```
+
+### 8.3 `bookeeper ab-benchmark`
 ```text
 Usage: bookeeper ab-benchmark [OPTIONS] [NUM_BOOKS]
 
@@ -330,6 +404,8 @@ Options:
 ## 9. Next Steps
 
 - 🛡️ **[Factual Verification & Auditing](verification.md)** — Detailed breakdown of verification modes and NLI cross-checking.
+- ⚡ **[Threshold Simulation & Sweep Engine](threshold-simulator.md)** — Sweep routing thresholds and simulate idea drift offline in seconds.
+- 💾 **[Backup & Restore Subsystem](backup-restore.md)** — Create milestone archives and run A/B audits vs historical backups.
 - 🏗️ **[Building the Knowledge Graph](building-graph.md)** — Core graph extraction options and rebuilds.
 - 🧪 **[Two-Pass Idea Post-Processing (Experimental POC)](post-processing.md)** — Experimental synthesis details.
 - 🏠 **[Return to Documentation Index](../README.md)**

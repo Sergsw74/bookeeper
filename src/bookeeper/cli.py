@@ -10,14 +10,18 @@ import random
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import typer
+import numpy as np
 from langchain_ollama import OllamaEmbeddings
 from rich.console import Console, Group
 from rich.live import Live
+from rich.logging import RichHandler
+from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
@@ -60,13 +64,26 @@ from bookeeper.processing.idea_postprocessor import (
     IdeaPostProcessor,
     IdeaPostProcessorReport,
 )
+from bookeeper.processing.recent_ideas import (
+    BatchRoutingResult,
+    ChunkPriority,
+    IdeaEmbeddingIndex,
+    RecentIdeaChunkRouter,
+    RoutedChunk,
+    SemanticRoutingEngine,
+    get_chunk_size,
+    normalize_sort_date,
+    partition_books_into_batches,
+    sort_books_chronologically,
+)
 from bookeeper.processing.ollama_pool import (
+    DaemonThreadPoolExecutor,
     FailoverOllamaEmbeddings,
     OllamaPool,
     aggregate_server_statistics,
     format_server_stats_table,
 )
-from bookeeper.processing.state import BookProcessingState, ProgressTracker
+from bookeeper.processing.state import BookProcessingState, BookStateCache, ProgressTracker
 from bookeeper.processing.verifier import (
     IdeaVerifier,
     VerificationItem,
@@ -83,13 +100,34 @@ from bookeeper.processing.verifier import (
     export_verification_stats,
     export_verification_debug,
 )
+from bookeeper.processing.graph_evaluator import (
+    GraphSpaceComparisonReport,
+    GraphSpaceMetrics,
+    PostProcessingDriftMetrics,
+    calculate_postprocessing_drift,
+    compare_graph_spaces,
+    evaluate_graph_space,
+    evaluate_skipping_leverage,
+    format_graph_comparison_table,
+    format_graph_space_table,
+    format_postprocessing_drift_table,
+    get_parent_chunk_ids,
+    load_raw_ideas_from_states,
+    run_graph_space_comparison,
+    run_graph_space_evaluation,
+    run_postprocessing_drift_evaluation,
+)
 from bookeeper.backup import (
     clean_knowledge_artifacts,
+    compare_knowledge_graphs,
     create_backup,
     detect_archive_format,
     inspect_backup,
+    open_backup_target,
+    resolve_backup_target,
     resolve_target_books_dir,
     restore_backup,
+    ResolvedBackupTarget,
 )
 from bookeeper.rag.lightrag_engine import LightRAGEngine
 
@@ -101,22 +139,6 @@ app = typer.Typer(
 console = Console()
 logger = logging.getLogger(__name__)
 
-
-class DaemonThreadPoolExecutor(ThreadPoolExecutor):
-    """ThreadPoolExecutor that creates daemon threads so cancellation terminates immediately without hanging."""
-
-    def _adjust_thread_count(self):
-        orig_thread = threading.Thread
-
-        def _daemon_thread(*args, **kwargs):
-            kwargs["daemon"] = True
-            return orig_thread(*args, **kwargs)
-
-        threading.Thread = _daemon_thread
-        try:
-            super()._adjust_thread_count()
-        finally:
-            threading.Thread = orig_thread
 
 
 def format_eta_min_sec(seconds: Optional[float]) -> str:
@@ -150,6 +172,96 @@ def format_eta_days_h_m(seconds: Optional[float]) -> str:
     h, rem2 = divmod(rem, 3600)
     m = int(rem2 // 60)
     return f"{d}d {h}h {m:02d}m"
+
+
+def compute_book_chunk_eta(
+    total_chunks: int,
+    completed_chunks_count: int,
+    durations: Sequence[float],
+    pool_concurrency: int = 1,
+) -> Tuple[Optional[float], str]:
+    """
+    Compute estimated remaining time for current book chunk extraction strictly based
+    on real LLM-processed chunk durations, ignoring zero-duration fastpath/skipped chunks.
+
+    Parameters:
+        total_chunks: Total number of chunks in the book.
+        completed_chunks_count: Chunks accounted for (including assigned, skipped, and extracted).
+        durations: Measured durations (in seconds) of chunks actually processed by LLM.
+        pool_concurrency: Parallel worker concurrency across the server pool.
+
+    Returns:
+        (rem_seconds, formatted_eta_str)
+    """
+    rem_chunks = max(0, total_chunks - completed_chunks_count)
+    if rem_chunks == 0:
+        return 0.0, "0h 00m 00s"
+
+    if not durations:
+        return None, "--h --m --s"
+
+    # Use sliding window of the last 50 LLM chunks to adapt to current cluster throughput
+    recent = durations[-50:] if len(durations) > 50 else durations
+    avg_chunk_dur = sum(recent) / len(recent)
+    if avg_chunk_dur <= 0:
+        return None, "--h --m --s"
+
+    concurrency = max(1, min(pool_concurrency, rem_chunks))
+    rem_sec = (rem_chunks * avg_chunk_dur) / concurrency
+    return rem_sec, format_eta_h_min_sec(rem_sec)
+
+
+def compute_overall_library_eta(
+    total_books: int,
+    current_book_idx: int,
+    current_book_rem_sec: Optional[float],
+    current_book_elapsed: float,
+    completed_book_records: Sequence[Dict[str, Any]],
+    batch_window: int = 10,
+) -> Tuple[Optional[float], Optional[float], str, str]:
+    """
+    Compute overall library processing ETA based on average book processing time
+    windowed across at most the last book batch (including extraction, indexing,
+    and batch post-processing).
+
+    Parameters:
+        total_books: Total books to process in the catalog.
+        current_book_idx: 1-based index of the currently processing book.
+        current_book_rem_sec: Estimated remaining seconds for current book (from compute_book_chunk_eta).
+        current_book_elapsed: Elapsed seconds so far for the current book.
+        completed_book_records: List of dicts with 'effective_total' (processing + indexing + batch overhead).
+        batch_window: Maximum books in the sliding window (typically batch_size_books).
+
+    Returns:
+        (avg_book_time_sec, overall_rem_sec, formatted_eta_str, formatted_avg_book_str)
+    """
+    recent_books = completed_book_records[-batch_window:] if completed_book_records else []
+    avg_book_time: Optional[float] = None
+
+    if recent_books:
+        avg_book_time = sum(r.get("effective_total", r.get("book_duration", 0.0)) for r in recent_books) / len(recent_books)
+    else:
+        # First batch in progress: estimate based on available time of current book
+        if current_book_rem_sec is not None:
+            avg_book_time = max(1.0, current_book_elapsed + current_book_rem_sec)
+        elif current_book_elapsed > 0:
+            avg_book_time = max(1.0, current_book_elapsed)
+
+    remaining_books_after = max(0, total_books - current_book_idx)
+
+    if total_books == 0 or (remaining_books_after == 0 and (current_book_rem_sec is None or current_book_rem_sec <= 0)):
+        overall_rem_sec: Optional[float] = 0.0
+        overall_eta_str = "0d 0h 00m"
+    elif avg_book_time is not None:
+        cur_part = current_book_rem_sec if current_book_rem_sec is not None else avg_book_time
+        overall_rem_sec = cur_part + (remaining_books_after * avg_book_time)
+        overall_eta_str = format_eta_days_h_m(overall_rem_sec)
+    else:
+        overall_rem_sec = None
+        overall_eta_str = "--d --h --m"
+
+    avg_book_fmt = format_eta_min_sec(avg_book_time) if avg_book_time is not None else "--m --s"
+    return avg_book_time, overall_rem_sec, overall_eta_str, avg_book_fmt
 
 
 class ChunkRemainingColumn(ProgressColumn):
@@ -190,6 +302,212 @@ class IngestionRemainingColumn(ProgressColumn):
         return Text(f"ETA: {eta_str}", style=style)
 
 
+class StepRemainingColumn(ProgressColumn):
+    """Renders estimated processing step time remaining adaptively as (days, h, m), (h, m, s), or (m, s)."""
+
+    def render(self, task: "Task") -> Text:
+        if task.finished:
+            return Text("ETA: 0m 00s", style="dim")
+        eta_str = task.fields.get("eta_str")
+        if not eta_str:
+            rem = task.time_remaining
+            if rem is None or rem < 0:
+                eta_str = "--m --s"
+            elif rem >= 86400:
+                eta_str = format_eta_days_h_m(rem)
+            elif rem >= 3600:
+                eta_str = format_eta_h_min_sec(rem)
+            else:
+                eta_str = format_eta_min_sec(rem)
+        style = "dim" if str(eta_str).startswith("--") else "bold yellow"
+        return Text(f"ETA: {eta_str}", style=style)
+
+
+class CrossCheckProgressTracker:
+    """
+    Manages live status display and metrics tracking for Cross-Check A/B testing.
+    Renders two dynamic lines:
+      Line 1: Current comparative performance (Base vs Candidate) with Fidelity, Score (S_net), Recall, and deltas.
+      Line 2: Progress bar, block counter, elapsed time, block rate (s/blk), and ETA.
+    """
+
+    def __init__(
+        self,
+        total_blocks: int,
+        branch_a_label: str = "Baseline (A)",
+        branch_b_label: str = "Candidate (B)",
+        console: Optional[Console] = None,
+    ):
+        self.total_blocks = total_blocks
+        self.branch_a_label = str(branch_a_label)
+        self.branch_b_label = str(branch_b_label)
+        self.escaped_a = escape(self.branch_a_label)
+        self.escaped_b = escape(self.branch_b_label)
+        self.console = console or Console()
+        self.completed = 0
+        self.completed_samples: List[CrossCheckBlockResult] = []
+        self.block_durations: List[float] = []
+        self.t_start = time.perf_counter()
+        self.current_block_info = "Auditing block #1..."
+        self._live: Optional[Live] = None
+        self._progress: Optional[Progress] = None
+        self._task_id: Optional[Any] = None
+        self._log_handler: Optional[logging.Handler] = None
+
+    def get_performance_line(self) -> str:
+        """
+        Build Line 1:
+        Current performance, base model versus candidate model, with fidelity number and current score.
+        """
+        if not self.completed_samples:
+            status_desc = escape(str(self.current_block_info))
+            return (
+                f"[bold cyan]{self.escaped_a}[/] vs [bold magenta]{self.escaped_b}[/] | "
+                f"Current Performance: [dim]{status_desc}[/dim]"
+            )
+
+        mean_old_fid = float(np.mean([s.old_system.calibrated_fidelity for s in self.completed_samples]))
+        mean_new_fid = float(np.mean([s.new_system.calibrated_fidelity for s in self.completed_samples]))
+        delta_fid = mean_new_fid - mean_old_fid
+
+        mean_old_net = float(np.mean([s.old_system.net_integrity_score for s in self.completed_samples]))
+        mean_new_net = float(np.mean([s.new_system.net_integrity_score for s in self.completed_samples]))
+        delta_net = mean_new_net - mean_old_net
+
+        mean_old_rec = float(np.mean([s.old_system.qa_recall for s in self.completed_samples]))
+        mean_new_rec = float(np.mean([s.new_system.qa_recall for s in self.completed_samples]))
+        delta_rec = mean_new_rec - mean_old_rec
+
+        d_fid_col = "green" if delta_fid >= 0 else "red"
+        d_net_col = "green" if delta_net >= 0 else "red"
+        d_rec_col = "green" if delta_rec >= 0 else "red"
+
+        return (
+            f"[bold cyan]{self.escaped_a}[/] vs [bold magenta]{self.escaped_b}[/] | "
+            f"Fidelity: [cyan]{mean_old_fid * 100:.1f}%[/] vs [magenta]{mean_new_fid * 100:.1f}%[/] ([{d_fid_col}]{delta_fid * 100:+.1f}%[/]) | "
+            f"Score: [cyan]{mean_old_net:+.2f}[/] vs [magenta]{mean_new_net:+.2f}[/] ([{d_net_col}]{delta_net:+.2f}[/]) | "
+            f"Recall: [cyan]{mean_old_rec * 100:.1f}%[/] vs [magenta]{mean_new_rec * 100:.1f}%[/] ([{d_rec_col}]{delta_rec * 100:+.1f}% pts[/])"
+        )
+
+    def compute_eta_and_speed(self) -> Tuple[str, str, str]:
+        """
+        Compute (speed_str, elapsed_str, eta_str) for Line 2.
+        """
+        elapsed = time.perf_counter() - self.t_start
+        elapsed_str = format_eta_min_sec(elapsed)
+
+        if self.block_durations:
+            recent = self.block_durations[-10:]
+            avg_dur = float(np.mean(recent))
+            if avg_dur >= 1.0:
+                speed_str = f"{avg_dur:.1f} s/blk"
+            elif avg_dur > 0:
+                speed_str = f"{1.0 / avg_dur:.2f} blk/s"
+            else:
+                speed_str = "-- s/blk"
+
+            remaining = max(0, self.total_blocks - self.completed)
+            if self.completed >= self.total_blocks:
+                eta_str = "0m 00s"
+            else:
+                rem_sec = remaining * avg_dur
+                eta_str = format_eta_h_min_sec(rem_sec) if rem_sec >= 3600 else format_eta_min_sec(rem_sec)
+        else:
+            speed_str = "-- s/blk"
+            eta_str = "--m --s"
+
+        return speed_str, elapsed_str, eta_str
+
+    def get_progress_renderable(self) -> Group:
+        """Combine Line 1 and Line 2 into a single Group for Live rendering."""
+        line1 = Text.from_markup(self.get_performance_line())
+        return Group(line1, self._progress) if self._progress else Group(line1)
+
+    def __enter__(self) -> "CrossCheckProgressTracker":
+        # Attach RichHandler so warning logs (like chunk length ratio) scroll above the live area cleanly
+        target_logger = logging.getLogger("bookeeper.processing.cross_checker")
+        self._log_handler = RichHandler(console=self.console, show_time=False, show_path=False)
+        target_logger.addHandler(self._log_handler)
+
+        self._progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]Cross-Check Progress:[/bold cyan]"),
+            BarColumn(bar_width=25),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TextColumn("{task.fields[stats_line]}"),
+            console=self.console,
+        )
+        self._task_id = self._progress.add_task(
+            "cc_total",
+            total=self.total_blocks,
+            completed=0,
+            stats_line="[dim]Elapsed: 0m 00s[/dim] | [cyan]-- s/blk[/cyan] | [bold yellow]ETA: --m --s[/bold yellow]",
+        )
+        self._live = Live(self.get_progress_renderable(), console=self.console, refresh_per_second=10)
+        self._live.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._live:
+            self._live.stop()
+        if self._log_handler:
+            logging.getLogger("bookeeper.processing.cross_checker").removeHandler(self._log_handler)
+
+    def on_progress(
+        self,
+        completed: int,
+        total: int,
+        block_info: str,
+        item: Optional[CrossCheckBlockResult] = None,
+    ):
+        """
+        Progress callback invoked by run_cross_check.
+        """
+        self.completed = completed
+        self.total_blocks = total
+        self.current_block_info = block_info
+
+        if item is not None:
+            self.completed_samples.append(item)
+            dur = getattr(item, "duration_seconds", None)
+            if dur and dur > 0:
+                self.block_durations.append(dur)
+            else:
+                elapsed = time.perf_counter() - self.t_start
+                self.block_durations.append(max(0.1, elapsed / max(1, completed)))
+
+        speed_str, elapsed_str, eta_str = self.compute_eta_and_speed()
+        stats_str = f"[dim]Elapsed: {elapsed_str}[/dim] | [cyan]{speed_str}[/cyan] | [bold yellow]ETA: {eta_str}[/bold yellow]"
+
+        if self._progress and self._task_id is not None:
+            self._progress.update(self._task_id, completed=completed, total=total, stats_line=stats_str)
+
+        if self._live:
+            self._live.update(self.get_progress_renderable())
+
+        # Milestone periodic output (every 5 blocks or when finished)
+        if item is not None and (completed % 5 == 0 or completed == total):
+            pct = (completed / total * 100) if total > 0 else 0.0
+            mean_old_fid = float(np.mean([s.old_system.calibrated_fidelity for s in self.completed_samples]))
+            mean_new_fid = float(np.mean([s.new_system.calibrated_fidelity for s in self.completed_samples]))
+            delta_fid = mean_new_fid - mean_old_fid
+            d_fid_col = "green" if delta_fid >= 0 else "red"
+
+            mean_old_net = float(np.mean([s.old_system.net_integrity_score for s in self.completed_samples]))
+            mean_new_net = float(np.mean([s.new_system.net_integrity_score for s in self.completed_samples]))
+            delta_net = mean_new_net - mean_old_net
+            d_net_col = "green" if delta_net >= 0 else "red"
+
+            self.console.print(
+                f"[bold cyan][Cross-Check][/bold cyan] {completed}/{total} blocks ({pct:.1f}%) | "
+                f"Fid: {mean_old_fid * 100:.1f}% vs {mean_new_fid * 100:.1f}% ([{d_fid_col}]{delta_fid * 100:+.1f}%[/]) | "
+                f"Score: {mean_old_net:+.2f} vs {mean_new_net:+.2f} ([{d_net_col}]{delta_net:+.2f}[/]) | "
+                f"{speed_str} | ETA: {eta_str}"
+            )
+            sys.stdout.flush()
+
+
 def _resolve_opt(val: Any, default: Any = None) -> Any:
     """Unwrap Typer OptionInfo when commands are called directly within Python."""
     if hasattr(val, "default"):
@@ -211,6 +529,13 @@ def _get_effective_settings(
     books_dir: Optional[str] = None,
     max_context_size: Optional[int] = None,
     max_chunk_batch: Optional[int] = None,
+    batch_books: Optional[int] = None,
+    recent_ideas: Optional[bool] = None,
+    similarity_unassigned: Optional[float] = None,
+    similarity_high_confidence: Optional[float] = None,
+    skip_limbo_chunks: Optional[bool] = None,
+    max_batch_chunk_size: Optional[int] = None,
+    state_cache_dir: Optional[str] = None,
 ) -> Settings:
     """Retrieve settings and merge explicit CLI arguments with highest precedence."""
     config_path = _resolve_opt(config_path)
@@ -226,9 +551,18 @@ def _get_effective_settings(
     books_dir = _resolve_opt(books_dir)
     max_context_size = _resolve_opt(max_context_size)
     max_chunk_batch = _resolve_opt(max_chunk_batch)
+    batch_books = _resolve_opt(batch_books)
+    recent_ideas = _resolve_opt(recent_ideas)
+    similarity_unassigned = _resolve_opt(similarity_unassigned)
+    similarity_high_confidence = _resolve_opt(similarity_high_confidence)
+    skip_limbo_chunks = _resolve_opt(skip_limbo_chunks)
+    max_batch_chunk_size = _resolve_opt(max_batch_chunk_size)
+    state_cache_dir = _resolve_opt(state_cache_dir)
 
     cfg = get_settings(config_path)
     overrides = {}
+    if state_cache_dir:
+        overrides["state_cache_dir"] = str(state_cache_dir)
     if calibre_path:
         overrides["calibre_library_path"] = str(calibre_path)
     if books_dir:
@@ -258,6 +592,31 @@ def _get_effective_settings(
         overrides["max_context_size"] = max_context_size
     if max_chunk_batch is not None:
         overrides["max_chunk_batch"] = max_chunk_batch
+    if batch_books is not None:
+        overrides["batch_books"] = batch_books
+    if similarity_unassigned is not None:
+        overrides["similarity_unassigned_threshold"] = similarity_unassigned
+    if similarity_high_confidence is not None:
+        overrides["similarity_high_confidence_threshold"] = similarity_high_confidence
+    if skip_limbo_chunks is not None:
+        overrides["skip_limbo_chunks"] = skip_limbo_chunks
+    if max_batch_chunk_size is not None:
+        overrides["max_batch_chunk_size"] = max_batch_chunk_size
+
+    has_recent_override = (
+        recent_ideas is not None
+        or skip_limbo_chunks is not None
+        or max_batch_chunk_size is not None
+    )
+    if has_recent_override:
+        rc = cfg.recent_ideas.model_copy()
+        if recent_ideas is not None:
+            rc.enabled = recent_ideas
+        if skip_limbo_chunks is not None:
+            rc.skip_limbo_chunks = skip_limbo_chunks
+        if max_batch_chunk_size is not None:
+            rc.max_batch_chunk_size = max_batch_chunk_size
+        overrides["recent_ideas"] = rc
 
     if overrides:
         data = cfg.model_dump()
@@ -672,21 +1031,36 @@ def clean_metadata(
             try:
                 total_bytes = client.db_path.stat().st_size
                 size_mb = total_bytes / (1024 * 1024)
+                t_stage_start = time.perf_counter()
                 with Progress(
                     SpinnerColumn(),
                     TextColumn("[progress.description]{task.description}"),
                     BarColumn(),
                     TaskProgressColumn(),
                     TextColumn("• {task.completed:.1f}/{task.total:.1f} MB"),
+                    TimeElapsedColumn(),
+                    StepRemainingColumn(),
                     console=console,
                 ) as stage_progress:
                     stage_task = stage_progress.add_task(
                         f"Downloading metadata.db ({size_mb:.1f} MB) locally for fast SSD transactions...",
                         total=size_mb,
+                        eta_str="--m --s",
                     )
 
                     def _on_stage_progress(copied_bytes: int, total_b: int):
-                        stage_progress.update(stage_task, completed=copied_bytes / (1024 * 1024))
+                        elapsed = time.perf_counter() - t_stage_start
+                        rate = (copied_bytes / elapsed) if elapsed > 0 else 0.0
+                        rem_sec = ((total_b - copied_bytes) / rate) if rate > 0 and total_b > copied_bytes else 0.0
+                        eta_str = format_eta_min_sec(rem_sec) if copied_bytes < total_b else "0m 00s"
+                        spd_mb = rate / (1024 * 1024)
+                        spd_badge = f" ({spd_mb:.1f} MB/s)" if spd_mb > 0 else ""
+                        stage_progress.update(
+                            stage_task,
+                            completed=copied_bytes / (1024 * 1024),
+                            eta_str=eta_str,
+                            description=f"Downloading metadata.db ({size_mb:.1f} MB){spd_badge}...",
+                        )
 
                     staged_file = client.stage_database(
                         staged_target,
@@ -877,23 +1251,33 @@ def clean_metadata(
             "server_used": server_used,
         }
 
+    t_norm_start = time.perf_counter()
     try:
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
             TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            StepRemainingColumn(),
             console=console,
         ) as progress:
             task = progress.add_task(
                 f"Normalizing metadata across {num_servers} Ollama server(s)...",
                 total=len(books),
+                eta_str="--m --s",
             )
 
             def _update_progress_description():
                 avg_s, p80_s, fastest_s = _calc_stats()
                 with stats_lock:
                     cur_active = active_tasks_count
+                    done_cnt = len(durations)
+                elapsed = time.perf_counter() - t_norm_start
+                rate = (done_cnt / elapsed) if elapsed > 0 else 0.0
+                rem_sec = ((len(books) - done_cnt) / rate) if rate > 0 and len(books) > done_cnt else 0.0
+                eta_str = format_eta_min_sec(rem_sec) if done_cnt < len(books) else "0m 00s"
                 desc = (
                     f"Normalizing across {num_servers} server(s) | "
                     f"Active: [bold cyan]{cur_active}[/bold cyan]"
@@ -904,7 +1288,7 @@ def clean_metadata(
                         f"p80: [bold yellow]{p80_s:.1f}s[/bold yellow] | "
                         f"fastest: [bold magenta]{fastest_s:.1f}s[/bold magenta]"
                     )
-                progress.update(task, description=desc)
+                progress.update(task, description=desc, eta_str=eta_str)
 
             _update_progress_description()
 
@@ -1031,6 +1415,7 @@ def clean_metadata(
                 f"[bold yellow]Metadata cleaning stopped by user.[/bold yellow] "
                 f"Successfully completed before cancel: [bold green]{success_count}[/bold green] book(s)."
             )
+            raise typer.Exit(code=130)
         else:
             summary_text = f"[bold green]Metadata cleaning finished.[/bold green] Completed: [bold green]{success_count}[/bold green]"
             if skipped_graphical_count > 0:
@@ -1061,21 +1446,36 @@ def clean_metadata(
                     console.print(
                         f"[bold blue]Syncing updated database ({success_count} newly modified book(s)) back to Calibre library...[/bold blue]"
                     )
+                    t_sync_start = time.perf_counter()
                     with Progress(
                         SpinnerColumn(),
                         TextColumn("[progress.description]{task.description}"),
                         BarColumn(),
                         TaskProgressColumn(),
                         TextColumn("• {task.completed:.1f}/{task.total:.1f} MB"),
+                        TimeElapsedColumn(),
+                        StepRemainingColumn(),
                         console=console,
                     ) as sync_progress:
                         sync_task = sync_progress.add_task(
                             "Uploading updated metadata.db to Calibre share...",
                             total=size_mb,
+                            eta_str="--m --s",
                         )
 
                         def _on_sync_progress(copied_bytes: int, total_b: int):
-                            sync_progress.update(sync_task, completed=copied_bytes / (1024 * 1024))
+                            elapsed = time.perf_counter() - t_sync_start
+                            rate = (copied_bytes / elapsed) if elapsed > 0 else 0.0
+                            rem_sec = ((total_b - copied_bytes) / rate) if rate > 0 and total_b > copied_bytes else 0.0
+                            eta_str = format_eta_min_sec(rem_sec) if copied_bytes < total_b else "0m 00s"
+                            spd_mb = rate / (1024 * 1024)
+                            spd_badge = f" ({spd_mb:.1f} MB/s)" if spd_mb > 0 else ""
+                            sync_progress.update(
+                                sync_task,
+                                completed=copied_bytes / (1024 * 1024),
+                                eta_str=eta_str,
+                                description=f"Uploading metadata.db ({size_mb:.1f} MB){spd_badge}...",
+                            )
 
                         client.sync_database(
                             create_backup=effective_backup_db,
@@ -1239,6 +1639,42 @@ def build_graph(
         "--max-chunk-batch",
         help="Top limit on the number of chunks combined in a single extraction task (default: 3).",
     ),
+    batch_books: Optional[int] = typer.Option(
+        None,
+        "--batch-books",
+        help="Number of books grouped per chronological ingestion batch (default: 10).",
+    ),
+    recent_ideas: Optional[bool] = typer.Option(
+        None,
+        "--recent-ideas/--no-recent-ideas",
+        help="Enable chronological batch ingestion with semantic chunk routing (default: True).",
+    ),
+    similarity_unassigned: Optional[float] = typer.Option(
+        None,
+        "--similarity-unassigned",
+        help="Cosine similarity threshold below which chunks are classified as unassigned (brand new ideas, default: 0.65).",
+    ),
+    similarity_high_confidence: Optional[float] = typer.Option(
+        None,
+        "--similarity-high-confidence",
+        help="Cosine similarity threshold above which chunks are directly assigned to an existing idea without LLM extraction (default: 0.90).",
+    ),
+    skip_limbo_chunks: Optional[bool] = typer.Option(
+        None,
+        "--skip-limbo-chunks/--no-skip-limbo-chunks",
+        "--skip-limbo/--no-skip-limbo",
+        help="Skip limbo chunks (chunks between unassigned and high-confidence similarity thresholds) completely from LLM processing (default: False).",
+    ),
+    max_batch_chunk_size: Optional[int] = typer.Option(
+        None,
+        "--max-batch-chunk-size",
+        help="Maximum batch chunk size threshold (in characters): if a limbo chunk is this size or bigger, recover it to unprocessed LLM queue.",
+    ),
+    state_cache_dir: Optional[str] = typer.Option(
+        None,
+        "--state-cache-dir",
+        help="Directory containing existing book state files (book_*_state.json) to use as read-only local cache for chunking and raw chunk analysis.",
+    ),
 ):
     """
     Ingest sections, perform semantic chunking, extract concepts via Ollama,
@@ -1273,6 +1709,13 @@ def build_graph(
     books_dir = _resolve_opt(books_dir)
     max_context_size = _resolve_opt(max_context_size)
     max_chunk_batch = _resolve_opt(max_chunk_batch)
+    batch_books = _resolve_opt(batch_books)
+    recent_ideas = _resolve_opt(recent_ideas)
+    similarity_unassigned = _resolve_opt(similarity_unassigned)
+    similarity_high_confidence = _resolve_opt(similarity_high_confidence)
+    skip_limbo_chunks = _resolve_opt(skip_limbo_chunks)
+    max_batch_chunk_size = _resolve_opt(max_batch_chunk_size)
+    state_cache_dir = _resolve_opt(state_cache_dir)
 
     cfg = _get_effective_settings(
         config_path,
@@ -1288,6 +1731,13 @@ def build_graph(
         books_dir=books_dir,
         max_context_size=max_context_size,
         max_chunk_batch=max_chunk_batch,
+        batch_books=batch_books,
+        recent_ideas=recent_ideas,
+        similarity_unassigned=similarity_unassigned,
+        similarity_high_confidence=similarity_high_confidence,
+        skip_limbo_chunks=skip_limbo_chunks,
+        max_batch_chunk_size=max_batch_chunk_size,
+        state_cache_dir=state_cache_dir,
     )
     output_dir = cfg.resolved_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1297,6 +1747,15 @@ def build_graph(
     should_clean = cfg.clean_export if clean_export is None else clean_export
     should_export_neo4j = cfg.neo4j.enabled if export_neo4j is None else export_neo4j
     has_cleaned = False
+    has_cleaned_neo4j = False
+
+    effective_state_cache = state_cache_dir or cfg.state_cache_dir
+    state_cache = BookStateCache(effective_state_cache)
+    if state_cache.is_enabled():
+        console.print(
+            f"[dim]Local State Cache Directory: [bold cyan]{state_cache.cache_dir}[/bold cyan] "
+            f"({len(state_cache._id_to_file)} book state file(s) indexed)[/dim]"
+        )
 
     tracker_path = Path(state_file) if state_file else cfg.resolved_state_file
     tracker = ProgressTracker(tracker_path)
@@ -1312,8 +1771,7 @@ def build_graph(
         resume = False
         continue_run = False
         rechunk = True
-        if clean_export is None:
-            should_clean = True
+        should_clean = True
         if graph_file.is_file():
             try:
                 graph_file.unlink()
@@ -1330,6 +1788,15 @@ def build_graph(
             output_dir / ".book_states",
             getattr(cfg, "resolved_output_dir", output_dir) / ".book_states",
         }
+        # Explicit protection: ensure state_cache_dir is never included or purged during cleanups
+        if state_cache.is_enabled():
+            sc_dir = state_cache.cache_dir
+            candidate_state_dirs = {
+                d for d in candidate_state_dirs
+                if d != sc_dir and not (sc_dir and d.is_relative_to(sc_dir))
+            }
+            console.print(f"[dim green]Preserving external state cache directory: {sc_dir}[/dim green]")
+
         total_purged_states = 0
         for b_sdir in candidate_state_dirs:
             total_purged_states += BookProcessingState.clean_all(b_sdir)
@@ -1346,6 +1813,19 @@ def build_graph(
             console.print(
                 f"[bold yellow]Deleted {purged_chunks} cached chunk file(s) from {target_chunks_path}.[/bold yellow]"
             )
+
+        # 3. Neo4j cleanup: ensure Neo4j database is completely wiped for a clean start synchronized with KG
+        if should_export_neo4j:
+            try:
+                neo_exp = Neo4jExporter.from_config(cfg.neo4j)
+                deleted_nodes = neo_exp.clean_database(console=console)
+                has_cleaned_neo4j = True
+            except Exception as e:
+                console.print(
+                    f"[bold red]✗ Failed to clean Neo4j database on start from scratch:[/bold red] {e}. "
+                    "Will attempt clean export during subsequent sync."
+                )
+                has_cleaned_neo4j = False
 
     store = ConceptGraphStore()
     if not from_scratch and graph_file.is_file():
@@ -1397,21 +1877,36 @@ def build_graph(
             try:
                 total_bytes = client.db_path.stat().st_size
                 size_mb = total_bytes / (1024 * 1024)
+                t_stage_start = time.perf_counter()
                 with Progress(
                     SpinnerColumn(),
                     TextColumn("[progress.description]{task.description}"),
                     BarColumn(),
                     TaskProgressColumn(),
                     TextColumn("• {task.completed:.1f}/{task.total:.1f} MB"),
+                    TimeElapsedColumn(),
+                    StepRemainingColumn(),
                     console=console,
                 ) as stage_progress:
                     stage_task = stage_progress.add_task(
                         f"Downloading metadata.db ({size_mb:.1f} MB) locally for fast SSD transactions...",
                         total=size_mb,
+                        eta_str="--m --s",
                     )
 
                     def _on_stage_progress(copied_bytes: int, total_b: int):
-                        stage_progress.update(stage_task, completed=copied_bytes / (1024 * 1024))
+                        elapsed = time.perf_counter() - t_stage_start
+                        rate = (copied_bytes / elapsed) if elapsed > 0 else 0.0
+                        rem_sec = ((total_b - copied_bytes) / rate) if rate > 0 and total_b > copied_bytes else 0.0
+                        eta_str = format_eta_min_sec(rem_sec) if copied_bytes < total_b else "0m 00s"
+                        spd_mb = rate / (1024 * 1024)
+                        spd_badge = f" ({spd_mb:.1f} MB/s)" if spd_mb > 0 else ""
+                        stage_progress.update(
+                            stage_task,
+                            completed=copied_bytes / (1024 * 1024),
+                            eta_str=eta_str,
+                            description=f"Downloading metadata.db ({size_mb:.1f} MB){spd_badge}...",
+                        )
 
                     staged_file = client.stage_database(
                         staged_target,
@@ -1433,13 +1928,33 @@ def build_graph(
     if not skip_warmup:
         _perform_ollama_warmup(extractor, console)
 
+    # Initialize shared FailoverOllamaEmbeddings pool once so all pipeline stages
+    # (chunker, semantic router, entity deduplicator, and dual-pass postprocessor)
+    # distribute embedding requests across all available embedding nodes in the pool.
+    embeddings: Optional[FailoverOllamaEmbeddings] = None
+    try:
+        embeddings = FailoverOllamaEmbeddings.from_settings(cfg)
+        chunker = HierarchicalChunker(embeddings=embeddings)
+    except Exception as e:
+        console.print(f"[dim yellow]Warning: Embeddings init skipped ({e}); using paragraph chunker.[/dim yellow]")
+        chunker = HierarchicalChunker()
+
     deduplicator = EntityDeduplicator.from_settings(
         cfg,
         embedding_model=cfg.embedding_model,
         similarity_threshold=cfg.similarity_threshold,
         high_similarity_threshold=getattr(cfg, "high_similarity_threshold", 0.95),
         extractor=extractor,
+        embeddings=embeddings,
     )
+    deduplicator.seed_from_graph(store)
+
+    active_neo4j_exporter: Optional[Neo4jExporter] = None
+    if cfg.neo4j.enabled if export_neo4j is None else export_neo4j:
+        try:
+            active_neo4j_exporter = Neo4jExporter.from_config(cfg.neo4j)
+        except Exception as e:
+            logger.debug(f"Could not initialize active Neo4jExporter for HNSW idea index: {e}")
 
     # Initialize ChunkStore for local persistence and fast reuse of book chunks
     resolved_chunks_path = Path(chunks_dir).expanduser().resolve() if chunks_dir else cfg.resolved_chunks_dir
@@ -1449,14 +1964,6 @@ def build_graph(
         console.print(f"[dim yellow]Purged {purged_count} cached chunk file(s) from {chunk_store.storage_dir}.[/dim yellow]")
         rechunk = True
     console.print(f"[dim]Persistent Chunks Directory: [bold cyan]{chunk_store.storage_dir}[/bold cyan][/dim]")
-
-    # Initialize HierarchicalChunker with Ollama embeddings using failover pool
-    try:
-        embeddings = FailoverOllamaEmbeddings.from_settings(cfg)
-        chunker = HierarchicalChunker(embeddings=embeddings)
-    except Exception as e:
-        console.print(f"[dim yellow]Warning: Embeddings init skipped ({e}); using paragraph chunker.[/dim yellow]")
-        chunker = HierarchicalChunker()
 
     effective_lightrag = cfg.enable_lightrag if enable_lightrag is None else enable_lightrag
     lightrag_engine: Optional[LightRAGEngine] = None
@@ -1487,7 +1994,15 @@ def build_graph(
         if BookParser.is_graphical_format(p):
             console.print(f"[yellow]Skipping graphical file '{p.name}': contains image-based content ({p.suffix}).[/yellow]")
             raise typer.Exit(0)
-        books_to_process.append({"id": 1, "title": p.stem, "author": "Unknown", "path": p})
+        p_pub = BookParser.extract_publication_date(p)
+        books_to_process.append({
+            "id": 1,
+            "title": p.stem,
+            "author": "Unknown",
+            "path": p,
+            "publication_date": p_pub,
+            "pubdate": p_pub,
+        })
 
     # Case 2: From Calibre / Download Folder / SMB share
     elif client.is_available():
@@ -1648,6 +2163,7 @@ def build_graph(
                 tracker.mark_skipped("build_graph", bid, title=b.get("title", f"Book {bid}"), reason=f"graphical: {fmts_label}")
                 continue
 
+            b_pub = b.get("publication_date") or b.get("pubdate")
             # If cached chunks exist locally, skip exporting or downloading EPUB from SMB share
             if chunk_store.has_chunks(bid) and not rechunk:
                 cached_files = [
@@ -1660,6 +2176,8 @@ def build_graph(
                         "title": b.get("title", f"Book {bid}"),
                         "author": ", ".join(b.get("authors", [])) or "Unknown",
                         "path": cached_files[0] if cached_files else None,
+                        "pubdate": b_pub,
+                        "publication_date": b_pub,
                     }
                 )
             else:
@@ -1676,6 +2194,8 @@ def build_graph(
                             "title": b.get("title", f"Book {bid}"),
                             "author": ", ".join(b.get("authors", [])) or "Unknown",
                             "path": book_file,
+                            "pubdate": b_pub,
+                            "publication_date": b_pub,
                         }
                     )
                 else:
@@ -1689,7 +2209,7 @@ def build_graph(
         )
         raise typer.Exit(1)
 
-    if should_clean:
+    if should_clean and not has_cleaned:
         indexed_books_count = len([n for n, d in store.graph.nodes(data=True) if d.get("type") == "Book"])
         export_reindex_str = f" and re-exporting {indexed_books_count} book(s) already in knowledge graph" if indexed_books_count > 0 else ""
         console.print(
@@ -1699,7 +2219,7 @@ def build_graph(
         obs.export(store, clean=True)
         gml = GraphMLExporter(graphml_dest)
         gml.export(store)
-        if should_export_neo4j:
+        if should_export_neo4j and not has_cleaned_neo4j:
             try:
                 neo_exp = Neo4jExporter.from_config(cfg.neo4j)
                 res = neo_exp.export(store, clean=True, show_progress=True, console=console)
@@ -1709,6 +2229,7 @@ def build_graph(
                     f"{res['nodes_upserted']} nodes, {res['edges_upserted']} relationships "
                     f"in database '{res['database']}' at {res['uri']}."
                 )
+                has_cleaned_neo4j = True
             except Exception as e:
                 console.print(f"[bold red]✗ Failed to export to Neo4j:[/bold red] {e}")
         has_cleaned = True
@@ -1719,6 +2240,14 @@ def build_graph(
         else:
             console.print("[bold yellow]No books available to process.[/bold yellow]")
         raise typer.Exit(0)
+
+    if cfg.recent_ideas.enabled:
+        books_to_process = sort_books_chronologically(books_to_process)
+        dated_count = sum(1 for b in books_to_process if b.get("publication_date") or b.get("pubdate"))
+        console.print(
+            f"[bold cyan]Chronological Ingestion:[/bold cyan] Sorted {len(books_to_process)} book(s) "
+            f"by publication date ({dated_count} dated, {len(books_to_process) - dated_count} undated)."
+        )
 
     console.print(f"[bold green]Starting pipeline for {len(books_to_process)} book(s)...[/bold green]")
 
@@ -1731,6 +2260,8 @@ def build_graph(
     )
 
     completed_in_session = 0
+    session_assigned_chunks = 0
+    session_skipped_chunks = 0
     interrupted = False
     pipeline_start_time = time.perf_counter()
 
@@ -1738,6 +2269,7 @@ def build_graph(
     display_lock = threading.Lock()
     active_tasks_count = 0
     durations: List[float] = []
+    completed_book_records: List[Dict[str, Any]] = []
     abort_event = threading.Event()
 
     def _calc_stats() -> Tuple[float, float, float, float]:
@@ -1756,8 +2288,21 @@ def build_graph(
 
     total_books = len(books_to_process)
     book_state = None
+    ran_batch_postproc_on_last_book = False
+    has_cleaned_neo4j = bool(has_cleaned_neo4j)
+    batch_size_books = cfg.batch_books if cfg.recent_ideas.enabled else 10
     try:
         for book_idx, binfo in enumerate(books_to_process, start=1):
+            # Reload knowledge graph at the start of each new batch to synchronize with previous batch state
+            if completed_in_session > 0 and (completed_in_session % batch_size_books == 0) and graph_file.is_file():
+                preserved_dirty_nodes = set(store.dirty_nodes)
+                preserved_dirty_edges = set(store.dirty_edges)
+                preserved_removed_nodes = set(store.removed_nodes)
+                store.load(graph_file)
+                store.dirty_nodes.update(preserved_dirty_nodes)
+                store.dirty_edges.update(preserved_dirty_edges)
+                store.removed_nodes.update(preserved_removed_nodes)
+                deduplicator.seed_from_graph(store)
             bid = binfo["id"]
             btitle = BookParser.repair_mojibake(binfo["title"])
             bauthor = BookParser.repair_mojibake(binfo["author"])
@@ -1784,10 +2329,23 @@ def build_graph(
                 f"[dim]| {model_banner} | Embeddings: [bold cyan]{cfg.embedding_model}[/bold cyan][/dim]"
             )
 
+            t_book_start = time.perf_counter()
             try:
-                # Check if chunks already exist in local ChunkStore
+                # Check if chunks already exist in local state cache or ChunkStore
                 chunks = None
-                if chunk_store.has_chunks(bid) and not rechunk:
+                if state_cache.is_enabled():
+                    chunks = state_cache.get_cached_chunks(bid, btitle)
+                    if chunks:
+                        console.print(
+                            f"  [bold green]⚡ Reused {len(chunks)} cached atomic chunks from state cache ({state_cache.cache_dir.name}).[/bold green]"
+                        )
+                        try:
+                            chunk_store.save_chunks(bid, btitle, chunks)
+                            book_state.set_chunks(chunks)
+                        except Exception:
+                            pass
+
+                if not chunks and chunk_store.has_chunks(bid) and not rechunk:
                     chunks = chunk_store.load_chunks(bid)
                     if chunks:
                         console.print(f"  Loaded [bold green]{len(chunks)} cached atomic chunks[/bold green] from local storage.")
@@ -1851,9 +2409,13 @@ def build_graph(
                             clean_sec = (sec_title or f"Section #{completed + 1}").strip().replace("\n", " ")
                             if len(clean_sec) > 30:
                                 clean_sec = clean_sec[:27] + "..."
-                            st = chunker.embedding_stats or getattr(embeddings, "embedding_stats", {})
+                            raw_st = getattr(chunker, "embedding_stats", None) or getattr(embeddings, "embedding_stats", {})
+                            st = raw_st if isinstance(raw_st, dict) else {}
                             spd_txt = st.get("speed_texts_per_sec", 0.0)
-                            spd_kb = st.get("speed_chars_per_sec", 0.0) / 1024.0
+                            if not isinstance(spd_txt, (int, float)):
+                                spd_txt = 0.0
+                            raw_kb = st.get("speed_chars_per_sec", 0.0)
+                            spd_kb = (raw_kb / 1024.0) if isinstance(raw_kb, (int, float)) else 0.0
                             if spd_txt > 0:
                                 speed_badge = f" | [bold green]{spd_txt:.1f} sent/s[/bold green] [dim]({spd_kb:.1f} KB/s)[/dim]"
                             else:
@@ -1908,8 +2470,9 @@ def build_graph(
 
                     console.print(f"  Created [bold green]{len(chunks)} atomic thematic chunks[/bold green]{speed_detail}.")
 
-                    # Persist chunks to local storage immediately
+                    # Persist chunks to local storage and book state immediately
                     chunk_store.save_chunks(bid, btitle, chunks)
+                    book_state.set_chunks(chunks)
                     console.print(f"  [dim]Saved chunks to local storage: {chunk_store._chunk_file(bid).name}[/dim]")
 
                 t_book_extract_start = time.perf_counter()
@@ -1941,33 +2504,35 @@ def build_graph(
                     )
 
                     extracted_results: List[Dict[str, Any]] = []
+                    book_assigned_chunks = 0
+                    book_skipped_chunks = 0
+                    book_llm_durations: List[float] = []
 
                     def _update_progress_description():
                         avg_s, p80_s, p18_s, fastest_s = _calc_stats()
                         with stats_lock:
                             cur_active = active_tasks_count
                             num_extracted = len(extracted_results)
+                            cur_book_assigned = book_assigned_chunks
+                            cur_book_skipped = book_skipped_chunks
+                            cur_session_assigned = session_assigned_chunks
+                            cur_session_skipped = session_skipped_chunks
+                            # Prefer current book's measured LLM durations; fallback to session durations
+                            cur_durations = list(book_llm_durations) if len(book_llm_durations) >= 2 else list(durations)
 
-                        # Calculate book analyses ETA formatted as (h, min, sec)
-                        rem_chunks = max(0, len(chunks) - num_extracted)
-                        book_elapsed = time.perf_counter() - t_book_extract_start
-                        if rem_chunks == 0:
-                            book_eta_str = "0h 00m 00s"
-                        elif num_extracted > 0 and book_elapsed > 0:
-                            rate = book_elapsed / num_extracted
-                            book_rem_sec = rate * rem_chunks
-                            book_eta_str = format_eta_h_min_sec(book_rem_sec)
-                        elif durations:
-                            avg_chunk_dur = sum(durations) / len(durations)
-                            concurrency = max(1, min(pool_concurrency, rem_chunks))
-                            book_rem_sec = (rem_chunks * avg_chunk_dur) / concurrency
-                            book_eta_str = format_eta_h_min_sec(book_rem_sec)
-                        else:
-                            book_eta_str = "--h --m --s"
+                        # 1. Calculate book analyses ETA strictly from real LLM-processed chunk durations
+                        book_rem_sec, book_eta_str = compute_book_chunk_eta(
+                            total_chunks=len(chunks),
+                            completed_chunks_count=num_extracted,
+                            durations=cur_durations,
+                            pool_concurrency=pool_concurrency,
+                        )
 
                         desc1 = (
                             f"[bold cyan]Current Book #{bid}[/bold cyan] ('{btitle[:18]}') | "
-                            f"Active: [bold cyan]{cur_active}[/bold cyan] tasks"
+                            f"Active: [bold cyan]{cur_active}[/bold cyan] tasks | "
+                            f"Assigned: [bold green]{cur_book_assigned}[/bold green] | "
+                            f"Skipped: [bold yellow]{cur_book_skipped}[/bold yellow]"
                         )
                         if durations:
                             desc1 += (
@@ -1976,26 +2541,27 @@ def build_graph(
                             )
                         progress.update(book_task, description=desc1, eta_str=book_eta_str)
 
-                        # Calculate overall library processing ETA formatted as (days, h, m)
-                        curr_fraction = (num_extracted / len(chunks)) if chunks else 0.0
-                        overall_completed_fraction = (book_idx - 1) + curr_fraction
-                        overall_remaining_fraction = max(0.0, total_books - overall_completed_fraction)
-                        overall_elapsed = time.perf_counter() - pipeline_start_time
-
-                        if overall_remaining_fraction == 0:
-                            overall_eta_str = "0d 0h 00m"
-                        elif overall_completed_fraction > 0 and overall_elapsed > 0:
-                            overall_rate = overall_elapsed / overall_completed_fraction
-                            overall_rem_sec = overall_rate * overall_remaining_fraction
-                            overall_eta_str = format_eta_days_h_m(overall_rem_sec)
-                        else:
-                            overall_eta_str = "--d --h --m"
+                        # 2. Calculate overall library processing ETA based on average book processing time
+                        # Windowed across at most the last book batch (including extraction, indexing, and batch post-processing)
+                        book_elapsed_so_far = time.perf_counter() - t_book_start
+                        avg_book_time, overall_rem_sec, overall_eta_str, avg_book_fmt = compute_overall_library_eta(
+                            total_books=total_books,
+                            current_book_idx=book_idx,
+                            current_book_rem_sec=book_rem_sec,
+                            current_book_elapsed=book_elapsed_so_far,
+                            completed_book_records=completed_book_records,
+                            batch_window=batch_size_books,
+                        )
 
                         desc2 = (
                             f"[bold magenta]Overall Progress[/bold magenta] ({book_idx}/{total_books} books) | "
+                            f"avg book: [bold yellow]{avg_book_fmt}[/bold yellow] | "
+                            f"Assigned: [bold green]{cur_session_assigned}[/bold green] | "
+                            f"Skipped: [bold yellow]{cur_session_skipped}[/bold yellow] | "
                             f"LLM: [bold green]{cfg.llm_model}[/bold green] | "
                             f"Embeddings: [bold cyan]{cfg.embedding_model}[/bold cyan]"
                         )
+                        curr_fraction = (num_extracted / len(chunks)) if chunks else 0.0
                         progress.update(
                             overall_task,
                             completed=book_idx - 1 + curr_fraction,
@@ -2007,7 +2573,15 @@ def build_graph(
 
                     book_state.set_total_chunks(len(chunks))
 
-                    # 1. Restore any already processed or failed chunks from previous run
+                    # Seed active book_state from state_cache if available
+                    if state_cache.is_enabled():
+                        cached_extractions_seeded = state_cache.populate_state_from_cache(book_state)
+                        if cached_extractions_seeded > 0:
+                            console.print(
+                                f"  [bold green]⚡ Reused {cached_extractions_seeded} raw chunk analyses from state cache ({state_cache.cache_dir.name}).[/bold green]"
+                            )
+
+                    # 1. Restore any already processed or failed chunks from previous run (or state cache)
                     restored_from_state = 0
                     restored_failed = 0
                     for chk in chunks:
@@ -2017,10 +2591,18 @@ def build_graph(
                             extraction = SectionExtraction(**raw_extraction)
                             dur = cached_rec.get("duration", 0.0)
                             srv = cached_rec.get("server_used", "cached")
+                            restored_status = "skipped_limbo" if srv == "skipped_limbo" else "extracted"
                             with stats_lock:
-                                durations.append(dur)
+                                if srv not in ("semantic_fastpath", "skipped_limbo"):
+                                    durations.append(dur)
+                                if srv == "semantic_fastpath":
+                                    book_assigned_chunks += 1
+                                    session_assigned_chunks += 1
+                                elif srv == "skipped_limbo":
+                                    book_skipped_chunks += 1
+                                    session_skipped_chunks += 1
                                 extracted_results.append({
-                                    "status": "extracted",
+                                    "status": restored_status,
                                     "chunk": chk,
                                     "extraction": extraction,
                                     "duration": dur,
@@ -2052,6 +2634,16 @@ def build_graph(
                     deferred_retries: List[Tuple[List[HierarchicalChunk], int, Set[str]]] = []
                     retry_queue: queue.Queue[Tuple[List[HierarchicalChunk], int, Set[str]]] = queue.Queue()
 
+                    # Check if any previously skipped limbo chunks should be recovered from state by size
+                    recovery_th = cfg.effective_limbo_recovery_size
+                    if recovery_th is not None and recovery_th > 0:
+                        recovered_prev = book_state.recover_skipped_limbo_chunks(chunks, threshold=recovery_th)
+                        if recovered_prev:
+                            console.print(
+                                f"  [bold cyan]↺ Recovered {len(recovered_prev)} previously skipped limbo chunk(s) "
+                                f"(size >= {recovery_th}) -> restored to unprocessed queue.[/bold cyan]"
+                            )
+
                     unprocessed_fresh: List[HierarchicalChunk] = []
                     unprocessed_retries: List[Tuple[HierarchicalChunk, int]] = []
 
@@ -2062,6 +2654,142 @@ def build_graph(
                                 unprocessed_fresh.append(chk)
                             else:
                                 unprocessed_retries.append((chk, init_attempt))
+
+                    # Semantic chunk routing if recent ideas are enabled
+                    limbo_candidate_map: Dict[str, Tuple[str, str]] = {}
+                    should_skip_limbo = bool(cfg.skip_limbo_chunks or cfg.recent_ideas.skip_limbo_chunks)
+                    if cfg.recent_ideas.enabled and unprocessed_fresh and embeddings is not None:
+                        idea_index = IdeaEmbeddingIndex.build_from_graph(store, embeddings=embeddings)
+                        if (idea_index.vectors is not None and len(idea_index.idea_names) > 0) or active_neo4j_exporter is not None:
+                            routing_engine = SemanticRoutingEngine(
+                                store=store,
+                                idea_index=idea_index,
+                                embeddings=embeddings,
+                                unassigned_threshold=cfg.similarity_unassigned_threshold,
+                                high_confidence_threshold=cfg.similarity_high_confidence_threshold,
+                                neo4j_exporter=active_neo4j_exporter,
+                                max_batch_chunk_size=recovery_th,
+                            )
+                            routing = routing_engine.route_chunks(unprocessed_fresh)
+                            if routing.embeddings_updated:
+                                try:
+                                    chunk_store.save_chunks(bid, btitle, chunks)
+                                except Exception as e:
+                                    logger.debug(f"Could not save updated chunk embeddings to ChunkStore: {e}")
+
+                            # Priority 2: High confidence chunks (Fast-path: direct assignment, skip LLM extraction completely!)
+                            for rc in routing.high_confidence:
+                                h_chk = rc.chunk
+                                h_idea = rc.matched_idea
+                                if h_idea:
+                                    routing_engine.integrate_high_confidence_chunk(
+                                        rc,
+                                        book_id=bid,
+                                        publication_date=bpubdate,
+                                    )
+                                    sec_node_id = store.add_section(
+                                        book_id=bid,
+                                        chapter_idx=h_chk.chapter_idx,
+                                        title=h_chk.section_title,
+                                        text=h_chk.text,
+                                    )
+                                    store.add_chunk(h_chk)
+                                    store.add_section_concept_link(
+                                        section_node_id=sec_node_id,
+                                        concept_name=h_idea,
+                                        summary=rc.matched_idea_summary,
+                                        quote=h_chk.text[:200] if h_chk.text else "",
+                                    )
+                                    book_state.mark_chunk_processed(
+                                        chunk_id=h_chk.chunk_id,
+                                        chunk_idx=h_chk.chunk_idx,
+                                        section_title=h_chk.section_title,
+                                        extraction_dict={"concepts": [{"name": h_idea, "summary": rc.matched_idea_summary, "category": "Idea"}]},
+                                        duration=0.0,
+                                        server_used="semantic_fastpath",
+                                    )
+                                    with stats_lock:
+                                        book_assigned_chunks += 1
+                                        session_assigned_chunks += 1
+                                        extracted_results.append({
+                                            "status": "extracted",
+                                            "chunk": h_chk,
+                                            "extraction": SectionExtraction(
+                                                concepts=[Concept(name=h_idea, summary=rc.matched_idea_summary, category="Idea")],
+                                                extracted_ideas=[],
+                                            ),
+                                            "duration": 0.0,
+                                            "server_used": "semantic_fastpath",
+                                        })
+                                    progress.advance(book_task, advance=1)
+                                    with display_lock:
+                                        console.print(
+                                            f"  [bold green]⚡ [{h_chk.section_title[:24]} p{h_chk.chunk_idx}][/bold green] "
+                                            f"High-confidence match ({rc.similarity:.2f}) -> directly assigned to '[bold cyan]{h_idea}[/bold cyan]' (skipped LLM)."
+                                        )
+
+                            # Priority 3: Limbo chunks (either skip completely if --skip-limbo-chunks enabled, or validate via LLM)
+                            if should_skip_limbo:
+                                for rc in routing.limbo:
+                                    l_chk = rc.chunk
+                                    sec_node_id = store.add_section(
+                                        book_id=bid,
+                                        chapter_idx=l_chk.chapter_idx,
+                                        title=l_chk.section_title,
+                                        text=l_chk.text,
+                                    )
+                                    store.add_chunk(l_chk)
+                                    book_state.mark_chunk_processed(
+                                        chunk_id=l_chk.chunk_id,
+                                        chunk_idx=l_chk.chunk_idx,
+                                        section_title=l_chk.section_title,
+                                        extraction_dict={"concepts": [], "extracted_ideas": []},
+                                        duration=0.0,
+                                        server_used="skipped_limbo",
+                                    )
+                                    with stats_lock:
+                                        book_skipped_chunks += 1
+                                        session_skipped_chunks += 1
+                                        extracted_results.append({
+                                            "status": "skipped_limbo",
+                                            "chunk": l_chk,
+                                            "extraction": SectionExtraction(concepts=[], extracted_ideas=[]),
+                                            "duration": 0.0,
+                                            "server_used": "skipped_limbo",
+                                        })
+                                    progress.advance(book_task, advance=1)
+                                    with display_lock:
+                                        console.print(
+                                            f"  [dim yellow]⏭ [{l_chk.section_title[:24]} p{l_chk.chunk_idx}][/dim yellow] "
+                                            f"Limbo chunk ({rc.similarity:.2f}) skipped (--skip-limbo-chunks enabled)."
+                                        )
+                            else:
+                                for rc in routing.limbo:
+                                    if rc.matched_idea:
+                                        limbo_candidate_map[rc.chunk.chunk_id] = (rc.matched_idea, rc.matched_idea_summary)
+
+                            # Order LLM extraction queue: Priority 1 (Unassigned, including size-recovered limbo chunks) first
+                            unprocessed_fresh = routing.get_llm_queue_chunks(skip_limbo=should_skip_limbo)
+                            _update_progress_description()
+                            if routing.recovered_from_limbo_count > 0:
+                                with display_lock:
+                                    for rc in routing.recovered_from_limbo:
+                                        r_chk = rc.chunk
+                                        r_sec = getattr(r_chk, "section_title", "")[:24]
+                                        r_idx = getattr(r_chk, "chunk_idx", 0)
+                                        r_sz = get_chunk_size(r_chk)
+                                        console.print(
+                                            f"  [bold cyan]↺ [{r_sec} p{r_idx}][/bold cyan] "
+                                            f"Chunk size {r_sz} >= {recovery_th}: recovered from limbo ({rc.similarity:.2f}) -> restored to unprocessed (Priority 1 queue)."
+                                        )
+                            if routing.high_confidence_count > 0 or routing.limbo_count > 0 or routing.recovered_from_limbo_count > 0:
+                                limbo_desc = "skipped" if should_skip_limbo else "Priority 3 validation"
+                                recov_desc = f" ({routing.recovered_from_limbo_count} recovered from limbo by size)" if routing.recovered_from_limbo_count > 0 else ""
+                                console.print(
+                                    f"  [dim cyan]Semantic Chunk Routing: {routing.unassigned_count} unassigned{recov_desc} (Priority 1 brand-new ideas), "
+                                    f"{routing.high_confidence_count} high-confidence (Priority 2 direct assignment), "
+                                    f"{routing.limbo_count} limbo ({limbo_desc}).[/dim cyan]"
+                                )
 
                     fresh_batches = batch_chunks_by_context_size(
                         unprocessed_fresh,
@@ -2174,6 +2902,7 @@ def build_graph(
                                 with stats_lock:
                                     for chk_item in chunk_batch:
                                         durations.append(chunk_dur)
+                                        book_llm_durations.append(chunk_dur)
                                         extraction = extractions.get(chk_item.chunk_id) or SectionExtraction(concepts=[], extracted_ideas=[])
                                         extracted_results.append({
                                             "status": "extracted",
@@ -2334,8 +3063,13 @@ def build_graph(
                         worker_futures = [
                             chunk_executor.submit(_chunk_worker) for _ in range(pool_concurrency)
                         ]
-                        for f in worker_futures:
-                            f.result()
+                        while not abort_event.is_set() and any(not f.done() for f in worker_futures):
+                            try:
+                                for f in worker_futures:
+                                    if not f.done():
+                                        f.result(timeout=0.15)
+                            except (concurrent.futures.TimeoutError, TimeoutError, FuturesTimeoutError):
+                                pass
 
                     except KeyboardInterrupt:
                         abort_event.set()
@@ -2343,10 +3077,6 @@ def build_graph(
                         for f in worker_futures:
                             f.cancel()
                         chunk_executor.shutdown(wait=False, cancel_futures=True)
-                        import concurrent.futures.thread
-                        with concurrent.futures.thread._global_shutdown_lock:
-                            for t in list(chunk_executor._threads):
-                                concurrent.futures.thread._threads_queues.pop(t, None)
                         if book_state is not None:
                             book_state.data["stacked_chunks"] = {}
                             if book_state.data.get("status") != "fully_indexed":
@@ -2367,9 +3097,117 @@ def build_graph(
                     successful_results = [r for r in extracted_results if r.get("status") == "extracted"]
                     failed_poison_results = [r for r in extracted_results if r.get("status") == "failed_chunk"]
 
-                    # Atomically integrate successful extractions into knowledge graph
-                    store.add_book(bid, title=btitle, author=bauthor, publication_date=bpubdate)
+                    t_finalize_start = time.perf_counter()
+
+                    # Batch-resolve all extracted concepts from this book/article in a single HNSW + embedding batch
+                    all_book_concepts: List[Concept] = []
                     for res in successful_results:
+                        ext = res["extraction"]
+                        if ext and ext.concepts:
+                            all_book_concepts.extend(ext.concepts)
+
+                    # Update overall task before exiting chunk extraction progress bar
+                    book_elapsed_so_far = time.perf_counter() - t_book_start
+                    avg_book_time, overall_rem_sec, overall_eta_str, avg_book_fmt = compute_overall_library_eta(
+                        total_books=total_books,
+                        current_book_idx=book_idx,
+                        current_book_rem_sec=0.0,
+                        current_book_elapsed=book_elapsed_so_far,
+                        completed_book_records=completed_book_records,
+                        batch_window=batch_size_books,
+                    )
+                    progress.update(overall_task, completed=book_idx, eta_str=overall_eta_str)
+
+                # Transparent 4-step Book Finalization Progress Display with detailed sub-step ETAs
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[bold cyan]{task.description}[/bold cyan]"),
+                    BarColumn(bar_width=24),
+                    TaskProgressColumn(),
+                    MofNCompleteColumn(),
+                    TimeElapsedColumn(),
+                    StepRemainingColumn(),
+                    console=console,
+                    transient=False,
+                ) as fin_progress:
+                    fin_task = fin_progress.add_task(
+                        f"  Finalizing Book #{bid} [1/4]: Resolving {len(all_book_concepts)} extracted idea(s)...",
+                        total=4,
+                        completed=0,
+                        eta_str="--m --s",
+                    )
+                    sub_task = fin_progress.add_task(
+                        f"    Resolving ideas...",
+                        total=max(1, len(all_book_concepts)),
+                        completed=0,
+                        eta_str="--m --s",
+                    )
+
+                    # Step 1/4: Resolve & deduplicate extracted concepts (embedding + HNSW + parallel LLM disambiguation)
+                    t_step1 = time.perf_counter()
+
+                    def _on_resolve_progress(stage: str, done_cnt: int, tot_cnt: int, detail: str) -> None:
+                        el = time.perf_counter() - t_step1
+                        rate = (done_cnt / el) if el > 0 else 0.0
+                        rem = ((tot_cnt - done_cnt) / rate) if rate > 0 and tot_cnt > done_cnt else 0.0
+                        sub_eta = format_eta_min_sec(rem) if done_cnt < tot_cnt else "0m 00s"
+                        spd_txt = f" ({rate:.1f}/s)" if rate > 0 else ""
+                        fin_progress.update(
+                            sub_task,
+                            total=tot_cnt,
+                            completed=done_cnt,
+                            eta_str=sub_eta,
+                            description=f"    {detail}{spd_txt}",
+                        )
+                        est_fin_rem = (rem if done_cnt < tot_cnt else 0.0) + max(1.0, el * 0.4)
+                        fin_progress.update(
+                            fin_task,
+                            eta_str=format_eta_min_sec(est_fin_rem),
+                            description=f"  Finalizing Book #{bid} [1/4]: {detail}...",
+                        )
+
+                    resolved_book_concepts = deduplicator.resolve_concepts_batch(
+                        all_book_concepts,
+                        neo4j_exporter=active_neo4j_exporter,
+                        top_k=3,
+                        on_progress=_on_resolve_progress,
+                    )
+                    dur_resolve = time.perf_counter() - t_step1
+                    fin_progress.update(
+                        fin_task,
+                        completed=1,
+                        eta_str=format_eta_min_sec(max(1.0, dur_resolve * 0.3)),
+                        description=f"  Finalizing Book #{bid} [2/4]: Integrating {len(successful_results)} chunk(s) & grounded quotes...",
+                    )
+                    fin_progress.update(
+                        sub_task,
+                        total=max(1, len(successful_results)),
+                        completed=0,
+                        eta_str="--m --s",
+                        description=f"    Integrating chunk 0/{len(successful_results)}...",
+                    )
+
+                    # Step 2/4: Integrate sections, chunks, concepts, and grounded quotes into Knowledge Graph
+                    t_step2 = time.perf_counter()
+                    store.add_book(bid, title=btitle, author=bauthor, publication_date=bpubdate)
+
+                    # Ensure ALL chunks from the book exist in the graph (including skipped chunks)
+                    # so sequential NEXT/PREV edges and section hierarchies remain completely contiguous.
+                    if chunks:
+                        for b_chk in chunks:
+                            store.add_section(
+                                book_id=bid,
+                                chapter_idx=b_chk.chapter_idx,
+                                title=b_chk.section_title,
+                                text=b_chk.text,
+                            )
+                            store.add_chunk(b_chk)
+
+                    resolved_concept_iter = iter(resolved_book_concepts)
+                    upserted_ideas_for_neo4j: Dict[str, Dict[str, Any]] = {}
+
+                    tot_succ = len(successful_results)
+                    for res_idx, res in enumerate(successful_results, start=1):
                         chk = res["chunk"]
                         extraction = res["extraction"]
 
@@ -2382,12 +3220,24 @@ def build_graph(
                         store.add_chunk(chk)
 
                         for concept in extraction.concepts:
-                            canonical_concept = deduplicator.resolve_concept(concept)
-                            store.add_concept(canonical_concept)
+                            canonical_concept = next(resolved_concept_iter, None) or deduplicator.resolve_concept(concept)
+                            store.add_concept(canonical_concept, embedding=canonical_concept.embedding)
+                            if canonical_concept.embedding and len(canonical_concept.embedding) > 1:
+                                upserted_ideas_for_neo4j[canonical_concept.name] = {
+                                    "node_id": f"concept:{canonical_concept.name}",
+                                    "name": canonical_concept.name,
+                                    "brief_description": canonical_concept.brief_description or canonical_concept.summary,
+                                    "detailed_explanation": canonical_concept.detailed_explanation,
+                                    "summary": canonical_concept.summary,
+                                    "category": canonical_concept.category,
+                                    "weight": canonical_concept.weight,
+                                    "embedding": canonical_concept.embedding,
+                                }
 
                             store.add_book_idea_link(
                                 book_id=bid,
                                 concept_name=canonical_concept.name,
+                                publication_date=bpubdate,
                             )
 
                             # Validate textual grounding in this specific chunk
@@ -2407,6 +3257,7 @@ def build_graph(
                                     quote=valid_quote,
                                     brief_description=local_brief,
                                     detailed_explanation=local_detailed,
+                                    publication_date=bpubdate,
                                 )
                                 store.add_section_concept_link(
                                     section_node_id=sec_node_id,
@@ -2425,31 +3276,158 @@ def build_graph(
                                     tgt_concept_name=rel_name,
                                 )
 
-                    # Ensure sequential NEXT and PREV relationships between chunks for this book
+                        if chk.chunk_id in limbo_candidate_map:
+                            matched_cand_idea, matched_cand_summary = limbo_candidate_map[chk.chunk_id]
+                            store.add_idea_support_link(
+                                concept_name=matched_cand_idea,
+                                chunk=chk,
+                                quote=chk.text[:200] if chk.text else "",
+                                brief_description=matched_cand_summary,
+                                publication_date=bpubdate,
+                            )
+                            store.add_book_idea_link(
+                                book_id=bid,
+                                concept_name=matched_cand_idea,
+                                publication_date=bpubdate,
+                            )
+
+                        if res_idx % 5 == 0 or res_idx == tot_succ:
+                            el2 = time.perf_counter() - t_step2
+                            rate2 = (res_idx / el2) if el2 > 0 else 0.0
+                            rem2 = ((tot_succ - res_idx) / rate2) if rate2 > 0 and tot_succ > res_idx else 0.0
+                            sub_eta2 = format_eta_min_sec(rem2) if res_idx < tot_succ else "0m 00s"
+                            spd_txt2 = f" ({rate2:.1f} chk/s)" if rate2 > 0 else ""
+                            fin_progress.update(
+                                sub_task,
+                                completed=res_idx,
+                                eta_str=sub_eta2,
+                                description=f"    Integrating chunk {res_idx}/{tot_succ} & grounded quotes{spd_txt2}...",
+                            )
+
+                    dur_integrate = time.perf_counter() - t_step2
+                    fin_progress.update(
+                        fin_task,
+                        completed=2,
+                        eta_str="0m 02s",
+                        description=f"  Finalizing Book #{bid} [3/4]: Linking sequential chunks & syncing HNSW vectors...",
+                    )
+                    fin_progress.update(
+                        sub_task,
+                        total=1,
+                        completed=0,
+                        eta_str="--m --s",
+                        description="    Linking sequential chunks & syncing Neo4j HNSW index...",
+                    )
+
+                    # Step 3/4: Link sequential chunks for this book and upsert new idea vectors into Neo4j HNSW index
+                    t_step3 = time.perf_counter()
                     store.link_sequential_chunks(book_id=bid)
+                    if active_neo4j_exporter is not None and upserted_ideas_for_neo4j:
+                        try:
+                            active_neo4j_exporter.upsert_idea_vectors_batch(list(upserted_ideas_for_neo4j.values()))
+                        except Exception as e:
+                            logger.debug(f"Could not upsert idea vectors batch to Neo4j: {e}")
+                    dur_link = time.perf_counter() - t_step3
+                    fin_progress.update(
+                        fin_task,
+                        completed=3,
+                        eta_str="0m 01s",
+                        description=f"  Finalizing Book #{bid} [4/4]: Saving Knowledge Graph checkpoint...",
+                    )
+                    fin_progress.update(
+                        sub_task,
+                        total=1,
+                        completed=0,
+                        eta_str="--m --s",
+                        description="    Persisting Knowledge Graph checkpoint to disk...",
+                    )
 
-                    overall_completed_fraction = float(book_idx)
-                    overall_remaining_fraction = max(0.0, total_books - overall_completed_fraction)
-                    overall_elapsed = time.perf_counter() - pipeline_start_time
-                    if overall_remaining_fraction == 0:
-                        overall_eta_str = "0d 0h 00m"
-                    elif overall_completed_fraction > 0 and overall_elapsed > 0:
-                        overall_rate = overall_elapsed / overall_completed_fraction
-                        overall_rem_sec = overall_rate * overall_remaining_fraction
-                        overall_eta_str = format_eta_days_h_m(overall_rem_sec)
+                    # Step 4/4: Finalize book state & persist graph checkpoint (without redundant full-graph chunk re-linking)
+                    t_step4 = time.perf_counter()
+                    if failed_poison_results:
+                        book_state.finalize(has_errors=True)
+                        tracker.mark_partially_indexed(
+                            "build_graph",
+                            bid,
+                            title=btitle,
+                            failed_chunks=len(failed_poison_results),
+                            total_chunks=len(chunks),
+                            metadata={
+                                "assigned_chunks": book_assigned_chunks,
+                                "skipped_chunks": book_skipped_chunks,
+                                "publication_date": bpubdate,
+                            },
+                        )
                     else:
-                        overall_eta_str = "--d --h --m"
+                        book_state.finalize(has_errors=False)
+                        tracker.mark_completed(
+                            "build_graph",
+                            bid,
+                            title=btitle,
+                            metadata={
+                                "indexing_status": "fully_indexed",
+                                "total_chunks": len(chunks),
+                                "assigned_chunks": book_assigned_chunks,
+                                "skipped_chunks": book_skipped_chunks,
+                                "publication_date": bpubdate,
+                            },
+                        )
 
-                    progress.update(overall_task, completed=book_idx, eta_str=overall_eta_str)
+                    store.save(graph_file, link_chunks=False)
+                    dur_save = time.perf_counter() - t_step4
+                    total_fin_dur = time.perf_counter() - t_finalize_start
+                    fin_progress.update(
+                        sub_task,
+                        completed=1,
+                        eta_str="0m 00s",
+                        description=f"    [bold green]✓ Sub-steps complete[/bold green] [dim]({dur_resolve:.1f}s resolve, {dur_integrate:.1f}s integrate, {dur_link:.1f}s link, {dur_save:.1f}s save)[/dim]",
+                    )
+                    fin_progress.update(
+                        fin_task,
+                        completed=4,
+                        eta_str="0m 00s",
+                        description=(
+                            f"  [bold green]✓ Book #{bid} finalized in {total_fin_dur:.2f}s[/bold green] "
+                            f"[dim](resolve={dur_resolve:.2f}s, integrate={dur_integrate:.2f}s, link={dur_link:.2f}s, save={dur_save:.2f}s)[/dim]"
+                        ),
+                    )
 
                 if lightrag_engine is not None and chunks:
                     try:
                         valid_chunks = [r["chunk"] for r in successful_results]
                         if valid_chunks:
                             console.print(f"  [dim cyan]Indexing {len(valid_chunks)} chunk(s) into LightRAG engine...[/dim cyan]")
-                            with console.status(f"[cyan]Indexing LightRAG ({len(valid_chunks)} chunks)...[/cyan]") as lrag_status:
+                            with Progress(
+                                SpinnerColumn(),
+                                TextColumn("[bold cyan]{task.description}[/bold cyan]"),
+                                BarColumn(),
+                                TaskProgressColumn(),
+                                MofNCompleteColumn(),
+                                TimeElapsedColumn(),
+                                StepRemainingColumn(),
+                                console=console,
+                            ) as lrag_progress:
+                                lrag_task = lrag_progress.add_task(
+                                    f"  Indexing LightRAG chunks...",
+                                    total=len(valid_chunks),
+                                    completed=0,
+                                    eta_str="--m --s",
+                                )
+                                t_lrag_start = time.perf_counter()
+
                                 def _on_inline_progress(done: int, tot: int):
-                                    lrag_status.update(f"[cyan]Indexing LightRAG: {done}/{tot} chunks ({int(done/tot*100)}%)...[/cyan]")
+                                    elapsed = time.perf_counter() - t_lrag_start
+                                    rate = (done / elapsed) if elapsed > 0 else 0.0
+                                    rem_sec = ((tot - done) / rate) if rate > 0 and tot > done else 0.0
+                                    eta_str = format_eta_min_sec(rem_sec) if done < tot else "0m 00s"
+                                    spd_str = f" ({rate:.1f} chk/s)" if rate > 0 else ""
+                                    lrag_progress.update(
+                                        lrag_task,
+                                        completed=done,
+                                        total=tot,
+                                        eta_str=eta_str,
+                                        description=f"  Indexing LightRAG: [cyan]{done}/{tot}[/cyan] chunks{spd_str}",
+                                    )
 
                                 lightrag_engine.insert_chunks(
                                     valid_chunks,
@@ -2458,46 +3436,98 @@ def build_graph(
                                     batch_size=getattr(cfg, "lightrag_max_parallel_insert", 6) * 2,
                                     on_progress=_on_inline_progress,
                                 )
+                                lrag_progress.update(
+                                    lrag_task,
+                                    completed=len(valid_chunks),
+                                    eta_str="0m 00s",
+                                    description=f"  [bold green]✓ Indexed {len(valid_chunks)} chunks into LightRAG[/bold green]",
+                                )
                             console.print(f"  [dim green]✓ Indexed into LightRAG.[/dim green]")
                     except Exception as e:
                         console.print(f"  [yellow]Warning: LightRAG indexing failed for '{btitle}': {e}[/yellow]")
 
-                # Finalize book state:
-                # If there are poison pill failed chunks -> partially indexed, state retained.
-                # If no errors -> fully indexed, state file deleted.
                 if failed_poison_results:
-                    book_state.finalize(has_errors=True)
-                    tracker.mark_partially_indexed(
-                        "build_graph",
-                        bid,
-                        title=btitle,
-                        failed_chunks=len(failed_poison_results),
-                        total_chunks=len(chunks),
-                    )
                     console.print(
-                        f"  [bold yellow]⚠ Book #{bid} partially indexed: {len(successful_results)}/{len(chunks)} chunks succeeded, "
+                        f"  [bold yellow]⚠ Book #{bid} partially indexed: {len(successful_results)}/{len(chunks)} chunks succeeded "
+                        f"(assigned={book_assigned_chunks}, skipped={book_skipped_chunks}), "
                         f"{len(failed_poison_results)} failed poison chunk(s) skipped. State retained at {book_state.file_path}.[/bold yellow]"
                     )
                 else:
-                    book_state.finalize(has_errors=False)
-                    tracker.mark_completed(
-                        "build_graph",
-                        bid,
-                        title=btitle,
-                        metadata={
-                            "indexing_status": "fully_indexed",
-                            "total_chunks": len(chunks),
-                            "publication_date": bpubdate,
-                        },
-                    )
                     console.print(
-                        f"  [dim green]✓ Book #{bid} fully indexed (all {len(chunks)} chunks succeeded). State retained at {book_state.file_path}.[/dim green]"
+                        f"  [dim green]✓ Book #{bid} fully indexed (all {len(chunks)} chunks succeeded; "
+                        f"assigned={book_assigned_chunks}, skipped={book_skipped_chunks}). State retained at {book_state.file_path}.[/dim green]"
                     )
 
-                # Incremental persistence: save graph checkpoint after every processed book
-                store.save(graph_file)
                 completed_in_session += 1
-                console.print(f"  [dim green]✓ Book #{bid} concepts integrated and graph checkpoint saved.[/dim green]")
+                t_book_end = time.perf_counter()
+                book_total_dur = t_book_end - t_book_start
+                completed_book_records.append({
+                    "book_id": bid,
+                    "book_duration": book_total_dur,
+                    "batch_overhead_share": 0.0,
+                    "effective_total": book_total_dur,
+                })
+                console.print(f"  [dim green]✓ Book #{bid} concepts integrated and graph checkpoint saved ({book_total_dur:.1f}s).[/dim green]")
+
+                # Inter-batch post-processing & incremental Neo4j export of affected nodes
+                batch_size = cfg.batch_books if cfg.recent_ideas.enabled else 10
+                is_batch_end = (completed_in_session % batch_size == 0) or (book_idx == len(books_to_process))
+                should_dual_pass = cfg.dual_pass.enabled if dual_pass is None else dual_pass
+                if is_batch_end and not interrupted and store.graph.number_of_nodes() > 0:
+                    t_batch_start = time.perf_counter()
+                    if should_dual_pass:
+                        console.print(f"\n  [bold cyan]═══ Running Inter-Batch Dual-Pass Idea Consolidation (Batch size: {batch_size}) ═══[/bold cyan]")
+                        try:
+                            postprocessor = IdeaPostProcessor.from_settings(
+                                cfg,
+                                pool=extractor.pool,
+                                embeddings=embeddings,
+                            )
+                            pp_report = postprocessor.process_graph(store, console=console)
+                            store.save(graph_file, link_chunks=False)
+                            if book_idx == len(books_to_process):
+                                ran_batch_postproc_on_last_book = True
+                            console.print(
+                                f"  [bold green]✓ Inter-Batch Postprocessing Complete ({pp_report.duration_seconds:.2f}s):[/bold green] "
+                                f"{pp_report.total_clusters} clusters synthesized/consolidated."
+                            )
+                        except Exception as e:
+                            console.print(f"  [bold yellow]⚠ Inter-Batch Idea Postprocessor failed:[/bold yellow] {e}")
+
+                    # Export ONLY affected nodes (chunks, ideas, books, sections) and relationships to Neo4j after each batch
+                    should_export_neo4j = cfg.neo4j.enabled if export_neo4j is None else export_neo4j
+                    if should_export_neo4j and store.has_dirty_changes():
+                        try:
+                            batch_neo_clean = bool((should_clean or cfg.neo4j.clean_export) and not has_cleaned_neo4j)
+                            console.print(
+                                f"  [bold cyan]Syncing Batch Affected Nodes to Neo4j "
+                                f"({len(store.dirty_nodes)} nodes, {len(store.dirty_edges)} relationships)...[/bold cyan]"
+                            )
+                            neo_exp = Neo4jExporter.from_config(cfg.neo4j)
+                            res = neo_exp.export(
+                                store,
+                                clean=batch_neo_clean,
+                                only_affected=not batch_neo_clean,
+                                show_progress=True,
+                                console=console,
+                            )
+                            has_cleaned_neo4j = True
+                            console.print(
+                                f"  [bold green]✓ Batch Neo4j Sync Complete:[/bold green] "
+                                f"upserted {res['nodes_upserted']} affected nodes, {res['edges_upserted']} relationships "
+                                f"in '{res['database']}'."
+                            )
+                        except Exception as e:
+                            console.print(f"  [bold yellow]⚠ Batch Neo4j sync failed:[/bold yellow] {e}")
+
+                    # Attribute batch postprocessing & sync overhead evenly to the books of this batch
+                    batch_overhead = time.perf_counter() - t_batch_start
+                    rem_in_batch = completed_in_session % batch_size
+                    books_in_this_batch = rem_in_batch if rem_in_batch != 0 else batch_size
+                    overhead_per_book = batch_overhead / max(1, books_in_this_batch)
+                    for r in completed_book_records[-books_in_this_batch:]:
+                        r["batch_overhead_share"] = overhead_per_book
+                        r["effective_total"] = r["book_duration"] + overhead_per_book
 
                 if limit is not None and limit > 0 and completed_in_session >= limit:
                     console.print(
@@ -2544,10 +3574,14 @@ def build_graph(
 
         if store.graph.number_of_nodes() > 0:
             should_dual_pass = cfg.dual_pass.enabled if dual_pass is None else dual_pass
-            if should_dual_pass and not interrupted:
+            if should_dual_pass and not interrupted and not ran_batch_postproc_on_last_book:
                 console.print("\n[bold cyan]═══ Running Dual-Pass Idea Postprocessor & Synthesis ═══[/bold cyan]")
                 try:
-                    postprocessor = IdeaPostProcessor.from_settings(cfg)
+                    postprocessor = IdeaPostProcessor.from_settings(
+                        cfg,
+                        pool=extractor.pool,
+                        embeddings=embeddings,
+                    )
                     pp_report = postprocessor.process_graph(store, console=console)
                     console.print(
                         f"[bold green]✓ Idea Postprocessing Complete ({pp_report.duration_seconds:.2f}s):[/bold green] "
@@ -2558,37 +3592,48 @@ def build_graph(
                 except Exception as e:
                     console.print(f"[bold red]✗ Idea Postprocessor failed:[/bold red] {e}")
 
-            store.save(graph_file)
-            final_clean = should_clean and not has_cleaned
-            try:
-                obs = ObsidianExporter(vault_dest)
-                obs.export(store, clean=final_clean)
-            except Exception as e:
-                console.print(f"[bold yellow]⚠ Obsidian export skipped or incomplete:[/bold yellow] {e}")
-
-            try:
-                gml = GraphMLExporter(graphml_dest)
-                gml.export(store)
-            except Exception as e:
-                console.print(f"[bold yellow]⚠ GraphML export skipped or incomplete:[/bold yellow] {e}")
-
-            should_export_neo4j = cfg.neo4j.enabled if export_neo4j is None else export_neo4j
-            if should_export_neo4j:
+            store.save(graph_file, link_chunks=False)
+            if not interrupted:
+                final_clean = should_clean and not has_cleaned
                 try:
-                    console.print("\n[bold cyan]Exporting Knowledge Graph to Neo4j...[/bold cyan]")
-                    neo_clean = final_clean or (cfg.neo4j.clean_export and not has_cleaned)
-                    neo_exp = Neo4jExporter.from_config(cfg.neo4j)
-                    res = neo_exp.export(store, clean=neo_clean, show_progress=True, console=console)
-                    clean_msg = f" (clean start: purged {res['cleaned_nodes']} previous nodes)" if res.get("clean_start") else ""
-                    console.print(
-                        f"[bold green]✓ Neo4j Export Complete{clean_msg}:[/bold green] "
-                        f"{res['nodes_upserted']} nodes, {res['edges_upserted']} relationships "
-                        f"in database '{res['database']}' at {res['uri']}."
-                    )
+                    obs = ObsidianExporter(vault_dest)
+                    obs.export(store, clean=final_clean)
                 except Exception as e:
-                    console.print(f"[bold red]✗ Failed to export to Neo4j:[/bold red] {e}")
+                    console.print(f"[bold yellow]⚠ Obsidian export skipped or incomplete:[/bold yellow] {e}")
 
-        if durations:
+                try:
+                    gml = GraphMLExporter(graphml_dest)
+                    gml.export(store)
+                except Exception as e:
+                    console.print(f"[bold yellow]⚠ GraphML export skipped or incomplete:[/bold yellow] {e}")
+
+                should_export_neo4j = cfg.neo4j.enabled if export_neo4j is None else export_neo4j
+                neo_clean = final_clean or (cfg.neo4j.clean_export and not has_cleaned_neo4j)
+                if should_export_neo4j and (neo_clean or store.has_dirty_changes()):
+                    try:
+                        console.print(
+                            "\n[bold cyan]Exporting Affected Knowledge Graph Nodes to Neo4j...[/bold cyan]"
+                            if not neo_clean
+                            else "\n[bold cyan]Exporting Knowledge Graph to Neo4j...[/bold cyan]"
+                        )
+                        neo_exp = Neo4jExporter.from_config(cfg.neo4j)
+                        res = neo_exp.export(
+                            store,
+                            clean=neo_clean,
+                            only_affected=not neo_clean,
+                            show_progress=True,
+                            console=console,
+                        )
+                        clean_msg = f" (clean start: purged {res['cleaned_nodes']} previous nodes)" if res.get("clean_start") else ""
+                        console.print(
+                            f"[bold green]✓ Neo4j Export Complete{clean_msg}:[/bold green] "
+                            f"{res['nodes_upserted']} nodes, {res['edges_upserted']} relationships "
+                            f"in database '{res['database']}' at {res['uri']}."
+                        )
+                    except Exception as e:
+                        console.print(f"[bold red]✗ Failed to export to Neo4j:[/bold red] {e}")
+
+        if durations and not interrupted:
             avg_s, p80_s, p18_s, fastest_s = _calc_stats()
             console.print(
                 f"\n[bold cyan]Concept Extraction Performance:[/bold cyan] "
@@ -2599,18 +3644,19 @@ def build_graph(
                 f"[dim](across {len(durations)} extracted chunk tasks)[/dim]"
             )
 
-        pools_to_report = [extractor.pool]
-        if hasattr(embeddings, "pool") and getattr(embeddings, "pool", None) is not extractor.pool:
-            pools_to_report.append(embeddings.pool)
-        _print_ollama_server_stats(pools_to_report, console=console)
+        if not interrupted:
+            pools_to_report = [extractor.pool]
+            if hasattr(embeddings, "pool") and getattr(embeddings, "pool", None) is not extractor.pool:
+                pools_to_report.append(embeddings.pool)
+            _print_ollama_server_stats(pools_to_report, console=console)
 
         if interrupted:
             console.print(
                 f"[bold yellow]Graph build stopped by user.[/bold yellow] "
                 f"Completed in this session: [bold green]{completed_in_session}[/bold green] book(s). "
-                f"Knowledge graph checkpoint and Obsidian vault preserved."
+                f"Knowledge graph checkpoint preserved at {graph_file}. (Exporters skipped due to cancellation)"
             )
-            raise typer.Exit(code=0)
+            raise typer.Exit(code=130)
 
     # Persist graph to JSON and exports
     console.print(f"\n[bold green]✓ Knowledge Graph persisted to:[/bold green] {graph_file}")
@@ -2619,10 +3665,23 @@ def build_graph(
 
     # Display final graph statistics
     st = store.stats()
+    cache_info = ""
+    if state_cache.is_enabled():
+        c_stats = state_cache.stats()
+        cache_info = (
+            f"\n\n[bold cyan]Local State Cache Statistics ({state_cache.cache_dir.name}):[/bold cyan]\n"
+            f"  • Books Reused from Cache: [bold green]{c_stats['reused_books_count']}[/bold green]\n"
+            f"  • Atomic Chunks Reused (Chunking Bypassed): [bold green]{c_stats['reused_chunks_count']}[/bold green]\n"
+            f"  • Raw Chunk Analyses Reused (LLM Bypassed): [bold green]{c_stats['reused_extractions_count']}[/bold green]"
+        )
+
     console.print(
         Panel.fit(
             f"[bold]Total Nodes:[/bold] {st['total_nodes']}\n"
-            f"[bold]Total Edges:[/bold] {st['total_edges']}\n\n"
+            f"[bold]Total Edges:[/bold] {st['total_edges']}\n"
+            f"[bold]Assigned Chunks (Fast-Path):[/bold] {session_assigned_chunks}\n"
+            f"[bold]Skipped Chunks (Limbo):[/bold] {session_skipped_chunks}"
+            f"{cache_info}\n\n"
             f"[bold green]Node Types:[/bold green]\n"
             + "\n".join(f"  • {k}: {v}" for k, v in st["node_types"].items())
             + "\n\n[bold green]Relationship Types:[/bold green]\n"
@@ -2638,11 +3697,58 @@ def show_status(
     state_file: Optional[str] = typer.Option(None, "--state-file", help="Custom path for progress checkpoint JSON file."),
 ):
     """Display progress and checkpoint summary for batch operations."""
+    config_path = _resolve_opt(config_path)
+    state_file = _resolve_opt(state_file)
     cfg = get_settings(config_path)
     tracker_path = Path(state_file) if state_file else cfg.resolved_state_file
     tracker = ProgressTracker(tracker_path)
     clean_summary = tracker.summary("clean_metadata")
     graph_summary = tracker.summary("build_graph")
+
+    # Aggregate assigned and skipped chunks from per-book state files & tracker records
+    book_states_dir = cfg.resolved_output_dir / ".book_states"
+    state_files = sorted(book_states_dir.glob("book_*_state.json")) if book_states_dir.is_dir() else []
+    per_book_chunk_stats: Dict[str, Tuple[int, int]] = {}
+    parsed_state_records: List[Dict[str, Any]] = []
+    for sf in state_files:
+        try:
+            with open(sf, "r", encoding="utf-8") as f:
+                sdata = json.load(f)
+            bid_str = str(sdata.get("book_id", sf.stem))
+            proc_map = sdata.get("processed_chunks", {})
+            b_assigned = sdata.get("assigned_chunks_count")
+            if b_assigned is None:
+                b_assigned = sum(
+                    1
+                    for rec in proc_map.values()
+                    if isinstance(rec, dict) and (rec.get("server_used") == "semantic_fastpath" or rec.get("status") == "assigned")
+                )
+            b_skipped = sdata.get("skipped_chunks_count")
+            if b_skipped is None:
+                b_skipped = sum(
+                    1
+                    for rec in proc_map.values()
+                    if isinstance(rec, dict) and (rec.get("server_used") == "skipped_limbo" or rec.get("status") == "skipped_limbo")
+                )
+            per_book_chunk_stats[bid_str] = (int(b_assigned), int(b_skipped))
+            sdata["_computed_assigned"] = int(b_assigned)
+            sdata["_computed_skipped"] = int(b_skipped)
+            parsed_state_records.append(sdata)
+        except Exception:
+            pass
+
+    # Merge tracker metadata for books whose state files might not be in per_book_chunk_stats
+    graph_records = tracker._get_op_records("build_graph")
+    for bid_str, rec in graph_records.items():
+        if bid_str not in per_book_chunk_stats:
+            meta = rec.get("metadata") or {}
+            per_book_chunk_stats[bid_str] = (
+                int(meta.get("assigned_chunks", 0)),
+                int(meta.get("skipped_chunks", 0)),
+            )
+
+    total_assigned_chunks = sum(v[0] for v in per_book_chunk_stats.values())
+    total_skipped_chunks = sum(v[1] for v in per_book_chunk_stats.values())
 
     table = Table(title=f"Bookeeper Checkpoint State ({tracker_path.name})", show_header=True)
     table.add_column("Operation", style="bold cyan")
@@ -2650,6 +3756,8 @@ def show_status(
     table.add_column("Partially Indexed", style="cyan", justify="right")
     table.add_column("Skipped (Graphical)", style="yellow", justify="right")
     table.add_column("Failed", style="bold red", justify="right")
+    table.add_column("Assigned Chunks", style="bold green", justify="right")
+    table.add_column("Skipped Chunks", style="bold yellow", justify="right")
     table.add_column("Total Recorded", style="white", justify="right")
 
     table.add_row(
@@ -2658,6 +3766,8 @@ def show_status(
         str(clean_summary.get("partially_indexed", 0)),
         str(clean_summary.get("skipped", 0)),
         str(clean_summary["failed"]),
+        "0",
+        "0",
         str(clean_summary["total_recorded"]),
     )
     table.add_row(
@@ -2666,32 +3776,33 @@ def show_status(
         str(graph_summary.get("partially_indexed", 0)),
         str(graph_summary.get("skipped", 0)),
         str(graph_summary["failed"]),
+        str(total_assigned_chunks),
+        str(total_skipped_chunks),
         str(graph_summary["total_recorded"]),
     )
     console.print(table)
+    console.print(
+        f"[bold cyan]Chunk Routing Summary:[/bold cyan] "
+        f"Assigned Chunks: [bold green]{total_assigned_chunks}[/bold green] | "
+        f"Skipped Chunks (Limbo): [bold yellow]{total_skipped_chunks}[/bold yellow]"
+    )
 
-    book_states_dir = cfg.resolved_output_dir / ".book_states"
-    if book_states_dir.is_dir():
-        state_files = list(book_states_dir.glob("book_*_state.json"))
-        if state_files:
-            console.print(f"[dim cyan]Per-book state checkpoints ({len(state_files)} found in {book_states_dir}):[/dim cyan]")
-            for sf in state_files[:5]:
-                try:
-                    with open(sf, "r", encoding="utf-8") as f:
-                        sdata = json.load(f)
-                    b_status = sdata.get("status", "unknown")
-                    b_proc = len(sdata.get("processed_chunks", {}))
-                    b_fail = len(sdata.get("failed_chunks", {}))
-                    b_tot = sdata.get("total_chunks", 0)
-                    b_title = sdata.get("book_title", sf.stem)
-                    console.print(
-                        f"  • [bold]{b_title}[/bold] (ID: {sdata.get('book_id')}): status=[cyan]{b_status}[/cyan], "
-                        f"processed={b_proc}/{b_tot}, failed={b_fail}"
-                    )
-                except Exception:
-                    pass
-            if len(state_files) > 5:
-                console.print(f"  [dim]... and {len(state_files) - 5} more.[/dim]")
+    if parsed_state_records:
+        console.print(f"[dim cyan]Per-book state checkpoints ({len(parsed_state_records)} found in {book_states_dir}):[/dim cyan]")
+        for sdata in parsed_state_records[:5]:
+            b_status = sdata.get("status", "unknown")
+            b_proc = len(sdata.get("processed_chunks", {}))
+            b_fail = len(sdata.get("failed_chunks", {}))
+            b_tot = sdata.get("total_chunks", 0)
+            b_assigned = sdata.get("_computed_assigned", 0)
+            b_skipped = sdata.get("_computed_skipped", 0)
+            b_title = sdata.get("book_title", "Unknown")
+            console.print(
+                f"  • [bold]{b_title}[/bold] (ID: {sdata.get('book_id')}): status=[cyan]{b_status}[/cyan], "
+                f"processed={b_proc}/{b_tot}, assigned={b_assigned}, skipped={b_skipped}, failed={b_fail}"
+            )
+        if len(parsed_state_records) > 5:
+            console.print(f"  [dim]... and {len(parsed_state_records) - 5} more.[/dim]")
 
     console.print(
         f"[dim]Active Models: LLM: [bold green]{cfg.llm_model}[/bold green] | "
@@ -2855,6 +3966,11 @@ def export_command(
         "--clean/--no-clean",
         help="Perform clean start on export destinations before exporting (default: config.yaml clean_export).",
     ),
+    backfill_embeddings: bool = typer.Option(
+        True,
+        "--backfill-embeddings/--no-backfill-embeddings",
+        help="Automatically backfill missing embeddings on existing Idea and Chunk nodes before exporting.",
+    ),
 ):
     """
     Export current Knowledge Graph to all destinations (Obsidian, GraphML, and Neo4j)
@@ -2881,6 +3997,24 @@ def export_command(
     if node_count == 0:
         console.print("[yellow]Knowledge graph contains 0 nodes. Nothing to export.[/yellow]")
         return
+
+    if backfill_embeddings:
+        try:
+            from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings
+            emb_client = FailoverOllamaEmbeddings.from_settings(cfg, model=cfg.embedding_model)
+            bf_res = store.backfill_missing_embeddings(
+                emb_client,
+                console=console,
+                chunks_dir=cfg.resolved_chunks_dir,
+            )
+            if bf_res["ideas_embedded"] > 0 or bf_res["chunks_embedded"] > 0:
+                store.save(target_graph_file, link_chunks=False)
+                console.print(
+                    f"[bold green]✓ Backfilled and saved missing embeddings:[/bold green] "
+                    f"{bf_res['ideas_embedded']} ideas, {bf_res['chunks_embedded']} chunks."
+                )
+        except Exception as e:
+            logger.debug(f"Could not backfill embeddings before export: {e}")
 
     effective_clean = cfg.clean_export if clean is None else clean
     target_vault = Path(vault_dir).expanduser().resolve() if vault_dir else cfg.resolved_output_dir / "obsidian_vault"
@@ -2932,6 +4066,11 @@ def export_neo4j_command(
         "--clean/--no-clean",
         help="Perform clean start: delete all existing content in target Neo4j database before export (default: config.yaml neo4j.clean_export).",
     ),
+    backfill_embeddings: bool = typer.Option(
+        True,
+        "--backfill-embeddings/--no-backfill-embeddings",
+        help="Automatically backfill missing embeddings on existing Idea and Chunk nodes before exporting.",
+    ),
 ):
     """
     Export and upsert the current Knowledge Graph into Neo4j.
@@ -2971,6 +4110,24 @@ def export_neo4j_command(
     if node_count == 0:
         console.print("[yellow]Knowledge graph contains 0 nodes. Nothing to export.[/yellow]")
         return
+
+    if backfill_embeddings:
+        try:
+            from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings
+            emb_client = FailoverOllamaEmbeddings.from_settings(cfg, model=cfg.embedding_model)
+            bf_res = store.backfill_missing_embeddings(
+                emb_client,
+                console=console,
+                chunks_dir=cfg.resolved_chunks_dir,
+            )
+            if bf_res["ideas_embedded"] > 0 or bf_res["chunks_embedded"] > 0:
+                store.save(target_graph_file, link_chunks=False)
+                console.print(
+                    f"[bold green]✓ Backfilled and saved missing embeddings:[/bold green] "
+                    f"{bf_res['ideas_embedded']} ideas, {bf_res['chunks_embedded']} chunks."
+                )
+        except Exception as e:
+            logger.debug(f"Could not backfill embeddings before Neo4j export: {e}")
 
     export_type_str = (
         "[bold red]clean start + upsert[/bold red] (delete all existing content, then insert fresh)"
@@ -3252,6 +4409,9 @@ def _execute_single_verification(
     debug: Optional[bool] = None,
     debug_output: Optional[str] = None,
     stats_output: Optional[str] = None,
+    tau: Optional[float] = None,
+    states_dir: Optional[str] = None,
+    tau_loss: Optional[float] = None,
     cfg: Optional[Settings] = None,
 ) -> Optional[Dict[str, Any]]:
     """
@@ -3265,6 +4425,9 @@ def _execute_single_verification(
     book_id = _resolve_opt(book_id)
     all_books = _resolve_opt(all_books, False)
     threshold = _resolve_opt(threshold)
+    tau = _resolve_opt(tau)
+    states_dir = _resolve_opt(states_dir)
+    tau_loss = _resolve_opt(tau_loss)
     chunks_dir = _resolve_opt(chunks_dir)
     model = _resolve_opt(model)
     temperature = _resolve_opt(temperature)
@@ -3277,6 +4440,9 @@ def _execute_single_verification(
     debug = _resolve_opt(debug)
     debug_output = _resolve_opt(debug_output)
     stats_output = _resolve_opt(stats_output)
+    tau = _resolve_opt(tau)
+    states_dir = _resolve_opt(states_dir)
+    tau_loss = _resolve_opt(tau_loss)
 
     if cfg is None:
         cfg = _get_effective_settings(
@@ -3846,13 +5012,29 @@ def _execute_single_verification(
         cand_path_a = _resolve_candidate_path(graph_file)
         cand_path_b = _resolve_candidate_path(compare_graph)
 
+        temp_backup_targets: List[ResolvedBackupTarget] = []
+        archive_suffixes = (".zip", ".7z", ".tar", ".gz", ".tgz")
+
         target_graph_a: Optional[Path] = None
         target_graph_b: Optional[Path] = None
         branch_a_label = "Baseline (A)"
         branch_b_label = "Candidate (B)"
 
+        # 0. Check if either target is a backup archive (.zip, .7z)
+        if cand_path_a and cand_path_a.is_file() and any(cand_path_a.name.lower().endswith(s) for s in archive_suffixes):
+            bt_a = resolve_backup_target(cand_path_a, label_fallback="Baseline (A)", console=console)
+            temp_backup_targets.append(bt_a)
+            target_graph_a = bt_a.graph_file
+            branch_a_label = bt_a.label
+
+        if cand_path_b and cand_path_b.is_file() and any(cand_path_b.name.lower().endswith(s) for s in archive_suffixes):
+            bt_b = resolve_backup_target(cand_path_b, label_fallback="Candidate (B)", console=console)
+            temp_backup_targets.append(bt_b)
+            target_graph_b = bt_b.graph_file
+            branch_b_label = bt_b.label
+
         # 1. If compare_graph points to an A/B test result directory containing both branches:
-        if cand_path_b and cand_path_b.is_dir():
+        if not target_graph_b and cand_path_b and cand_path_b.is_dir():
             run_graphs = _discover_graphs_from_run_dir(cand_path_b)
             if run_graphs:
                 target_graph_a, target_graph_b, branch_a_label, branch_b_label = run_graphs
@@ -3944,67 +5126,12 @@ def _execute_single_verification(
             warmup_verifier = IdeaVerifier(pool=pool, model_name=effective_model)
             warmup_verifier.warmup(timeout=90)
 
-        t_start = time.perf_counter()
-        tot_delta = 0.0
-        tot_trunc = 0.0
-
-        cc_progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[bold cyan]Cross-Check Progress:[/bold cyan]"),
-            BarColumn(bar_width=25),
-            TaskProgressColumn(),
-            MofNCompleteColumn(),
-            TextColumn("{task.fields[stats_line]}"),
+        with CrossCheckProgressTracker(
+            total_blocks=effective_blocks,
+            branch_a_label=branch_a_label,
+            branch_b_label=branch_b_label,
             console=console,
-        )
-        tot_cc_task = cc_progress.add_task("cc_total", total=effective_blocks, completed=0, stats_line="")
-        cur_cc_line = Text.from_markup("[bold blue]Current Block:[/bold blue] Initializing cross-check auditor...")
-
-        with Live(Group(cur_cc_line, cc_progress), console=console, refresh_per_second=10) as live:
-            def _on_cc_progress(completed: int, total: int, block_info: str, item: Optional[CrossCheckBlockResult] = None):
-                nonlocal tot_delta, tot_trunc
-                if item is not None:
-                    tot_delta += item.delta_recall
-                    tot_trunc += item.new_system.truncation_rate
-                    avg_d = tot_delta / completed if completed > 0 else 0.0
-                    cur_text = (
-                        f"[bold blue]Current Block:[/bold blue] {block_info} | "
-                        f"ΔQA Recall: [{'green' if avg_d >= 0 else 'red'}]{avg_d * 100:+.1f}% pts[/] | "
-                        f"Net Int B: [magenta]{item.new_system.net_integrity_score:+.2f}[/magenta] | "
-                        f"Disprop: [cyan]{item.chunk_disproportion:.2f}[/cyan]"
-                    )
-                else:
-                    cur_text = f"[bold blue]Current Block:[/bold blue] {block_info} | [bold yellow]Auditing...[/bold yellow]"
-
-                elapsed = time.perf_counter() - t_start
-                rate = (completed / elapsed) if elapsed > 0 else 0.0
-                if completed > 0 and total > completed and rate > 0:
-                    rem_sec = (total - completed) / rate
-                    eta_str = format_eta_min_sec(rem_sec)
-                elif completed >= total:
-                    eta_str = "0m 00s"
-                else:
-                    eta_str = "--"
-
-                if rate >= 1.0:
-                    speed_str = f"{rate:.2f} blk/s"
-                elif rate > 0:
-                    sec_per_blk = 1.0 / rate
-                    speed_str = f"{sec_per_blk:.1f} s/blk ({rate:.3f} blk/s)"
-                else:
-                    speed_str = "-- blk/s"
-
-                stats_str = f"[cyan]{speed_str}[/cyan] | [yellow]ETA: {eta_str}[/yellow]"
-                cc_progress.update(tot_cc_task, completed=completed, total=total, stats_line=stats_str)
-                live.update(Group(Text.from_markup(cur_text), cc_progress))
-                if item is not None and (completed % 5 == 0 or completed == total):
-                    pct = (completed / total * 100) if total > 0 else 0.0
-                    console.print(
-                        f"[bold cyan][Cross-Check][/bold cyan] {completed}/{total} blocks ({pct:.1f}%)"
-                        f" | {speed_str} | ETA: {eta_str}"
-                    )
-                    sys.stdout.flush()
-
+        ) as tracker:
             report = run_cross_check(
                 store_a=store_a,
                 store_b=store_b,
@@ -4017,7 +5144,7 @@ def _execute_single_verification(
                 seed=seed,
                 print_chunks=int(print_chunks or 0),
                 console=console,
-                progress_callback=_on_cc_progress,
+                progress_callback=tracker.on_progress,
             )
 
         # 1. Summary Metrics Table
@@ -4172,26 +5299,293 @@ def _execute_single_verification(
         console.print(Panel(legend_content, title="[bold]📖 Metrics Legend[/bold]", border_style="dim", expand=False))
 
         # 4. Save JSON Report, Standalone Statistics, and Debug Trace
-        return _save_verification_artifacts(
-            report=report,
-            effective_mode=effective_mode,
-            effective_model=effective_model,
-            output_report=output_report or str(cfg.resolved_output_dir / "cross_check_report.json"),
-            stats_output=stats_output,
-            debug_output=debug_output,
-            effective_debug=effective_debug,
-            cfg=cfg,
-            pool=pool,
-            mode_label="cross-check verification",
-        )
+        try:
+            return _save_verification_artifacts(
+                report=report,
+                effective_mode=effective_mode,
+                effective_model=effective_model,
+                output_report=output_report or str(cfg.resolved_output_dir / "cross_check_report.json"),
+                stats_output=stats_output,
+                debug_output=debug_output,
+                effective_debug=effective_debug,
+                cfg=cfg,
+                pool=pool,
+                mode_label="cross-check verification",
+            )
+        finally:
+            if temp_backup_targets:
+                console.print("[dim cyan]🧹 Verification complete: cleaning up temporal backup folders to spare memory...[/dim cyan]")
+                for bt in temp_backup_targets:
+                    bt.cleanup()
+                temp_backup_targets.clear()
+
+    # Mode: 'graph' or 'kg' (Knowledge Graph Embedding Space Suite & Decision Matrix)
+    if effective_mode in ("graph", "kg", "graph-space", "graph_space"):
+        effective_tau = float(tau if tau is not None else 0.75)
+        temp_backup_targets: List[ResolvedBackupTarget] = []
+
+        try:
+            cand_path_a = Path(graph_file).expanduser().resolve() if graph_file else None
+            cand_path_b = Path(compare_graph).expanduser().resolve() if compare_graph else None
+
+            # Resolve archive formats
+            archive_suffixes = (".zip", ".7z", ".tar", ".gz", ".tgz")
+            target_graph_a: Optional[Path] = None
+            target_graph_b: Optional[Path] = None
+            branch_a_label = "Baseline (A)"
+            branch_b_label = "Candidate (B)"
+
+            if cand_path_a and cand_path_a.is_file() and any(cand_path_a.name.lower().endswith(s) for s in archive_suffixes):
+                bt_a = resolve_backup_target(cand_path_a, label_fallback="Baseline (A)", console=console)
+                temp_backup_targets.append(bt_a)
+                target_graph_a = bt_a.graph_file
+                branch_a_label = bt_a.label
+
+            if cand_path_b and cand_path_b.is_file() and any(cand_path_b.name.lower().endswith(s) for s in archive_suffixes):
+                bt_b = resolve_backup_target(cand_path_b, label_fallback="Candidate (B)", console=console)
+                temp_backup_targets.append(bt_b)
+                target_graph_b = bt_b.graph_file
+                branch_b_label = bt_b.label
+
+            # Check directory run resolution
+            if not target_graph_b and cand_path_b and cand_path_b.is_dir():
+                subdirs = sorted([p for p in cand_path_b.iterdir() if p.is_dir()])
+                cand_a = [p for p in subdirs if p.name.startswith("branch_A")]
+                cand_b = [p for p in subdirs if p.name.startswith("branch_B")]
+                if cand_a and cand_b:
+                    target_graph_a = cand_a[0] / "knowledge_graph.json"
+                    target_graph_b = cand_b[0] / "knowledge_graph.json"
+                    branch_a_label = cand_a[0].name.replace("branch_A_", "").replace("branch_A", "").strip("_") or cand_a[0].name
+                    branch_b_label = cand_b[0].name.replace("branch_B_", "").replace("branch_B", "").strip("_") or cand_b[0].name
+
+            if not target_graph_a:
+                if cand_path_a and cand_path_a.is_file():
+                    target_graph_a = cand_path_a
+                elif cand_path_a and cand_path_a.is_dir() and (cand_path_a / "knowledge_graph.json").is_file():
+                    target_graph_a = cand_path_a / "knowledge_graph.json"
+                else:
+                    default_kg = cfg.resolved_output_dir / "knowledge_graph.json"
+                    if default_kg.is_file():
+                        target_graph_a = default_kg
+
+            if not target_graph_b and cand_path_b:
+                if cand_path_b.is_file():
+                    target_graph_b = cand_path_b
+                elif cand_path_b and cand_path_b.is_dir() and (cand_path_b / "knowledge_graph.json").is_file():
+                    target_graph_b = cand_path_b / "knowledge_graph.json"
+
+            if not target_graph_a or not target_graph_a.is_file():
+                console.print(
+                    f"[bold red]Knowledge graph file not found at '{graph_file or cfg.resolved_output_dir}'.[/bold red]\n"
+                )
+                raise typer.Exit(1)
+
+            store_a = ConceptGraphStore()
+            with console.status(f"[bold cyan]Loading Graph A from {target_graph_a}...[/bold cyan]"):
+                store_a.load(target_graph_a)
+
+            # Initialize embeddings provider if needed
+            embeddings = None
+            try:
+                embedding_model_name = getattr(cfg, "embedding_model", "nomic-embed-text")
+                verifier_servers = cfg.resolved_verification_servers
+                pool = OllamaPool(servers=verifier_servers, cooldown_seconds=0, max_tasks_per_server=2)
+                embeddings = FailoverOllamaEmbeddings(model=embedding_model_name, pool=pool)
+            except Exception as e:
+                logger.debug(f"Could not initialize FailoverOllamaEmbeddings: {e}")
+
+            chunks_dir_resolved = Path(chunks_dir).expanduser().resolve() if chunks_dir else cfg.resolved_output_dir / "chunks"
+            effective_tau_loss = float(tau_loss if tau_loss is not None else getattr(cfg.verification, "tau_loss", 0.70))
+
+            # Resolve state cache directory (containing book_*_state.json)
+            cand_states_dirs = []
+            if states_dir:
+                cand_states_dirs.append(Path(states_dir).expanduser().resolve())
+            elif getattr(cfg, "state_cache_dir", None):
+                cand_states_dirs.append(Path(cfg.state_cache_dir).expanduser().resolve())
+            else:
+                if target_graph_a and target_graph_a.is_file():
+                    cand_states_dirs.append(target_graph_a.parent / ".book_states")
+                    cand_states_dirs.append(target_graph_a.parent)
+                if not graph_file or (target_graph_a and target_graph_a.parent == cfg.resolved_output_dir):
+                    cand_states_dirs.extend([
+                        cfg.resolved_output_dir / ".book_states",
+                        cfg.resolved_output_dir,
+                    ])
+
+            resolved_states_dir: Optional[Path] = None
+            for cdir in cand_states_dirs:
+                if cdir.is_dir() and (list(cdir.glob("book_*_state.json")) or (cdir / ".book_states").is_dir()):
+                    resolved_states_dir = cdir
+                    break
+
+            if target_graph_b and target_graph_b.is_file():
+                # Comparative Mode (A/B)
+                store_b = ConceptGraphStore()
+                with console.status(f"[bold cyan]Loading Graph B from {target_graph_b}...[/bold cyan]"):
+                    store_b.load(target_graph_b)
+
+                cand_states_dirs_b = []
+                if target_graph_b.is_file():
+                    cand_states_dirs_b.append(target_graph_b.parent / ".book_states")
+                    cand_states_dirs_b.append(target_graph_b.parent)
+                resolved_states_dir_b: Optional[Path] = None
+                for cdir in cand_states_dirs_b:
+                    if cdir.is_dir() and (list(cdir.glob("book_*_state.json")) or (cdir / ".book_states").is_dir()):
+                        resolved_states_dir_b = cdir
+                        break
+
+                with console.status(f"[bold cyan]Evaluating Graph Embedding Space Comparison (τ = {effective_tau:.2f})...[/bold cyan]"):
+                    kg_report = run_graph_space_comparison(
+                        store_a=store_a,
+                        store_b=store_b,
+                        tau=effective_tau,
+                        label_a=branch_a_label,
+                        label_b=branch_b_label,
+                        embeddings=embeddings,
+                        chunks_dir=chunks_dir_resolved,
+                        console=console,
+                        states_dir_a=resolved_states_dir,
+                        states_dir_b=resolved_states_dir_b or resolved_states_dir,
+                        tau_loss=effective_tau_loss,
+                    )
+                console.print(format_graph_comparison_table(kg_report))
+                report_dict = kg_report.model_dump()
+            else:
+                # Single Graph Evaluation Mode
+                with console.status(f"[bold cyan]Evaluating Graph Embedding Space (τ = {effective_tau:.2f})...[/bold cyan]"):
+                    metrics = run_graph_space_evaluation(
+                        store=store_a,
+                        tau=effective_tau,
+                        embeddings=embeddings,
+                        chunks_dir=chunks_dir_resolved,
+                        console=console,
+                        states_dir=resolved_states_dir,
+                        tau_loss=effective_tau_loss,
+                        book_id=book_id,
+                    )
+                console.print(format_graph_space_table(metrics))
+                if metrics.postprocessing_drift:
+                    console.print(format_postprocessing_drift_table(metrics.postprocessing_drift))
+                report_dict = metrics.model_dump()
+
+            # Clean up temporary folders immediately after verification to spare memory
+            if temp_backup_targets:
+                console.print("[dim cyan]🧹 Verification complete: cleaning up temporal backup folders to spare memory...[/dim cyan]")
+                for bt in temp_backup_targets:
+                    bt.cleanup()
+                temp_backup_targets.clear()
+
+            # Save report
+            out_dest = Path(output_report) if output_report else cfg.resolved_output_dir / "graph_space_report.json"
+            out_dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_dest, "w", encoding="utf-8") as f:
+                json.dump(report_dict, f, indent=2, ensure_ascii=False)
+            console.print(f"[bold green]✓ Report saved to:[/bold green] [bold cyan]{out_dest}[/bold cyan]")
+            return report_dict
+        finally:
+            for bt in temp_backup_targets:
+                bt.cleanup()
+
+    # Mode: 'drift', 'idea-drift', or 'postprocess-drift' (RAW vs KG Ideas Drift & Alignment)
+    if effective_mode in ("drift", "idea-drift", "idea_drift", "postprocess-drift", "postprocess_drift"):
+        effective_tau_loss = float(tau_loss if tau_loss is not None else getattr(cfg.verification, "tau_loss", 0.70))
+        target_graph_file = Path(graph_file).expanduser().resolve() if graph_file else cfg.resolved_output_dir / "knowledge_graph.json"
+
+        temp_drift_target: Optional[ResolvedBackupTarget] = None
+        if target_graph_file.is_file() and any(target_graph_file.name.lower().endswith(s) for s in (".zip", ".7z", ".tar", ".gz", ".tgz")):
+            temp_drift_target = resolve_backup_target(target_graph_file, label_fallback="Target", console=console)
+            target_graph_file = temp_drift_target.graph_file
+
+        if not target_graph_file.is_file():
+            console.print(
+                f"[bold red]Knowledge graph file not found at {target_graph_file}[/bold red]\n"
+                f"[yellow]Please run 'bookeeper build-graph' first to generate knowledge_graph.json.[/yellow]"
+            )
+            if temp_drift_target:
+                temp_drift_target.cleanup()
+            raise typer.Exit(1)
+
+        store = ConceptGraphStore()
+        with console.status(f"[bold cyan]Loading graph from {target_graph_file}...[/bold cyan]"):
+            try:
+                store.load(target_graph_file)
+            except Exception as e:
+                if temp_drift_target:
+                    temp_drift_target.cleanup()
+                console.print(f"[bold red]Failed to load knowledge graph:[/bold red] {e}")
+                raise typer.Exit(1)
+
+        # Resolve state cache directory (containing book_*_state.json)
+        cand_states_dirs = []
+        if states_dir:
+            cand_states_dirs.append(Path(states_dir).expanduser().resolve())
+        if getattr(cfg, "state_cache_dir", None):
+            cand_states_dirs.append(Path(cfg.state_cache_dir).expanduser().resolve())
+        cand_states_dirs.extend([
+            target_graph_file.parent / ".book_states",
+            target_graph_file.parent,
+            cfg.resolved_output_dir / ".book_states",
+            cfg.resolved_output_dir,
+        ])
+
+        resolved_states_dir: Optional[Path] = None
+        for cdir in cand_states_dirs:
+            if cdir.is_dir() and (list(cdir.glob("book_*_state.json")) or (cdir / ".book_states").is_dir()):
+                resolved_states_dir = cdir
+                break
+
+        if not resolved_states_dir:
+            resolved_states_dir = cfg.resolved_output_dir / ".book_states"
+
+        # Initialize embeddings provider if needed
+        embeddings = None
+        try:
+            embedding_model_name = getattr(cfg, "embedding_model", "nomic-embed-text")
+            verifier_servers = cfg.resolved_verification_servers
+            pool = OllamaPool(servers=verifier_servers, cooldown_seconds=0, max_tasks_per_server=2)
+            embeddings = FailoverOllamaEmbeddings(model=embedding_model_name, pool=pool)
+        except Exception as e:
+            logger.debug(f"Could not initialize FailoverOllamaEmbeddings: {e}")
+
+        try:
+            with console.status(f"[bold cyan]Evaluating Post-Processing Idea Drift (τ_loss = {effective_tau_loss:.2f})...[/bold cyan]"):
+                drift_metrics = run_postprocessing_drift_evaluation(
+                    store=store,
+                    states_dir=resolved_states_dir,
+                    book_id=book_id,
+                    tau_loss=effective_tau_loss,
+                    embeddings=embeddings,
+                    console=console,
+                )
+            console.print(format_postprocessing_drift_table(drift_metrics))
+            drift_dict = drift_metrics.model_dump()
+
+            # Save report
+            out_dest = Path(output_report) if output_report else cfg.resolved_output_dir / "drift_verification_report.json"
+            out_dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_dest, "w", encoding="utf-8") as f:
+                json.dump(drift_dict, f, indent=2, ensure_ascii=False)
+            console.print(f"[bold green]✓ Report saved to:[/bold green] [bold cyan]{out_dest}[/bold cyan]")
+            return drift_dict
+        finally:
+            if temp_drift_target:
+                temp_drift_target.cleanup()
 
     # Mode: 'ideas'
     target_graph_file = Path(graph_file).expanduser().resolve() if graph_file else cfg.resolved_output_dir / "knowledge_graph.json"
+    temp_ideas_target: Optional[ResolvedBackupTarget] = None
+    if target_graph_file.is_file() and any(target_graph_file.name.lower().endswith(s) for s in (".zip", ".7z", ".tar", ".gz", ".tgz")):
+        temp_ideas_target = resolve_backup_target(target_graph_file, label_fallback="Target", console=console)
+        target_graph_file = temp_ideas_target.graph_file
+
     if not target_graph_file.is_file():
         console.print(
             f"[bold red]Knowledge graph file not found at {target_graph_file}[/bold red]\n"
             f"[yellow]Please run 'bookeeper build-graph' first to generate knowledge_graph.json.[/yellow]"
         )
+        if temp_ideas_target:
+            temp_ideas_target.cleanup()
         raise typer.Exit(1)
 
     store = ConceptGraphStore()
@@ -4199,6 +5593,8 @@ def _execute_single_verification(
         try:
             store.load(target_graph_file)
         except Exception as e:
+            if temp_ideas_target:
+                temp_ideas_target.cleanup()
             console.print(f"[bold red]Failed to load knowledge graph:[/bold red] {e}")
             raise typer.Exit(1)
 
@@ -4365,18 +5761,22 @@ def _execute_single_verification(
 
     # 3. Save JSON report
     # 3. Save JSON Report, Standalone Statistics, and Debug Trace
-    return _save_verification_artifacts(
-        report=report,
-        effective_mode=effective_mode,
-        effective_model=effective_model,
-        output_report=output_report,
-        stats_output=stats_output,
-        debug_output=debug_output,
-        effective_debug=effective_debug,
-        cfg=cfg,
-        pool=pool,
-        mode_label="ideas verification",
-    )
+    try:
+        return _save_verification_artifacts(
+            report=report,
+            effective_mode=effective_mode,
+            effective_model=effective_model,
+            output_report=output_report,
+            stats_output=stats_output,
+            debug_output=debug_output,
+            effective_debug=effective_debug,
+            cfg=cfg,
+            pool=pool,
+            mode_label="ideas verification",
+        )
+    finally:
+        if temp_ideas_target:
+            temp_ideas_target.cleanup()
 
 
 def _write_combined_multi_verification_report(
@@ -4440,15 +5840,18 @@ def verify_command(
         None, "--percent", "-p", help="Percentage of ideas to randomly verify (default: 1.0 for 1%)."
     ),
     mode: Optional[str] = typer.Option(
-        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', 'chunk', or 'cross-check' (default: from config.yaml or 'ideas')."
+        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', 'chunk', 'cross-check', 'graph'/'kg', or 'drift' (default: from config.yaml or 'ideas')."
     ),
     compare_graph: Optional[str] = typer.Option(
         None,
         "--compare-graph",
-        help="Path to A/B test result directory OR candidate knowledge_graph.json to compare against in cross-check mode.",
+        help="Path to A/B test result directory OR candidate knowledge_graph.json to compare against in cross-check or graph mode.",
     ),
     blocks: Optional[int] = typer.Option(
         None, "--blocks", help="Number of contiguous chunk blocks to audit in cross-check mode (default: 20)."
+    ),
+    tau: Optional[float] = typer.Option(
+        0.75, "--tau", help="Semantic proximity radius threshold for graph space coverage in 'graph'/'kg' mode (default: 0.75)."
     ),
     book_id: Optional[int] = typer.Option(
         None, "--book-id", "-b", help="Specific book ID to verify (in chunking mode)."
@@ -4509,6 +5912,16 @@ def verify_command(
         "--stats-output",
         help="Optional path to save standalone statistics JSON file (default: output_dir/verification_stats.json).",
     ),
+    states_dir: Optional[str] = typer.Option(
+        None,
+        "--states-dir",
+        help="Directory containing book state files (book_*_state.json) for post-processing drift verification.",
+    ),
+    tau_loss: Optional[float] = typer.Option(
+        0.70,
+        "--tau-loss",
+        help="Cosine similarity cutoff below which a raw idea is considered dropped in drift verification (default: 0.70).",
+    ),
 ):
     """
     Verify Knowledge Graph factual integrity, chunking correctness, or chunk Oracle alignment.
@@ -4534,6 +5947,9 @@ def verify_command(
     debug = _resolve_opt(debug)
     debug_output = _resolve_opt(debug_output)
     stats_output = _resolve_opt(stats_output)
+    tau = _resolve_opt(tau)
+    states_dir = _resolve_opt(states_dir)
+    tau_loss = _resolve_opt(tau_loss)
 
     cfg = _get_effective_settings(
         config_path=config_path,
@@ -4620,6 +6036,9 @@ def verify_command(
                 debug=v_debug,
                 debug_output=v_debug_file,
                 stats_output=v_stats,
+                tau=getattr(v, "tau", tau),
+                states_dir=getattr(v, "states_dir", states_dir),
+                tau_loss=getattr(v, "tau_loss", tau_loss),
             )
             reports.append((v_mode, v_report, rep))
 
@@ -4683,6 +6102,9 @@ def verify_command(
         debug=debug,
         debug_output=debug_output,
         stats_output=stats_output,
+        tau=tau,
+        states_dir=states_dir,
+        tau_loss=tau_loss,
     )
 
 
@@ -4696,15 +6118,18 @@ def verifiers_command(
         None, "--percent", "-p", help="Percentage of ideas to randomly verify (default: 1.0 for 1%)."
     ),
     mode: Optional[str] = typer.Option(
-        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', 'chunk', or 'cross-check' (default: from config.yaml or 'ideas')."
+        None, "--mode", "-m", help="Verification mode: 'ideas', 'chunking', 'chunk', 'cross-check', 'graph'/'kg', or 'drift' (default: from config.yaml or 'ideas')."
     ),
     compare_graph: Optional[str] = typer.Option(
         None,
         "--compare-graph",
-        help="Path to A/B test result directory OR candidate knowledge_graph.json to compare against in cross-check mode.",
+        help="Path to A/B test result directory OR candidate knowledge_graph.json to compare against in cross-check or graph mode.",
     ),
     blocks: Optional[int] = typer.Option(
         None, "--blocks", help="Number of contiguous chunk blocks to audit in cross-check mode (default: 20)."
+    ),
+    tau: Optional[float] = typer.Option(
+        0.75, "--tau", help="Semantic proximity radius threshold for graph space coverage in 'graph'/'kg' mode (default: 0.75)."
     ),
     book_id: Optional[int] = typer.Option(
         None, "--book-id", "-b", help="Specific book ID to verify (in chunking mode)."
@@ -4774,6 +6199,385 @@ def verifiers_command(
         max_tasks=max_tasks,
         cooldown=cooldown,
     )
+
+
+@app.command("ab-compare")
+@app.command("ab-backup")
+def ab_compare_command(
+    target_a: str = typer.Argument(
+        ...,
+        help="Path to baseline Knowledge Graph (backup archive .zip/.7z, directory, or knowledge_graph.json).",
+    ),
+    target_b: Optional[str] = typer.Argument(
+        None,
+        help="Path to candidate Knowledge Graph or backup archive. Defaults to active output directory if omitted.",
+    ),
+    mode: str = typer.Option(
+        "cross-check",
+        "--mode",
+        "-m",
+        help="Comparison mode: 'cross-check' (NLI adversarial QA probe audit), 'graph'/'kg' (semantic space coverage & Vendi diversity suite), 'ideas' (factual grounding audit), or 'stats' (fast topological & entity metrics).",
+    ),
+    tau: float = typer.Option(
+        0.75,
+        "--tau",
+        help="Semantic proximity radius threshold for graph space coverage in 'graph'/'kg' mode (default: 0.75).",
+    ),
+    blocks: int = typer.Option(
+        20,
+        "--blocks",
+        help="Number of contiguous chunk blocks to audit in cross-check mode (default: 20).",
+    ),
+    percent: float = typer.Option(
+        1.0,
+        "--percent",
+        "-p",
+        help="Percentage of ideas to sample in ideas verification mode (default: 1.0 for 1%).",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        help="Dedicated verifier LLM model (default: from config.yaml).",
+    ),
+    config_path: Optional[str] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to config.yaml file.",
+    ),
+    output_report: Optional[str] = typer.Option(
+        None,
+        "--output",
+        "--output-report",
+        "-o",
+        help="Optional path to save JSON comparative report (default: output_dir/ab_compare_report.json).",
+    ),
+    print_chunks: Optional[int] = typer.Option(
+        None,
+        "--print-chunks",
+        help="Print text & QA probes comparison for up to X blocks (cross-check mode).",
+    ),
+    seed: Optional[int] = typer.Option(
+        None,
+        "--seed",
+        help="Random seed for reproducible block/sample selection.",
+    ),
+    max_tasks: Optional[int] = typer.Option(
+        None,
+        "--max-tasks",
+        "-t",
+        help="Max concurrent verification worker tasks across Ollama servers.",
+    ),
+):
+    """
+    Compare two Knowledge Bases (e.g. archived backup vs active graph, or backup vs backup)
+    without re-indexing through LLMs. Unpacks backup archives (.zip, .7z) into isolated temporary
+    folders, evaluates topological and idea differences, and executes comparative cross-check audits.
+    """
+    cfg = get_settings(config_path)
+    output_dir = cfg.resolved_output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    target_b_path = target_b
+    if not target_b_path:
+        default_b = output_dir / "knowledge_graph.json"
+        if not default_b.is_file():
+            console.print(
+                f"[bold red]Candidate target B not provided and default Knowledge Graph not found at '{default_b}'.[/bold red]\n"
+                f"[yellow]Specify target_b as a backup archive (.zip/.7z) or path to knowledge_graph.json.[/yellow]"
+            )
+            raise typer.Exit(1)
+        target_b_path = str(default_b)
+
+    with open_backup_target(target_a, label_fallback="Baseline (A)", console=console) as bt_a, \
+         open_backup_target(target_b_path, label_fallback="Candidate (B)", console=console) as bt_b:
+
+        if not bt_a.graph_file.is_file():
+            console.print(f"[bold red]Knowledge graph file not found in baseline target: '{target_a}'.[/bold red]")
+            raise typer.Exit(1)
+        if not bt_b.graph_file.is_file():
+            console.print(f"[bold red]Knowledge graph file not found in candidate target: '{target_b_path}'.[/bold red]")
+            raise typer.Exit(1)
+
+        store_a = ConceptGraphStore()
+        store_b = ConceptGraphStore()
+
+        with console.status(f"[bold cyan]Loading Baseline Knowledge Graph ({bt_a.label})...[/bold cyan]"):
+            store_a.load(bt_a.graph_file)
+        with console.status(f"[bold cyan]Loading Candidate Knowledge Graph ({bt_b.label})...[/bold cyan]"):
+            store_b.load(bt_b.graph_file)
+
+        comp_stats = compare_knowledge_graphs(store_a, store_b, label_a=bt_a.label, label_b=bt_b.label)
+
+        # 1. Header Banner
+        a_src = f"{Path(target_a).name} (temporal: [yellow]{bt_a.root_dir}[/yellow])" if bt_a.is_temp else str(bt_a.graph_file)
+        b_src = f"{Path(target_b_path).name} (temporal: [yellow]{bt_b.root_dir}[/yellow])" if bt_b.is_temp else str(bt_b.graph_file)
+        console.print(
+            Panel.fit(
+                f"[bold cyan]🔬 Knowledge Base A/B Backup Comparison[/bold cyan]\n"
+                f"• [bold]Baseline (A):[/bold] [cyan]{bt_a.label}[/cyan] ({a_src})\n"
+                f"• [bold]Candidate (B):[/bold] [magenta]{bt_b.label}[/magenta] ({b_src})\n"
+                f"• [bold]Mode:[/bold] [yellow]{mode.upper()}[/yellow]",
+                title="bookeeper ab-compare",
+                border_style="cyan",
+            )
+        )
+
+        # 2. Structural & Topological Metrics Table
+        s_tbl = Table(title="Knowledge Base Structural Comparison", border_style="cyan")
+        s_tbl.add_column("Entity / Dimension", style="bold")
+        s_tbl.add_column(f"Baseline A ({bt_a.label})", justify="right", style="cyan")
+        s_tbl.add_column(f"Candidate B ({bt_b.label})", justify="right", style="magenta")
+        s_tbl.add_column("Delta (B - A)", justify="right")
+
+        def _fmt_delta(val: int) -> str:
+            if val > 0:
+                return f"[green]+{val:,}[/green]"
+            if val < 0:
+                return f"[red]{val:,}[/red]"
+            return "[dim]0[/dim]"
+
+        b_st = comp_stats["books"]
+        s_tbl.add_row("Total Books", f"{b_st['a']:,}", f"{b_st['b']:,}", _fmt_delta(b_st["delta"]))
+        sec_st = comp_stats["sections"]
+        s_tbl.add_row("Total Sections", f"{sec_st['a']:,}", f"{sec_st['b']:,}", _fmt_delta(sec_st["delta"]))
+        chk_st = comp_stats["chunks"]
+        s_tbl.add_row("Total Chunks", f"{chk_st['a']:,}", f"{chk_st['b']:,}", _fmt_delta(chk_st["delta"]))
+        s_tbl.add_row("Avg Chunk Size (chars)", f"{chk_st['avg_chars_a']:.1f}", f"{chk_st['avg_chars_b']:.1f}", f"{chk_st['avg_chars_b'] - chk_st['avg_chars_a']:+.1f}")
+        s_tbl.add_section()
+
+        idea_st = comp_stats["ideas"]
+        s_tbl.add_row("Unique Concepts / Ideas", f"{idea_st['a']:,}", f"{idea_st['b']:,}", _fmt_delta(idea_st["delta"]))
+        s_tbl.add_row("Shared Ideas (A ∩ B)", f"{idea_st['common_count']:,}", f"{idea_st['common_count']:,}", f"[yellow]{idea_st['jaccard_similarity']*100:.1f}% Jaccard[/yellow]")
+        s_tbl.add_row("Unique to Baseline (A \\ B)", f"{idea_st['only_a_count']:,}", "-", "[dim]-[/dim]")
+        s_tbl.add_row("Novel to Candidate (B \\ A)", "-", f"{idea_st['only_b_count']:,}", f"[green]+{idea_st['only_b_count']:,}[/green]" if idea_st["only_b_count"] else "[dim]0[/dim]")
+        s_tbl.add_section()
+
+        edg_st = comp_stats["edges"]
+        s_tbl.add_row("Relationships / Edges", f"{edg_st['a']:,}", f"{edg_st['b']:,}", _fmt_delta(edg_st["delta"]))
+        console.print(s_tbl)
+
+        final_report: Dict[str, Any] = {
+            "mode": mode,
+            "target_a": str(target_a),
+            "target_b": str(target_b_path),
+            "label_a": bt_a.label,
+            "label_b": bt_b.label,
+            "structural_comparison": comp_stats,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+
+        # 3. Mode execution
+        if mode.lower() in ("cross-check", "cross_check"):
+            effective_model = model or cfg.resolved_verifier_model
+            effective_embedding_model = getattr(cfg, "embedding_model", "nomic-embed-text")
+            verifier_servers = cfg.resolved_verification_servers
+            pool = OllamaPool(
+                servers=verifier_servers,
+                cooldown_seconds=cfg.resolved_verification_cooldown_seconds,
+                max_tasks_per_server=1,
+            )
+            pool_concurrency = max_tasks if max_tasks is not None else cfg.calculate_pool_concurrency(len(pool.alive_nodes) or 1)
+
+            with console.status(f"[bold blue]Preloading and warming up verifier model '{effective_model}'...[/bold blue]"):
+                warmup_verifier = IdeaVerifier(pool=pool, model_name=effective_model)
+                warmup_verifier.warmup(timeout=90)
+
+            with CrossCheckProgressTracker(
+                total_blocks=blocks,
+                branch_a_label=bt_a.label,
+                branch_b_label=bt_b.label,
+                console=console,
+            ) as tracker:
+                cc_report = run_cross_check(
+                    store_a=store_a,
+                    store_b=store_b,
+                    num_blocks=blocks,
+                    pool=pool,
+                    model_name=effective_model,
+                    embedding_model=effective_embedding_model,
+                    branch_a_name=bt_a.label,
+                    branch_b_name=bt_b.label,
+                    seed=seed,
+                    print_chunks=int(print_chunks or 0),
+                    console=console,
+                    progress_callback=tracker.on_progress,
+                )
+
+            sm = cc_report.summary
+            cc_tbl = Table(title="Cross-Check Verification Summary & Decision Gates", border_style="cyan")
+            cc_tbl.add_column("Metric", style="bold")
+            cc_tbl.add_column(f"Baseline ({bt_a.label})", justify="right", style="cyan")
+            cc_tbl.add_column(f"Candidate ({bt_b.label})", justify="right", style="magenta")
+            cc_tbl.add_column("Delta (B - A)", justify="right")
+
+            cc_tbl.add_row("Total Contiguous Blocks Audited", str(sm.total_samples), str(sm.total_samples), "-")
+            cc_tbl.add_row("Total Assertions Evaluated", str(sm.total_assertions_count), str(sm.total_assertions_count), "-")
+            cc_tbl.add_row("Supported Assertions (+1.0)", str(sm.total_old_supported), str(sm.total_new_supported), f"[{'green' if sm.delta_supported >= 0 else 'red'}]{sm.delta_supported:+d}[/]")
+            cc_tbl.add_row("Omission / Not Mentioned (-0.25)", str(sm.total_old_not_mentioned), str(sm.total_new_not_mentioned), f"[{'green' if sm.delta_not_mentioned <= 0 else 'yellow'}]{sm.delta_not_mentioned:+d}[/]")
+            cc_tbl.add_row("Contradicted Assertions (-1.0)", str(sm.total_old_against), str(sm.total_new_against), f"[{'green' if sm.delta_against <= 0 else 'red'}]{sm.delta_against:+d}[/]")
+            cc_tbl.add_row("Mean QA Recall (%)", f"{sm.mean_old_recall * 100:.2f}%", f"{sm.mean_new_recall * 100:.2f}%", f"[{'green' if sm.mean_delta_recall >= -0.03 else 'red'}]{sm.mean_delta_recall * 100:+.2f}% pts[/]")
+            cc_tbl.add_row("Mean Seam Integrity Rate (%)", f"{sm.mean_old_seam_integrity * 100:.2f}%", f"{sm.mean_new_seam_integrity * 100:.2f}%", f"{(sm.mean_new_seam_integrity - sm.mean_old_seam_integrity) * 100:+.2f}% pts")
+            cc_tbl.add_row("Mean Net Semantic Integrity (S_net)", f"{sm.mean_old_net_integrity:+.2f}", f"{sm.mean_new_net_integrity:+.2f}", f"[{'green' if sm.mean_delta_net_integrity >= 0 else 'red'}]{sm.mean_delta_net_integrity:+.2f}[/]")
+            cc_tbl.add_row("Mean Calibrated Fidelity (R_calib) (%)", f"{sm.mean_old_calibrated_fidelity * 100:.1f}%", f"{sm.mean_new_calibrated_fidelity * 100:.1f}%", f"[{'green' if sm.mean_delta_calibrated_fidelity >= 0 else 'red'}]{sm.mean_delta_calibrated_fidelity * 100:+.1f}% pts[/]")
+            cc_tbl.add_section()
+            cc_tbl.add_row("Decision Gating Checklist", "-", "[bold green]PASS[/bold green]" if sm.decision_pass else "[bold red]FAIL[/bold red]", f"[dim]{sm.pass_reason}[/dim]")
+            console.print(cc_tbl)
+
+            final_report["cross_check"] = cc_report.model_dump()
+            final_report["decision_pass"] = sm.decision_pass
+            final_report["pass_reason"] = sm.pass_reason
+
+        elif mode.lower() in ("graph", "kg", "graph-space", "graph_space"):
+            embeddings = None
+            try:
+                embedding_model_name = getattr(cfg, "embedding_model", "nomic-embed-text")
+                verifier_servers = cfg.resolved_verification_servers
+                pool = OllamaPool(servers=verifier_servers, cooldown_seconds=0, max_tasks_per_server=2)
+                embeddings = FailoverOllamaEmbeddings(model=embedding_model_name, pool=pool)
+            except Exception as e:
+                logger.debug(f"Could not initialize FailoverOllamaEmbeddings: {e}")
+
+            chunks_dir = cfg.resolved_output_dir / "chunks"
+
+            with console.status(f"[bold cyan]Evaluating Graph Embedding Space Comparison (τ = {tau:.2f})...[/bold cyan]"):
+                kg_report = run_graph_space_comparison(
+                    store_a=store_a,
+                    store_b=store_b,
+                    tau=tau,
+                    label_a=bt_a.label,
+                    label_b=bt_b.label,
+                    embeddings=embeddings,
+                    chunks_dir=chunks_dir,
+                    console=console,
+                )
+
+            console.print(format_graph_comparison_table(kg_report))
+
+            final_report["graph_space"] = kg_report.model_dump()
+            final_report["decision_pass"] = kg_report.decision_pass
+            final_report["pass_reason"] = kg_report.pass_reason
+
+        # Clean up temporary folders immediately after verification to spare memory & disk
+        if bt_a.is_temp or bt_b.is_temp:
+            console.print("[dim cyan]🧹 Verification complete: cleaning up temporal backup folders to spare memory...[/dim cyan]")
+            if bt_a.is_temp:
+                bt_a.cleanup()
+            if bt_b.is_temp:
+                bt_b.cleanup()
+
+        # 4. Save JSON Report and Markdown
+        report_dest = Path(output_report) if output_report else output_dir / "ab_compare_report.json"
+        md_dest = report_dest.with_suffix(".md")
+        with open(report_dest, "w", encoding="utf-8") as f:
+            json.dump(final_report, f, indent=2, ensure_ascii=False)
+
+        md_lines = [
+            f"# 🔬 Knowledge Base A/B Comparison Report",
+            f"",
+            f"- **Date:** {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
+            f"- **Baseline (A):** `{bt_a.label}` (`{target_a}`)",
+            f"- **Candidate (B):** `{bt_b.label}` (`{target_b_path}`)",
+            f"- **Mode:** `{mode}`",
+            f"",
+            f"## 1. Structural Comparison",
+            f"",
+            f"| Metric | Baseline (A) | Candidate (B) | Delta (B - A) |",
+            f"| :--- | :---: | :---: | :---: |",
+            f"| Books | {b_st['a']} | {b_st['b']} | {b_st['delta']:+d} |",
+            f"| Sections | {sec_st['a']} | {sec_st['b']} | {sec_st['delta']:+d} |",
+            f"| Chunks | {chk_st['a']} | {chk_st['b']} | {chk_st['delta']:+d} |",
+            f"| Ideas / Concepts | {idea_st['a']} | {idea_st['b']} | {idea_st['delta']:+d} |",
+            f"| Shared Ideas (A ∩ B) | {idea_st['common_count']} | {idea_st['common_count']} | Jaccard: {idea_st['jaccard_similarity']*100:.1f}% |",
+            f"| Novel Ideas (B \\ A) | - | {idea_st['only_b_count']} | +{idea_st['only_b_count']} |",
+            f"| Edges / Relationships | {edg_st['a']} | {edg_st['b']} | {edg_st['delta']:+d} |",
+            f"",
+        ]
+        if "cross_check" in final_report:
+            sm_cc = final_report["cross_check"]["summary"]
+            gate_badge = "✅ PASS" if sm_cc.get("decision_pass") else "❌ FAIL"
+            md_lines.extend([
+                f"## 2. Cross-Check Adversarial QA Probe Results",
+                f"",
+                f"- **Decision Gate Status:** **{gate_badge}** ({sm_cc.get('pass_reason')})",
+                f"- **Mean QA Recall Delta:** `{sm_cc.get('mean_delta_recall', 0)*100:+.2f}% pts` (Baseline: `{sm_cc.get('mean_old_recall', 0)*100:.2f}%`, Candidate: `{sm_cc.get('mean_new_recall', 0)*100:.2f}%`)",
+                f"- **Mean Seam Integrity Rate:** `{sm_cc.get('mean_new_seam_integrity', 0)*100:.2f}%`",
+                f"- **Net Semantic Integrity (S_net):** Baseline: `{sm_cc.get('mean_old_net_integrity', 0):+.2f}`, Candidate: `{sm_cc.get('mean_new_net_integrity', 0):+.2f}` (Delta: `{sm_cc.get('mean_delta_net_integrity', sm_cc.get('delta_net_integrity', 0)):+.2f}`)",
+                f"- **Calibrated Fidelity (R_calib):** Baseline: `{sm_cc.get('mean_old_calibrated_fidelity', 0)*100:.1f}%`, Candidate: `{sm_cc.get('mean_new_calibrated_fidelity', 0)*100:.1f}%` (Delta: `{sm_cc.get('mean_delta_calibrated_fidelity', sm_cc.get('delta_calibrated_fidelity', 0))*100:+.1f}% pts`)",
+                f"",
+            ])
+        if "graph_space" in final_report:
+            gs = final_report["graph_space"]
+            bm = gs["baseline_metrics"]
+            cm = gs["candidate_metrics"]
+            gate_badge = "✅ PASS" if gs.get("decision_pass") else "❌ FAIL"
+            if (
+                gs.get("universe_chunks_count_a")
+                and gs.get("universe_chunks_count_b")
+                and gs["universe_chunks_count_a"] != gs["universe_chunks_count_b"]
+            ):
+                u_info = f"`{gs['universe_chunks_count_a']:,}` (Baseline A) / `{gs['universe_chunks_count_b']:,}` (Candidate B) literature chunks"
+            else:
+                u_info = f"`{gs.get('universe_chunks_count', 0):,}` literature chunks"
+
+            md_lines.extend([
+                f"## 2. Knowledge Graph Embedding Space Evaluation (τ = {gs.get('tau', 0.75):.2f})",
+                f"",
+                f"- **Decision Gate Status:** **{gate_badge}** ({gs.get('pass_reason')})",
+                f"- **Universe Chunks:** {u_info}",
+                f"",
+                f"| Metric | Baseline ({bt_a.label}) | Candidate ({bt_b.label}) | Delta (B - A) | Operational Purpose |",
+                f"| :--- | :---: | :---: | :---: | :--- |",
+            ])
+            if bm.get("universe_chunks_count") and cm.get("universe_chunks_count") and bm["universe_chunks_count"] != cm["universe_chunks_count"]:
+                md_lines.append(f"| Corpus Chunks Evaluated (|U|) | {bm['universe_chunks_count']:,} | {cm['universe_chunks_count']:,} | {cm['universe_chunks_count'] - bm['universe_chunks_count']:+d} | Chunks in respective corpus space |")
+            md_lines.extend([
+                f"| Concept Nodes (|G|) | {bm['nodes_count']:,} | {cm['nodes_count']:,} | {gs['delta_nodes_count']:+d} | Total idea vertices |",
+                f"| Threshold Coverage (Cov_τ) | {bm['coverage_at_tau_pct']:.2f}% | {cm['coverage_at_tau_pct']:.2f}% | {gs['delta_coverage_at_tau_pct']:+.2f}% pts | Corpus reachable within radius τ |",
+                f"| Chamfer Mean (μ) | {bm['chamfer_mean']:.4f} | {cm['chamfer_mean']:.4f} | {gs['delta_chamfer_mean']:+.4f} | Expected semantic proximity |",
+                f"| Coverage Std Dev (σ) | {bm['chamfer_std']:.4f} | {cm['chamfer_std']:.4f} | {gs['delta_chamfer_std']:+.4f} | Regularity: lower is more uniform |",
+                f"| Worst-Decile (p10) | {bm['worst_decile_p10']:.4f} | {cm['worst_decile_p10']:.4f} | {gs['delta_worst_decile_p10']:+.4f} | Proximity of bottom 10% hardest chunks |",
+                f"| Median (p50) | {bm['median_p50']:.4f} | {cm['median_p50']:.4f} | {gs['delta_median_p50']:+.4f} | Robust central tendency |",
+                f"| Directed Hausdorff (dH) | {bm['worst_case_gap']:.4f} | {cm['worst_case_gap']:.4f} | {gs['delta_worst_case_gap']:+.4f} | Maximum blind spot (1 - min cos) |",
+                f"| Vendi Diversity Score | {bm['vendi_diversity_score']:.1f} | {cm['vendi_diversity_score']:.1f} | {gs['delta_vendi_diversity_score']:+.1f} | Effective orthogonal concept modes |",
+                f"| Compression Efficiency | {bm['coverage_per_node_efficiency']:.4f} | {cm['coverage_per_node_efficiency']:.4f} | {gs['delta_coverage_per_node_efficiency']:+.4f} | Corpus coverage % per node |",
+                f"| Concept Quality (Vendi/Node) | {bm['vendi_per_node']:.3f} | {cm['vendi_per_node']:.3f} | {gs['delta_vendi_per_node']:+.3f} | Information density per node |",
+            ])
+            if bm.get("parent_chunk_ratio_pct") is not None or cm.get("parent_chunk_ratio_pct") is not None:
+                d_pr = gs.get("delta_parent_chunk_ratio_pct")
+                d_sr = gs.get("delta_skipped_retention_pct")
+                d_gs = gs.get("delta_generalization_surplus_pct")
+                d_cl = gs.get("delta_compression_leverage_factor")
+                p_r_a = bm.get("parent_chunk_ratio_pct")
+                p_r_b = cm.get("parent_chunk_ratio_pct")
+                s_r_a = bm.get("skipped_retention_pct")
+                s_r_b = cm.get("skipped_retention_pct")
+                g_s_a = bm.get("generalization_surplus_pct")
+                g_s_b = cm.get("generalization_surplus_pct")
+                c_l_a = bm.get("compression_leverage_factor")
+                c_l_b = cm.get("compression_leverage_factor")
+                md_lines.extend([
+                    f"| Extraction Ratio (ρ_parent) | {p_r_a:.2f}% | {p_r_b:.2f}% | {d_pr:+.2f}% pts | Fraction of corpus compute spent on |" if p_r_a is not None and p_r_b is not None and d_pr is not None else "",
+                    f"| Skipped Retention (R_skipped) | {s_r_a:.2f}% | {s_r_b:.2f}% | {d_sr:+.2f}% pts | Bypassed chunks retained within radius τ |" if s_r_a is not None and s_r_b is not None and d_sr is not None else "",
+                    f"| Generalization Surplus (Δ_cov) | {g_s_a:+.2f}% pts | {g_s_b:+.2f}% pts | {d_gs:+.2f}% pts | Excess coverage gained over extraction ratio |" if g_s_a is not None and g_s_b is not None and d_gs is not None else "",
+                    f"| Compression Leverage (L_comp) | {c_l_a:.2f}x | {c_l_b:.2f}x | {d_cl:+.2f}x | Coverage multiplier per compute spent |" if c_l_a is not None and c_l_b is not None and d_cl is not None else "",
+                ])
+                md_lines = [line for line in md_lines if line]
+
+            md_lines.extend([
+                f"",
+                f"### Practical Decision Matrix Checklist",
+                f"",
+            ])
+            for k, gate in gs.get("gate_checklist", {}).items():
+                gb = "✅ PASS" if gate["passed"] else "❌ FAIL"
+                md_lines.append(f"- **{gate['name']}:** {gb} — {gate['details']} (Threshold: `{gate['threshold']}`)")
+            md_lines.append("")
+        md_dest.write_text("\n".join(md_lines), encoding="utf-8")
+
+        console.print(f"\n[bold green]✓ Comparative Report saved to:[/bold green] [bold cyan]{report_dest}[/bold cyan]")
+        console.print(f"[bold green]✓ Markdown Summary saved to:[/bold green] [bold cyan]{md_dest}[/bold cyan]\n")
+        return final_report
 
 
 @app.command("remove-book")
@@ -5130,6 +6934,11 @@ def rebuild_graph_command(
     dedup: bool = typer.Option(
         True, "--dedup/--no-dedup", help="Apply entity deduplication (default: True)."
     ),
+    state_cache_dir: Optional[str] = typer.Option(
+        None,
+        "--state-cache-dir",
+        help="Directory containing existing book state files (book_*_state.json) to use as source state directory.",
+    ),
 ):
     """
     Fast, offline rebuild of the Knowledge Graph directly from existing per-book state checkpoints (.book_states).
@@ -5149,6 +6958,7 @@ def rebuild_graph_command(
     clean_export = _resolve_opt(clean_export, True)
     dedup = _resolve_opt(dedup, True)
     books_dir = _resolve_opt(books_dir)
+    state_cache_dir = _resolve_opt(state_cache_dir)
 
     cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir)
     output_dir = cfg.resolved_output_dir
@@ -5157,7 +6967,8 @@ def rebuild_graph_command(
     graphml_dest = output_dir / "knowledge_graph.graphml"
     vault_dest = Path(export_obsidian) if export_obsidian else output_dir / "obsidian_vault"
 
-    resolved_states_dir = Path(states_dir) if states_dir else output_dir / ".book_states"
+    effective_states = states_dir or state_cache_dir or cfg.state_cache_dir
+    resolved_states_dir = Path(effective_states) if effective_states else output_dir / ".book_states"
     resolved_chunks_dir = Path(chunks_dir) if chunks_dir else output_dir / "chunks"
     tracker_path = Path(state_file) if state_file else cfg.resolved_state_file
     tracker = ProgressTracker(tracker_path)
@@ -5252,127 +7063,157 @@ def rebuild_graph_command(
     total_rebuilt_chunks = 0
     total_rebuilt_concepts = 0
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold cyan]{task.description}[/bold cyan]"),
-        BarColumn(),
-        TaskProgressColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        rebuild_task = progress.add_task(
-            "Rebuilding Knowledge Graph...",
-            total=len(candidate_states),
-            completed=0,
-        )
+    interrupted = False
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold cyan]{task.description}[/bold cyan]"),
+            BarColumn(),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            StepRemainingColumn(),
+            console=console,
+        ) as progress:
+            rebuild_task = progress.add_task(
+                "Rebuilding Knowledge Graph...",
+                total=len(candidate_states),
+                completed=0,
+                eta_str="--m --s",
+            )
 
-        for bid, sf, s_data, extracted_count in candidate_states:
-            btitle = BookParser.repair_mojibake(s_data.get("book_title", f"Book {bid}"))
-            bauthor = authors_by_id.get(bid) or "Unknown"
-            progress.update(rebuild_task, description=f"Rebuilding Book #{bid} ('{btitle[:20]}')...")
+            for bid, sf, s_data, extracted_count in candidate_states:
+                btitle = BookParser.repair_mojibake(s_data.get("book_title", f"Book {bid}"))
+                bauthor = authors_by_id.get(bid) or "Unknown"
+                progress.update(rebuild_task, description=f"Rebuilding Book #{bid} ('{btitle[:20]}')...")
 
-            # Load chunks
-            chunks = chunk_store.load_chunks(bid) if chunk_store.has_chunks(bid) else []
-            chunks_map = {c.chunk_id: c for c in chunks}
+                # Load chunks
+                chunks = chunk_store.load_chunks(bid) if chunk_store.has_chunks(bid) else []
+                chunks_map = {c.chunk_id: c for c in chunks}
 
-            processed = s_data.get("processed_chunks", {})
-            extracted_items = [v for v in processed.values() if v.get("status") == "extracted"]
-            extracted_items.sort(key=lambda x: x.get("chunk_idx", 0))
+                processed = s_data.get("processed_chunks", {})
+                extracted_items = [v for v in processed.values() if v.get("status") == "extracted"]
+                extracted_items.sort(key=lambda x: x.get("chunk_idx", 0))
 
-            rebuild_pubdate = s_data.get("publication_date")
-            store.add_book(bid, title=btitle, author=bauthor, publication_date=rebuild_pubdate)
+                rebuild_pubdate = s_data.get("publication_date")
+                store.add_book(bid, title=btitle, author=bauthor, publication_date=rebuild_pubdate)
 
-            for res in extracted_items:
-                chk_id = res["chunk_id"]
-                chk = chunks_map.get(chk_id)
-                if not chk:
-                    chk = HierarchicalChunk(
-                        chunk_id=chk_id,
+                # Ensure ALL chunks from the book exist in the graph (including skipped chunks)
+                # so sequential NEXT/PREV edges and section hierarchies remain completely contiguous.
+                if chunks:
+                    for b_chk in chunks:
+                        store.add_section(
+                            book_id=bid,
+                            chapter_idx=b_chk.chapter_idx,
+                            title=b_chk.section_title,
+                            text=b_chk.text,
+                        )
+                        store.add_chunk(b_chk)
+
+                for res in extracted_items:
+                    chk_id = res["chunk_id"]
+                    chk = chunks_map.get(chk_id)
+                    if not chk:
+                        chk = HierarchicalChunk(
+                            chunk_id=chk_id,
+                            book_id=bid,
+                            book_title=btitle,
+                            section_title=res.get("section_title", "Section"),
+                            chapter_idx=1,
+                            chunk_idx=res.get("chunk_idx", 1),
+                            text="",
+                        )
+                    total_rebuilt_chunks += 1
+                    sec_node_id = store.add_section(
                         book_id=bid,
-                        book_title=btitle,
-                        section_title=res.get("section_title", "Section"),
-                        chapter_idx=1,
-                        chunk_idx=res.get("chunk_idx", 1),
-                        text="",
+                        chapter_idx=chk.chapter_idx,
+                        title=chk.section_title,
+                        text=chk.text,
                     )
-                total_rebuilt_chunks += 1
-                sec_node_id = store.add_section(
-                    book_id=bid,
-                    chapter_idx=chk.chapter_idx,
-                    title=chk.section_title,
-                    text=chk.text,
-                )
-                store.add_chunk(chk)
+                    store.add_chunk(chk)
 
-                extraction = res.get("extraction", {})
-                for c_dict in extraction.get("concepts", []):
-                    try:
-                        concept = Concept(**c_dict)
-                    except Exception:
-                        continue
-                    canonical_concept = deduplicator.resolve_concept(concept) if deduplicator else concept
-                    store.add_concept(canonical_concept)
-                    store.add_book_idea_link(book_id=bid, concept_name=canonical_concept.name)
-                    total_rebuilt_concepts += 1
+                    extraction = res.get("extraction", {})
+                    for c_dict in extraction.get("concepts", []):
+                        try:
+                            concept = Concept(**c_dict)
+                        except Exception:
+                            continue
+                        canonical_concept = deduplicator.resolve_concept(concept) if deduplicator else concept
+                        store.add_concept(canonical_concept)
+                        store.add_book_idea_link(book_id=bid, concept_name=canonical_concept.name)
+                        total_rebuilt_concepts += 1
 
-                    local_brief = (concept.brief_description or "").strip()
-                    local_detailed = (concept.detailed_explanation or "").strip()
-                    is_grounded, valid_quote = validate_concept_chunk_grounding(
-                        concept_name=canonical_concept.name,
-                        supporting_quote=concept.supporting_quote,
-                        chunk_text=chk.text,
-                        brief_description=local_brief or local_detailed,
+                        local_brief = (concept.brief_description or "").strip()
+                        local_detailed = (concept.detailed_explanation or "").strip()
+                        is_grounded, valid_quote = validate_concept_chunk_grounding(
+                            concept_name=canonical_concept.name,
+                            supporting_quote=concept.supporting_quote,
+                            chunk_text=chk.text,
+                            brief_description=local_brief or local_detailed,
+                        )
+                        if is_grounded:
+                            store.add_idea_support_link(
+                                concept_name=canonical_concept.name,
+                                chunk=chk,
+                                quote=valid_quote,
+                                brief_description=local_brief,
+                                detailed_explanation=local_detailed,
+                            )
+                            store.add_section_concept_link(
+                                section_node_id=sec_node_id,
+                                concept_name=canonical_concept.name,
+                                summary=concept.summary,
+                                quote=valid_quote,
+                            )
+                        for rel_name in canonical_concept.related_concepts:
+                            store.add_concept_relation(
+                                src_concept_name=canonical_concept.name,
+                                tgt_concept_name=rel_name,
+                            )
+
+                # Link sequential chunks
+                store.link_sequential_chunks(book_id=bid)
+
+                # Mark state in tracker
+                total_expected = s_data.get("total_chunks", len(chunks))
+                failed_chunks = len(s_data.get("failed_chunks", []))
+                if failed_chunks == 0 and len(extracted_items) >= total_expected and total_expected > 0:
+                    tracker.mark_completed(
+                        "build_graph",
+                        bid,
+                        title=btitle,
+                        metadata={"indexing_status": "fully_indexed", "total_chunks": total_expected},
                     )
-                    if is_grounded:
-                        store.add_idea_support_link(
-                            concept_name=canonical_concept.name,
-                            chunk=chk,
-                            quote=valid_quote,
-                            brief_description=local_brief,
-                            detailed_explanation=local_detailed,
-                        )
-                        store.add_section_concept_link(
-                            section_node_id=sec_node_id,
-                            concept_name=canonical_concept.name,
-                            summary=concept.summary,
-                            quote=valid_quote,
-                        )
-                    for rel_name in canonical_concept.related_concepts:
-                        store.add_concept_relation(
-                            src_concept_name=canonical_concept.name,
-                            tgt_concept_name=rel_name,
-                        )
+                else:
+                    tracker.mark_partially_indexed(
+                        "build_graph",
+                        bid,
+                        title=btitle,
+                        failed_chunks=failed_chunks,
+                        total_chunks=total_expected,
+                    )
 
-            # Link sequential chunks
-            store.link_sequential_chunks(book_id=bid)
-
-            # Mark state in tracker
-            total_expected = s_data.get("total_chunks", len(chunks))
-            failed_chunks = len(s_data.get("failed_chunks", []))
-            if failed_chunks == 0 and len(extracted_items) >= total_expected and total_expected > 0:
-                tracker.mark_completed(
-                    "build_graph",
-                    bid,
-                    title=btitle,
-                    metadata={"indexing_status": "fully_indexed", "total_chunks": total_expected},
-                )
-            else:
-                tracker.mark_partially_indexed(
-                    "build_graph",
-                    bid,
-                    title=btitle,
-                    failed_chunks=failed_chunks,
-                    total_chunks=total_expected,
-                )
-
-            rebuilt_books += 1
-            progress.advance(rebuild_task)
+                rebuilt_books += 1
+                el_r = time.perf_counter() - t0
+                rate_r = (rebuilt_books / el_r) if el_r > 0 else 0.0
+                rem_r = ((len(candidate_states) - rebuilt_books) / rate_r) if rate_r > 0 and len(candidate_states) > rebuilt_books else 0.0
+                eta_r = format_eta_min_sec(rem_r) if rebuilt_books < len(candidate_states) else "0m 00s"
+                progress.update(rebuild_task, completed=rebuilt_books, eta_str=eta_r)
+    except KeyboardInterrupt:
+        interrupted = True
+        console.print("\n[bold yellow]Rebuild cancelled by user. Saving partial Knowledge Graph checkpoint...[/bold yellow]")
 
     elapsed = time.perf_counter() - t0
 
     # Save rebuilt graph
     store.save(graph_file)
+    if interrupted:
+        console.print(
+            f"[bold yellow]Knowledge graph rebuild stopped by user.[/bold yellow] "
+            f"Successfully reconstructed {rebuilt_books} book(s) into {graph_file}. (Exporters skipped due to cancellation)"
+        )
+        raise typer.Exit(code=130)
+
     obs = ObsidianExporter(vault_dest)
     obs.export(store, clean=False)
     gml = GraphMLExporter(graphml_dest)
@@ -5551,16 +7392,22 @@ def backup_command(
         TaskProgressColumn(),
         MofNCompleteColumn(),
         TimeElapsedColumn(),
+        StepRemainingColumn(),
         console=console,
     ) as progress:
-        backup_task = progress.add_task("Archiving files...", total=1)
+        backup_task = progress.add_task("Archiving files...", total=1, eta_str="--m --s")
 
         def _on_progress(completed: int, total: int, fname: str):
             short_name = (fname[:32] + "...") if len(fname) > 35 else fname
+            el = time.perf_counter() - t0
+            rate = (completed / el) if el > 0 else 0.0
+            rem = ((total - completed) / rate) if rate > 0 and total > completed else 0.0
+            eta_str = format_eta_min_sec(rem) if completed < total else "0m 00s"
             progress.update(
                 backup_task,
                 total=total,
                 completed=completed,
+                eta_str=eta_str,
                 description=f"Archiving: [cyan]{short_name}[/cyan]",
             )
 
@@ -5731,16 +7578,22 @@ def restore_command(
         TaskProgressColumn(),
         MofNCompleteColumn(),
         TimeElapsedColumn(),
+        StepRemainingColumn(),
         console=console,
     ) as progress:
-        restore_task = progress.add_task("Restoring files...", total=1)
+        restore_task = progress.add_task("Restoring files...", total=1, eta_str="--m --s")
 
         def _on_progress(completed: int, total: int, fname: str):
             short_name = (fname[:32] + "...") if len(fname) > 35 else fname
+            el = time.perf_counter() - t0
+            rate = (completed / el) if el > 0 else 0.0
+            rem = ((total - completed) / rate) if rate > 0 and total > completed else 0.0
+            eta_str = format_eta_min_sec(rem) if completed < total else "0m 00s"
             progress.update(
                 restore_task,
                 total=total,
                 completed=completed,
+                eta_str=eta_str,
                 description=f"Restoring: [cyan]{short_name}[/cyan]",
             )
 
@@ -5913,6 +7766,7 @@ def sync_command(
     }
 
     try:
+        t_pack_start = time.perf_counter()
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -5920,16 +7774,22 @@ def sync_command(
             TaskProgressColumn(),
             MofNCompleteColumn(),
             TimeElapsedColumn(),
+            StepRemainingColumn(),
             console=console,
         ) as progress:
-            backup_task = progress.add_task("Archiving local books & graph...", total=1)
+            backup_task = progress.add_task("Archiving local books & graph...", total=1, eta_str="--m --s")
 
             def _on_sync_progress(completed: int, total: int, fname: str):
                 short_name = (fname[:32] + "...") if len(fname) > 35 else fname
+                el = time.perf_counter() - t_pack_start
+                rate = (completed / el) if el > 0 else 0.0
+                rem = ((total - completed) / rate) if rate > 0 and total > completed else 0.0
+                eta_str = format_eta_min_sec(rem) if completed < total else "0m 00s"
                 progress.update(
                     backup_task,
                     total=total,
                     completed=completed,
+                    eta_str=eta_str,
                     description=f"Packaging: [cyan]{short_name}[/cyan]",
                 )
 
@@ -6462,6 +8322,213 @@ def ab_benchmark_command(
                 border_style="green",
             )
         )
+
+
+@app.command("simulate-thresholds")
+@app.command("sweep-thresholds")
+def simulate_thresholds_command(
+    threshold_pairs: str = typer.Option(
+        "0.60:0.90,0.65:0.90,0.70:0.90,0.75:0.90,0.65:0.95",
+        "--threshold-pairs",
+        "--pairs",
+        "-p",
+        help="Comma-separated list of low:high threshold pairs (e.g. '0.60:0.90,0.65:0.90,0.70:0.90,0.75:0.90,0.65:0.95').",
+    ),
+    state_cache_dir: Optional[str] = typer.Option(
+        None,
+        "--state-cache-dir",
+        "--cache-dir",
+        help="Path to state cache directory containing book_*_state.json files (default: output_dir/.book_states or output_dir).",
+    ),
+    chunks_dir: Optional[str] = typer.Option(
+        None,
+        "--chunks-dir",
+        help="Path to chunks directory containing book_*_chunks.json files (default: output_dir/chunks).",
+    ),
+    graph_path: Optional[str] = typer.Option(
+        None,
+        "--graph-path",
+        "--kg",
+        help="Path to knowledge_graph.json to extract concept embeddings (default: output_dir/knowledge_graph.json).",
+    ),
+    tau: float = typer.Option(
+        0.75,
+        "--tau",
+        help="Semantic proximity radius threshold for coverage evaluation (default: 0.75).",
+    ),
+    skip_limbo: bool = typer.Option(
+        True,
+        "--skip-limbo/--no-skip-limbo",
+        help="Whether to bypass/skip limbo chunks in simulation (default: True).",
+    ),
+    postprocess: bool = typer.Option(
+        True,
+        "--postprocess/--no-postprocess",
+        help="Whether to run post-processing deduplication and calculate idea drift metrics (default: True).",
+    ),
+    postprocess_threshold: float = typer.Option(
+        0.92,
+        "--postprocess-threshold",
+        help="Cosine similarity threshold for postprocessing concept deduplication (default: 0.92).",
+    ),
+    tau_loss: float = typer.Option(
+        0.70,
+        "--tau-loss",
+        help="Cosine similarity cutoff below which a raw idea is considered dropped in drift calculation (default: 0.70).",
+    ),
+    llm_pool: bool = typer.Option(
+        True,
+        "--llm-pool/--no-llm-pool",
+        help="Whether to initialize and use LLM server pool for multi-occurrence idea synthesis during postprocessing (default: True).",
+    ),
+    model: Optional[str] = typer.Option(
+        None,
+        "--model",
+        "-m",
+        help="Dedicated LLM model for idea consolidation (default: from config.yaml dual_pass.model or llm_model).",
+    ),
+    batch_size: int = typer.Option(
+        10,
+        "--batch-size",
+        help="Number of books per processing batch before triggering inter-batch idea post-processing (default: 10).",
+    ),
+    max_books: Optional[int] = typer.Option(
+        None,
+        "--max-books",
+        help="Optional cap on number of books to simulate for rapid testing.",
+    ),
+    output_report: Optional[str] = typer.Option(
+        None,
+        "--output-report",
+        "--output",
+        "-o",
+        help="Path to write the Markdown comparative report (default: output_dir/threshold_simulation_report.md).",
+    ),
+    config_path: Optional[str] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to config.yaml file.",
+    ),
+):
+    """
+    Simulate Knowledge Base generation across an array of (low, high) threshold pairs.
+    Replays chunk routing over the book chunk & state cache from scratch for each variation,
+    computes embedding space verification metrics (μ, σ, p10, Cov_τ, L_comp, Vendi),
+    prints a comparative summary table, and generates a visual Markdown report with plotting charts.
+    """
+    from bookeeper.evaluation.threshold_simulator import run_threshold_simulation_suite
+
+    cfg = _get_effective_settings(config_path)
+
+    # Resolve state cache directory
+    if state_cache_dir:
+        resolved_state_dir = Path(state_cache_dir).expanduser().resolve()
+    else:
+        # Check output/.book_states first, then output
+        cand = cfg.resolved_output_dir / ".book_states"
+        if cand.is_dir() and any(cand.glob("book_*_state.json")):
+            resolved_state_dir = cand
+        else:
+            resolved_state_dir = cfg.resolved_output_dir
+
+    # Resolve companion chunks dir
+    resolved_chunks_dir = Path(chunks_dir).expanduser().resolve() if chunks_dir else (cfg.resolved_output_dir / "chunks")
+
+    # Resolve knowledge graph path
+    resolved_graph_path = Path(graph_path).expanduser().resolve() if graph_path else (cfg.resolved_output_dir / "knowledge_graph.json")
+
+    # Resolve output report path
+    resolved_report_path = (
+        Path(output_report).expanduser().resolve()
+        if output_report
+        else (cfg.resolved_output_dir / "threshold_simulation_report.md")
+    )
+
+    console.print(
+        Panel.fit(
+            f"[bold cyan]Knowledge Base Threshold Simulation & Optimization Suite[/bold cyan]\n"
+            f"• State Cache Dir: [bold]{resolved_state_dir}[/bold]\n"
+            f"• Chunks Dir: [bold]{resolved_chunks_dir}[/bold]\n"
+            f"• Graph Path: [bold]{resolved_graph_path}[/bold]\n"
+            f"• Threshold Pairs: [bold green]{threshold_pairs}[/bold green]\n"
+            f"• Radius (τ): [bold]{tau:.2f}[/bold] | Skip Limbo: [bold]{skip_limbo}[/bold]\n"
+            f"• Output Report: [bold cyan]{resolved_report_path}[/bold cyan]",
+            title="Threshold Simulator",
+            border_style="cyan",
+        )
+    )
+
+    # Initialize embeddings client so all concepts are accurately embedded with genuine vectors
+    embeddings_client = None
+    try:
+        from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings
+        embeddings_client = FailoverOllamaEmbeddings.from_settings(cfg)
+    except Exception as e:
+        logger.debug(f"Could not initialize FailoverOllamaEmbeddings for simulation: {e}")
+
+    pool = None
+    if llm_pool:
+        try:
+            from bookeeper.processing.ollama_pool import OllamaPool
+            servers = getattr(cfg, "resolved_llm_servers", None) or cfg.resolved_ollama_servers
+            cooldown = getattr(cfg, "resolved_analysis_cooldown_seconds", getattr(cfg, "failover_cooldown_seconds", 600))
+            pool = OllamaPool(
+                servers=servers,
+                cooldown_seconds=cooldown,
+                max_tasks_per_server=1,
+            )
+        except Exception as e:
+            logger.warning(f"Could not initialize OllamaPool for simulation: {e}")
+
+    eff_model = model or getattr(cfg, "resolved_dual_pass_model", "qwen2.5:7b-instruct-q4_K_M")
+
+    try:
+        suite_report = run_threshold_simulation_suite(
+            pairs=threshold_pairs,
+            state_cache_dir=resolved_state_dir,
+            chunks_dir=resolved_chunks_dir,
+            graph_path=resolved_graph_path,
+            tau=tau,
+            skip_limbo=skip_limbo,
+            max_books=max_books,
+            embeddings_client=embeddings_client,
+            pool=pool,
+            console=console,
+            postprocess=postprocess,
+            postprocess_threshold=postprocess_threshold,
+            tau_loss=tau_loss,
+            batch_size=batch_size,
+            model_name=eff_model,
+        )
+    except Exception as e:
+        console.print(f"[bold red]Simulation suite failed: {e}[/bold red]")
+        raise typer.Exit(1)
+
+    # 1. Print comparative terminal tables: compute tradeoff and post-processing degradation
+    console.print()
+    console.print(suite_report.to_rich_table())
+    if any(v.forward_retention is not None for v in suite_report.variations):
+        console.print()
+        console.print(suite_report.to_drift_rich_table())
+    console.print()
+
+    # 2. Write Markdown visual report
+    md_content = suite_report.to_markdown()
+    resolved_report_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_report_path.write_text(md_content, encoding="utf-8")
+
+    console.print(
+        Panel.fit(
+            f"[bold green]✓ Threshold Simulation Benchmark Complete[/bold green]\n"
+            f"• Variations Simulated: [bold cyan]{len(suite_report.variations)}[/bold cyan]\n"
+            f"• Markdown Visual Report: [bold underline cyan]{resolved_report_path}[/bold underline cyan]\n"
+            f"  (Includes comparative summary table and Mermaid xychart-beta visual plots)",
+            title="Simulation Finished",
+            border_style="green",
+        )
+    )
+
 
 
 if __name__ == "__main__":

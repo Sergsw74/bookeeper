@@ -19,6 +19,7 @@ import shutil
 import sys
 import tempfile
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
@@ -39,12 +40,13 @@ from rich.progress import (
     TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
+    TimeRemainingColumn,
 )
 from rich.text import Text
 
-from bookeeper.calibre.parser import BookParser
+from bookeeper.calibre.parser import BookParser, format_idea_month
 from bookeeper.config import Settings
-from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings, OllamaPool
+from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings, OllamaPool, format_idea_for_embedding
 
 if TYPE_CHECKING:
     from bookeeper.graph.store import ConceptGraphStore
@@ -166,6 +168,7 @@ class IdeaObservation:
     weight: int = 5
     category: str = "Idea"
     related_concepts: List[str] = field(default_factory=list)
+    month: Optional[str] = None
 
 
 @dataclass
@@ -180,6 +183,14 @@ class IdeaCluster:
     category: str = "Idea"
     max_weight: int = 5
     embedding: Optional[np.ndarray] = None
+    first_occurrence_month: Optional[str] = None
+    existing_node_ids: Set[str] = field(default_factory=set)
+    already_refined: bool = False
+    already_postprocessed: bool = False
+    was_merged: bool = False
+    refined_brief: str = ""
+    refined_detailed: str = ""
+    refined_related_entities: List[str] = field(default_factory=list)
 
     def add_observation(self, obs: IdeaObservation) -> None:
         self.observations.append(obs)
@@ -191,6 +202,16 @@ class IdeaCluster:
             self.max_weight = obs.weight
         if obs.category and obs.category not in ("Idea", "Concept", ""):
             self.category = obs.category
+        if obs.month:
+            if not self.first_occurrence_month or obs.month < self.first_occurrence_month:
+                self.first_occurrence_month = obs.month
+
+    def get_first_occurrence_month(self) -> Optional[str]:
+        """Find the earliest occurrence month across all observations and cluster metadata (earlier date wins)."""
+        valid = [o.month for o in self.observations if o.month]
+        if self.first_occurrence_month:
+            valid.append(self.first_occurrence_month)
+        return min(valid) if valid else None
 
     @property
     def total_occurrences(self) -> int:
@@ -342,6 +363,13 @@ class IdeaPostProcessorState:
         """Check if an idea has already been processed in this state."""
         return canonical_name in self.processed_ideas
 
+    def get_status(self, canonical_name: str) -> Optional[str]:
+        """Retrieve processing status ('synthesized' or 'bypassed') for an idea if present."""
+        rec = self.processed_ideas.get(canonical_name)
+        if not rec or not isinstance(rec, dict):
+            return None
+        return rec.get("status")
+
     def get_output(self, canonical_name: str) -> Optional[ConsolidatedIdeaOutput]:
         """Retrieve cached ConsolidatedIdeaOutput for an idea if present."""
         rec = self.processed_ideas.get(canonical_name)
@@ -353,6 +381,26 @@ class IdeaPostProcessorState:
             logger.warning(f"Failed to validate cached ConsolidatedIdeaOutput for '{canonical_name}': {e}")
             return None
 
+    def get_synthesized_output_for_cluster(self, cluster: IdeaCluster) -> Optional[ConsolidatedIdeaOutput]:
+        """
+        Retrieve cached ConsolidatedIdeaOutput if the cluster's canonical name or any of its aliases
+        has already been refined (status == 'synthesized'). Ensures refinement happens at most once.
+        """
+        candidates = [cluster.canonical_name] + sorted(
+            a for a in cluster.aliases if a != cluster.canonical_name
+        )
+        for name in candidates:
+            rec = self.processed_ideas.get(name)
+            if rec and isinstance(rec, dict) and rec.get("status") == "synthesized" and "output" in rec:
+                try:
+                    res = ConsolidatedIdeaOutput.model_validate(rec["output"])
+                    if "embedding" in rec and (cluster.embedding is None or len(cluster.embedding) <= 1):
+                        cluster.embedding = np.array(rec["embedding"], dtype=np.float32)
+                    return res
+                except Exception as e:
+                    logger.warning(f"Failed to validate cached synthesized output for '{name}': {e}")
+        return None
+
     def record_processed(
         self,
         cluster: IdeaCluster,
@@ -360,7 +408,7 @@ class IdeaPostProcessorState:
         status: str = "synthesized",
     ) -> None:
         """Record a processed idea cluster and its consolidated output."""
-        self.processed_ideas[cluster.canonical_name] = {
+        rec: Dict[str, Any] = {
             "canonical_name": cluster.canonical_name,
             "normalized_name": cluster.normalized_name,
             "total_occurrences": cluster.total_occurrences,
@@ -368,6 +416,9 @@ class IdeaPostProcessorState:
             "output": output.model_dump(),
             "timestamp": time.time(),
         }
+        if cluster.embedding is not None and len(cluster.embedding) > 1:
+            rec["embedding"] = [round(float(x), 6) for x in cluster.embedding]
+        self.processed_ideas[cluster.canonical_name] = rec
 
     def clear(self) -> None:
         """Clear all in-memory and on-disk state."""
@@ -520,6 +571,23 @@ class IdeaPostProcessor:
                 cat = attrs.get("category") or "Idea"
                 weight = int(attrs.get("weight") or 5)
                 clean_cand = clean_canonical_name(raw_name)
+                node_month = format_idea_month(attrs.get("first_occurrence_month") or attrs.get("month"))
+
+                # 2. Gather edges connecting this concept to Chunks
+                # SUPPORTED_BY / MENTIONED_IN edges (Concept -> Chunk)
+                chunk_edges = []
+                for _, target, edge_data in store.graph.out_edges(node_id, data=True):
+                    if edge_data.get("relation") in ("SUPPORTED_BY", "MENTIONED_IN"):
+                        chunk_edges.append((target, edge_data))
+
+                # SUPPORTS_IDEA edges (Chunk -> Concept)
+                for source, _, edge_data in store.graph.in_edges(node_id, data=True):
+                    if edge_data.get("relation") == "SUPPORTS_IDEA":
+                        chunk_edges.append((source, edge_data))
+
+                # Skip empty stub nodes created solely as targets of :RELATES_TO edges
+                if not chunk_edges and not attrs.get("is_idea") and not (brief or detailed):
+                    continue
 
                 if norm_name not in clusters_by_norm:
                     clusters_by_norm[norm_name] = IdeaCluster(
@@ -527,30 +595,48 @@ class IdeaPostProcessor:
                         normalized_name=norm_name,
                         category=cat,
                         max_weight=weight,
+                        first_occurrence_month=node_month,
+                        already_postprocessed=bool(attrs.get("postprocessed")),
                     )
+                else:
+                    clusters_by_norm[norm_name].was_merged = True
+                    clusters_by_norm[norm_name].already_postprocessed = False
 
                 cluster = clusters_by_norm[norm_name]
+                cluster.existing_node_ids.add(node_id)
+                if attrs.get("refined"):
+                    cluster.already_refined = True
+                    if brief and not cluster.refined_brief:
+                        cluster.refined_brief = brief
+                    if detailed and not cluster.refined_detailed:
+                        cluster.refined_detailed = detailed
+                    for rel_ent in attrs.get("related_entities") or []:
+                        if rel_ent and rel_ent not in cluster.refined_related_entities:
+                            cluster.refined_related_entities.append(rel_ent)
+                    if not cluster.refined_related_entities:
+                        for _, tgt_nid, edata in store.graph.out_edges(node_id, data=True):
+                            if edata.get("relation") == "RELATES_TO":
+                                tgt_name = store.graph.nodes.get(tgt_nid, {}).get("name") or tgt_nid.replace("concept:", "")
+                                if tgt_name and tgt_name not in cluster.refined_related_entities:
+                                    cluster.refined_related_entities.append(tgt_name)
+
+                existing_emb = attrs.get("embedding")
+                if cluster.embedding is None and isinstance(existing_emb, (list, np.ndarray)) and len(existing_emb) > 1:
+                    arr = np.array(existing_emb, dtype=np.float32)
+                    norm = float(np.linalg.norm(arr))
+                    cluster.embedding = (arr / norm) if norm > 0.0 else arr
                 cluster.aliases.add(raw_name)
                 if clean_cand:
                     cluster.aliases.add(clean_cand)
+                if node_month:
+                    if not cluster.first_occurrence_month or node_month < cluster.first_occurrence_month:
+                        cluster.first_occurrence_month = node_month
 
                 # Update canonical name if current has leading determiner or candidate is better capitalized
                 if bool(re.match(r"^(?:the|a|an)\s+", cluster.canonical_name, re.IGNORECASE)):
                     cluster.canonical_name = clean_cand
                 elif len(clean_cand) > len(cluster.canonical_name) and not clean_cand.islower():
                     cluster.canonical_name = clean_cand
-
-                # 2. Gather edges connecting this concept to Chunks
-                # SUPPORTED_BY edges (Concept -> Chunk)
-                chunk_edges = []
-                for _, target, edge_data in store.graph.out_edges(node_id, data=True):
-                    if edge_data.get("relation") == "SUPPORTED_BY":
-                        chunk_edges.append((target, edge_data))
-
-                # SUPPORTS_IDEA edges (Chunk -> Concept)
-                for source, _, edge_data in store.graph.in_edges(node_id, data=True):
-                    if edge_data.get("relation") == "SUPPORTS_IDEA":
-                        chunk_edges.append((source, edge_data))
 
                 seen_chunk_ids_for_node: Set[str] = set()
 
@@ -573,6 +659,10 @@ class IdeaPostProcessor:
                     edge_brief = edge_data.get("brief_description") or brief
                     edge_detailed = edge_data.get("detailed_explanation") or detailed
 
+                    book_node = store.graph.nodes.get(f"book:{b_id}", {})
+                    book_pub = book_node.get("publication_date") or book_node.get("pubdate")
+                    obs_month = format_idea_month(book_pub) or node_month
+
                     obs = IdeaObservation(
                         concept_name=raw_name,
                         chunk_id=chunk_id,
@@ -585,6 +675,7 @@ class IdeaPostProcessor:
                         quote=quote,
                         weight=weight,
                         category=cat,
+                        month=obs_month,
                     )
                     cluster.add_observation(obs)
 
@@ -598,6 +689,7 @@ class IdeaPostProcessor:
                             local_detailed=detailed,
                             weight=weight,
                             category=cat,
+                            month=node_month,
                         )
                     )
         finally:
@@ -619,79 +711,139 @@ class IdeaPostProcessor:
     ) -> List[IdeaCluster]:
         """
         Step 1b: Semantic Similarity Clustering (Within Same Book / Corpus).
-        Computes dense embeddings for canonical_name + brief_description.
+        Reuses cached embeddings on IdeaCluster when available and only embeds missing clusters.
         Merges unmerged clusters if cosine similarity >= 0.92.
         """
-        if not clusters or self.embeddings is None:
+        if not clusters:
             return clusters
 
-        # Generate texts for embedding
-        texts = [f"{c.canonical_name}: {c.get_representative_brief()}" for c in clusters]
-        emb_model = getattr(self.embeddings, "model", "embeddings")
-        batch_size = 16
+        missing_indices: List[int] = [
+            idx for idx, c in enumerate(clusters) if c.embedding is None or len(c.embedding) <= 1
+        ]
 
-        try:
-            vectors_raw = []
-            if console is not None and len(texts) > 0:
-                emb_progress = Progress(
-                    SpinnerColumn(),
-                    TextColumn("[bold cyan]Generating Semantic Embeddings:[/bold cyan]"),
-                    BarColumn(bar_width=25),
-                    TaskProgressColumn(),
-                    MofNCompleteColumn(),
-                    TextColumn(f"[dim]• {emb_model}[/dim]"),
-                    TimeElapsedColumn(),
-                    console=console,
-                )
-                with emb_progress:
-                    task = emb_progress.add_task("embed", total=len(texts))
-                    for i in range(0, len(texts), batch_size):
-                        batch = texts[i : i + batch_size]
-                        vecs = self.embeddings.embed_documents(batch)
-                        vectors_raw.extend(vecs)
-                        emb_progress.update(task, advance=len(batch))
-            else:
-                vectors_raw = self.embeddings.embed_documents(texts)
-
-            if len(vectors_raw) != len(clusters):
-                logger.warning(
-                    f"Mismatch between clusters ({len(clusters)}) and embeddings ({len(vectors_raw)}). Skipping semantic merge."
-                )
-                return clusters
-
-            if console is not None:
-                console.print(
-                    f"[bold green]✓[/bold green] [dim]Generated semantic embeddings for {len(texts)} clusters ({emb_model})[/dim]"
-                )
-
-            # Normalize vectors to unit norm
-            vectors = []
-            for v in vectors_raw:
-                arr = np.array(v, dtype=np.float32)
-                norm = np.linalg.norm(arr)
-                vectors.append(arr / norm if norm > 0 else arr)
-        except Exception as e:
-            logger.warning(f"Error computing cluster embeddings: {e}. Skipping semantic merge.")
-            if console is not None:
-                console.print(f"[yellow]⚠ Semantic embedding skipped: {e}[/yellow]")
-            return clusters
-
-        status = None
-        if console is not None:
-            status = console.status(
-                f"[bold cyan]Clustering concepts via cosine similarity (>= {self.similarity_threshold})...[/bold cyan]",
-                spinner="dots",
+        if missing_indices and self.embeddings is not None:
+            from bookeeper.processing.ollama_pool import (
+                format_idea_for_embedding,
+                partition_texts_for_embedding,
             )
-            status.start()
 
-        try:
-            for i, cluster in enumerate(clusters):
-                cluster.embedding = vectors[i]
+            texts = [
+                format_idea_for_embedding(
+                    clusters[idx].canonical_name,
+                    brief_description=clusters[idx].get_representative_brief(),
+                    detailed_explanation=clusters[idx].get_representative_detailed(),
+                    summary=clusters[idx].get_representative_brief(),
+                    description=clusters[idx].get_representative_detailed(),
+                    short_description=clusters[idx].get_representative_brief(),
+                )
+                for idx in missing_indices
+            ]
+            emb_model = getattr(self.embeddings, "model", "embeddings")
+            text_batches = partition_texts_for_embedding(
+                texts,
+                max_batch_chars=12000,
+                max_batch_items=32,
+            )
 
-            merged: List[IdeaCluster] = []
-            consumed_indices: Set[int] = set()
+            try:
+                vectors_raw = []
+                if console is not None and len(texts) > 0:
+                    emb_progress = Progress(
+                        SpinnerColumn(),
+                        TextColumn("[bold cyan]Generating Semantic Embeddings:[/bold cyan]"),
+                        BarColumn(bar_width=25),
+                        TaskProgressColumn(),
+                        MofNCompleteColumn(),
+                        TextColumn(f"[dim]• {emb_model}[/dim]"),
+                        TimeElapsedColumn(),
+                        TextColumn("• ETA:"),
+                        TimeRemainingColumn(),
+                        console=console,
+                    )
+                    with emb_progress:
+                        task = emb_progress.add_task("embed", total=len(texts))
+                        if isinstance(self.embeddings, FailoverOllamaEmbeddings):
+                            vectors_raw = self.embeddings.embed_documents(
+                                texts,
+                                batch_size=32,
+                                max_batch_chars=12000,
+                                on_progress=lambda n: emb_progress.update(task, advance=n),
+                            )
+                        else:
+                            for batch in text_batches:
+                                vecs = self.embeddings.embed_documents(batch)
+                                vectors_raw.extend(vecs)
+                                emb_progress.update(task, advance=len(batch))
+                else:
+                    if isinstance(self.embeddings, FailoverOllamaEmbeddings):
+                        vectors_raw = self.embeddings.embed_documents(
+                            texts,
+                            batch_size=32,
+                            max_batch_chars=12000,
+                        )
+                    else:
+                        for batch in text_batches:
+                            vecs = self.embeddings.embed_documents(batch)
+                            vectors_raw.extend(vecs)
+
+                if len(vectors_raw) != len(missing_indices):
+                    logger.warning(
+                        f"Mismatch between missing clusters ({len(missing_indices)}) and embeddings ({len(vectors_raw)}). Skipping semantic merge."
+                    )
+                    return clusters
+
+                if console is not None:
+                    reused_cnt = len(clusters) - len(missing_indices)
+                    reused_note = f", {reused_cnt} reused" if reused_cnt > 0 else ""
+                    console.print(
+                        f"[bold green]✓[/bold green] [dim]Generated semantic embeddings for {len(texts)} clusters ({emb_model}{reused_note})[/dim]"
+                    )
+
+                for idx, v in zip(missing_indices, vectors_raw):
+                    arr = np.array(v, dtype=np.float32)
+                    norm = np.linalg.norm(arr)
+                    clusters[idx].embedding = (arr / norm) if norm > 0 else arr
+            except Exception as e:
+                logger.warning(f"Error computing cluster embeddings: {e}. Skipping semantic merge.")
+                if console is not None:
+                    console.print(f"[yellow]⚠ Semantic embedding skipped: {e}[/yellow]")
+                return clusters
+        elif missing_indices and self.embeddings is None:
+            logger.warning(
+                f"Missing embeddings for {len(missing_indices)} clusters and no embeddings client provided. Skipping semantic merge."
+            )
+            if console is not None:
+                console.print(f"[yellow]⚠ Semantic embedding skipped: no embeddings client[/yellow]")
+            return clusters
+        elif not missing_indices and console is not None:
+            console.print(
+                f"[bold green]✓[/bold green] [dim]Reused cached semantic embeddings for all {len(clusters)} clusters[/dim]"
+            )
+
+        merged: List[IdeaCluster] = []
+        consumed_indices: Set[int] = set()
+
+        if console is not None and len(clusters) > 0:
+            cluster_progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[bold cyan]Clustering concepts (similarity >= {task.fields[thresh]}):[/bold cyan]"),
+                BarColumn(bar_width=25),
+                TaskProgressColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                TextColumn("• ETA:"),
+                TimeRemainingColumn(),
+                console=console,
+            )
+        else:
+            cluster_progress = nullcontext()
+
+        with cluster_progress as c_prog:
+            c_task = c_prog.add_task("clustering", total=len(clusters), thresh=f"{self.similarity_threshold:.2f}") if c_prog else None
 
             for i in range(len(clusters)):
+                if c_prog and c_task is not None:
+                    c_prog.update(c_task, completed=i)
                 if i in consumed_indices:
                     continue
 
@@ -704,7 +856,11 @@ class IdeaPostProcessor:
                         continue
 
                     other = clusters[j]
-                    if current.embedding is not None and other.embedding is not None:
+                    if (
+                        current.embedding is not None
+                        and other.embedding is not None
+                        and current.embedding.shape == other.embedding.shape
+                    ):
                         sim = float(np.dot(current.embedding, other.embedding))
                         if sim >= self.similarity_threshold:
                             logger.info(
@@ -712,6 +868,19 @@ class IdeaPostProcessor:
                                 f"'{other.canonical_name}' into '{current.canonical_name}'"
                             )
                             # Merge other into current
+                            current.was_merged = True
+                            current.already_postprocessed = False
+                            current.existing_node_ids.update(other.existing_node_ids)
+                            if other.already_refined:
+                                if not current.already_refined:
+                                    current.already_refined = True
+                                    current.refined_brief = other.refined_brief
+                                    current.refined_detailed = other.refined_detailed
+                                    current.refined_related_entities = list(other.refined_related_entities)
+                                else:
+                                    for r_ent in other.refined_related_entities:
+                                        if r_ent not in current.refined_related_entities:
+                                            current.refined_related_entities.append(r_ent)
                             current.aliases.update(other.aliases)
                             current.aliases.add(other.canonical_name)
                             for obs in other.observations:
@@ -721,9 +890,9 @@ class IdeaPostProcessor:
                             consumed_indices.add(j)
 
                 merged.append(current)
-        finally:
-            if status is not None:
-                status.stop()
+
+            if c_prog and c_task is not None:
+                c_prog.update(c_task, completed=len(clusters))
 
         if console is not None:
             merged_diff = len(clusters) - len(merged)
@@ -923,7 +1092,8 @@ class IdeaPostProcessor:
     ) -> int:
         """
         Step 4: Upsert canonical entity node, merge aliases, link provenance
-        relationships (:MENTIONED_IN, :SUPPORTED_BY), and emit directed :RELATES_TO edges.
+        relationships (:SUPPORTED_BY, :SUPPORTS_IDEA), and emit directed :RELATES_TO edges.
+        Strictly marks only genuinely created or modified nodes/edges as dirty.
         Returns the number of new edges added.
         """
         canonical_name = cluster.canonical_name
@@ -935,37 +1105,130 @@ class IdeaPostProcessor:
         cat = BookParser.repair_mojibake(output.category or cluster.category or "Idea")
         weight = output.weight if output.weight is not None else cluster.max_weight
         occurrences = cluster.total_occurrences
+        is_refined = bool(occurrences >= self.min_occurrences or cluster.already_refined)
+        clean_related = [
+            BookParser.repair_mojibake(r).strip()
+            for r in (output.related_entities or [])
+            if r and BookParser.repair_mojibake(r).strip().lower() != canonical_name.lower()
+        ]
 
         # 1. Upsert Canonical Entity Node
-        if not store.graph.has_node(canonical_nid):
-            store.graph.add_node(
-                canonical_nid,
-                type="Concept",
-                tag="idea",
-                tags=["idea", cat.lower().replace(" ", "-")],
-                is_idea=True,
-                name=canonical_name,
-                category=cat,
+        earliest_month = cluster.get_first_occurrence_month()
+        emb_list: Optional[List[float]] = None
+        if cluster.embedding is not None and len(cluster.embedding) > 1:
+            emb_list = [round(float(x), 6) for x in cluster.embedding]
+
+        # Calculate or update embedding against the full synthesized idea
+        # (name, description, short description) after each post-processing update
+        if self.embeddings is not None and (emb_list is None or (is_refined and self.pool is not None)):
+            full_embed_text = format_idea_for_embedding(
+                canonical_name,
                 brief_description=brief,
                 detailed_explanation=detailed,
                 summary=brief or detailed,
-                weight=weight,
-                occurrences=occurrences,
+                description=detailed,
+                short_description=brief,
             )
+            try:
+                if hasattr(self.embeddings, "embed_query"):
+                    raw_vec = self.embeddings.embed_query(full_embed_text)
+                elif hasattr(self.embeddings, "embed_documents"):
+                    docs_embs = self.embeddings.embed_documents([full_embed_text])
+                    raw_vec = docs_embs[0] if docs_embs else None
+                else:
+                    raw_vec = None
+
+                if raw_vec and len(raw_vec) > 1:
+                    arr = np.array(raw_vec, dtype=np.float32)
+                    norm = float(np.linalg.norm(arr))
+                    unit = (arr / norm) if norm > 0 else arr
+                    emb_list = [round(float(x), 6) for x in unit]
+                    cluster.embedding = unit
+            except Exception as e:
+                logger.debug(f"Could not calculate updated post-processing embedding for '{canonical_name}': {e}")
+
+        node_changed = False
+        if not store.graph.has_node(canonical_nid):
+            node_attrs: Dict[str, Any] = {
+                "type": "Concept",
+                "tag": "idea",
+                "tags": ["idea", cat.lower().replace(" ", "-")],
+                "is_idea": True,
+                "name": canonical_name,
+                "category": cat,
+                "brief_description": brief,
+                "short_description": brief,
+                "detailed_explanation": detailed,
+                "description": detailed,
+                "summary": brief or detailed,
+                "weight": weight,
+                "occurrences": occurrences,
+                "postprocessed": True,
+                "refined": is_refined,
+            }
+            if clean_related:
+                node_attrs["related_entities"] = clean_related
+            if earliest_month:
+                node_attrs["first_occurrence_month"] = earliest_month
+                node_attrs["month"] = earliest_month
+            if emb_list is not None:
+                node_attrs["embedding"] = emb_list
+            store.graph.add_node(canonical_nid, **node_attrs)
+            node_changed = True
         else:
             nd = store.graph.nodes[canonical_nid]
+            prev_brief = nd.get("brief_description")
+            prev_detailed = nd.get("detailed_explanation")
+            prev_cat = nd.get("category")
+            prev_weight = int(nd.get("weight") or 0)
+            prev_occ = int(nd.get("occurrences") or 0)
+            prev_month = nd.get("first_occurrence_month") or nd.get("month")
+            prev_emb = nd.get("embedding")
+            prev_refined = bool(nd.get("refined"))
+
+            new_weight = max(prev_weight, weight)
+            new_occ = max(prev_occ, occurrences)
+
             nd["type"] = "Concept"
             nd["is_idea"] = True
             nd["tag"] = "idea"
             nd["name"] = canonical_name
             nd["brief_description"] = brief
+            nd["short_description"] = brief
             nd["detailed_explanation"] = detailed
+            nd["description"] = detailed
             nd["summary"] = brief or detailed
             nd["category"] = cat
-            nd["weight"] = max(int(nd.get("weight") or 0), weight)
-            nd["occurrences"] = max(int(nd.get("occurrences") or 0), occurrences)
+            nd["weight"] = new_weight
+            nd["occurrences"] = new_occ
+            nd["postprocessed"] = True
+            nd["refined"] = prev_refined or is_refined
+            if clean_related:
+                nd["related_entities"] = clean_related
+            if earliest_month:
+                curr_month = nd.get("first_occurrence_month") or nd.get("month")
+                if not curr_month or earliest_month < curr_month:
+                    nd["first_occurrence_month"] = earliest_month
+                    nd["month"] = earliest_month
+            if emb_list is not None:
+                nd["embedding"] = emb_list
             if "tags" not in nd:
                 nd["tags"] = ["idea", cat.lower().replace(" ", "-")]
+
+            if (
+                prev_brief != brief
+                or prev_detailed != detailed
+                or prev_cat != cat
+                or prev_weight != new_weight
+                or prev_occ != new_occ
+                or (nd.get("first_occurrence_month") or nd.get("month")) != prev_month
+                or prev_emb != emb_list
+                or prev_refined != bool(nd.get("refined"))
+            ):
+                node_changed = True
+
+        if node_changed:
+            store.mark_node_dirty(canonical_nid)
 
         # 2. Redirect alias nodes into canonical node and remove redundant nodes
         for alias in cluster.aliases:
@@ -973,21 +1236,37 @@ class IdeaPostProcessor:
                 continue
             alias_nid = f"concept:{alias}"
             if store.graph.has_node(alias_nid):
+                store.mark_node_dirty(canonical_nid)
+                alias_month = store.graph.nodes[alias_nid].get("first_occurrence_month") or store.graph.nodes[alias_nid].get("month")
+                if alias_month:
+                    curr_m = store.graph.nodes[canonical_nid].get("first_occurrence_month") or store.graph.nodes[canonical_nid].get("month")
+                    if not curr_m or alias_month < curr_m:
+                        store.graph.nodes[canonical_nid]["first_occurrence_month"] = alias_month
+                        store.graph.nodes[canonical_nid]["month"] = alias_month
                 # Redirect in-edges to canonical
                 in_edges = list(store.graph.in_edges(alias_nid, data=True))
                 for src, _, edata in in_edges:
                     if src != canonical_nid:
+                        had_edge = store.graph.has_edge(src, canonical_nid)
                         store.graph.add_edge(src, canonical_nid, **edata)
+                        store.mark_edge_dirty(src, canonical_nid)
+                        if not had_edge:
+                            edges_added += 1
                 # Redirect out-edges to canonical
                 out_edges = list(store.graph.out_edges(alias_nid, data=True))
                 for _, tgt, edata in out_edges:
                     if tgt != canonical_nid:
+                        had_edge = store.graph.has_edge(canonical_nid, tgt)
                         store.graph.add_edge(canonical_nid, tgt, **edata)
+                        store.mark_edge_dirty(canonical_nid, tgt)
+                        if not had_edge:
+                            edges_added += 1
                 # Remove alias node
                 store.graph.remove_node(alias_nid)
+                store.mark_node_removed(alias_nid)
 
         # 3. Link Provenance & Structural Edges
-        # Connect consolidated idea node to all source chunks
+        # Connect consolidated idea node to all source chunks without overwriting existing edges
         quotes = cluster.get_representative_quotes(max_quotes=self.max_quotes)
         rep_quote = quotes[0] if quotes else ""
 
@@ -1005,6 +1284,7 @@ class IdeaPostProcessor:
                         detailed_explanation=detailed,
                         chunk_id=chunk_id,
                     )
+                    store.mark_edge_dirty(canonical_nid, chunk_nid)
                     edges_added += 1
 
                 # (:Chunk) -[:SUPPORTS_IDEA]-> (:Concept)
@@ -1017,31 +1297,122 @@ class IdeaPostProcessor:
                         brief_description=brief,
                         detailed_explanation=detailed,
                     )
+                    store.mark_edge_dirty(chunk_nid, canonical_nid)
                     edges_added += 1
 
-                # Explicit [:MENTIONED_IN] provenance relation
-                if not store.graph.has_edge(canonical_nid, chunk_nid) or store.graph[canonical_nid][chunk_nid].get("relation") != "MENTIONED_IN":
-                    # We can store a specific MENTIONED_IN edge or mark on SUPPORTED_BY
-                    store.graph.add_edge(
-                        canonical_nid,
-                        chunk_nid,
-                        relation="MENTIONED_IN",
-                        chunk_id=chunk_id,
-                    )
-                    edges_added += 1
-
-        # 4. Emit directed relational edges ([:RELATES_TO])
-        for rel_entity in output.related_entities:
-            rel_name = BookParser.repair_mojibake(rel_entity).strip()
-            if rel_name and rel_name.lower() != canonical_name.lower():
-                store.add_concept_relation(
-                    src_concept_name=canonical_name,
-                    tgt_concept_name=rel_name,
-                    relation_type="RELATES_TO",
-                )
+        # 4. Emit directed relational edges ([:RELATES_TO]) only when not already present
+        for rel_name in clean_related:
+            if store.add_concept_relation(
+                src_concept_name=canonical_name,
+                tgt_concept_name=rel_name,
+                relation_type="RELATES_TO",
+            ):
                 edges_added += 1
 
         return edges_added
+
+    def _is_cluster_already_refined(
+        self,
+        cluster: IdeaCluster,
+        state_manager: Optional[IdeaPostProcessorState] = None,
+    ) -> bool:
+        """
+        Check whether a cluster (or any of its merged aliases) has ALREADY been refined
+        by the LLM. Refinement must be done no more than 1 time per idea.
+        """
+        if not self.resume:
+            return False
+        if cluster.already_refined:
+            return True
+        if state_manager is not None and state_manager.get_synthesized_output_for_cluster(cluster) is not None:
+            return True
+        return False
+
+    def _is_cluster_affected(
+        self,
+        store: ConceptGraphStore,
+        cluster: IdeaCluster,
+        state_manager: Optional[IdeaPostProcessorState] = None,
+    ) -> bool:
+        """
+        Determine whether a cluster was affected in the current cycle and needs
+        post-processing / graph consolidation, or if it was already post-processed
+        in an earlier cycle and can be skipped without re-ingestion.
+        """
+        if not self.resume:
+            return True
+
+        canonical_name = cluster.canonical_name
+        canonical_nid = f"concept:{canonical_name}"
+        if not store.graph.has_node(canonical_nid):
+            return True
+
+        # If multiple graph nodes were merged into this cluster (by normalization or cosine similarity),
+        # or if any alias node still exists separately in the graph, we must consolidate them.
+        if cluster.was_merged or len(cluster.existing_node_ids) > 1:
+            return True
+        for alias in cluster.aliases:
+            if alias != canonical_name and store.graph.has_node(f"concept:{alias}"):
+                return True
+
+        nd = store.graph.nodes[canonical_nid]
+        is_multi = cluster.total_occurrences >= self.min_occurrences
+        already_refined = self._is_cluster_already_refined(cluster, state_manager)
+
+        # If cluster has >= min_occurrences and has never been refined yet, it needs its 1-time LLM refinement!
+        if is_multi and not already_refined:
+            return True
+
+        # Check whether the node in store.graph already has its post-processed state applied
+        if not nd.get("postprocessed"):
+            # Backward-compatibility with graphs saved before the 'postprocessed' node flag existed:
+            # If state_manager has a cached output whose brief/detailed already match the graph node
+            # (and the node wasn't modified in the current batch), stamp it in-memory as postprocessed.
+            if state_manager is not None and canonical_nid not in store.dirty_nodes:
+                cached_out = (
+                    state_manager.get_synthesized_output_for_cluster(cluster)
+                    if is_multi
+                    else state_manager.get_output(canonical_name)
+                )
+                if cached_out is not None:
+                    node_brief = BookParser.repair_mojibake(nd.get("brief_description") or "")
+                    node_det = BookParser.repair_mojibake(nd.get("detailed_explanation") or "")
+                    cache_brief = BookParser.repair_mojibake(cached_out.brief_description or "")
+                    cache_det = BookParser.repair_mojibake(cached_out.detailed_explanation or "")
+                    if node_brief == cache_brief and node_det == cache_det:
+                        nd["postprocessed"] = True
+                        if is_multi or state_manager.get_status(canonical_name) == "synthesized":
+                            nd["refined"] = True
+                    else:
+                        return True
+                else:
+                    return True
+            else:
+                return True
+
+        # If multi-occurrence and already refined in state_manager, ensure graph node has refined state applied
+        if is_multi and not nd.get("refined"):
+            return True
+
+        # Check if occurrence count, earliest month, embedding, or chunk provenance edges need updating
+        if int(nd.get("occurrences") or 0) < cluster.total_occurrences:
+            return True
+
+        earliest_month = cluster.get_first_occurrence_month()
+        curr_month = nd.get("first_occurrence_month") or nd.get("month")
+        if earliest_month and (not curr_month or earliest_month < curr_month):
+            return True
+
+        if cluster.embedding is not None and len(cluster.embedding) > 1 and not nd.get("embedding"):
+            return True
+
+        for chunk_id in cluster.chunk_ids:
+            chunk_nid = f"chunk:{chunk_id}"
+            if store.graph.has_node(chunk_nid):
+                if not store.graph.has_edge(canonical_nid, chunk_nid) or not store.graph.has_edge(chunk_nid, canonical_nid):
+                    return True
+
+        return False
 
     def _process_single_cluster(
         self,
@@ -1050,16 +1421,45 @@ class IdeaPostProcessor:
     ) -> Tuple[ConsolidatedIdeaOutput, bool, bool]:
         """
         Synthesize or retrieve cached cluster output.
+        Refinement via LLM is performed no more than 1 time per idea:
+        - If the cluster (or any merged alias) was already refined once, reuses the refined output.
+        - If the cluster was previously single-occurrence ('bypassed') and now has >= min_occurrences,
+          performs its 1-time LLM refinement now.
         Returns: (output, is_multi, was_resumed)
         """
         is_multi = cluster.total_occurrences >= self.min_occurrences
-        if state_manager and self.resume:
-            cached = state_manager.get_output(cluster.canonical_name)
-            if cached is not None:
-                return cached, is_multi, True
+        if self.resume:
+            # 1. Check if already refined in state_manager (canonical or any merged alias)
+            if state_manager is not None:
+                synth_cached = state_manager.get_synthesized_output_for_cluster(cluster)
+                if synth_cached is not None:
+                    cluster.already_refined = True
+                    if state_manager.get_status(cluster.canonical_name) != "synthesized":
+                        state_manager.record_processed(cluster, synth_cached, status="synthesized")
+                    return synth_cached, True, True
+
+            # 2. Check if already refined on the graph node itself
+            if cluster.already_refined:
+                refined_out = ConsolidatedIdeaOutput(
+                    brief_description=cluster.refined_brief or cluster.get_representative_brief(),
+                    detailed_explanation=cluster.refined_detailed or cluster.get_representative_detailed(),
+                    related_entities=list(cluster.refined_related_entities),
+                    category=cluster.category,
+                    weight=cluster.max_weight,
+                )
+                if state_manager is not None:
+                    state_manager.record_processed(cluster, refined_out, status="synthesized")
+                return refined_out, True, True
+
+            # 3. For single-occurrence ideas, reuse cached bypassed output if present
+            if not is_multi and state_manager is not None:
+                cached = state_manager.get_output(cluster.canonical_name)
+                if cached is not None:
+                    return cached, False, True
 
         if is_multi:
             output = self.synthesize_cluster(cluster)
+            cluster.already_refined = True
             if state_manager:
                 state_manager.record_processed(cluster, output, status="synthesized")
             return output, True, False
@@ -1089,9 +1489,9 @@ class IdeaPostProcessor:
         Execute full two-pass aggregation and synthesis pipeline on the graph:
         1. Group ideas deterministically by normalized name.
         2. Merge clusters by semantic similarity (>= 0.92).
-        3. For N == 1: pass through as-is (bypass LLM).
-           For N >= 2: synthesize cohesive brief and detailed explanations with LLM.
-        4. Overwrite/upsert canonical concept nodes and provenance/relational edges.
+        3. Filter out already post-processed and untouched clusters so only affected
+           clusters are processed/ingested, ensuring LLM refinement runs at most once per idea.
+        4. Overwrite/upsert canonical concept nodes and provenance/relational edges for affected clusters.
         Supports state file checkpointing (save every N ideas) and auto-continue.
         """
         t0 = time.time()
@@ -1102,7 +1502,7 @@ class IdeaPostProcessor:
         initial_clusters = list(clusters_by_norm.values())
         total_input_concepts = sum(len(c.aliases) for c in initial_clusters)
 
-        # 2. Semantic similarity clustering
+        # 2. Semantic similarity clustering (across all ideas in the graph)
         merged_clusters = self.cluster_by_semantic_similarity(initial_clusters, console=console)
         merged_diff = len(initial_clusters) - len(merged_clusters)
         total_clusters = len(merged_clusters)
@@ -1129,11 +1529,24 @@ class IdeaPostProcessor:
                         f"({resumed_count} ideas previously processed). Auto-continuing...[/bold cyan]"
                     )
 
+        # Partition clusters into untouched (already post-processed & up-to-date in graph) vs affected
+        affected_clusters: List[IdeaCluster] = []
+        untouched_clusters: List[IdeaCluster] = []
+        for c in merged_clusters:
+            if self._is_cluster_affected(store, c, state_manager):
+                affected_clusters.append(c)
+            else:
+                untouched_clusters.append(c)
+
         # Display Section Header
         if console is not None:
             resumed_info = (
                 f"\n• Resumed from State:       [bold green]{resumed_count}[/bold green] ideas (auto-continued from {state_manager.state_path.name})"
                 if resumed_count > 0 and state_manager else ""
+            )
+            already_proc_info = (
+                f"\n• Already Post-Processed:   [bold cyan]{len(untouched_clusters)}[/bold cyan] ideas skipped (affected in this cycle: [bold yellow]{len(affected_clusters)}[/bold yellow])"
+                if len(untouched_clusters) > 0 else ""
             )
             checkpoint_info = (
                 f"\n• State Checkpoint File:    [bold]{state_manager.state_path}[/bold] (saves every {self.checkpoint_interval} ideas)"
@@ -1147,6 +1560,7 @@ class IdeaPostProcessor:
                 f"• Multi-Occurrence Ideas:    [bold green]{len(target_multi)}[/bold green] (filtered in for LLM consolidation, >= {self.min_occurrences} mentions)\n"
                 f"• Single-Occurrence Ideas:   [dim]{len(target_single)} (filtered out / bypassed to conserve compute)[/dim]\n"
                 f"• Cosine Similarity Thresh:  [bold yellow]{self.similarity_threshold}[/bold yellow]"
+                f"{already_proc_info}"
                 f"{checkpoint_info}"
                 f"{resumed_info}"
             )
@@ -1154,8 +1568,7 @@ class IdeaPostProcessor:
         else:
             logger.info(
                 f"Starting IdeaPostProcessor (model={self.model_name}): {total_input_concepts} raw concepts -> "
-                f"{total_clusters} clusters ({len(target_multi)} multi-occurrence filtered for synthesis, "
-                f"{len(target_single)} single-occurrence bypassed, resumed: {resumed_count})."
+                f"{total_clusters} clusters ({len(affected_clusters)} affected, {len(untouched_clusters)} already post-processed)."
             )
 
         single_occ_count = 0
@@ -1166,9 +1579,22 @@ class IdeaPostProcessor:
         synthesized_names: List[str] = []
         bypassed_names: List[str] = []
 
+        # Account for untouched clusters without re-ingesting them or marking them dirty
+        for u_cluster in untouched_clusters:
+            actual_resumed_count += 1
+            if u_cluster.total_occurrences >= self.min_occurrences or u_cluster.already_refined:
+                synthesized_count += 1
+                multi_occ_count += 1
+                synthesized_names.append(u_cluster.canonical_name)
+            else:
+                single_occ_count += 1
+                bypassed_names.append(u_cluster.canonical_name)
+
+        num_affected = len(affected_clusters)
+
         try:
-            # 3 & 4. Branch by mention count and apply to graph with live progress
-            if console is not None and total_clusters > 0:
+            # 3 & 4. Process and apply ONLY affected clusters to the graph
+            if console is not None and num_affected > 0:
                 progress = Progress(
                     SpinnerColumn(),
                     TextColumn("[bold cyan]Consolidation Progress:[/bold cyan]"),
@@ -1178,9 +1604,13 @@ class IdeaPostProcessor:
                     TextColumn("{task.fields[stats_line]}"),
                     console=console,
                 )
-                tot_task = progress.add_task("total", total=total_clusters, completed=0, stats_line="")
-                first_c = merged_clusters[0]
-                first_is_cached = bool(state_manager and state_manager.is_processed(first_c.canonical_name))
+                tot_task = progress.add_task("total", total=num_affected, completed=0, stats_line="")
+                first_c = affected_clusters[0]
+                first_is_cached = self._is_cluster_already_refined(first_c, state_manager) or bool(
+                    not (first_c.total_occurrences >= self.min_occurrences)
+                    and state_manager
+                    and state_manager.is_processed(first_c.canonical_name)
+                )
                 if first_c.total_occurrences >= self.min_occurrences:
                     if first_is_cached:
                         first_init_text = f"[bold blue]Current Idea:[/bold blue] '{first_c.canonical_name}' | [bold green]✓ Synthesized (resumed)[/bold green]"
@@ -1196,25 +1626,25 @@ class IdeaPostProcessor:
                 cur_line = Text.from_markup(first_init_text)
 
                 with Live(Group(cur_line, progress), console=console, refresh_per_second=10) as live:
-                    for idx, cluster in enumerate(merged_clusters, start=1):
+                    for idx, cluster in enumerate(affected_clusters, start=1):
                         is_multi = cluster.total_occurrences >= self.min_occurrences
-                        is_cached = bool(state_manager and state_manager.is_processed(cluster.canonical_name))
+                        is_already_refined = self._is_cluster_already_refined(cluster, state_manager)
 
-                        if is_multi and not is_cached:
+                        if is_multi and not is_already_refined:
                             cur_text = (
                                 f"[bold blue]Current Idea:[/bold blue] '{cluster.canonical_name}' "
                                 f"({cluster.total_occurrences} mentions) | [bold yellow]Consolidating with {self.model_name}...[/bold yellow]"
                             )
                             live.update(Group(Text.from_markup(cur_text), progress))
 
-                        output, _, was_resumed = self._process_single_cluster(cluster, state_manager)
+                        output, eff_is_multi, was_resumed = self._process_single_cluster(cluster, state_manager)
                         edges_added = self.apply_consolidation_to_graph(store, cluster, output)
                         total_edges_added += edges_added
 
                         if was_resumed:
                             actual_resumed_count += 1
 
-                        if is_multi:
+                        if eff_is_multi:
                             synthesized_count += 1
                             multi_occ_count += 1
                             synthesized_names.append(cluster.canonical_name)
@@ -1229,10 +1659,10 @@ class IdeaPostProcessor:
 
                         elapsed = time.perf_counter() - t_start
                         rate = (completed / elapsed) if elapsed > 0 else 0.0
-                        if completed > 0 and total_clusters > completed and rate > 0:
-                            rem_sec = (total_clusters - completed) / rate
+                        if completed > 0 and num_affected > completed and rate > 0:
+                            rem_sec = (num_affected - completed) / rate
                             eta_str = _format_eta(rem_sec)
-                        elif completed >= total_clusters:
+                        elif completed >= num_affected:
                             eta_str = "0m 00s"
                         else:
                             eta_str = "--m --s"
@@ -1245,45 +1675,50 @@ class IdeaPostProcessor:
                             f"[dim]{single_occ_count} bypassed[/dim]{resumed_stats}"
                         )
 
-                        progress.update(tot_task, completed=completed, total=total_clusters, stats_line=stats_str)
+                        progress.update(tot_task, completed=completed, total=num_affected, stats_line=stats_str)
                         live.update(Group(Text.from_markup(cur_text), progress))
 
                         # Save checkpoint every checkpoint_interval (default: 100)
-                        if state_manager and (completed % self.checkpoint_interval == 0 or completed == total_clusters):
+                        if state_manager and (completed % self.checkpoint_interval == 0 or completed == num_affected):
                             state_manager.save()
-                            if completed % self.checkpoint_interval == 0 and completed < total_clusters:
+                            if completed % self.checkpoint_interval == 0 and completed < num_affected:
                                 console.print(
-                                    f"[bold cyan][Idea Postprocessor][/bold cyan] [dim]💾 Checkpoint saved at {completed}/{total_clusters} ideas -> {state_manager.state_path.name}[/dim]"
+                                    f"[bold cyan][Idea Postprocessor][/bold cyan] [dim]💾 Checkpoint saved at {completed}/{num_affected} ideas -> {state_manager.state_path.name}[/dim]"
                                 )
                                 sys.stdout.flush()
 
                         # Periodic statistical line info every 10 ideas (or on final completion)
-                        if completed % 10 == 0 or completed == total_clusters:
-                            pct = (completed / total_clusters * 100) if total_clusters > 0 else 100.0
+                        if completed % 10 == 0 or completed == num_affected:
+                            pct = (completed / num_affected * 100) if num_affected > 0 else 100.0
                             console.print(
-                                f"[bold cyan][Idea Postprocessor][/bold cyan] {completed}/{total_clusters} ideas ({pct:.1f}%)"
+                                f"[bold cyan][Idea Postprocessor][/bold cyan] {completed}/{num_affected} ideas ({pct:.1f}%)"
                                 f" | {rate_str} | ETA: {eta_str} | [bold green]✓ {synthesized_count} synthesized[/bold green]"
                                 f" | [dim]{single_occ_count} bypassed[/dim]{resumed_stats} | +{total_edges_added} edges"
                             )
                             sys.stdout.flush()
 
                         if on_progress:
-                            on_progress(completed, total_clusters, cluster.canonical_name, {
+                            on_progress(completed, num_affected, cluster.canonical_name, {
                                 "synthesized": synthesized_count,
                                 "bypassed": single_occ_count,
                                 "resumed": actual_resumed_count,
                                 "edges_added": total_edges_added,
                             })
+            elif console is not None and total_clusters > 0 and num_affected == 0:
+                console.print(
+                    f"[bold cyan][Idea Postprocessor][/bold cyan] All {total_clusters} ideas already post-processed and up-to-date "
+                    f"([cyan]{actual_resumed_count} resumed[/cyan], 0 affected ideas to re-ingest, +0 edges)."
+                )
             else:
-                for idx, cluster in enumerate(merged_clusters, start=1):
-                    output, is_multi, was_resumed = self._process_single_cluster(cluster, state_manager)
+                for idx, cluster in enumerate(affected_clusters, start=1):
+                    output, eff_is_multi, was_resumed = self._process_single_cluster(cluster, state_manager)
                     edges_added = self.apply_consolidation_to_graph(store, cluster, output)
                     total_edges_added += edges_added
 
                     if was_resumed:
                         actual_resumed_count += 1
 
-                    if is_multi:
+                    if eff_is_multi:
                         synthesized_count += 1
                         multi_occ_count += 1
                         synthesized_names.append(cluster.canonical_name)
@@ -1292,18 +1727,18 @@ class IdeaPostProcessor:
                         bypassed_names.append(cluster.canonical_name)
 
                     completed = idx
-                    if state_manager and (completed % self.checkpoint_interval == 0 or completed == total_clusters):
+                    if state_manager and (completed % self.checkpoint_interval == 0 or completed == num_affected):
                         state_manager.save()
 
-                    if completed % 10 == 0 or completed == total_clusters:
-                        pct = (completed / total_clusters * 100) if total_clusters > 0 else 100.0
+                    if completed % 10 == 0 or completed == num_affected:
+                        pct = (completed / num_affected * 100) if num_affected > 0 else 100.0
                         logger.info(
-                            f"[Idea Postprocessor] {completed}/{total_clusters} ideas ({pct:.1f}%)"
+                            f"[Idea Postprocessor] {completed}/{num_affected} affected ideas ({pct:.1f}%)"
                             f" | Synthesized: {synthesized_count} | Bypassed: {single_occ_count} | Resumed: {actual_resumed_count} | Edges: +{total_edges_added}"
                         )
 
                     if on_progress:
-                        on_progress(completed, total_clusters, cluster.canonical_name, {
+                        on_progress(completed, num_affected, cluster.canonical_name, {
                             "synthesized": synthesized_count,
                             "bypassed": single_occ_count,
                             "resumed": actual_resumed_count,
@@ -1330,6 +1765,7 @@ class IdeaPostProcessor:
 
         logger.info(
             f"IdeaPostProcessor completed in {duration:.2f}s: "
-            f"{len(merged_clusters)} clusters ({multi_occ_count} synthesized, {single_occ_count} bypassed, {actual_resumed_count} resumed)."
+            f"{len(merged_clusters)} total clusters ({num_affected} affected, {len(untouched_clusters)} untouched; "
+            f"{multi_occ_count} synthesized, {single_occ_count} bypassed, {actual_resumed_count} resumed)."
         )
         return report

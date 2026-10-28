@@ -51,6 +51,7 @@ dependencies = [
     "bcrypt>=5.0.0",
     "python-multipart>=0.0.32",
     "aiofiles>=25.1.0",
+    "usearch>=2.26.5",
 ]
 
 [project.optional-dependencies]

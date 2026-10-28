@@ -5,6 +5,7 @@ Multi-server smart proxy and failover client for Ollama with priority routing an
 import atexit
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -16,6 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -25,6 +27,43 @@ from langchain_ollama import OllamaEmbeddings
 from bookeeper.config import DEFAULT_CAPABILITIES, OllamaServerConfig
 
 logger = logging.getLogger(__name__)
+
+
+class DaemonThreadPoolExecutor(ThreadPoolExecutor):
+    """ThreadPoolExecutor that creates daemon threads so cancellation terminates immediately without hanging."""
+
+    def _adjust_thread_count(self):
+        orig_thread = threading.Thread
+
+        def _daemon_thread(*args, **kwargs):
+            kwargs["daemon"] = True
+            return orig_thread(*args, **kwargs)
+
+        threading.Thread = _daemon_thread
+        try:
+            super()._adjust_thread_count()
+        finally:
+            threading.Thread = orig_thread
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        super().shutdown(wait=wait, cancel_futures=cancel_futures)
+        if not wait:
+            # Unregister daemon threads from Python's atexit handler so exit is instant
+            try:
+                import concurrent.futures.thread
+
+                with concurrent.futures.thread._global_shutdown_lock:
+                    for t in list(self._threads):
+                        concurrent.futures.thread._threads_queues.pop(t, None)
+            except Exception:
+                pass
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            self.shutdown(wait=False, cancel_futures=True)
+            return False
+        self.shutdown(wait=True)
+        return False
 
 _macos_bridge_lock = threading.Lock()
 _macos_bridge_tunnels: Dict[str, Tuple[str, subprocess.Popen]] = {}
@@ -250,6 +289,7 @@ class OllamaServerNode:
     total_duration: float = 0.0
     success_duration: float = 0.0
     stats_by_type: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    _last_embed_seq: int = 0
 
     def wake(self) -> bool:
         """Trigger Wake-on-LAN if node has a MAC address configured."""
@@ -387,6 +427,7 @@ class OllamaServerNode:
         self.total_duration = 0.0
         self.success_duration = 0.0
         self.stats_by_type.clear()
+        self._last_embed_seq = 0
 
 
 _thread_local = threading.local()
@@ -457,6 +498,7 @@ class OllamaPool:
         self.max_tasks_per_server = max(1, max_tasks_per_server)
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
+        self._embed_rr_seq: int = 0
         self.nodes: List[OllamaServerNode] = [
             OllamaServerNode(
                 url=s.url.rstrip("/"),
@@ -730,11 +772,29 @@ class OllamaPool:
                             if n.active_tasks < self.max_tasks_per_server
                         ]
                         if available:
-                            # Prefer lowest active tasks (idle first), then highest priority (lowest number)
-                            available.sort(key=lambda n: (n.active_tasks, n.priority))
+                            is_embedding_task = (
+                                (task_type and task_type.strip().lower() == "embedding")
+                                or (
+                                    capability
+                                    and capability.strip().lower()
+                                    in ("embedding", "embeddings", "embed", "embeds")
+                                )
+                            )
+                            if is_embedding_task:
+                                # Distribute embedding tasks across all idle embedding nodes (round-robin / least-recently-used),
+                                # falling back to node priority on initial cold start.
+                                available.sort(
+                                    key=lambda n: (n.active_tasks, n._last_embed_seq, n.priority)
+                                )
+                            else:
+                                # Prefer lowest active tasks (idle first), then highest priority (lowest number)
+                                available.sort(key=lambda n: (n.active_tasks, n.priority))
                             selected_node = available[0]
                             selected_node.active_tasks += 1
                             selected_node.last_task_start = time.time()
+                            if is_embedding_task:
+                                self._embed_rr_seq += 1
+                                selected_node._last_embed_seq = self._embed_rr_seq
                             break
                         else:
                             # All eligible servers are currently busy processing another task sequentially.
@@ -993,9 +1053,112 @@ class OllamaPool:
         )
 
 
+def partition_texts_for_embedding(
+    texts: Sequence[str],
+    max_batch_chars: int = 16000,
+    max_batch_items: int = 64,
+    max_item_chars: int = 6000,
+) -> List[List[str]]:
+    """
+    Dynamically partition texts (sentences, chunks, short ideas, or full ideas) into
+    size-aware batches bounded by both character budget (`max_batch_chars`) and item count
+    (`max_batch_items`).
+
+    - Short sentences (~100-300 chars) pack up to `max_batch_items` (e.g. 64) per batch.
+    - Full ideas (name + brief + detailed explanation, ~500-2,000 chars) pack ~8-24 per batch.
+    - Full chunks (~1,500-3,000 chars) pack ~5-10 per batch so Ollama's embedding context
+      buffer never overflows or times out.
+    """
+    if not texts:
+        return []
+
+    eff_max_items = max(1, int(max_batch_items)) if max_batch_items and max_batch_items > 0 else len(texts)
+    eff_max_chars = int(max_batch_chars) if max_batch_chars and max_batch_chars > 0 else 0
+
+    batches: List[List[str]] = []
+    current_batch: List[str] = []
+    current_chars: int = 0
+
+    for raw in texts:
+        s = str(raw or "")
+        if max_item_chars and max_item_chars > 0 and len(s) > max_item_chars:
+            s = s[:max_item_chars]
+        item_len = max(1, len(s))
+
+        if current_batch and (
+            len(current_batch) >= eff_max_items
+            or (eff_max_chars > 0 and current_chars + item_len > eff_max_chars)
+        ):
+            batches.append(current_batch)
+            current_batch = []
+            current_chars = 0
+
+        current_batch.append(s)
+        current_chars += item_len
+
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
+
+
+def format_idea_for_embedding(
+    name: str,
+    brief_description: str = "",
+    detailed_explanation: str = "",
+    summary: str = "",
+    description: str = "",
+    short_description: str = "",
+    max_chars: int = 2400,
+    **kwargs: Any,
+) -> str:
+    """
+    Format a full idea into a single text string for semantic embedding,
+    including name, description, and short description (or brief description/summary/detailed explanation),
+    avoiding duplicate text and respecting max_chars.
+    """
+    clean_name = (name or "").strip()
+    short_desc = (short_description or brief_description or summary or "").strip()
+    main_desc = (description or "").strip()
+    detailed_desc = (detailed_explanation or "").strip()
+
+    parts: List[str] = []
+    seen_lower: Set[str] = set()
+
+    if clean_name:
+        parts.append(clean_name)
+        seen_lower.add(clean_name.lower())
+
+    if short_desc and short_desc.lower() not in seen_lower:
+        parts.append(short_desc)
+        seen_lower.add(short_desc.lower())
+
+    if main_desc and main_desc.lower() not in seen_lower:
+        parts.append(main_desc)
+        seen_lower.add(main_desc.lower())
+
+    if detailed_desc and detailed_desc.lower() not in seen_lower:
+        parts.append(detailed_desc)
+        seen_lower.add(detailed_desc.lower())
+
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        text = parts[0]
+    elif len(parts) == 2:
+        text = f"{parts[0]}: {parts[1]}"
+    else:
+        text = f"{parts[0]}: {' — '.join(parts[1:])}"
+
+    if max_chars and max_chars > 0 and len(text) > max_chars:
+        return text[:max_chars]
+    return text
+
+
 class FailoverOllamaEmbeddings(Embeddings):
     """
-    LangChain Embeddings wrapper with multi-server failover support across OllamaPool.
+    LangChain Embeddings wrapper with multi-server failover and dynamic size-aware batching
+    across OllamaPool for sentences, chunks, and ideas (short or full ideas).
     """
 
     def __init__(
@@ -1003,11 +1166,17 @@ class FailoverOllamaEmbeddings(Embeddings):
         pool: OllamaPool,
         model: str = "nomic-embed-text",
         request_timeout: int = 120,
+        max_batch_chars: int = 16000,
+        max_batch_items: int = 64,
+        max_item_chars: int = 6000,
         **kwargs: Any,
     ):
         self.pool = pool
         self.model = model
         self.request_timeout = request_timeout
+        self.max_batch_chars = max_batch_chars
+        self.max_batch_items = max_batch_items
+        self.max_item_chars = max_item_chars
         self._lock = threading.Lock()
         self.total_embedded_texts: int = 0
         self.total_embedded_chars: int = 0
@@ -1056,10 +1225,39 @@ class FailoverOllamaEmbeddings(Embeddings):
                 "speed_chars_per_sec": speed_chars,
             }
 
-    def embed_documents(self, texts: List[str], batch_size: int = 64) -> List[List[float]]:
-        """Embed a list of documents with multi-server failover, batching, and curl fallback."""
+    def embed_documents(
+        self,
+        texts: List[str],
+        batch_size: Optional[int] = None,
+        max_batch_chars: Optional[int] = None,
+        on_progress: Optional[Callable[[int], None]] = None,
+    ) -> List[List[float]]:
+        """
+        Embed a list of documents (sentences, chunks, or ideas) using dynamic size-aware
+        batching (bounded by both item count and character budget) and concurrent multi-server
+        distribution across all available embedding nodes in OllamaPool.
+        """
         if not texts:
             return []
+
+        eff_batch_items = batch_size if batch_size is not None else self.max_batch_items
+        eff_batch_chars = max_batch_chars if max_batch_chars is not None else self.max_batch_chars
+
+        # Determine how many healthy embedding servers are available in the pool
+        alive_embed_nodes = self.pool.alive_nodes_for_capability("embedding")
+        if not alive_embed_nodes:
+            alive_embed_nodes = self.pool.nodes_for_capability("embedding") or list(self.pool.nodes)
+        num_alive = max(1, len(alive_embed_nodes))
+
+        # When multiple embedding servers are available, split the workload across all servers
+        # so every available embedding node in the pool participates in parallel.
+        if num_alive > 1 and len(texts) > 1:
+            per_server_items = max(1, math.ceil(len(texts) / num_alive))
+            eff_batch_items = min(eff_batch_items, per_server_items)
+            total_chars = sum(max(1, len(str(t or ""))) for t in texts)
+            if total_chars > 0 and eff_batch_chars and eff_batch_chars > 0:
+                per_server_chars = max(1000, math.ceil(total_chars / num_alive))
+                eff_batch_chars = min(eff_batch_chars, per_server_chars)
 
         def _embed_batch(batch_texts: List[str]) -> List[List[float]]:
             def _embed(url: str):
@@ -1091,27 +1289,63 @@ class FailoverOllamaEmbeddings(Embeddings):
                     raise exc
 
             batch_chars = sum(len(t) for t in batch_texts)
-            t0 = time.perf_counter()
             result = self.pool.execute_with_failover(
                 _embed,
                 capability="embedding",
                 input_chars=batch_chars,
                 task_type="embedding",
             )
-            elapsed = time.perf_counter() - t0
             with self._lock:
                 self.total_embedded_texts += len(batch_texts)
                 self.total_embedded_chars += batch_chars
-                self.total_embedding_seconds += elapsed
             return result
 
-        if len(texts) <= batch_size:
-            return _embed_batch(texts)
+        batches = partition_texts_for_embedding(
+            texts,
+            max_batch_chars=eff_batch_chars,
+            max_batch_items=eff_batch_items,
+            max_item_chars=self.max_item_chars,
+        )
 
-        all_embs: List[List[float]] = []
-        for i in range(0, len(texts), batch_size):
-            all_embs.extend(_embed_batch(texts[i : i + batch_size]))
-        return all_embs
+        t_wall_start = time.perf_counter()
+        try:
+            if len(batches) == 1:
+                res_single = _embed_batch(batches[0])
+                if on_progress is not None:
+                    on_progress(len(batches[0]))
+                return res_single
+
+            max_workers = min(len(batches), num_alive)
+            if max_workers <= 1:
+                all_embs: List[List[float]] = []
+                for b in batches:
+                    b_res = _embed_batch(b)
+                    all_embs.extend(b_res)
+                    if on_progress is not None:
+                        on_progress(len(b))
+                return all_embs
+
+            ordered_results: List[Optional[List[List[float]]]] = [None] * len(batches)
+            with DaemonThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_idx = {
+                    executor.submit(_embed_batch, b): idx
+                    for idx, b in enumerate(batches)
+                }
+                for fut in as_completed(future_to_idx):
+                    idx = future_to_idx[fut]
+                    ordered_results[idx] = fut.result()
+                    if on_progress is not None:
+                        on_progress(len(batches[idx]))
+
+            all_embs = []
+            for batch_res in ordered_results:
+                if batch_res:
+                    all_embs.extend(batch_res)
+            return all_embs
+        finally:
+            wall_elapsed = time.perf_counter() - t_wall_start
+            with self._lock:
+                self.total_embedding_seconds += wall_elapsed
 
     def embed_query(self, text: str) -> List[float]:
         """Embed query text with multi-server failover and curl fallback."""

@@ -180,6 +180,16 @@ class CrossCheckSummary(BaseModel):
     total_new_against: int = 0
     delta_against: int = 0
 
+    @property
+    def delta_net_integrity(self) -> float:
+        """Backward-compatible alias for mean_delta_net_integrity."""
+        return self.mean_delta_net_integrity
+
+    @property
+    def delta_calibrated_fidelity(self) -> float:
+        """Backward-compatible alias for mean_delta_calibrated_fidelity."""
+        return self.mean_delta_calibrated_fidelity
+
 
 class CrossCheckReport(BaseModel):
     """Complete serialization report for Cross-Check verification mode."""
@@ -1019,6 +1029,12 @@ def run_cross_check(
     attempts = 0
     printed_chunks_count = 0
 
+    if progress_callback:
+        try:
+            progress_callback(0, num_blocks, "Initializing cross-check auditor...", None)
+        except TypeError:
+            progress_callback(0, num_blocks, "Initializing cross-check auditor...")
+
     while len(samples) < num_blocks and attempts < max_attempts:
         attempts += 1
         t0 = time.time()
@@ -1099,6 +1115,13 @@ def run_cross_check(
 
         dedup_ideas_old = tiered_deduplicate_ideas(raw_ideas_old, deduplicator)
         dedup_ideas_new = tiered_deduplicate_ideas(raw_ideas_new, deduplicator)
+
+        curr_idx = len(samples) + 1
+        if progress_callback:
+            try:
+                progress_callback(len(samples), num_blocks, f"Auditing Block #{curr_idx}/{num_blocks} ({b_title[:20]})...", None)
+            except TypeError:
+                progress_callback(len(samples), num_blocks, f"Auditing Block #{curr_idx}/{num_blocks} ({b_title[:20]})...")
 
         # 6. QA Probe Oracle Evaluation on contiguous passage
         probes, qa_m_old, qa_m_new = evaluate_block_qa_probes(
@@ -1236,7 +1259,10 @@ def run_cross_check(
             )
 
         if progress_callback:
-            progress_callback(curr_idx, num_blocks, f"Block #{curr_idx} ({b_title[:20]})", block_result)
+            try:
+                progress_callback(curr_idx, num_blocks, f"Block #{curr_idx} ({b_title[:20]})", block_result)
+            except TypeError:
+                progress_callback(curr_idx, num_blocks, f"Block #{curr_idx} ({b_title[:20]})")
 
     # 8. Compute Summary & Decision Checklist
     tot = len(samples)

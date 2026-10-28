@@ -40,6 +40,7 @@ class HierarchicalChunk(BaseModel):
     parent_text: Optional[str] = None
     prev_chunk_id: Optional[str] = None
     next_chunk_id: Optional[str] = None
+    embedding: Optional[List[float]] = None
 
     def model_post_init(self, __context) -> None:
         from bookeeper.calibre.parser import BookParser
@@ -188,25 +189,28 @@ class HierarchicalChunker:
             parent_chunk_id = f"b{book_id}_c{section.chapter_idx}_sub{sub_idx}_{sub_h}"
             parent_text = sub_text[:3000]
 
-            raw_chunks: List[str] = []
+            raw_chunks_with_emb: List[Tuple[str, Optional[List[float]]]] = []
 
             # 1. Attempt semantic chunking via embeddings if text is sufficiently large
             if self._semantic_splitter is not None and len(sub_text) > self.max_chunk_chars:
                 try:
                     docs = self._semantic_splitter.create_documents([sub_text])
-                    raw_chunks = [d.page_content.strip() for d in docs if d.page_content.strip()]
+                    for d in docs:
+                        if d.page_content.strip():
+                            doc_emb = d.metadata.get("embedding") if hasattr(d, "metadata") and isinstance(d.metadata, dict) else None
+                            raw_chunks_with_emb.append((d.page_content.strip(), doc_emb))
                 except Exception as e:
                     logger.debug(
                         f"Semantic chunking fallback on '{section.title}' > '{subtitle}': {e}"
                     )
-                    raw_chunks = []
+                    raw_chunks_with_emb = []
 
             # 2. Smart structural fallback: paragraphs, code blocks, tables, sentences
-            if not raw_chunks:
-                raw_chunks = self._smart_split(sub_text, self.max_chunk_chars)
+            if not raw_chunks_with_emb:
+                raw_chunks_with_emb = [(ct, None) for ct in self._smart_split(sub_text, self.max_chunk_chars)]
 
-            for chunk_text in raw_chunks:
-                if len(chunk_text) < self.min_chunk_chars and raw_chunks and len(raw_chunks) > 1:
+            for chunk_text, chunk_emb in raw_chunks_with_emb:
+                if len(chunk_text) < self.min_chunk_chars and raw_chunks_with_emb and len(raw_chunks_with_emb) > 1:
                     continue
 
                 h = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()[:8]
@@ -225,9 +229,71 @@ class HierarchicalChunker:
                     hierarchy_level="child",
                     parent_chunk_id=parent_chunk_id,
                     parent_text=parent_text,
+                    embedding=chunk_emb,
                 )
                 all_chunks.append(chunk)
                 global_chunk_idx += 1
+
+        # Batch-embed any chunks that bypassed RollingWindowSemanticChunker (e.g. subsections <= max_chunk_chars)
+        if self.embeddings is not None and hasattr(self.embeddings, "embed_documents") and all_chunks:
+            missing_chunks = [c for c in all_chunks if not c.embedding]
+            if missing_chunks:
+                from bookeeper.processing.ollama_pool import (
+                    FailoverOllamaEmbeddings,
+                    partition_texts_for_embedding,
+                )
+                import numpy as np
+
+                missing_texts = [c.text or "" for c in missing_chunks]
+                computed_vecs: List[Optional[List[float]]] = []
+                if isinstance(self.embeddings, FailoverOllamaEmbeddings):
+                    try:
+                        vecs = self.embeddings.embed_documents(
+                            missing_texts,
+                            batch_size=16,
+                            max_batch_chars=12000,
+                        )
+                        if isinstance(vecs, list) and len(vecs) == len(missing_texts):
+                            for v in vecs:
+                                if isinstance(v, (list, tuple, np.ndarray)) and len(v) > 1:
+                                    arr = np.array(v, dtype=np.float32)
+                                    norm = float(np.linalg.norm(arr))
+                                    unit = (arr / norm).tolist() if norm > 0.0 else arr.tolist()
+                                    computed_vecs.append(unit)
+                                else:
+                                    computed_vecs.append(None)
+                        else:
+                            computed_vecs.extend([None] * len(missing_texts))
+                    except Exception as e:
+                        logger.debug(f"Could not batch-embed structural chunks across pool: {e}")
+                        computed_vecs.extend([None] * len(missing_texts))
+                else:
+                    batches = partition_texts_for_embedding(
+                        missing_texts,
+                        max_batch_chars=12000,
+                        max_batch_items=16,
+                    )
+                    for b in batches:
+                        try:
+                            vecs = self.embeddings.embed_documents(b)
+                            if isinstance(vecs, list) and len(vecs) == len(b):
+                                for v in vecs:
+                                    if isinstance(v, (list, tuple, np.ndarray)) and len(v) > 1:
+                                        arr = np.array(v, dtype=np.float32)
+                                        norm = float(np.linalg.norm(arr))
+                                        unit = (arr / norm).tolist() if norm > 0.0 else arr.tolist()
+                                        computed_vecs.append(unit)
+                                    else:
+                                        computed_vecs.append(None)
+                            else:
+                                computed_vecs.extend([None] * len(b))
+                        except Exception as e:
+                            logger.debug(f"Could not batch-embed structural chunks: {e}")
+                            computed_vecs.extend([None] * len(b))
+
+                for chk_obj, vec_val in zip(missing_chunks, computed_vecs):
+                    if vec_val is not None:
+                        chk_obj.embedding = vec_val
 
         # Link sequential prev_chunk_id and next_chunk_id
         for i in range(len(all_chunks)):

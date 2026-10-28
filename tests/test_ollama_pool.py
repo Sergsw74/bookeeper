@@ -1148,6 +1148,97 @@ def test_failover_embeddings_with_kwargs():
     assert embs.request_timeout == 60
 
 
+def test_multi_server_embedding_distribution_across_all_pool_nodes():
+    """
+    Verify that when multiple embedding servers are configured in OllamaPool,
+    FailoverOllamaEmbeddings distributes batches across ALL available nodes in the pool
+    (both for multi-item batch calls and sequential calls) while preserving exact result order.
+    """
+    servers = [
+        OllamaServerConfig(
+            url="http://192.168.50.118:11434",
+            priority=1,
+            name="mypc-gpu-node",
+            capability=["llm", "embedding", "verification"],
+        ),
+        OllamaServerConfig(
+            url="http://192.168.50.15:11434",
+            priority=2,
+            name="primary-gpu-node",
+            capability=["embedding"],
+        ),
+        OllamaServerConfig(
+            url="http://localhost:11434",
+            priority=4,
+            name="mac-node",
+            capability=["embedding"],
+        ),
+    ]
+    pool = OllamaPool(servers=servers, cooldown_seconds=600, max_tasks_per_server=1)
+    embeddings = FailoverOllamaEmbeddings(pool=pool, model="bge-m3:latest")
+
+    calls_by_url = {
+        "http://192.168.50.118:11434": 0,
+        "http://192.168.50.15:11434": 0,
+        "http://localhost:11434": 0,
+    }
+    call_lock = threading.Lock()
+
+    with patch("bookeeper.processing.ollama_pool.OllamaEmbeddings") as mock_emb_cls:
+        def make_client(base_url, model):
+            client = MagicMock()
+
+            def _embed_docs(batch_texts):
+                with call_lock:
+                    calls_by_url[base_url] = calls_by_url.get(base_url, 0) + 1
+                # Return deterministic vector encoding the text index so we can verify exact ordering
+                return [[float(t.split("-")[-1]), 1.0, 0.0] for t in batch_texts]
+
+            def _embed_query(text):
+                with call_lock:
+                    calls_by_url[base_url] = calls_by_url.get(base_url, 0) + 1
+                return [1.0, 0.0, 0.0]
+
+            client.embed_documents.side_effect = _embed_docs
+            client.embed_query.side_effect = _embed_query
+            return client
+
+        mock_emb_cls.side_effect = make_client
+
+        # 1. Embed 30 texts in a single embed_documents call (previously would have been 1 batch on 1 node)
+        texts = [f"sentence-{i}" for i in range(30)]
+        progress_advances = []
+        vectors = embeddings.embed_documents(texts, on_progress=lambda n: progress_advances.append(n))
+
+        # Verify all 30 vectors returned in exact original order
+        assert len(vectors) == 30
+        for i in range(30):
+            assert vectors[i][0] == float(i)
+        assert sum(progress_advances) == 30
+
+        # Verify ALL 3 embedding servers in the pool were utilized!
+        assert calls_by_url["http://192.168.50.118:11434"] >= 1
+        assert calls_by_url["http://192.168.50.15:11434"] >= 1
+        assert calls_by_url["http://localhost:11434"] >= 1
+
+        # Verify per-node statistics recorded embedding tasks on all 3 nodes
+        for node in pool.nodes:
+            assert node.total_tasks >= 1
+            assert node.success_tasks >= 1
+            assert node.stats_by_type.get("embedding", {}).get("success_tasks", 0) >= 1
+
+        # 2. Verify sequential single-query calls also round-robin across all 3 idle embedding servers
+        for k in calls_by_url:
+            calls_by_url[k] = 0
+        for _ in range(6):
+            embeddings.embed_query("query text")
+
+        assert calls_by_url["http://192.168.50.118:11434"] == 2
+        assert calls_by_url["http://192.168.50.15:11434"] == 2
+        assert calls_by_url["http://localhost:11434"] == 2
+
+
+
 
 
 

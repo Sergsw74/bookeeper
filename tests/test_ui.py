@@ -19,8 +19,9 @@ runner = CliRunner()
 
 @pytest.fixture
 def mock_backend(tmp_path):
-    cfg = Settings()
+    cfg = Settings(output_dir=str(tmp_path))
     backend = SearchEngineBackend(config=cfg, lightrag_dir=tmp_path)
+    backend.get_neo4j_stats = MagicMock(return_value=(False, None, "Connection refused"))
     return backend
 
 

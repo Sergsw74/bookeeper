@@ -16,7 +16,7 @@ import os
 import re
 import threading
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
@@ -2514,6 +2514,529 @@ class SearchEngineBackend:
 
         return books
 
+    @staticmethod
+    def _normalize_idea_month(val: Any, is_upper_bound: bool = False) -> Optional[str]:
+        """
+        Normalize a date or month+year string into 'YYYY-MM' format.
+        Supports:
+          - '2024-05', '2024/05', '2024-05-12'
+          - '05/2024', '05-2024', '5/2024'
+          - 'May 2024', '2024 May', 'May, 2024'
+          - '2024' -> '2024-12' if is_upper_bound else '2024-01'
+        """
+        if val is None:
+            return None
+        s = str(val).strip()
+        if not s:
+            return None
+
+        # Check plain 4-digit year first so we can apply upper/lower bound month
+        m_year_only = re.match(r"^(\d{4})$", s)
+        if m_year_only:
+            yr = int(m_year_only.group(1))
+            if 1000 <= yr <= 2999:
+                return f"{yr:04d}-12" if is_upper_bound else f"{yr:04d}-01"
+
+        # Check YYYY/MM or YYYY.MM
+        m_yyyymm = re.match(r"^(\d{4})[-/\.](\d{1,2})(?:[-/\.]\d{1,2})?", s)
+        if m_yyyymm:
+            yr, mo = int(m_yyyymm.group(1)), int(m_yyyymm.group(2))
+            if 1000 <= yr <= 2999 and 1 <= mo <= 12:
+                return f"{yr:04d}-{mo:02d}"
+
+        # Check MM/YYYY or MM-YYYY
+        m_mmyyyy = re.match(r"^(\d{1,2})[-/\.](\d{4})$", s)
+        if m_mmyyyy:
+            mo, yr = int(m_mmyyyy.group(1)), int(m_mmyyyy.group(2))
+            if 1000 <= yr <= 2999 and 1 <= mo <= 12:
+                return f"{yr:04d}-{mo:02d}"
+
+        # Check textual Month + Year ("Jan 2023", "January, 2023", "2023 Jan")
+        month_map = {
+            "jan": 1, "january": 1,
+            "feb": 2, "february": 2,
+            "mar": 3, "march": 3,
+            "apr": 4, "april": 4,
+            "may": 5,
+            "jun": 6, "june": 6,
+            "jul": 7, "july": 7,
+            "aug": 8, "august": 8,
+            "sep": 9, "sept": 9, "september": 9,
+            "oct": 10, "october": 10,
+            "nov": 11, "november": 11,
+            "dec": 12, "december": 12,
+        }
+        m_text1 = re.match(r"^([a-zA-Z]+)[\s,\-/]+(\d{4})$", s)
+        if m_text1:
+            m_name = m_text1.group(1).lower()
+            yr = int(m_text1.group(2))
+            if m_name in month_map and 1000 <= yr <= 2999:
+                return f"{yr:04d}-{month_map[m_name]:02d}"
+
+        m_text2 = re.match(r"^(\d{4})[\s,\-/]+([a-zA-Z]+)$", s)
+        if m_text2:
+            yr = int(m_text2.group(1))
+            m_name = m_text2.group(2).lower()
+            if m_name in month_map and 1000 <= yr <= 2999:
+                return f"{yr:04d}-{month_map[m_name]:02d}"
+
+        from bookeeper.calibre.parser import BookParser
+        return BookParser.format_idea_month(s)
+
+    @classmethod
+    def _is_month_in_range(
+        cls,
+        idea_month: Optional[str],
+        month_from: Optional[str] = None,
+        month_to: Optional[str] = None,
+    ) -> bool:
+        """
+        Return True if idea_month ('YYYY-MM') falls within [month_from, month_to] inclusive.
+        If neither month_from nor month_to is set, returns True.
+        If a bound is set and idea_month is None/empty, returns False.
+        """
+        norm_from = cls._normalize_idea_month(month_from, is_upper_bound=False) if month_from else None
+        norm_to = cls._normalize_idea_month(month_to, is_upper_bound=True) if month_to else None
+
+        if not norm_from and not norm_to:
+            return True
+
+        norm_idea = cls._normalize_idea_month(idea_month)
+        if not norm_idea:
+            return False
+
+        if norm_from and norm_idea < norm_from:
+            return False
+        if norm_to and norm_idea > norm_to:
+            return False
+        return True
+
+    def get_ideas_list_and_search(
+        self,
+        query: str = "",
+        search_type: str = "exact",
+        month_from: Optional[str] = None,
+        month_to: Optional[str] = None,
+        category: Optional[str] = None,
+        sort_by: str = "month_desc",
+        limit: int = 500,
+        similarity_threshold: float = 0.45,
+    ) -> Dict[str, Any]:
+        """
+        Retrieve and search indexed Ideas/Concepts with support for:
+          1. Browsing the full Ideas List
+          2. Exact / Lexical Search (`search_type="exact"`)
+          3. Embedded / Semantic Vector Search (`search_type="embedded"`)
+          4. Modernity / First-Occurrence Month+Year Range Filtering (`month_from`, `month_to` in YYYY-MM or Month+Year)
+        Falls back to local knowledge_graph.json if Neo4j is offline or empty.
+        """
+        from bookeeper.calibre.parser import BookParser
+
+        all_ideas: List[Dict[str, Any]] = []
+        seen_ids = set()
+
+        # 1. Try Neo4j first
+        try:
+            driver = self.get_neo4j_driver()
+            with driver.session(database=self.neo4j_cfg.database) as session:
+                cypher = """
+                MATCH (c:Concept)
+                OPTIONAL MATCH (b:Book)-[r:EXPLORES_IDEA]->(c)
+                WITH c,
+                     collect(DISTINCT CASE WHEN b IS NOT NULL THEN {
+                         id: coalesce(b.id, ''),
+                         book_id: coalesce(b.book_id, ''),
+                         title: coalesce(b.title, b.name, b.id, ''),
+                         publication_date: coalesce(b.publication_date, b.pubdate, '')
+                     } ELSE null END) AS raw_books
+                RETURN c, [bk IN raw_books WHERE bk IS NOT NULL] AS books
+                """
+                records = list(session.run(cypher))
+                for rec in records:
+                    c_node = rec["c"]
+                    c_props = dict(c_node.items()) if hasattr(c_node, "items") else {}
+                    cid = str(c_props.get("id") or f"concept:{c_props.get('name', '')}").strip()
+                    name = str(c_props.get("name") or cid.replace("concept:", "")).strip()
+                    if not name or cid in seen_ids:
+                        continue
+                    seen_ids.add(cid)
+
+                    cat = str(c_props.get("category") or "Idea").strip()
+                    summary = str(
+                        c_props.get("brief_description")
+                        or c_props.get("summary")
+                        or c_props.get("description")
+                        or ""
+                    ).strip()
+                    detailed = str(c_props.get("detailed_explanation") or "").strip()
+                    weight = float(c_props.get("weight") or 5.0)
+                    occurrences = int(c_props.get("occurrences") or 1)
+
+                    raw_month = c_props.get("first_occurrence_month") or c_props.get("month")
+                    idea_month = self._normalize_idea_month(raw_month)
+
+                    books_list = []
+                    earliest_book_month: Optional[str] = None
+                    for bk in (rec["books"] or []):
+                        b_title = bk.get("title") or ""
+                        b_pub = bk.get("publication_date") or ""
+                        if not b_pub and (bk.get("book_id") or b_title):
+                            b_pub = self.resolve_publication_date(book_id=bk.get("book_id"), title=b_title) or ""
+                        b_month = self._normalize_idea_month(b_pub)
+                        if b_month and (earliest_book_month is None or b_month < earliest_book_month):
+                            earliest_book_month = b_month
+                        books_list.append({
+                            "id": bk.get("id") or f"book:{bk.get('book_id', '')}",
+                            "book_id": str(bk.get("book_id") or bk.get("id") or "").replace("book:", ""),
+                            "title": b_title,
+                            "publication_date": BookParser.parse_publication_date(b_pub) or b_pub or None,
+                            "month": b_month,
+                        })
+
+                    if earliest_book_month and (not idea_month or earliest_book_month < idea_month):
+                        idea_month = earliest_book_month
+
+                    all_ideas.append({
+                        "id": cid,
+                        "name": name,
+                        "category": cat,
+                        "summary": summary,
+                        "brief_description": summary,
+                        "detailed_explanation": detailed,
+                        "weight": weight,
+                        "occurrences": occurrences,
+                        "month": idea_month,
+                        "first_occurrence_month": idea_month,
+                        "books_count": len(books_list),
+                        "books": books_list[:8],
+                    })
+        except Exception as e:
+            logger.info(f"Neo4j get_ideas_list_and_search skipped or offline ({e}). Using local graph.")
+
+        # 2. Local fallback from knowledge_graph.json (and .book_states if needed)
+        if not all_ideas:
+            out_p = Path(getattr(self.config, "resolved_output_dir", Path("output"))).expanduser().resolve()
+            kg_path = out_p / "knowledge_graph.json"
+            if kg_path.is_file():
+                try:
+                    with open(kg_path, "r", encoding="utf-8") as f:
+                        kg_data = json.load(f)
+                    nodes = kg_data.get("nodes", [])
+                    edges = kg_data.get("edges", [])
+                    nodes_by_id = {n.get("id"): n for n in nodes if n.get("id")}
+
+                    # Map concept_id -> list of connected book nodes
+                    concept_books: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+                    concept_book_seen: Dict[str, set] = defaultdict(set)
+
+                    for edge in edges:
+                        rel = edge.get("relation") or edge.get("type") or ""
+                        src = edge.get("source", "")
+                        tgt = edge.get("target", "")
+                        if rel == "EXPLORES_IDEA" and src in nodes_by_id:
+                            bnode = nodes_by_id[src]
+                            if bnode.get("type") == "Book" or bnode.get("tag") == "book":
+                                bid = str(bnode.get("book_id") or src).replace("book:", "")
+                                if bid not in concept_book_seen[tgt]:
+                                    concept_book_seen[tgt].add(bid)
+                                    concept_books[tgt].append(bnode)
+                        elif rel in ("SUPPORTED_BY", "SUPPORTS_IDEA"):
+                            cid = src if rel == "SUPPORTED_BY" else tgt
+                            chid = tgt if rel == "SUPPORTED_BY" else src
+                            chnode = nodes_by_id.get(chid, {})
+                            bid = str(chnode.get("book_id") or "").replace("book:", "").strip()
+                            if bid and bid not in concept_book_seen[cid]:
+                                bnode = nodes_by_id.get(f"book:{bid}") or nodes_by_id.get(bid)
+                                if bnode:
+                                    concept_book_seen[cid].add(bid)
+                                    concept_books[cid].append(bnode)
+
+                    for n in nodes:
+                        ntype = n.get("type", "")
+                        ntag = n.get("tag", "")
+                        if ntype not in ("Concept", "Idea") and ntag != "idea":
+                            continue
+                        cid = str(n.get("id") or f"concept:{n.get('name', '')}").strip()
+                        name = str(n.get("name") or cid.replace("concept:", "")).strip()
+                        if not name or cid in seen_ids:
+                            continue
+                        seen_ids.add(cid)
+
+                        cat = str(n.get("category") or "Idea").strip()
+                        summary = str(
+                            n.get("brief_description")
+                            or n.get("summary")
+                            or n.get("description")
+                            or ""
+                        ).strip()
+                        detailed = str(n.get("detailed_explanation") or "").strip()
+                        weight = float(n.get("weight") or 5.0)
+                        occurrences = int(n.get("occurrences") or 1)
+
+                        raw_month = n.get("first_occurrence_month") or n.get("month")
+                        idea_month = self._normalize_idea_month(raw_month)
+
+                        books_list = []
+                        earliest_book_month: Optional[str] = None
+                        for bnode in concept_books.get(cid, []):
+                            bid = str(bnode.get("book_id") or bnode.get("id") or "").replace("book:", "")
+                            b_title = bnode.get("title") or bnode.get("name") or f"Book {bid}"
+                            b_pub = (
+                                bnode.get("publication_date")
+                                or bnode.get("pubdate")
+                                or self.resolve_publication_date(book_id=bid, title=b_title)
+                                or ""
+                            )
+                            b_month = self._normalize_idea_month(b_pub)
+                            if b_month and (earliest_book_month is None or b_month < earliest_book_month):
+                                earliest_book_month = b_month
+                            books_list.append({
+                                "id": bnode.get("id") or f"book:{bid}",
+                                "book_id": bid,
+                                "title": b_title,
+                                "publication_date": BookParser.parse_publication_date(b_pub) or b_pub or None,
+                                "month": b_month,
+                            })
+
+                        if earliest_book_month and (not idea_month or earliest_book_month < idea_month):
+                            idea_month = earliest_book_month
+
+                        all_ideas.append({
+                            "id": cid,
+                            "name": name,
+                            "category": cat,
+                            "summary": summary,
+                            "brief_description": summary,
+                            "detailed_explanation": detailed,
+                            "weight": weight,
+                            "occurrences": occurrences,
+                            "month": idea_month,
+                            "first_occurrence_month": idea_month,
+                            "books_count": len(books_list),
+                            "books": books_list[:8],
+                        })
+                except Exception as e:
+                    logger.warning(f"Failed to load ideas from local knowledge_graph.json: {e}")
+
+        # 3. Compute global metadata across all indexed ideas
+        total_ideas = len(all_ideas)
+        categories_set = sorted({i["category"] for i in all_ideas if i.get("category")})
+        valid_months = sorted({i["month"] for i in all_ideas if i.get("month")})
+        min_month = valid_months[0] if valid_months else None
+        max_month = valid_months[-1] if valid_months else None
+
+        norm_month_from = self._normalize_idea_month(month_from, is_upper_bound=False) if month_from else None
+        norm_month_to = self._normalize_idea_month(month_to, is_upper_bound=True) if month_to else None
+
+        # 4. Filter by Category and Month Range (Modernity)
+        filtered_ideas: List[Dict[str, Any]] = []
+        cat_filter = (category or "").strip()
+        for idea in all_ideas:
+            if cat_filter and cat_filter.lower() != "all":
+                if (idea.get("category") or "").lower() != cat_filter.lower():
+                    continue
+            if not self._is_month_in_range(idea.get("month"), norm_month_from, norm_month_to):
+                continue
+            filtered_ideas.append(dict(idea))
+
+        # 5. Apply Search Query (Exact vs Embedded)
+        q_clean = (query or "").strip()
+        mode_norm = (search_type or "exact").strip().lower()
+        is_embedded_mode = mode_norm in ("embedded", "semantic", "embedding", "vector")
+
+        if q_clean:
+            if is_embedded_mode:
+                # Embedded / Semantic Search using ConceptEmbeddingIndex (with fallback to FastConceptVectorizer)
+                sim_by_id: Dict[str, float] = {}
+                sim_by_name_lower: Dict[str, float] = {}
+
+                emb_idx = self._get_concept_embedding_index()
+                if emb_idx is not None and len(emb_idx.concept_ids) > 0:
+                    try:
+                        q_vec = emb_idx.embed_text(q_clean)
+                        if q_vec is not None and emb_idx._norm_matrix is not None:
+                            cos_scores = emb_idx._norm_matrix @ q_vec
+                            for idx_pos, cid_val in enumerate(emb_idx.concept_ids):
+                                score_val = float(cos_scores[idx_pos])
+                                sim_by_id[str(cid_val)] = score_val
+                                cname_val = str(emb_idx.names[idx_pos]).lower().strip()
+                                if cname_val:
+                                    sim_by_name_lower[cname_val] = max(sim_by_name_lower.get(cname_val, -1.0), score_val)
+                    except Exception as e:
+                        logger.warning(f"Embedded search via ConceptEmbeddingIndex failed: {e}")
+
+                # Fallback / supplement for ideas not in precomputed .npz using FastConceptVectorizer
+                vec_engine = self._get_concept_vectorizer()
+                vec_scores_by_name: Dict[str, float] = {}
+                if vec_engine is not None:
+                    try:
+                        v_matches = vec_engine.query(q_clean, top_k=max(len(filtered_ideas), 200), min_score=0.01)
+                        for vm in v_matches:
+                            vname = str(vm.get("name") or "").lower().strip()
+                            if vname:
+                                vec_scores_by_name[vname] = float(vm.get("similarity", 0.0))
+                    except Exception:
+                        pass
+
+                sem_results: List[Dict[str, Any]] = []
+                for idea in filtered_ideas:
+                    cid = idea["id"]
+                    nl = idea["name"].lower().strip()
+                    cos_sim: Optional[float] = None
+                    if cid in sim_by_id:
+                        cos_sim = sim_by_id[cid]
+                    elif f"concept:{idea['name']}" in sim_by_id:
+                        cos_sim = sim_by_id[f"concept:{idea['name']}"]
+                    elif nl in sim_by_name_lower:
+                        cos_sim = sim_by_name_lower[nl]
+                    elif nl in vec_scores_by_name:
+                        cos_sim = vec_scores_by_name[nl]
+                    else:
+                        # Compute lightweight character/token cosine overlap if neither index had this concept
+                        q_tokens = set(re.findall(r"[a-z0-9]+", q_clean.lower()))
+                        doc_text = f"{idea['name']} {idea.get('category', '')} {idea.get('summary', '')}".lower()
+                        d_tokens = set(re.findall(r"[a-z0-9]+", doc_text))
+                        if q_tokens and d_tokens:
+                            inter = len(q_tokens & d_tokens)
+                            cos_sim = inter / ((len(q_tokens) ** 0.5) * (len(d_tokens) ** 0.5))
+                        else:
+                            cos_sim = 0.0
+
+                    if cos_sim is not None and cos_sim >= similarity_threshold:
+                        idea["cosine_similarity"] = round(float(cos_sim), 4)
+                        idea["priority_score"] = round(float(cos_sim) * float(idea.get("weight", 5.0)), 4)
+                        idea["match_type"] = "embedded"
+                        sem_results.append(idea)
+
+                filtered_ideas = sem_results
+            else:
+                # Exact / Lexical Search for Ideas
+                q_lower = q_clean.lower()
+                q_tokens = [t for t in re.split(r"\s+", q_lower) if t]
+                exact_results: List[Dict[str, Any]] = []
+
+                for idea in filtered_ideas:
+                    name_l = idea["name"].lower()
+                    cat_l = (idea.get("category") or "").lower()
+                    sum_l = (idea.get("summary") or "").lower()
+                    det_l = (idea.get("detailed_explanation") or "").lower()
+
+                    match_score = 0.0
+                    match_type = ""
+
+                    if name_l == q_lower:
+                        match_score = 100.0
+                        match_type = "exact_name"
+                    elif name_l.startswith(q_lower):
+                        match_score = 85.0
+                        match_type = "prefix_name"
+                    elif q_lower in name_l:
+                        match_score = 75.0
+                        match_type = "substring_name"
+                    elif q_lower in cat_l:
+                        match_score = 60.0
+                        match_type = "category_match"
+                    elif q_lower in sum_l:
+                        match_score = 50.0
+                        match_type = "summary_match"
+                    elif q_lower in det_l:
+                        match_score = 40.0
+                        match_type = "detail_match"
+                    elif len(q_tokens) > 1 and all(
+                        (tok in name_l or tok in sum_l or tok in cat_l or tok in det_l)
+                        for tok in q_tokens
+                    ):
+                        # Multi-word exact token match
+                        name_hits = sum(1 for tok in q_tokens if tok in name_l)
+                        match_score = 45.0 + (name_hits / len(q_tokens)) * 25.0
+                        match_type = "all_tokens"
+
+                    if match_score > 0:
+                        idea["match_score"] = round(match_score, 2)
+                        idea["match_type"] = match_type
+                        exact_results.append(idea)
+
+                filtered_ideas = exact_results
+
+        # 6. Sort Results
+        sort_key = (sort_by or "month_desc").strip().lower()
+        if q_clean and is_embedded_mode and sort_key in ("default", "relevance", "similarity_desc"):
+            filtered_ideas.sort(
+                key=lambda x: (float(x.get("cosine_similarity") or 0.0), float(x.get("weight") or 0.0)),
+                reverse=True,
+            )
+        elif q_clean and not is_embedded_mode and sort_key in ("default", "relevance"):
+            filtered_ideas.sort(
+                key=lambda x: (float(x.get("match_score") or 0.0), float(x.get("weight") or 0.0), int(x.get("occurrences") or 0)),
+                reverse=True,
+            )
+        elif sort_key == "similarity_desc":
+            filtered_ideas.sort(
+                key=lambda x: (float(x.get("cosine_similarity") or 0.0), float(x.get("weight") or 0.0)),
+                reverse=True,
+            )
+        elif sort_key == "month_desc":
+            # Newest / most modern first; ideas without a month go last
+            filtered_ideas.sort(
+                key=lambda x: (
+                    1 if x.get("month") else 0,
+                    x.get("month") or "",
+                    float(x.get("weight") or 0.0),
+                    int(x.get("occurrences") or 0),
+                ),
+                reverse=True,
+            )
+        elif sort_key == "month_asc":
+            # Oldest / earliest first; ideas without a month go last
+            filtered_ideas.sort(
+                key=lambda x: (
+                    0 if x.get("month") else 1,
+                    x.get("month") or "9999-99",
+                    -float(x.get("weight") or 0.0),
+                )
+            )
+        elif sort_key == "weight_desc":
+            filtered_ideas.sort(
+                key=lambda x: (float(x.get("weight") or 0.0), int(x.get("occurrences") or 0), x.get("month") or ""),
+                reverse=True,
+            )
+        elif sort_key == "occurrences_desc":
+            filtered_ideas.sort(
+                key=lambda x: (int(x.get("occurrences") or 0), float(x.get("weight") or 0.0), x.get("month") or ""),
+                reverse=True,
+            )
+        elif sort_key == "name_asc":
+            filtered_ideas.sort(key=lambda x: (x.get("name") or "").lower())
+        else:
+            filtered_ideas.sort(
+                key=lambda x: (
+                    1 if x.get("month") else 0,
+                    x.get("month") or "",
+                    float(x.get("weight") or 0.0),
+                ),
+                reverse=True,
+            )
+
+        total_filtered = len(filtered_ideas)
+        if limit and limit > 0:
+            filtered_ideas = filtered_ideas[:limit]
+
+        return {
+            "ideas": filtered_ideas,
+            "total": total_ideas,
+            "filtered": total_filtered,
+            "returned": len(filtered_ideas),
+            "query": q_clean,
+            "search_type": "embedded" if is_embedded_mode else "exact",
+            "month_from": norm_month_from,
+            "month_to": norm_month_to,
+            "category": cat_filter or None,
+            "sort_by": sort_key,
+            "min_month": min_month,
+            "max_month": max_month,
+            "categories": categories_set,
+        }
+
     def prepare_full_backup(
         self,
         format_type: str = "zip",
@@ -2831,6 +3354,17 @@ class SearchEngineBackend:
                             breadcrumb=node_props.get("breadcrumb"),
                         )
                         node_data["book_file"] = {k: v for k, v in bf.items() if k != "absolute_path"} if bf else None
+                    elif "Concept" in node_labels or "Idea" in node_labels or node_cat not in ("Book", "Chunk", "Section"):
+                        idea_m = self._normalize_idea_month(node_props.get("first_occurrence_month") or node_props.get("month"))
+                        for bk in books:
+                            bm = self._normalize_idea_month(bk.get("publication_date"))
+                            if bm and (not idea_m or bm < idea_m):
+                                idea_m = bm
+                        if idea_m:
+                            node_data["first_occurrence_month"] = idea_m
+                            node_data["month"] = idea_m
+                            node_props["first_occurrence_month"] = idea_m
+                            node_props["month"] = idea_m
 
                     return {
                         "node": node_data,
@@ -2936,6 +3470,17 @@ class SearchEngineBackend:
                             breadcrumb=l_props.get("breadcrumb"),
                         )
                         local_node["book_file"] = {k: v for k, v in bf.items() if k != "absolute_path"} if bf else None
+                    elif "Concept" in l_labels or "Idea" in l_labels or l_cat not in ("Book", "Chunk", "Section"):
+                        idea_m = self._normalize_idea_month(l_props.get("first_occurrence_month") or l_props.get("month"))
+                        for bk in books:
+                            bm = self._normalize_idea_month(bk.get("publication_date"))
+                            if bm and (not idea_m or bm < idea_m):
+                                idea_m = bm
+                        if idea_m:
+                            local_node["first_occurrence_month"] = idea_m
+                            local_node["month"] = idea_m
+                            l_props["first_occurrence_month"] = idea_m
+                            l_props["month"] = idea_m
 
                     return {
                         "node": local_node,

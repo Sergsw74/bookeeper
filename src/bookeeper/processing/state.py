@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 logger = logging.getLogger(__name__)
 
@@ -234,12 +234,14 @@ class ProgressTracker:
         self.save()
 
     def summary(self, operation: str) -> Dict[str, Any]:
-        """Return counts of completed, partially_indexed, failed, and skipped items for an operation."""
+        """Return counts of completed, partially_indexed, failed, skipped items, and assigned/skipped chunks for an operation."""
         records = self._get_op_records(operation)
         completed = sum(1 for r in records.values() if r.get("status") == "completed")
         partially_indexed = sum(1 for r in records.values() if r.get("status") == "partially_indexed")
         failed = sum(1 for r in records.values() if r.get("status") == "failed")
         skipped = sum(1 for r in records.values() if r.get("status") == "skipped")
+        assigned_chunks = sum(int((r.get("metadata") or {}).get("assigned_chunks", 0)) for r in records.values())
+        skipped_chunks = sum(int((r.get("metadata") or {}).get("skipped_chunks", 0)) for r in records.values())
         return {
             "operation": operation,
             "total_recorded": len(records),
@@ -247,6 +249,8 @@ class ProgressTracker:
             "partially_indexed": partially_indexed,
             "failed": failed,
             "skipped": skipped,
+            "assigned_chunks": assigned_chunks,
+            "skipped_chunks": skipped_chunks,
         }
 
 
@@ -369,6 +373,40 @@ class BookProcessingState:
         with self._lock:
             return chunk_id in self.data.get("processed_chunks", {})
 
+    def unmark_chunk_processed(self, chunk_id: str) -> bool:
+        """Remove chunk from processed_chunks (e.g. to recover a skipped limbo chunk) and persist."""
+        with self._lock:
+            if "processed_chunks" in self.data and chunk_id in self.data["processed_chunks"]:
+                del self.data["processed_chunks"][chunk_id]
+                self.save()
+                return True
+            return False
+
+    def recover_skipped_limbo_chunks(self, chunks: Sequence[Any], threshold: int) -> List[str]:
+        """
+        Recover chunks previously marked as skipped_limbo whose size is >= threshold,
+        unmarking them from processed_chunks so they are returned to unprocessed status.
+        Returns list of recovered chunk IDs.
+        """
+        recovered = []
+        with self._lock:
+            processed = self.data.get("processed_chunks", {})
+            for chk in chunks:
+                cid = getattr(chk, "chunk_id", None) or (chk.get("chunk_id") if isinstance(chk, dict) else None)
+                if not cid or cid not in processed:
+                    continue
+                rec = processed[cid]
+                if rec.get("server_used") == "skipped_limbo" or rec.get("status") == "skipped_limbo":
+                    c_size = getattr(chk, "char_count", 0) or len(getattr(chk, "text", "") or "")
+                    if isinstance(chk, dict) and not c_size:
+                        c_size = chk.get("char_count") or len(chk.get("text", "") or "")
+                    if c_size >= threshold:
+                        del processed[cid]
+                        recovered.append(cid)
+            if recovered:
+                self.save()
+        return recovered
+
     def is_chunk_failed(self, chunk_id: str) -> bool:
         with self._lock:
             return chunk_id in self.data.get("failed_chunks", {})
@@ -412,6 +450,26 @@ class BookProcessingState:
             stacked = self.data.setdefault("stacked_chunks", {})
             stacked.pop(chunk_id, None)
 
+    @property
+    def assigned_chunks_count(self) -> int:
+        with self._lock:
+            processed = self.data.get("processed_chunks", {})
+            return sum(
+                1
+                for rec in processed.values()
+                if rec.get("server_used") == "semantic_fastpath" or rec.get("status") == "assigned"
+            )
+
+    @property
+    def skipped_chunks_count(self) -> int:
+        with self._lock:
+            processed = self.data.get("processed_chunks", {})
+            return sum(
+                1
+                for rec in processed.values()
+                if rec.get("server_used") == "skipped_limbo" or rec.get("status") == "skipped_limbo"
+            )
+
     def mark_chunk_processed(
         self,
         chunk_id: str,
@@ -426,17 +484,26 @@ class BookProcessingState:
             self.unstack_chunk(chunk_id)
             self.data.setdefault("retried_chunks", {}).pop(chunk_id, None)
 
+            if server_used == "semantic_fastpath":
+                chunk_status = "assigned"
+            elif server_used == "skipped_limbo":
+                chunk_status = "skipped_limbo"
+            else:
+                chunk_status = "extracted"
+
             processed = self.data.setdefault("processed_chunks", {})
             processed[chunk_id] = {
                 "chunk_id": chunk_id,
                 "chunk_idx": chunk_idx,
                 "section_title": section_title,
-                "status": "extracted",
+                "status": chunk_status,
                 "duration": duration,
                 "server_used": server_used,
                 "extraction": extraction_dict,
                 "completed_at": time.time(),
             }
+            self.data["assigned_chunks_count"] = self.assigned_chunks_count
+            self.data["skipped_chunks_count"] = self.skipped_chunks_count
             self.save()
 
     def mark_chunk_retried(
@@ -510,6 +577,32 @@ class BookProcessingState:
             self.save()
             return self.data["status"]
 
+    def set_chunks(self, chunks: Sequence[Any]) -> None:
+        """Store chunk records in state file so it serves as a standalone local cache."""
+        with self._lock:
+            serialized = []
+            for c in chunks:
+                if hasattr(c, "model_dump"):
+                    serialized.append(c.model_dump())
+                elif isinstance(c, dict):
+                    serialized.append(c)
+            self.data["chunks"] = serialized
+            self.data["total_chunks"] = len(chunks)
+            self.save()
+
+    def get_chunks(self) -> Optional[List[Any]]:
+        """Retrieve stored chunks if present in state file."""
+        from bookeeper.processing.chunker import HierarchicalChunk
+
+        with self._lock:
+            raw = self.data.get("chunks")
+            if isinstance(raw, list) and raw:
+                try:
+                    return [HierarchicalChunk.model_validate(c) for c in raw]
+                except Exception:
+                    return None
+            return None
+
     @classmethod
     def clean_all(cls, state_dir: Path | str) -> int:
         """
@@ -527,4 +620,210 @@ class BookProcessingState:
             except Exception:
                 pass
         return count
+
+
+class BookStateCache:
+    """
+    Manages an external read-only directory of historical or backup book state files
+    (book_*_state.json) and optional chunk files to serve as local cache.
+    Never modified or purged during cleanups or start-from-scratch.
+    """
+
+    def __init__(self, cache_dir: Optional[Path | str] = None):
+        self.cache_dir: Optional[Path] = (
+            Path(cache_dir).expanduser().resolve() if cache_dir else None
+        )
+        self._id_to_file: Dict[str, Path] = {}
+        self._title_to_file: Dict[str, Path] = {}
+        self._loaded_cache: Dict[str, Dict[str, Any]] = {}
+
+        # Statistics
+        self.reused_books_count: int = 0
+        self.reused_chunks_count: int = 0
+        self.reused_extractions_count: int = 0
+
+        self._index_cache()
+
+    def is_enabled(self) -> bool:
+        """Return True if a valid cache directory was configured and exists."""
+        return self.cache_dir is not None and self.cache_dir.is_dir()
+
+    def _index_cache(self) -> None:
+        """Scan and index all book state files in cache_dir by book_id and book_title."""
+        if not self.is_enabled():
+            return
+        assert self.cache_dir is not None
+
+        candidate_dirs = [self.cache_dir]
+        sub_states = self.cache_dir / ".book_states"
+        if sub_states.is_dir():
+            candidate_dirs.append(sub_states)
+
+        for cdir in candidate_dirs:
+            for f in cdir.glob("book_*_state.json"):
+                stem = f.stem  # e.g. "book_1_state"
+                parts = stem.split("_")
+                if len(parts) >= 3 and parts[0] == "book" and parts[-1] == "state":
+                    bid = "_".join(parts[1:-1])
+                    if bid and bid not in self._id_to_file:
+                        self._id_to_file[bid] = f
+
+                try:
+                    with open(f, "r", encoding="utf-8") as sf:
+                        meta = json.load(sf)
+                    f_bid = str(meta.get("book_id") or "")
+                    if f_bid and f_bid not in self._id_to_file:
+                        self._id_to_file[f_bid] = f
+                    title = meta.get("book_title")
+                    if title:
+                        from bookeeper.calibre.parser import BookParser
+
+                        norm_title = BookParser.repair_mojibake(str(title)).strip().lower()
+                        if norm_title and norm_title not in self._title_to_file:
+                            self._title_to_file[norm_title] = f
+                except Exception as e:
+                    logger.debug(f"Failed to pre-index cache file {f}: {e}")
+
+    def get_cached_state(self, book_id: int | str, book_title: str = "") -> Optional[Dict[str, Any]]:
+        """Retrieve cached state dictionary for a book by ID or title."""
+        if not self.is_enabled():
+            return None
+
+        bid_str = str(book_id)
+        if bid_str in self._loaded_cache:
+            return self._loaded_cache[bid_str]
+
+        f_path = self._id_to_file.get(bid_str)
+        if not f_path and book_title:
+            from bookeeper.calibre.parser import BookParser
+
+            norm_title = BookParser.repair_mojibake(str(book_title)).strip().lower()
+            f_path = self._title_to_file.get(norm_title)
+
+        if not f_path and self.cache_dir:
+            direct = self.cache_dir / f"book_{bid_str}_state.json"
+            if direct.is_file():
+                f_path = direct
+            else:
+                sub_direct = self.cache_dir / ".book_states" / f"book_{bid_str}_state.json"
+                if sub_direct.is_file():
+                    f_path = sub_direct
+
+        if f_path and f_path.is_file():
+            try:
+                with open(f_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    self._loaded_cache[bid_str] = data
+                    return data
+            except Exception as e:
+                logger.warning(f"Failed to read cache state file from {f_path}: {e}")
+
+        return None
+
+    def get_cached_chunks(self, book_id: int | str, book_title: str = "") -> Optional[List[Any]]:
+        """
+        Check if chunks for this book exist in the cached state file or in companion chunk files.
+        Returns list of HierarchicalChunk instances if found, or None if absent.
+        """
+        if not self.is_enabled():
+            return None
+
+        from bookeeper.processing.chunker import HierarchicalChunk
+
+        # 1. Check if cached state file itself contains embedded chunks
+        st = self.get_cached_state(book_id, book_title)
+        if st and st.get("chunks"):
+            try:
+                raw_chunks = st["chunks"]
+                if isinstance(raw_chunks, list) and len(raw_chunks) > 0:
+                    chunks = [HierarchicalChunk.model_validate(c) for c in raw_chunks]
+                    self.reused_chunks_count += len(chunks)
+                    return chunks
+            except Exception as e:
+                logger.debug(f"Failed to parse embedded chunks from cache state for book #{book_id}: {e}")
+
+        # 2. Check if companion book_{id}_chunks.json exists in cache_dir or its chunks/ subfolder
+        bid_str = str(book_id)
+        assert self.cache_dir is not None
+        candidate_paths = [
+            self.cache_dir / f"book_{bid_str}_chunks.json",
+            self.cache_dir / "chunks" / f"book_{bid_str}_chunks.json",
+            self.cache_dir.parent / "chunks" / f"book_{bid_str}_chunks.json",
+        ]
+        sub_states = self.cache_dir / ".book_states"
+        if sub_states.is_dir():
+            candidate_paths.append(self.cache_dir / "chunks" / f"book_{bid_str}_chunks.json")
+
+        for cp in candidate_paths:
+            if cp.is_file() and cp.stat().st_size > 0:
+                try:
+                    with open(cp, "r", encoding="utf-8") as cf:
+                        c_data = json.load(cf)
+                    raw_chunks = c_data.get("chunks", [])
+                    if isinstance(raw_chunks, list) and len(raw_chunks) > 0:
+                        chunks = [HierarchicalChunk.model_validate(c) for c in raw_chunks]
+                        self.reused_chunks_count += len(chunks)
+                        return chunks
+                except Exception as e:
+                    logger.debug(f"Failed to read chunks from {cp}: {e}")
+
+        return None
+
+    def get_cached_raw_analysis(
+        self, book_id: int | str, chunk_id: str, book_title: str = ""
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Check if raw extraction / analysis for chunk_id is present in the cached state file.
+        Returns the chunk extraction record dict if present, or None.
+        """
+        st = self.get_cached_state(book_id, book_title)
+        if not st:
+            return None
+        processed = st.get("processed_chunks", {})
+        if chunk_id in processed:
+            rec = processed[chunk_id]
+            if rec.get("status") in ("extracted", "assigned", "skipped_limbo") and "extraction" in rec:
+                return rec
+        return None
+
+    def populate_state_from_cache(self, active_state: BookProcessingState) -> int:
+        """
+        Seed active_state with cached processed chunks from cache state file.
+        Returns count of chunk records reused.
+        """
+        st = self.get_cached_state(active_state.book_id, active_state.book_title)
+        if not st:
+            return 0
+        cached_processed = st.get("processed_chunks", {})
+        if not cached_processed:
+            return 0
+
+        seeded = 0
+        with active_state._lock:
+            act_processed = active_state.data.setdefault("processed_chunks", {})
+            for cid, rec in cached_processed.items():
+                if (
+                    cid not in act_processed
+                    and rec.get("status") in ("extracted", "assigned", "skipped_limbo")
+                    and "extraction" in rec
+                ):
+                    act_processed[cid] = rec
+                    seeded += 1
+            if seeded > 0:
+                self.reused_books_count += 1
+                self.reused_extractions_count += seeded
+                active_state.save()
+        return seeded
+
+    def stats(self) -> Dict[str, Any]:
+        """Return cache reuse statistics."""
+        return {
+            "enabled": self.is_enabled(),
+            "cache_dir": str(self.cache_dir) if self.cache_dir else None,
+            "indexed_state_files": len(self._id_to_file),
+            "reused_books_count": self.reused_books_count,
+            "reused_chunks_count": self.reused_chunks_count,
+            "reused_extractions_count": self.reused_extractions_count,
+        }
 

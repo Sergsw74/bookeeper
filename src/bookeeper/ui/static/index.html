@@ -1793,6 +1793,130 @@
       gap: 10px;
       margin-top: 8px;
     }
+
+    /* Dedicated Ideas Explorer Page Styling */
+    .ideas-search-panel {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+    }
+
+    .ideas-search-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .ideas-query-box {
+      flex: 1;
+      min-width: 260px;
+      display: flex;
+      align-items: center;
+      background: var(--bg-dark);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0 12px;
+      transition: border-color 0.15s ease;
+    }
+
+    .ideas-query-box:focus-within {
+      border-color: var(--accent);
+    }
+
+    .ideas-query-input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: var(--text-main);
+      padding: 9px 8px;
+      font-size: 0.9rem;
+      outline: none;
+    }
+
+    .ideas-filter-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      padding-top: 8px;
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .ideas-month-range-box {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(15, 23, 42, 0.65);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 5px 10px;
+      flex-wrap: wrap;
+    }
+
+    .ideas-month-input {
+      background: var(--bg-dark);
+      border: 1px solid var(--border);
+      color: var(--text-main);
+      border-radius: 5px;
+      padding: 4px 8px;
+      font-size: 0.8rem;
+      outline: none;
+      color-scheme: dark;
+    }
+
+    .ideas-month-input:focus {
+      border-color: var(--accent);
+    }
+
+    .idea-month-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      background: rgba(56, 189, 248, 0.12);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      color: #38bdf8;
+      padding: 3px 9px;
+      border-radius: 12px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .idea-sim-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: rgba(16, 185, 129, 0.14);
+      border: 1px solid rgba(16, 185, 129, 0.4);
+      color: #34d399;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 0.74rem;
+      font-weight: 700;
+    }
+
+    .idea-preset-btn {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      border-radius: 5px;
+      padding: 3px 8px;
+      font-size: 0.73rem;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .idea-preset-btn:hover {
+      color: var(--text-main);
+      border-color: var(--accent);
+      background: rgba(99, 102, 241, 0.15);
+    }
   </style>
 </head>
 <body>
@@ -1823,6 +1947,10 @@
       <div class="nav-tabs">
         <button class="nav-tab-btn active" id="tab-btn-graph" onclick="switchTab('graph')">
           🌐 Search & Graph
+        </button>
+        <button class="nav-tab-btn" id="tab-btn-ideas" onclick="switchTab('ideas')">
+          💡 Ideas
+          <span id="ideas-count-badge" class="debug-tag info" style="display:none; margin-left:4px;">0</span>
         </button>
         <button class="nav-tab-btn" id="tab-btn-books" onclick="switchTab('books')">
           📚 Books
@@ -2015,6 +2143,226 @@
               Enter an idea name or search query to explore concepts and their surrounding neighborhood notes.
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- View 1b: Dedicated Ideas Search & List Page -->
+    <div class="view-pane" id="pane-ideas">
+      <div class="books-container">
+        <div class="books-header">
+          <div class="books-header-left">
+            <h2 class="books-title"><span>💡</span> Ideas &amp; Concepts Directory</h2>
+            <span class="books-subtitle" id="ideas-subtitle-count">Browse, search (exact or embedded), and filter ideas by how modern they are (first occurrence Month + Year)</span>
+          </div>
+          <div class="books-controls">
+            <button class="debug-action-btn" onclick="resetIdeasFilters()" title="Reset all search and date range filters">
+              <span>🧹</span> Clear Filters
+            </button>
+            <button class="debug-action-btn" onclick="executeIdeasSearch(true)" title="Refresh ideas directory from knowledge base">
+              <span>🔄</span> Refresh Ideas
+            </button>
+          </div>
+        </div>
+
+        <!-- Ideas Search & Modernity Filtering Panel -->
+        <div class="ideas-search-panel">
+          <!-- Row 1: Query Input + Exact vs Embedded Search Mode + Search Button -->
+          <div class="ideas-search-row">
+            <div class="ideas-query-box">
+              <span style="color:var(--text-muted); font-size:0.95rem;">🔍</span>
+              <input
+                type="text"
+                id="ideas-search-input"
+                class="ideas-query-input"
+                placeholder="Search for ideas (exact title/summary match or semantic embedded meaning)..."
+                onkeydown="if(event.key === 'Enter') executeIdeasSearch()"
+              />
+              <button
+                id="ideas-search-clear-btn"
+                class="search-clear-btn"
+                style="display:none; position:static; transform:none; padding:2px 6px;"
+                onclick="clearIdeasSearchQuery()"
+                title="Clear idea search query"
+              >✕</button>
+            </div>
+
+            <div class="toolbar-group" style="gap:6px;">
+              <span class="toolbar-label">Search Mode:</span>
+              <div class="segmented-control" id="ideas-search-mode-segmented">
+                <button
+                  type="button"
+                  class="seg-btn active"
+                  data-idea-mode="exact"
+                  onclick="setIdeasSearchMode('exact')"
+                  title="Exact & substring lexical search on idea name, category, and description"
+                >🎯 Exact Search</button>
+                <button
+                  type="button"
+                  class="seg-btn"
+                  data-idea-mode="embedded"
+                  onclick="setIdeasSearchMode('embedded')"
+                  title="Neural embedding vector search (bge-m3 cosine similarity)"
+                >🧠 Embedded Search</button>
+              </div>
+              <input type="hidden" id="ideas-search-mode" value="exact" />
+            </div>
+
+            <div class="toolbar-group" id="ideas-sim-threshold-group" style="display:none; gap:6px;">
+              <label for="ideas-sim-threshold" class="toolbar-label" title="Minimum cosine similarity for embedded search">Min Similarity:</label>
+              <select id="ideas-sim-threshold" class="toolbar-select" onchange="executeIdeasSearch()">
+                <option value="0.30">≥ 0.30 (Broad)</option>
+                <option value="0.45" selected>≥ 0.45 (Standard)</option>
+                <option value="0.60">≥ 0.60 (Confident)</option>
+                <option value="0.70">≥ 0.70 (Strict)</option>
+                <option value="0.80">≥ 0.80 (Exact Semantic)</option>
+              </select>
+            </div>
+
+            <button class="search-btn" id="ideas-search-btn" onclick="executeIdeasSearch()" style="padding: 8px 18px; font-size: 0.88rem;">
+              <span>🔍 Search Ideas</span>
+            </button>
+          </div>
+
+          <!-- Row 2: How Modern is Idea (Month + Year From / To Range) + Category + Sort -->
+          <div class="ideas-filter-row">
+            <div class="ideas-month-range-box">
+              <span class="toolbar-label" style="color:#38bdf8; display:flex; align-items:center; gap:4px;" title="Filter ideas by the Month + Year they first occurred in literature">
+                📅 Modernity (First Occurrence):
+              </span>
+
+              <!-- FROM: Month + Year -->
+              <div style="display:flex; align-items:center; gap:4px;">
+                <span style="font-size:0.75rem; color:var(--text-muted); font-weight:600;">From:</span>
+                <select id="ideas-from-month-sel" class="toolbar-select" style="padding:3px 6px;" onchange="onIdeasMonthYearPartChange('from')" title="From Month">
+                  <option value="">Month</option>
+                  <option value="01">01 - Jan</option>
+                  <option value="02">02 - Feb</option>
+                  <option value="03">03 - Mar</option>
+                  <option value="04">04 - Apr</option>
+                  <option value="05">05 - May</option>
+                  <option value="06">06 - Jun</option>
+                  <option value="07">07 - Jul</option>
+                  <option value="08">08 - Aug</option>
+                  <option value="09">09 - Sep</option>
+                  <option value="10">10 - Oct</option>
+                  <option value="11">11 - Nov</option>
+                  <option value="12">12 - Dec</option>
+                </select>
+                <input
+                  type="number"
+                  id="ideas-from-year-inp"
+                  class="ideas-month-input"
+                  placeholder="Year (YYYY)"
+                  min="1900"
+                  max="2100"
+                  style="width:88px;"
+                  oninput="onIdeasMonthYearPartChange('from')"
+                  onkeydown="if(event.key === 'Enter') executeIdeasSearch()"
+                  title="From Year (e.g. 2022)"
+                />
+                <input
+                  type="month"
+                  id="ideas-month-from"
+                  class="ideas-month-input"
+                  style="width:132px;"
+                  onchange="onIdeasNativeMonthInputChange('from')"
+                  title="From Month & Year (YYYY-MM)"
+                />
+              </div>
+
+              <span style="color:var(--text-muted); font-weight:700;">→</span>
+
+              <!-- TO: Month + Year -->
+              <div style="display:flex; align-items:center; gap:4px;">
+                <span style="font-size:0.75rem; color:var(--text-muted); font-weight:600;">To:</span>
+                <select id="ideas-to-month-sel" class="toolbar-select" style="padding:3px 6px;" onchange="onIdeasMonthYearPartChange('to')" title="To Month">
+                  <option value="">Month</option>
+                  <option value="01">01 - Jan</option>
+                  <option value="02">02 - Feb</option>
+                  <option value="03">03 - Mar</option>
+                  <option value="04">04 - Apr</option>
+                  <option value="05">05 - May</option>
+                  <option value="06">06 - Jun</option>
+                  <option value="07">07 - Jul</option>
+                  <option value="08">08 - Aug</option>
+                  <option value="09">09 - Sep</option>
+                  <option value="10">10 - Oct</option>
+                  <option value="11">11 - Nov</option>
+                  <option value="12">12 - Dec</option>
+                </select>
+                <input
+                  type="number"
+                  id="ideas-to-year-inp"
+                  class="ideas-month-input"
+                  placeholder="Year (YYYY)"
+                  min="1900"
+                  max="2100"
+                  style="width:88px;"
+                  oninput="onIdeasMonthYearPartChange('to')"
+                  onkeydown="if(event.key === 'Enter') executeIdeasSearch()"
+                  title="To Year (e.g. 2025)"
+                />
+                <input
+                  type="month"
+                  id="ideas-month-to"
+                  class="ideas-month-input"
+                  style="width:132px;"
+                  onchange="onIdeasNativeMonthInputChange('to')"
+                  title="To Month & Year (YYYY-MM)"
+                />
+              </div>
+
+              <!-- Quick Modernity Presets -->
+              <div style="display:flex; align-items:center; gap:4px; margin-left:4px;">
+                <button type="button" class="idea-preset-btn" onclick="applyIdeasDatePreset('last_1y')" title="Ideas first occurring in the last 12 months">Last 1Y</button>
+                <button type="button" class="idea-preset-btn" onclick="applyIdeasDatePreset('last_3y')" title="Ideas first occurring in the last 3 years">Last 3Y</button>
+                <button type="button" class="idea-preset-btn" onclick="applyIdeasDatePreset('2020_plus')" title="Ideas from Jan 2020 onwards">2020+</button>
+                <button type="button" class="idea-preset-btn" onclick="clearIdeasDateRange()" title="Clear Month+Year filter (All Time)">All Time</button>
+              </div>
+            </div>
+
+            <div class="toolbar-group" style="gap:6px;">
+              <label for="ideas-category-filter" class="toolbar-label">Category:</label>
+              <select id="ideas-category-filter" class="toolbar-select" onchange="executeIdeasSearch()">
+                <option value="all" selected>All Categories</option>
+              </select>
+            </div>
+
+            <div class="toolbar-group" style="gap:6px; margin-left:auto;">
+              <label for="ideas-sort-select" class="toolbar-label">Sort By:</label>
+              <select id="ideas-sort-select" class="toolbar-select" onchange="executeIdeasSearch()">
+                <option value="month_desc" selected>📅 Newest Ideas First (Month ↓)</option>
+                <option value="month_asc">📅 Oldest Ideas First (Month ↑)</option>
+                <option value="weight_desc">⚖️ Significance Weight (↓)</option>
+                <option value="occurrences_desc">🔢 Occurrences Count (↓)</option>
+                <option value="similarity_desc">🧠 Similarity / Match Score (↓)</option>
+                <option value="name_asc">🔤 Idea Name (A–Z)</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- Ideas Directory Table -->
+        <div class="books-table-card">
+          <table class="books-table" id="ideas-table">
+            <thead>
+              <tr>
+                <th style="width: 24%;">Idea / Concept &amp; Category</th>
+                <th style="width: 36%;">Summary &amp; Core Description</th>
+                <th style="width: 14%;">First Occurrence (Month + Year)</th>
+                <th style="width: 16%;">Significance &amp; Books</th>
+                <th style="width: 10%; text-align: right;">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="ideas-table-body">
+              <tr>
+                <td colspan="5" style="text-align:center; padding: 40px; color: var(--text-muted);">
+                  Loading ideas from knowledge base...
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </div>
     </div>
@@ -2943,6 +3291,8 @@
     }
 
     let indexedBooksCache = [];
+    let indexedIdeasLoadedOnce = false;
+    let indexedIdeasCategoriesPopulated = false;
 
     function switchTab(tab) {
       document.querySelectorAll('.nav-tab-btn').forEach(b => b.classList.remove('active'));
@@ -2954,6 +3304,14 @@
         const paneGraph = document.getElementById('pane-graph');
         if (paneGraph) paneGraph.classList.add('active');
         if (cyInstance) cyInstance.resize();
+      } else if (tab === 'ideas') {
+        const btnIdeas = document.getElementById('tab-btn-ideas');
+        if (btnIdeas) btnIdeas.classList.add('active');
+        const paneIdeas = document.getElementById('pane-ideas');
+        if (paneIdeas) paneIdeas.classList.add('active');
+        if (!indexedIdeasLoadedOnce) {
+          executeIdeasSearch();
+        }
       } else if (tab === 'books') {
         const btnBooks = document.getElementById('tab-btn-books');
         if (btnBooks) btnBooks.classList.add('active');
@@ -2972,6 +3330,400 @@
         if (paneDebug) paneDebug.classList.add('active');
         renderDebugTab();
       }
+    }
+
+    function setIdeasSearchMode(mode) {
+      const hiddenInput = document.getElementById('ideas-search-mode');
+      if (hiddenInput) hiddenInput.value = mode;
+
+      document.querySelectorAll('#ideas-search-mode-segmented .seg-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.getAttribute('data-idea-mode') === mode);
+      });
+
+      const simGroup = document.getElementById('ideas-sim-threshold-group');
+      if (simGroup) {
+        simGroup.style.display = mode === 'embedded' ? 'flex' : 'none';
+      }
+
+      const sortSel = document.getElementById('ideas-sort-select');
+      const qVal = (document.getElementById('ideas-search-input')?.value || '').trim();
+      if (sortSel && qVal && mode === 'embedded') {
+        sortSel.value = 'similarity_desc';
+      }
+
+      if (qVal) {
+        executeIdeasSearch();
+      }
+    }
+
+    function clearIdeasSearchQuery() {
+      const inp = document.getElementById('ideas-search-input');
+      const clearBtn = document.getElementById('ideas-search-clear-btn');
+      if (inp) inp.value = '';
+      if (clearBtn) clearBtn.style.display = 'none';
+      executeIdeasSearch();
+    }
+
+    function onIdeasMonthYearPartChange(bound) {
+      const monthSel = document.getElementById(`ideas-${bound}-month-sel`);
+      const yearInp = document.getElementById(`ideas-${bound}-year-inp`);
+      const nativeInp = document.getElementById(`ideas-month-${bound}`);
+      if (!yearInp || !nativeInp) return;
+
+      const yr = (yearInp.value || '').trim();
+      let mo = monthSel ? monthSel.value : '';
+      if (yr.length === 4 && /^\d{4}$/.test(yr)) {
+        if (!mo) {
+          mo = bound === 'to' ? '12' : '01';
+          if (monthSel) monthSel.value = mo;
+        }
+        nativeInp.value = `${yr}-${mo}`;
+      } else if (!yr) {
+        nativeInp.value = '';
+      }
+    }
+
+    function onIdeasNativeMonthInputChange(bound) {
+      const monthSel = document.getElementById(`ideas-${bound}-month-sel`);
+      const yearInp = document.getElementById(`ideas-${bound}-year-inp`);
+      const nativeInp = document.getElementById(`ideas-month-${bound}`);
+      if (!nativeInp) return;
+
+      const val = (nativeInp.value || '').trim();
+      if (/^\d{4}-\d{2}$/.test(val)) {
+        const [yr, mo] = val.split('-');
+        if (yearInp) yearInp.value = yr;
+        if (monthSel) monthSel.value = mo;
+      } else if (!val) {
+        if (yearInp) yearInp.value = '';
+        if (monthSel) monthSel.value = '';
+      }
+      executeIdeasSearch();
+    }
+
+    function getIdeasMonthBoundValue(bound) {
+      const nativeInp = document.getElementById(`ideas-month-${bound}`);
+      if (nativeInp && nativeInp.value && /^\d{4}-\d{2}$/.test(nativeInp.value.trim())) {
+        return nativeInp.value.trim();
+      }
+      const monthSel = document.getElementById(`ideas-${bound}-month-sel`);
+      const yearInp = document.getElementById(`ideas-${bound}-year-inp`);
+      const yr = (yearInp?.value || '').trim();
+      if (/^\d{4}$/.test(yr)) {
+        const mo = (monthSel?.value || (bound === 'to' ? '12' : '01')).padStart(2, '0');
+        return `${yr}-${mo}`;
+      }
+      return '';
+    }
+
+    function setIdeasMonthBoundValue(bound, yyyyMm) {
+      const monthSel = document.getElementById(`ideas-${bound}-month-sel`);
+      const yearInp = document.getElementById(`ideas-${bound}-year-inp`);
+      const nativeInp = document.getElementById(`ideas-month-${bound}`);
+      if (!yyyyMm || !/^\d{4}-\d{2}$/.test(yyyyMm)) {
+        if (monthSel) monthSel.value = '';
+        if (yearInp) yearInp.value = '';
+        if (nativeInp) nativeInp.value = '';
+        return;
+      }
+      const [yr, mo] = yyyyMm.split('-');
+      if (yearInp) yearInp.value = yr;
+      if (monthSel) monthSel.value = mo;
+      if (nativeInp) nativeInp.value = yyyyMm;
+    }
+
+    function applyIdeasDatePreset(preset) {
+      const now = new Date();
+      const curYear = now.getFullYear();
+      const curMonth = String(now.getMonth() + 1).padStart(2, '0');
+      const nowStr = `${curYear}-${curMonth}`;
+
+      if (preset === 'last_1y') {
+        const dFrom = new Date(curYear - 1, now.getMonth(), 1);
+        const fromStr = `${dFrom.getFullYear()}-${String(dFrom.getMonth() + 1).padStart(2, '0')}`;
+        setIdeasMonthBoundValue('from', fromStr);
+        setIdeasMonthBoundValue('to', nowStr);
+      } else if (preset === 'last_3y') {
+        const dFrom = new Date(curYear - 3, now.getMonth(), 1);
+        const fromStr = `${dFrom.getFullYear()}-${String(dFrom.getMonth() + 1).padStart(2, '0')}`;
+        setIdeasMonthBoundValue('from', fromStr);
+        setIdeasMonthBoundValue('to', nowStr);
+      } else if (preset === '2020_plus') {
+        setIdeasMonthBoundValue('from', '2020-01');
+        setIdeasMonthBoundValue('to', '');
+      }
+      executeIdeasSearch();
+    }
+
+    function clearIdeasDateRange() {
+      setIdeasMonthBoundValue('from', '');
+      setIdeasMonthBoundValue('to', '');
+      executeIdeasSearch();
+    }
+
+    function resetIdeasFilters() {
+      const inp = document.getElementById('ideas-search-input');
+      const clearBtn = document.getElementById('ideas-search-clear-btn');
+      if (inp) inp.value = '';
+      if (clearBtn) clearBtn.style.display = 'none';
+      setIdeasMonthBoundValue('from', '');
+      setIdeasMonthBoundValue('to', '');
+      const catSel = document.getElementById('ideas-category-filter');
+      if (catSel) catSel.value = 'all';
+      const sortSel = document.getElementById('ideas-sort-select');
+      if (sortSel) sortSel.value = 'month_desc';
+      setIdeasSearchMode('exact');
+      executeIdeasSearch();
+    }
+
+    function formatIdeaMonthHuman(yyyyMm) {
+      if (!yyyyMm || typeof yyyyMm !== 'string') return '';
+      const m = yyyyMm.trim().match(/^(\d{4})-(\d{2})$/);
+      if (!m) return yyyyMm;
+      const yr = parseInt(m[1], 10);
+      const mo = parseInt(m[2], 10) - 1;
+      const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      const mLabel = monthNames[mo] || m[2];
+      return `${mLabel} ${yr} (${yyyyMm})`;
+    }
+
+    async function executeIdeasSearch() {
+      const tbody = document.getElementById('ideas-table-body');
+      const qVal = (document.getElementById('ideas-search-input')?.value || '').trim();
+      const searchMode = document.getElementById('ideas-search-mode')?.value || 'exact';
+      const simThresh = parseFloat(document.getElementById('ideas-sim-threshold')?.value || '0.45');
+      const monthFrom = getIdeasMonthBoundValue('from');
+      const monthTo = getIdeasMonthBoundValue('to');
+      const category = document.getElementById('ideas-category-filter')?.value || 'all';
+      const sortBy = document.getElementById('ideas-sort-select')?.value || 'month_desc';
+
+      if (tbody) {
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="5" style="text-align:center; padding: 40px; color: var(--text-muted);">
+              <div class="spinner" style="width:24px; height:24px; margin:0 auto 10px auto; border-width:2px;"></div>
+              ${qVal ? `Searching ideas (${searchMode === 'embedded' ? 'Embedded neural vector search' : 'Exact search'})...` : 'Loading ideas directory...'}
+            </td>
+          </tr>
+        `;
+      }
+
+      try {
+        const params = new URLSearchParams();
+        if (qVal) params.set('q', qVal);
+        params.set('search_type', searchMode);
+        if (monthFrom) params.set('month_from', monthFrom);
+        if (monthTo) params.set('month_to', monthTo);
+        if (category && category !== 'all') params.set('category', category);
+        params.set('sort_by', sortBy);
+        params.set('similarity_threshold', String(simThresh));
+        params.set('limit', '500');
+
+        const resp = await fetch(`/api/ideas?${params.toString()}`);
+        const data = await resp.json();
+        if (data.error) {
+          throw new Error(data.error);
+        }
+
+        indexedIdeasLoadedOnce = true;
+
+        // Update top tab badge with total ideas count
+        const badge = document.getElementById('ideas-count-badge');
+        if (badge && data.total !== undefined) {
+          badge.textContent = data.total.toLocaleString();
+          badge.style.display = data.total > 0 ? 'inline-block' : 'none';
+        }
+
+        // Populate categories dropdown if not yet populated
+        if (!indexedIdeasCategoriesPopulated && Array.isArray(data.categories) && data.categories.length > 0) {
+          const catSel = document.getElementById('ideas-category-filter');
+          if (catSel) {
+            const currentVal = catSel.value;
+            catSel.innerHTML = '<option value="all">All Categories</option>' +
+              data.categories.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+            catSel.value = currentVal || 'all';
+            indexedIdeasCategoriesPopulated = true;
+          }
+        }
+
+        renderIdeasTable(data);
+      } catch (err) {
+        console.error('Failed to search/load ideas:', err);
+        if (tbody) {
+          tbody.innerHTML = `
+            <tr>
+              <td colspan="5" style="text-align:center; padding: 30px; color: #f87171;">
+                Failed to load ideas: ${escapeHtml(err.message)}
+              </td>
+            </tr>
+          `;
+        }
+      }
+    }
+
+    function renderIdeasTable(data) {
+      const tbody = document.getElementById('ideas-table-body');
+      const subtitle = document.getElementById('ideas-subtitle-count');
+      if (!tbody) return;
+
+      const ideas = data.ideas || [];
+      const total = data.total || 0;
+      const filtered = data.filtered !== undefined ? data.filtered : ideas.length;
+      const q = data.query || '';
+      const mode = data.search_type || 'exact';
+      const mFrom = data.month_from || '';
+      const mTo = data.month_to || '';
+
+      let subParts = [`Showing ${ideas.length.toLocaleString()} of ${total.toLocaleString()} ideas`];
+      if (filtered !== ideas.length) {
+        subParts = [`Showing top ${ideas.length.toLocaleString()} (${filtered.toLocaleString()} matched of ${total.toLocaleString()} total)`];
+      }
+      if (q) {
+        subParts.push(`Mode: ${mode === 'embedded' ? '🧠 Embedded Semantic' : '🎯 Exact Match'} for "${q}"`);
+      }
+      if (mFrom || mTo) {
+        subParts.push(`📅 Modernity Range: ${mFrom || 'Earliest'} → ${mTo || 'Present'}`);
+      } else if (data.min_month && data.max_month) {
+        subParts.push(`Timeline span: ${data.min_month} to ${data.max_month}`);
+      }
+      if (subtitle) {
+        subtitle.textContent = subParts.join('  •  ');
+      }
+
+      if (ideas.length === 0) {
+        tbody.innerHTML = `
+          <tr>
+            <td colspan="5" style="text-align:center; padding: 40px; color: var(--text-muted);">
+              No ideas matched your current search or Month+Year modernity filter.
+              <div style="margin-top:10px;">
+                <button class="book-action-btn" onclick="resetIdeasFilters()">🧹 Reset Filters</button>
+              </div>
+            </td>
+          </tr>
+        `;
+        return;
+      }
+
+      let html = '';
+      ideas.forEach(idea => {
+        const ideaName = idea.name || idea.id || 'Unnamed Idea';
+        const ideaId = idea.id || `concept:${ideaName}`;
+        const cat = idea.category || 'Idea';
+        const summary = idea.summary || idea.brief_description || 'No summary description available.';
+        const wt = idea.weight !== undefined ? idea.weight : 5;
+        const occ = idea.occurrences !== undefined ? idea.occurrences : 1;
+        const monthVal = idea.month || idea.first_occurrence_month || '';
+
+        // Similarity or exact match badge
+        let matchBadgeHtml = '';
+        if (idea.cosine_similarity !== undefined && idea.cosine_similarity !== null) {
+          const pct = (idea.cosine_similarity * 100).toFixed(1);
+          matchBadgeHtml = `<span class="idea-sim-badge" title="Cosine Similarity: ${idea.cosine_similarity.toFixed(4)} | Priority Score: ${idea.priority_score || 0}">🧠 ${pct}% sim (${idea.cosine_similarity.toFixed(2)})</span>`;
+        } else if (idea.match_type && q) {
+          const labelMap = {
+            exact_name: '🎯 Exact Title',
+            prefix_name: '🎯 Title Prefix',
+            substring_name: '🎯 Title Match',
+            category_match: '🏷️ Category Match',
+            summary_match: '📝 Summary Match',
+            detail_match: '📄 Detail Match',
+            all_tokens: '🔤 Token Match'
+          };
+          const mLabel = labelMap[idea.match_type] || '🎯 Match';
+          matchBadgeHtml = `<span class="idea-sim-badge" style="color:#a5b4fc; border-color:rgba(165,180,252,0.4); background:rgba(99,102,241,0.14);">${mLabel}</span>`;
+        }
+
+        // First Occurrence Month+Year badge
+        let monthHtml = '';
+        if (monthVal) {
+          const humanMonth = formatIdeaMonthHuman(monthVal);
+          monthHtml = `<span class="idea-month-badge" title="First Occurrence Month (earliest publication where this idea appeared)">📅 ${escapeHtml(humanMonth)}</span>`;
+        } else {
+          monthHtml = `<span style="color:var(--text-muted); font-size:0.78rem; font-style:italic;">Unknown date</span>`;
+        }
+
+        // Connected books pills
+        const books = idea.books || [];
+        let booksHtml = '';
+        if (books.length > 0) {
+          booksHtml = books.slice(0, 3).map(bk => {
+            const bTitle = bk.title || `Book ${bk.book_id}`;
+            const bMonth = bk.month ? ` (${bk.month})` : '';
+            return `<a href="javascript:void(0)" class="book-meta-badge" style="text-decoration:none; color:#93c5fd; border:1px solid rgba(59,130,246,0.3); display:inline-block; margin:2px 4px 2px 0;" onclick="openBookInGraph('${escapeHtml(bk.id || bk.book_id).replace(/'/g, "\\'")}', '${escapeHtml(bTitle).replace(/'/g, "\\'")}')" title="Book: ${escapeHtml(bTitle)}${escapeHtml(bMonth)}">📚 ${escapeHtml(bTitle.length > 28 ? bTitle.slice(0, 28) + '…' : bTitle)}</a>`;
+          }).join('');
+          if (idea.books_count > 3) {
+            booksHtml += `<span class="book-meta-badge">+${idea.books_count - 3} more</span>`;
+          }
+        } else {
+          booksHtml = `<span style="color:var(--text-muted); font-size:0.75rem;">—</span>`;
+        }
+
+        const safeIdeaNameJs = escapeHtml(ideaName).replace(/'/g, "\\'");
+        const safeIdeaIdJs = escapeHtml(ideaId).replace(/'/g, "\\'");
+
+        html += `
+          <tr>
+            <td>
+              <div style="display:flex; flex-direction:column; gap:5px;">
+                <div>
+                  <a href="javascript:void(0)" onclick="exploreIdeaFromIdeasPage('${safeIdeaNameJs}', '${safeIdeaIdJs}')" style="color:var(--text-main); text-decoration:none; font-weight:700; font-size:0.93rem;" onmouseover="this.style.color='#818cf8'" onmouseout="this.style.color='var(--text-main)'">
+                    💡 ${escapeHtml(ideaName)}
+                  </a>
+                </div>
+                <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+                  <span class="book-meta-badge" style="color:#c4b5fd; border:1px solid rgba(139,92,246,0.3);">${escapeHtml(cat)}</span>
+                  ${matchBadgeHtml}
+                </div>
+              </div>
+            </td>
+            <td>
+              <div style="font-size:0.84rem; color:var(--text-main); line-height:1.45;">
+                ${escapeHtml(summary)}
+              </div>
+            </td>
+            <td style="white-space:nowrap;">
+              ${monthHtml}
+            </td>
+            <td>
+              <div style="display:flex; flex-direction:column; gap:4px;">
+                <div style="display:flex; gap:6px; align-items:center;">
+                  <span class="book-meta-badge" title="Conceptual Significance Weight (1-10)">⚖️ Weight: <strong>${wt}</strong>/10</span>
+                  <span class="book-meta-badge" title="Total Occurrences Across Literature">🔢 Occ: <strong>${occ}</strong></span>
+                </div>
+                <div style="margin-top:2px;">
+                  ${booksHtml}
+                </div>
+              </div>
+            </td>
+            <td style="text-align:right; white-space:nowrap;">
+              <button class="book-action-btn" onclick="exploreIdeaFromIdeasPage('${safeIdeaNameJs}', '${safeIdeaIdJs}')" title="Search and visualize this idea in the Knowledge Graph">
+                <span>🌐 Graph</span>
+              </button>
+              <button class="book-action-btn" onclick="openIdeaNoteFromIdeasPage('${safeIdeaIdJs}', '${safeIdeaNameJs}')" title="Open full Obsidian-style concept note & citations">
+                <span>📖 Note</span>
+              </button>
+            </td>
+          </tr>
+        `;
+      });
+
+      tbody.innerHTML = html;
+    }
+
+    function exploreIdeaFromIdeasPage(ideaName, ideaId) {
+      const input = document.getElementById('search-input');
+      if (input) {
+        input.value = ideaName;
+        const clearBtn = document.getElementById('search-clear-btn');
+        if (clearBtn) clearBtn.style.display = 'block';
+      }
+      switchTab('graph');
+      executeSearch();
+    }
+
+    function openIdeaNoteFromIdeasPage(ideaId, ideaName) {
+      switchTab('graph');
+      loadNodeDetails(ideaId || ideaName);
     }
 
     async function loadIndexedBooks(forceRefresh = false) {
@@ -3897,6 +4649,7 @@
 
         // 2. Obsidian YAML Frontmatter Box
         const pubDateVal = node.publication_date || props.publication_date || (node.book_file ? node.book_file.publication_date : null);
+        const ideaMonthVal = node.first_occurrence_month || node.month || props.first_occurrence_month || props.month || null;
         html += `
           <div class="frontmatter-card">
             <div class="fm-row"><span class="fm-label">title:</span><span class="fm-value">"${escapeHtml(node.name)}"</span></div>
@@ -3904,6 +4657,7 @@
             <div class="fm-row"><span class="fm-label">category:</span><span class="fm-value">"${escapeHtml(node.category)}"</span></div>
             <div class="fm-row"><span class="fm-label">weight:</span><span class="fm-value">${node.weight}/10</span></div>
             <div class="fm-row"><span class="fm-label">occurrences:</span><span class="fm-value">${node.occurrences}</span></div>
+            ${ideaMonthVal ? `<div class="fm-row"><span class="fm-label">first_occurrence:</span><span class="fm-value" style="color:#38bdf8;">"📅 ${escapeHtml(ideaMonthVal)}"</span></div>` : ''}
             ${pubDateVal ? `<div class="fm-row"><span class="fm-label">published:</span><span class="fm-value">"${escapeHtml(pubDateVal)}"</span></div>` : ''}
           </div>
         `;
@@ -4812,6 +5566,13 @@
     }
 
     function updateDebugSyncStatus(data) {
+      const ideasBadge = document.getElementById('ideas-count-badge');
+      const ideasCount = (data.neo4j_connected && data.neo4j_stats && data.neo4j_stats.ideas) ? data.neo4j_stats.ideas : (data.local_stats ? data.local_stats.ideas : 0);
+      if (ideasBadge && ideasCount > 0 && !indexedIdeasLoadedOnce) {
+        ideasBadge.textContent = ideasCount.toLocaleString();
+        ideasBadge.style.display = 'inline-block';
+      }
+
       const badge = document.getElementById('debug-sync-badge');
       const details = document.getElementById('debug-sync-details');
       if (!details) return;
@@ -4911,7 +5672,9 @@
       const tabParam = urlParams.get('tab');
       const searchParam = urlParams.get('search') || urlParams.get('q');
 
-      if (tabParam === 'books') {
+      if (tabParam === 'ideas') {
+        switchTab('ideas');
+      } else if (tabParam === 'books') {
         switchTab('books');
       } else if (tabParam === 'backup' || tabParam === 'restore' || tabParam === 'backup-restore') {
         switchTab('backup');
@@ -4919,6 +5682,14 @@
         switchTab('debug');
       } else if (tabParam === 'search' || tabParam === 'graph') {
         switchTab('graph');
+      }
+
+      const ideasInput = document.getElementById('ideas-search-input');
+      if (ideasInput) {
+        ideasInput.addEventListener('input', function() {
+          const clearBtn = document.getElementById('ideas-search-clear-btn');
+          if (clearBtn) clearBtn.style.display = this.value.trim().length > 0 ? 'block' : 'none';
+        });
       }
 
       if (searchParam) {

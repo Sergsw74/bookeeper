@@ -34,6 +34,22 @@ max_retries: 1           # Retries for an attempt on an Ollama server before fai
 max_chunk_attempts: 6    # Maximum attempts across pool for a stalled chunk before marking failed (default: 6)
 max_context_size: 5120   # Maximum combined chunk context size in bytes (default: 5KB) for simultaneous extraction
 max_chunk_batch: 3       # Top limit on number of chunks combined per extraction task (default: 3)
+# Chronological Ingestion & 3-Tier Semantic Chunk Routing Options
+# Top-level shorthand (also configurable under 'recent_ideas:' block):
+batch_books: 10          # Number of books grouped per chronological ingestion batch (default: 10)
+similarity_unassigned_threshold: 0.65       # Chunks below this similarity (<0.65) treated as brand new ideas (Tier 1)
+similarity_high_confidence_threshold: 0.90  # Chunks above this similarity (>=0.90) directly assigned to idea, skipping LLM (Tier 2)
+skip_limbo_chunks: false                    # Skip limbo chunks (0.65 <= sim < 0.90) completely from LLM processing (Tier 3)
+max_batch_chunk_size: null                  # If a limbo chunk is this size (chars) or larger, recover it from limbo into processing queue
+
+# Alternatively, configure as structured section:
+# recent_ideas:
+#   enabled: true
+#   batch_books: 10
+#   similarity_unassigned_threshold: 0.65
+#   similarity_high_confidence_threshold: 0.90
+#   skip_limbo_chunks: false
+#   max_batch_chunk_size: 500               # Recover limbo chunks >= 500 chars to unprocessed LLM queue
 
 # Dedicated local or remote Embeddings endpoint (Recommended for maximum performance)
 # Offloading embeddings to your local machine (e.g. Apple Silicon Mac on http://localhost:11434)

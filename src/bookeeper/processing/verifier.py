@@ -34,7 +34,7 @@ from bookeeper.processing.cross_checker import (
     run_cross_check,
 )
 from bookeeper.processing.extractor import Concept
-from bookeeper.processing.ollama_pool import OllamaPool, _thread_local
+from bookeeper.processing.ollama_pool import DaemonThreadPoolExecutor, OllamaPool, _thread_local
 from bookeeper.processing.qa_probe import (
     AtomicAssertionItem,
     NLIAssertionEvaluation,
@@ -957,7 +957,7 @@ def verify_graph(
 
     # 5. Execute evaluations with worker concurrency
     completed_count = 0
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
+    with DaemonThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
         futures = {executor.submit(_eval_single, t): t for t in eval_tasks}
         for fut in as_completed(futures):
             item = fut.result()
@@ -1710,7 +1710,7 @@ def verify_chunks(
                 except Exception:
                     pass
     else:
-        with ThreadPoolExecutor(max_workers=eff_concurrency) as executor:
+        with DaemonThreadPoolExecutor(max_workers=eff_concurrency) as executor:
             futures = {executor.submit(_audit_single_chunk, item): item for item in sampled_chunks}
             for fut in as_completed(futures):
                 item = futures[fut]

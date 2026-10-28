@@ -24,6 +24,17 @@ from bookeeper.processing.idea_postprocessor import (
     IdeaPostProcessorReport,
     normalize_idea_name,
 )
+from bookeeper.processing.recent_ideas import (
+    BatchRoutingResult,
+    ChunkPriority,
+    IdeaEmbeddingIndex,
+    RecentIdeaChunkRouter,
+    RoutedChunk,
+    SemanticRoutingEngine,
+    normalize_sort_date,
+    partition_books_into_batches,
+    sort_books_chronologically,
+)
 
 __all__ = [
     "HierarchicalChunk",
@@ -44,4 +55,13 @@ __all__ = [
     "IdeaObservation",
     "ConsolidatedIdeaOutput",
     "normalize_idea_name",
+    "ChunkPriority",
+    "RoutedChunk",
+    "BatchRoutingResult",
+    "IdeaEmbeddingIndex",
+    "RecentIdeaChunkRouter",
+    "SemanticRoutingEngine",
+    "normalize_sort_date",
+    "sort_books_chronologically",
+    "partition_books_into_batches",
 ]

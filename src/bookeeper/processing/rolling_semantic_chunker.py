@@ -84,6 +84,7 @@ class RollingWindowSemanticChunker:
         overlap_sentences: int = 1,
         token_counter: Optional[Callable[[str], int]] = None,
         batch_size: int = 64,
+        max_batch_chars: int = 16000,
         breakpoint_threshold_type: str = "similarity_threshold",
         breakpoint_threshold_amount: float = 85.0,
         respect_paragraphs: bool = True,
@@ -109,6 +110,7 @@ class RollingWindowSemanticChunker:
         self.similarity_threshold = similarity_threshold
         self.overlap_sentences = overlap_sentences
         self.batch_size = batch_size
+        self.max_batch_chars = max_batch_chars
         self.breakpoint_threshold_type = breakpoint_threshold_type
         self.breakpoint_threshold_amount = breakpoint_threshold_amount
         self.respect_paragraphs = respect_paragraphs
@@ -291,16 +293,35 @@ class RollingWindowSemanticChunker:
         unique_texts = list(dict.fromkeys(left_contexts + right_contexts))
         text_to_idx = {t: i for i, t in enumerate(unique_texts)}
 
-        # 2. Batch embed unique texts
-        all_embeddings_list: List[np.ndarray] = []
-        for b_start in range(0, len(unique_texts), self.batch_size):
-            batch = unique_texts[b_start : b_start + self.batch_size]
-            b_emb = self._embed_fn(batch)
-            if b_emb.ndim == 1:
-                b_emb = b_emb.reshape(1, -1)
-            all_embeddings_list.append(b_emb)
+        # 2. Dynamically batch embed unique sentence/window texts by both item count and character size
+        from bookeeper.processing.ollama_pool import (
+            FailoverOllamaEmbeddings,
+            partition_texts_for_embedding,
+        )
 
-        all_embeddings = np.vstack(all_embeddings_list)
+        if isinstance(self.embedding_model, FailoverOllamaEmbeddings):
+            raw_embs = self.embedding_model.embed_documents(
+                unique_texts,
+                batch_size=self.batch_size,
+                max_batch_chars=self.max_batch_chars,
+            )
+            all_embeddings = np.asarray(raw_embs, dtype=np.float32)
+            if all_embeddings.ndim == 1:
+                all_embeddings = all_embeddings.reshape(1, -1)
+        else:
+            batches = partition_texts_for_embedding(
+                unique_texts,
+                max_batch_chars=self.max_batch_chars,
+                max_batch_items=self.batch_size,
+            )
+            all_embeddings_list: List[np.ndarray] = []
+            for batch in batches:
+                b_emb = self._embed_fn(batch)
+                if b_emb.ndim == 1:
+                    b_emb = b_emb.reshape(1, -1)
+                all_embeddings_list.append(b_emb)
+
+            all_embeddings = np.vstack(all_embeddings_list)
 
         # 3. Safe L2 normalization on unique embeddings
         norms = np.linalg.norm(all_embeddings, axis=1, keepdims=True)
@@ -313,6 +334,9 @@ class RollingWindowSemanticChunker:
 
         left_normed = normed_embeddings[left_indices]
         right_normed = normed_embeddings[right_indices]
+
+        self._last_left_normed = left_normed
+        self._last_right_normed = right_normed
 
         similarities = np.sum(left_normed * right_normed, axis=1)
         return np.clip(similarities, -1.0, 1.0)
@@ -404,19 +428,32 @@ class RollingWindowSemanticChunker:
         # Edge case: single-sentence document
         if num_sentences == 1:
             chunk_str = sentences[0]
-            return [
-                {
-                    "chunk_id": 0,
-                    "text": chunk_str,
-                    "token_count": self.count_tokens(chunk_str),
-                    "char_count": len(chunk_str),
-                    "word_count": len(chunk_str.split()),
-                    "start_sentence_idx": 0,
-                    "end_sentence_idx": 0,
-                    "split_reason": "document_end",
-                    "metadata": base_meta,
-                }
-            ]
+            single_emb: Optional[List[float]] = None
+            if self._embed_fn is not None:
+                try:
+                    raw_arr = self._embed_fn([chunk_str])
+                    if raw_arr is not None and raw_arr.size > 1:
+                        vec_1d = raw_arr.reshape(-1).astype(np.float32)
+                        n_val = float(np.linalg.norm(vec_1d))
+                        if n_val > 1e-12:
+                            vec_1d = vec_1d / n_val
+                        single_emb = [round(float(x), 6) for x in vec_1d]
+                except Exception:
+                    single_emb = None
+            single_dict: Dict[str, Any] = {
+                "chunk_id": 0,
+                "text": chunk_str,
+                "token_count": self.count_tokens(chunk_str),
+                "char_count": len(chunk_str),
+                "word_count": len(chunk_str.split()),
+                "start_sentence_idx": 0,
+                "end_sentence_idx": 0,
+                "split_reason": "document_end",
+                "metadata": base_meta,
+            }
+            if single_emb is not None:
+                single_dict["embedding"] = single_emb
+            return [single_dict]
 
         # Step B: Compute rolling window embeddings
         num_split_points = num_sentences - 1
@@ -524,19 +561,39 @@ class RollingWindowSemanticChunker:
             chunk_text = "".join(chunk_pieces)
             final_token_count = self.count_tokens(chunk_text)
 
-            chunks.append(
-                {
-                    "chunk_id": chunk_id,
-                    "text": chunk_text,
-                    "token_count": final_token_count,
-                    "char_count": len(chunk_text),
-                    "word_count": len(chunk_text.split()),
-                    "start_sentence_idx": start_idx,
-                    "end_sentence_idx": split_idx,
-                    "split_reason": split_reason,
-                    "metadata": base_meta,
-                }
-            )
+            # Reuse already-computed rolling window embeddings to derive the chunk embedding without extra API calls
+            chunk_emb_list: Optional[List[float]] = None
+            left_normed = getattr(self, "_last_left_normed", None)
+            right_normed = getattr(self, "_last_right_normed", None)
+            if left_normed is not None and len(left_normed) > 0:
+                vec_slices: List[np.ndarray] = []
+                l_end = min(split_idx, len(left_normed) - 1)
+                if start_idx <= l_end:
+                    vec_slices.append(left_normed[start_idx : l_end + 1])
+                if right_normed is not None and 0 <= split_idx - 1 < len(right_normed):
+                    vec_slices.append(right_normed[split_idx - 1 : split_idx])
+                if vec_slices:
+                    stacked = np.vstack(vec_slices)
+                    mean_vec = np.mean(stacked, axis=0)
+                    norm_val = float(np.linalg.norm(mean_vec))
+                    if norm_val > 1e-12:
+                        mean_vec = mean_vec / norm_val
+                    chunk_emb_list = [round(float(x), 6) for x in mean_vec]
+
+            chunk_dict: Dict[str, Any] = {
+                "chunk_id": chunk_id,
+                "text": chunk_text,
+                "token_count": final_token_count,
+                "char_count": len(chunk_text),
+                "word_count": len(chunk_text.split()),
+                "start_sentence_idx": start_idx,
+                "end_sentence_idx": split_idx,
+                "split_reason": split_reason,
+                "metadata": base_meta,
+            }
+            if chunk_emb_list is not None:
+                chunk_dict["embedding"] = chunk_emb_list
+            chunks.append(chunk_dict)
             chunk_id += 1
             prev_split_idx = split_idx
 
@@ -583,6 +640,8 @@ class RollingWindowSemanticChunker:
                         "split_reason": c["split_reason"],
                     }
                 )
+                if "embedding" in c and c["embedding"] is not None:
+                    chunk_meta["embedding"] = c["embedding"]
                 docs.append(Document(page_content=c["text"], metadata=chunk_meta))
         return docs
 

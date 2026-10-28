@@ -789,3 +789,256 @@ def test_process_graph_state_reset(tmp_path):
     assert mock_pool.execute_with_failover.call_count == 1
     assert report2.resumed_count == 0
 
+
+def test_incremental_batch_cycles_at_most_once_refinement_and_affected_only_upsert(tmp_path):
+    """
+    Verify across consecutive batch cycles:
+    1. Clustering still runs across all ideas in the graph.
+    2. Refinement via LLM happens at most 1 time per idea (already-refined ideas are never refined again,
+       even if a new occurrence or semantic alias merges into them in a later batch).
+    3. Ideas that were single-occurrence ('bypassed') in Batch 1 and reach >= min_occurrences in Batch 2
+       ARE refined once in Batch 2.
+    4. Untouched ideas from Batch 1 are NOT re-ingested, add 0 redundant edges, and do NOT pollute
+       store.dirty_nodes / store.dirty_edges (so Neo4j only upserts affected nodes and refs).
+    """
+    state_file = tmp_path / "dual_pass_state.json"
+    store = ConceptGraphStore()
+    store.add_book(1, title="Book 1", author="Author 1", publication_date="2023-01-15")
+
+    c1 = HierarchicalChunk(
+        chunk_id="b1_c1",
+        chunk_idx=1,
+        book_id=1,
+        book_title="Book 1",
+        chapter_idx=1,
+        chapter_title="Ch1",
+        section_title="Sec1",
+        breadcrumb="B1 > Ch1",
+        text="Event sourcing stores state changes as an immutable log.",
+        char_count=56,
+        word_count=9,
+    )
+    c2 = HierarchicalChunk(
+        chunk_id="b1_c2",
+        chunk_idx=2,
+        book_id=1,
+        book_title="Book 1",
+        chapter_idx=1,
+        chapter_title="Ch1",
+        section_title="Sec2",
+        breadcrumb="B1 > Ch1",
+        text="Event sourcing enables deterministic replay.",
+        char_count=44,
+        word_count=5,
+    )
+    store.add_chunk(c1)
+    store.add_chunk(c2)
+
+    # Multi-occurrence in Batch 1 (2 occurrences -> refined once in Batch 1)
+    store.add_idea_support_link("Event Sourcing", c1, quote="immutable log", brief_description="Event log")
+    store.add_idea_support_link("Event Sourcing", c2, quote="deterministic replay", brief_description="Replay")
+
+    # Single-occurrence in Batch 1 (1 occurrence -> bypassed in Batch 1, will reach 2 in Batch 2)
+    store.add_idea_support_link("Write-Ahead Logging", c1, quote="WAL durability", brief_description="WAL")
+
+    # Untouched single-occurrence in Batch 1 (1 occurrence -> untouched in Batch 2)
+    store.add_idea_support_link("Consistent Hashing", c2, quote="Ring partitioning", brief_description="Hash ring")
+
+    mock_pool = MagicMock()
+    mock_pool.nodes = [OllamaServerNode(url="http://localhost:11434", priority=1)]
+    mock_pool.execute_with_failover.side_effect = lambda *args, **kwargs: ConsolidatedIdeaOutput(
+        brief_description="Refined brief.",
+        detailed_explanation="Refined detailed explanation.",
+        related_entities=["CQRS"],
+        category="Pattern",
+        weight=8,
+    )
+
+    class _ThreeTopicEmbeddings:
+        def embed_documents(self, texts: list[str]) -> list[list[float]]:
+            vecs = []
+            for t in texts:
+                tl = t.lower()
+                if "event" in tl or "sourcing" in tl:
+                    vecs.append([0.98, 0.05, 0.0])
+                elif "audit trail" in tl:
+                    vecs.append([0.97, 0.06, 0.0])
+                elif "write-ahead" in tl or "wal" in tl:
+                    vecs.append([0.05, 0.98, 0.0])
+                else:
+                    vecs.append([0.0, 0.05, 0.98])
+            return vecs
+
+    pp1 = IdeaPostProcessor(
+        pool=mock_pool,
+        embeddings=_ThreeTopicEmbeddings(),
+        similarity_threshold=0.92,
+        min_occurrences=2,
+        state_file=state_file,
+        resume=True,
+    )
+    rep1 = pp1.process_graph(store)
+    assert rep1.total_clusters == 3
+    # Only "Event Sourcing" had >= 2 occurrences in Batch 1
+    assert mock_pool.execute_with_failover.call_count == 1
+    assert store.graph.nodes["concept:Event Sourcing"]["refined"] is True
+    assert store.graph.nodes["concept:Event Sourcing"]["postprocessed"] is True
+    assert store.graph.nodes["concept:Write-Ahead Logging"]["refined"] is False
+    assert store.graph.nodes["concept:Write-Ahead Logging"]["postprocessed"] is True
+    assert store.graph.nodes["concept:Consistent Hashing"]["postprocessed"] is True
+
+    # Simulate end-of-batch Neo4j export clearing dirty tracking
+    store.clear_dirty()
+    assert not store.has_dirty_changes()
+
+    # Re-running postprocessor immediately with no changes should skip all 3 clusters and mark 0 dirty
+    mock_pool.execute_with_failover.reset_mock()
+    rep_noop = pp1.process_graph(store)
+    assert mock_pool.execute_with_failover.call_count == 0
+    assert rep_noop.edges_added_count == 0
+    assert not store.has_dirty_changes()
+
+    # --- Batch 2: Ingest Book 2 ---
+    store.add_book(2, title="Book 2", author="Author 2", publication_date="2024-03-10")
+    c3 = HierarchicalChunk(
+        chunk_id="b2_c1",
+        chunk_idx=1,
+        book_id=2,
+        book_title="Book 2",
+        chapter_idx=1,
+        chapter_title="Ch1",
+        section_title="Sec1",
+        breadcrumb="B2 > Ch1",
+        text="Audit trail events and write-ahead logging in distributed storage.",
+        char_count=66,
+        word_count=9,
+    )
+    store.add_chunk(c3)
+
+    # 1) "Audit Trail Events" is semantically similar (>= 0.92 in MockEmbeddings) to "Event Sourcing"
+    store.add_idea_support_link(
+        "Audit Trail Events",
+        c3,
+        quote="Audit trail events",
+        brief_description="Audit trail of historical events.",
+    )
+    # 2) "Write-Ahead Logging" gets its 2nd occurrence in Batch 2!
+    store.add_idea_support_link(
+        "Write-Ahead Logging",
+        c3,
+        quote="write-ahead logging in distributed storage",
+        brief_description="Distributed WAL.",
+    )
+
+    # Clear book ingestion dirty state so we can inspect strictly what IdeaPostProcessor marks dirty
+    store.clear_dirty()
+
+    pp2 = IdeaPostProcessor(
+        pool=mock_pool,
+        embeddings=_ThreeTopicEmbeddings(),
+        similarity_threshold=0.92,
+        min_occurrences=2,
+        state_file=state_file,
+        resume=True,
+    )
+    rep2 = pp2.process_graph(store)
+
+    # Clustering merged "Audit Trail Events" into "Event Sourcing" -> still 3 clusters total
+    assert rep2.total_clusters == 3
+    assert not store.graph.has_node("concept:Audit Trail Events")
+    assert "concept:Audit Trail Events" in store.removed_nodes
+
+    # LLM refinement was called ONLY ONCE in Batch 2: for "Write-Ahead Logging" (which reached 2 occurrences).
+    # "Event Sourcing" was ALREADY refined in Batch 1 and was NOT refined a 2nd time!
+    assert mock_pool.execute_with_failover.call_count == 1
+    assert store.graph.nodes["concept:Write-Ahead Logging"]["refined"] is True
+    assert store.graph.nodes["concept:Write-Ahead Logging"]["brief_description"] == "Refined brief."
+
+    # Untouched "Consistent Hashing" and its chunk edge (b1_c2) were NOT marked dirty!
+    assert "concept:Consistent Hashing" not in store.dirty_nodes
+    assert ("concept:Consistent Hashing", "chunk:b1_c2") not in store.dirty_edges
+    # Affected ideas ("Event Sourcing" and "Write-Ahead Logging") WERE marked dirty
+    assert "concept:Event Sourcing" in store.dirty_nodes
+    assert "concept:Write-Ahead Logging" in store.dirty_nodes
+
+
+def test_apply_consolidation_recalculates_embeddings_with_full_idea():
+    """Verify embeddings are recalculated against the full idea text on post-processing updates."""
+    store = ConceptGraphStore()
+    node_id = "concept:Event Sourcing"
+    old_emb = [0.1, 0.2, 0.3]
+    store.graph.add_node(
+        node_id,
+        name="Event Sourcing",
+        type="Concept",
+        is_idea=True,
+        brief_description="Old brief",
+        detailed_explanation="Old detailed",
+        embedding=old_emb,
+    )
+    store.clear_dirty()
+
+    cluster = IdeaCluster(canonical_name="Event Sourcing", normalized_name="event sourcing")
+    obs = IdeaObservation(
+        concept_name="Event Sourcing",
+        book_id=1,
+        chapter_idx=1,
+        chunk_idx=1,
+        chunk_id="c1",
+        quote="State is stored as events.",
+        local_brief="Local brief",
+        local_detailed="Local detailed",
+    )
+    cluster.add_observation(obs)
+
+    output = ConsolidatedIdeaOutput(
+        brief_description="Captures state transitions as an immutable stream of events.",
+        detailed_explanation="An architectural pattern in which every state change is recorded as a discrete event log.",
+        category="Architectural Pattern",
+        related_entities=["CQRS"],
+        weight=8,
+    )
+
+    embedded_texts = []
+    mock_embeddings = MagicMock()
+
+    def fake_embed_query(text: str):
+        embedded_texts.append(text)
+        return [0.6, 0.8, 0.0]
+
+    mock_embeddings.embed_query = MagicMock(side_effect=fake_embed_query)
+
+    pp = IdeaPostProcessor(
+        pool=MagicMock(),
+        embeddings=mock_embeddings,
+        min_occurrences=1,
+    )
+
+    pp.apply_consolidation_to_graph(store, cluster, output)
+
+    # 1. Verify embedder was called with full idea text (name, brief/short, detailed/description)
+    assert len(embedded_texts) == 1
+    call_text = embedded_texts[0]
+    assert "Event Sourcing" in call_text
+    assert "Captures state transitions as an immutable stream of events." in call_text
+    assert "An architectural pattern in which every state change is recorded as a discrete event log." in call_text
+
+    # 2. Verify graph node was updated with new normalized embedding
+    nd = store.graph.nodes[node_id]
+    new_emb = nd["embedding"]
+    assert new_emb is not None
+    assert new_emb != old_emb
+    # [0.6, 0.8, 0.0] normalized is [0.6, 0.8, 0.0]
+    assert np.isclose(new_emb[0], 0.6)
+    assert np.isclose(new_emb[1], 0.8)
+    assert np.isclose(new_emb[2], 0.0)
+
+    # 3. Verify fields were stored on node
+    assert nd["brief_description"] == output.brief_description
+    assert nd["short_description"] == output.brief_description
+    assert nd["detailed_explanation"] == output.detailed_explanation
+    assert nd["description"] == output.detailed_explanation
+    assert node_id in store.dirty_nodes
+
+
+

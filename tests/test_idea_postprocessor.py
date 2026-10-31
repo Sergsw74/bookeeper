@@ -621,6 +621,47 @@ def test_idea_postprocessor_state_persistence(tmp_path):
     assert cached.brief_description == "Captures state as events."
     assert cached.related_entities == ["CQRS"]
     assert cached.weight == 8
+    state.close()
+    loaded_state.close()
+
+
+def test_idea_postprocessor_state_async_save_and_flush(tmp_path):
+    """Verify that save_async() dispatches in background and flush() ensures full disk persistence."""
+    state_file = tmp_path / "async_postprocess_state.json"
+    state = IdeaPostProcessorState(state_file, async_save=True)
+
+    for i in range(10):
+        cluster = IdeaCluster(
+            canonical_name=f"Pattern {i}",
+            normalized_name=f"pattern {i}",
+            chunk_ids={f"c{i}"},
+        )
+        output = ConsolidatedIdeaOutput(
+            brief_description=f"Description {i}.",
+            detailed_explanation=f"Detailed {i}.",
+            related_entities=[f"Related {i}"],
+            category="Pattern",
+            weight=5,
+        )
+        state.record_processed(cluster, output, status="synthesized")
+
+    # save_async() should trigger background executor without blocking
+    state.save_async()
+
+    # Flush guarantees all records are written to disk
+    state.flush()
+    assert state_file.is_file()
+
+    loaded = IdeaPostProcessorState(state_file)
+    assert len(loaded.processed_ideas) == 10
+    assert loaded.is_processed("Pattern 0")
+    assert loaded.is_processed("Pattern 9")
+    cached = loaded.get_output("Pattern 5")
+    assert cached is not None
+    assert cached.brief_description == "Description 5."
+
+    state.close()
+    loaded.close()
 
 
 def test_process_graph_state_checkpoint_and_auto_continue(tmp_path):
@@ -1039,6 +1080,183 @@ def test_apply_consolidation_recalculates_embeddings_with_full_idea():
     assert nd["detailed_explanation"] == output.detailed_explanation
     assert nd["description"] == output.detailed_explanation
     assert node_id in store.dirty_nodes
+
+
+# ==============================================================================
+# 9. Affected Concepts (Inter-Batch Targeted Postprocessing) Tests
+# ==============================================================================
+
+
+def test_process_graph_with_empty_affected_concepts():
+    """Verify that when affected_concepts is empty, process_graph returns immediately."""
+    store = ConceptGraphStore()
+    store.add_book(1, title="Test Architecture", author="Architect")
+    store.add_concept(Concept(name="Unchanged Concept", summary="Old concept", category="Idea"))
+
+    pp = IdeaPostProcessor(
+        pool=MagicMock(),
+        model_name="test-model",
+        min_occurrences=1,
+    )
+    report = pp.process_graph(store, affected_concepts=set())
+    assert report.total_clusters == 0
+    assert report.total_input_concepts == 0
+    assert report.duration_seconds == 0.0
+
+
+def test_process_graph_with_affected_concepts_filters_untouched():
+    """Verify that process_graph only processes concepts specified in affected_concepts."""
+    store = ConceptGraphStore()
+    store.add_book(1, title="Test Architecture", author="Architect")
+
+    # Add untouched concepts
+    store.add_concept(Concept(name="Untouched A", summary="Summary A", category="Idea"))
+    store.add_concept(Concept(name="Untouched B", summary="Summary B", category="Idea"))
+
+    # Add affected concepts (multi-occurrence so they trigger synthesis)
+    for i in range(1, 3):
+        chk = HierarchicalChunk(
+            chunk_id=f"chk_aff_{i}",
+            chunk_idx=i,
+            book_id=1,
+            book_title="Test Architecture",
+            chapter_idx=1,
+            chapter_title="Ch1",
+            section_title="Sec1",
+            breadcrumb="Ch1 > Sec1",
+            text=f"Batch affected idea mention {i}",
+            char_count=30,
+            word_count=5,
+        )
+        store.add_chunk(chk)
+        store.add_idea_support_link(
+            concept_name="Batch Affected Idea",
+            chunk=chk,
+            quote=f"Quote {i}",
+            brief_description=f"Brief {i}",
+        )
+
+    mock_pool = MagicMock()
+    mock_pool.nodes = [OllamaServerNode(url="http://localhost:11434", priority=1)]
+    mock_pool.execute_with_failover.return_value = ConsolidatedIdeaOutput(
+        brief_description="Synthesized Batch Affected Idea.",
+        detailed_explanation="Detailed explanation of Batch Affected Idea.",
+        related_entities=[],
+        category="Idea",
+        weight=8,
+    )
+
+    pp = IdeaPostProcessor(
+        pool=mock_pool,
+        model_name="test-synth",
+        min_occurrences=2,
+    )
+
+    # Pass only "Batch Affected Idea" as affected
+    report = pp.process_graph(store, affected_concepts={"Batch Affected Idea"})
+
+    # Only 1 cluster processed
+    assert report.total_clusters == 1
+    assert "Batch Affected Idea" in report.synthesized_ideas
+    assert "Untouched A" not in report.synthesized_ideas
+    assert "Untouched B" not in report.synthesized_ideas
+
+    # Verify Untouched concepts were never postprocessed
+    assert not store.graph.nodes["concept:Untouched A"].get("postprocessed")
+    assert store.graph.nodes["concept:Batch Affected Idea"].get("postprocessed") is True
+
+
+def test_process_graph_affected_concepts_cross_merges_with_graph():
+    """
+    Verify that an affected concept from a new batch cross-merges with an existing
+    graph concept having cosine similarity >= 0.92, while leaving non-matching graph concepts untouched.
+    """
+    store = ConceptGraphStore()
+    store.add_book(1, title="Financial Architecture", author="Fin")
+
+    # 1. Existing concept in graph from earlier batch (with embedding)
+    v1 = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    store.add_concept(
+        Concept(
+            name="High-Frequency Trading",
+            summary="Automated algorithmic trading at sub-millisecond latency.",
+            category="Finance",
+            weight=8,
+        ),
+        embedding=v1.tolist(),
+    )
+    # Existing untouched concept
+    v_other = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    store.add_concept(
+        Concept(
+            name="Quantum Computing",
+            summary="Qubit-based quantum computing.",
+            category="Hardware",
+            weight=9,
+        ),
+        embedding=v_other.tolist(),
+    )
+
+    # 2. New affected concept in current batch (nearly identical embedding)
+    # Cosine similarity between [1.0, 0.0, 0.0] and [0.99, 0.01, 0.0] is ~0.999 >= 0.92
+    v2 = np.array([0.99, 0.01, 0.0], dtype=np.float32)
+    v2_unit = (v2 / np.linalg.norm(v2)).tolist()
+    chk_new = HierarchicalChunk(
+        chunk_id="chk_hft_new",
+        chunk_idx=1,
+        book_id=1,
+        book_title="Financial Architecture",
+        chapter_idx=2,
+        chapter_title="Ch2",
+        section_title="Sec2",
+        breadcrumb="Ch2 > Sec2",
+        text="HFT Trading Systems execute millions of orders per second.",
+        char_count=50,
+        word_count=8,
+    )
+    store.add_chunk(chk_new)
+    store.add_concept(
+        Concept(
+            name="HFT Trading Systems",
+            summary="Ultra low latency automated execution systems.",
+            category="Finance",
+            weight=7,
+        ),
+        embedding=v2_unit,
+    )
+    store.add_idea_support_link(
+        concept_name="HFT Trading Systems",
+        chunk=chk_new,
+        quote="HFT Trading Systems execute millions of orders per second.",
+        brief_description="Ultra low latency execution.",
+    )
+
+    mock_pool = MagicMock()
+    mock_pool.nodes = [OllamaServerNode(url="http://localhost:11434", priority=1)]
+    mock_pool.execute_with_failover.return_value = ConsolidatedIdeaOutput(
+        brief_description="Consolidated High-Frequency Trading Systems.",
+        detailed_explanation="Automated algorithmic trading and ultra-low latency execution systems.",
+        related_entities=[],
+        category="Finance",
+        weight=9,
+    )
+
+    pp = IdeaPostProcessor(
+        pool=mock_pool,
+        model_name="test-synth",
+        similarity_threshold=0.92,
+        min_occurrences=2,
+    )
+
+    # Run postprocessor scoped strictly to the new affected concept
+    report = pp.process_graph(store, affected_concepts={"HFT Trading Systems"})
+
+    # Should have merged "High-Frequency Trading" from the graph into the cluster
+    assert report.total_clusters == 1
+    assert report.merged_clusters_count >= 1
+
+    # Check that Quantum Computing was untouched
+    assert not store.graph.nodes["concept:Quantum Computing"].get("postprocessed")
 
 
 

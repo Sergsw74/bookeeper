@@ -286,6 +286,14 @@ class SingleVerifierConfig(BaseModel):
         default=0.70,
         description="Cosine similarity cutoff below which a raw idea is considered dropped in drift verification (default: 0.70).",
     )
+    low_p10_prompt: bool = Field(
+        default=False,
+        description="Whether to generate a ~1M verification prompt for high-capability models evaluating lowest-p10 proximity chunks in KG verification.",
+    )
+    low_p10_output: Optional[str] = Field(
+        default=None,
+        description="Optional destination path for generated low-p10 verification prompt.",
+    )
 
     @property
     def resolved_distance_threshold(self) -> Optional[float]:
@@ -350,6 +358,14 @@ class VerificationConfig(BaseModel):
         default=0.70,
         description="Cosine similarity cutoff below which a raw idea is considered dropped in drift verification (default: 0.70).",
     )
+    low_p10_prompt: bool = Field(
+        default=False,
+        description="Whether to generate a ~1M verification prompt for high-capability models evaluating lowest-p10 proximity chunks in KG verification.",
+    )
+    low_p10_output: Optional[str] = Field(
+        default=None,
+        description="Optional destination path for generated low-p10 verification prompt.",
+    )
     verifiers: List[SingleVerifierConfig] = Field(
         default_factory=list,
         description="Optional list of verifier configurations for multi-verification.",
@@ -411,6 +427,10 @@ class DualPassConfig(BaseModel):
         default=100,
         description="Save postprocessing state checkpoint every N ideas (default: 100).",
     )
+    async_save: bool = Field(
+        default=True,
+        description="Whether to persist postprocessor state checkpoints asynchronously in a background thread without pausing the worker loop (default: True).",
+    )
 
 
 class RecentIdeasConfig(BaseModel):
@@ -446,6 +466,40 @@ class RecentIdeasConfig(BaseModel):
         if self.max_batch_chunk_size is not None and int(self.max_batch_chunk_size) > 0:
             return int(self.max_batch_chunk_size)
         return None
+
+
+class SectionPricing(BaseModel):
+    """Unit prices ($ per 1M tokens) for the four token sections."""
+    embedding: float = Field(default=0.02, description="Price per 1M embedding tokens ($).")
+    input: float = Field(default=0.15, description="Price per 1M input / prompt tokens ($).")
+    output: float = Field(default=0.60, description="Price per 1M output / completion tokens ($).")
+    cache: float = Field(default=0.075, description="Price per 1M prompt cache read / hit tokens ($).")
+
+
+class TokenPricingConfig(BaseModel):
+    """Pricing configuration for token cost estimation (in USD per 1M tokens)."""
+    # Direct rate per section (if user provides single flat pricing)
+    embedding_price_per_1m: Optional[float] = Field(default=None, description="Price per 1M embedding tokens ($).")
+    input_price_per_1m: Optional[float] = Field(default=None, description="Price per 1M input tokens ($).")
+    output_price_per_1m: Optional[float] = Field(default=None, description="Price per 1M output tokens ($).")
+    cache_price_per_1m: Optional[float] = Field(default=None, description="Price per 1M cache tokens ($).")
+
+    # Three comparative industry pricing tiers ($/1M tokens)
+    tier1_name: str = Field(default="Tier 1: Budget / Local / DeepSeek", description="Label for pricing tier 1.")
+    tier1: SectionPricing = Field(
+        default_factory=lambda: SectionPricing(embedding=0.02, input=0.14, output=0.28, cache=0.014),
+        description="Tier 1 pricing ($/1M tokens).",
+    )
+    tier2_name: str = Field(default="Tier 2: Standard / GPT-4o-mini", description="Label for pricing tier 2.")
+    tier2: SectionPricing = Field(
+        default_factory=lambda: SectionPricing(embedding=0.10, input=0.15, output=0.60, cache=0.075),
+        description="Tier 2 pricing ($/1M tokens).",
+    )
+    tier3_name: str = Field(default="Tier 3: Flagship / GPT-4o / Sonnet", description="Label for pricing tier 3.")
+    tier3: SectionPricing = Field(
+        default_factory=lambda: SectionPricing(embedding=0.15, input=2.50, output=10.00, cache=1.25),
+        description="Tier 3 pricing ($/1M tokens).",
+    )
 
 
 class Settings(BaseSettings):
@@ -880,6 +934,40 @@ class Settings(BaseSettings):
         default=False,
         description="Enable LightRAG engine for fast incremental indexing and dual-level retrieval.",
     )
+    # Hierarchical Semantic Cover & Section-Aware Deduplication settings
+    enable_hierarchical_cover: bool = Field(
+        default=True,
+        description="Whether to use Section-Aware Hierarchical Semantic Cover to prune redundant chunks within articles.",
+    )
+    cover_similarity_threshold: float = Field(
+        default=0.92,
+        description="Cosine similarity threshold (>=) within section to mark a chunk redundant/covered.",
+    )
+    cover_window_size: int = Field(
+        default=3,
+        description="Sliding window size (number of recent section chunks) to compare against for redundancy.",
+    )
+    cover_min_section_chunks: int = Field(
+        default=2,
+        description="Minimum chunks in a section before redundancy pruning applies (single-chunk sections are always kept).",
+    )
+    skip_references_sections: bool = Field(
+        default=True,
+        description="Automatically bypass References, Bibliography, and Acknowledgments sections in scientific white papers.",
+    )
+    # Legacy alias fields for backward compatibility with existing configs
+    enable_mmr: Optional[bool] = Field(
+        default=None,
+        description="Legacy alias for enable_hierarchical_cover.",
+    )
+    mmr_lambda: Optional[float] = Field(
+        default=None,
+        description="Legacy MMR setting (deprecated).",
+    )
+    mmr_chunk_ratio: Optional[float] = Field(
+        default=None,
+        description="Legacy MMR setting (deprecated).",
+    )
     lightrag_dir: Optional[str] = Field(
         default=None,
         description="Working directory for LightRAG graph and vector indices (default: output_dir/lightrag).",
@@ -949,6 +1037,30 @@ class Settings(BaseSettings):
         default_factory=DualPassConfig,
         description="Configuration for two-pass idea postprocessing, aggregation, and synthesis.",
     )
+
+    pricing: TokenPricingConfig = Field(
+        default_factory=TokenPricingConfig,
+        description="Configuration for token cost pricing rates and 3-tier models.",
+    )
+
+    @field_validator("pricing", mode="before")
+    @classmethod
+    def parse_pricing_config(cls, v: Any) -> Any:
+        if v is None:
+            return TokenPricingConfig()
+        if isinstance(v, dict):
+            # Map shorthand keys (embedding, input, output, cache) to direct rates
+            v_copy = dict(v)
+            if "embedding" in v_copy and "embedding_price_per_1m" not in v_copy:
+                v_copy["embedding_price_per_1m"] = v_copy.pop("embedding")
+            if "input" in v_copy and "input_price_per_1m" not in v_copy:
+                v_copy["input_price_per_1m"] = v_copy.pop("input")
+            if "output" in v_copy and "output_price_per_1m" not in v_copy:
+                v_copy["output_price_per_1m"] = v_copy.pop("output")
+            if "cache" in v_copy and "cache_price_per_1m" not in v_copy:
+                v_copy["cache_price_per_1m"] = v_copy.pop("cache")
+            return TokenPricingConfig(**v_copy)
+        return v
 
     @field_validator("dual_pass", mode="before")
     @classmethod
@@ -1092,6 +1204,8 @@ class Settings(BaseSettings):
                 flat_data["verification"] = val
             elif key in ("dual_pass", "idea_postprocessor") and isinstance(val, dict):
                 flat_data["dual_pass"] = val
+            elif key in ("pricing", "token_pricing") and isinstance(val, dict):
+                flat_data["pricing"] = val
             elif key == "verifiers" and isinstance(val, list):
                 flat_data["verifiers"] = val
             elif key == "lightrag" and isinstance(val, dict):

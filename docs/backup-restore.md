@@ -60,7 +60,7 @@ flowchart LR
 
 ### Knowledge-Only Backup (Default)
 Packages all generated semantic structures without duplicating large original book files:
-* Knowledge Graph files (`knowledge_graph.json`, `knowledge_graph.graphml`).
+* Knowledge Graph files (`knowledge_graph.json`, embeddings, state files).
 * Obsidian Markdown notes vault (`obsidian_vault/`).
 * Per-book processing state checkpoints (`.book_states/book_*_state.json`).
 * Companion hierarchical text chunks and embeddings (`chunks/book_*_chunks.json`).

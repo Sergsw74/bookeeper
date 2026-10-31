@@ -18,11 +18,20 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
+
+try:
+    import orjson
+    HAS_ORJSON = True
+except ImportError:
+    orjson = None
+    HAS_ORJSON = False
 
 import numpy as np
 from langchain_core.embeddings import Embeddings
@@ -299,9 +308,11 @@ class IdeaPostProcessorState:
     """
     Persistent checkpoint state manager for two-pass idea postprocessing.
     Saves progress every N ideas (default: 100) and enables auto-continue on resume.
+    Supports high-speed C-accelerated serialization (orjson) and asynchronous
+    background persistence to eliminate IO pauses on processing safe points.
     """
 
-    def __init__(self, state_path: Path | str):
+    def __init__(self, state_path: Path | str, async_save: bool = True):
         self.state_path = Path(state_path).expanduser().resolve()
         self.version: int = 1
         self.created_at: float = time.time()
@@ -311,15 +322,30 @@ class IdeaPostProcessorState:
         self.similarity_threshold: float = 0.92
         self.min_occurrences: int = 2
         self.processed_ideas: Dict[str, Dict[str, Any]] = {}
+        self.async_save_enabled: bool = async_save
+        self._dirty: bool = False
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._pending_future: Optional[Future] = None
+        self._lock = threading.Lock()
         self.load()
+
+    def _get_executor(self) -> ThreadPoolExecutor:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="postproc_saver")
+        return self._executor
 
     def load(self) -> bool:
         """Load state from disk. Returns True if existing valid state was loaded."""
         if not self.state_path.is_file():
             return False
         try:
-            with open(self.state_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            if HAS_ORJSON:
+                with open(self.state_path, "rb") as f:
+                    data = orjson.loads(f.read())
+            else:
+                with open(self.state_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
             if isinstance(data, dict):
                 self.version = data.get("version", 1)
                 self.created_at = data.get("created_at", self.created_at)
@@ -329,17 +355,55 @@ class IdeaPostProcessorState:
                 self.similarity_threshold = data.get("similarity_threshold", 0.92)
                 self.min_occurrences = data.get("min_occurrences", 2)
                 self.processed_ideas = data.get("processed_ideas", {})
+                self._dirty = False
                 return True
         except Exception as e:
             logger.warning(f"Could not load postprocessor state from {self.state_path} ({e}); starting fresh.")
         return False
 
-    def save(self) -> None:
-        """Atomically persist state to disk using a temporary file rename."""
+    @staticmethod
+    def _write_snapshot_to_disk(data: Dict[str, Any], state_path: Path) -> None:
+        """Helper executed in background thread or synchronously to serialize and atomically replace state file."""
         try:
-            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            dir_name = state_path.parent
+            temp_name = None
+            try:
+                if HAS_ORJSON:
+                    payload = orjson.dumps(data)
+                    with tempfile.NamedTemporaryFile("wb", dir=dir_name, delete=False) as tf:
+                        tf.write(payload)
+                        temp_name = tf.name
+                else:
+                    with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+                        json.dump(data, tf, separators=(',', ':'), ensure_ascii=False)
+                        temp_name = tf.name
+                os.replace(temp_name, state_path)
+                logger.debug(f"Saved postprocessor state ({data.get('completed_count', 0)} ideas) to {state_path}")
+            finally:
+                if temp_name and os.path.exists(temp_name):
+                    try:
+                        os.unlink(temp_name)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning(f"Failed to persist postprocessor state to {state_path}: {e}")
+
+    def save_async(self) -> None:
+        """
+        Asynchronously dispatch checkpoint save in background thread.
+        Never pauses the main worker thread. If a save is already in-flight, coalesces.
+        """
+        if not self._dirty:
+            return
+
+        with self._lock:
+            if self._pending_future is not None and not self._pending_future.done():
+                # Previous save still writing to disk; coalesce and let subsequent checkpoint/flush write newer snapshot
+                return
+
             self.updated_at = time.time()
-            data = {
+            snapshot = {
                 "version": self.version,
                 "created_at": self.created_at,
                 "updated_at": self.updated_at,
@@ -348,16 +412,89 @@ class IdeaPostProcessorState:
                 "similarity_threshold": self.similarity_threshold,
                 "min_occurrences": self.min_occurrences,
                 "completed_count": len(self.processed_ideas),
-                "processed_ideas": self.processed_ideas,
+                "processed_ideas": dict(self.processed_ideas),
             }
-            dir_name = self.state_path.parent
-            with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
-                json.dump(data, tf, indent=2, ensure_ascii=False)
-                temp_name = tf.name
-            os.replace(temp_name, self.state_path)
-            logger.debug(f"Saved postprocessor state ({len(self.processed_ideas)} ideas) to {self.state_path}")
-        except Exception as e:
-            logger.warning(f"Failed to persist postprocessor state to {self.state_path}: {e}")
+            self._dirty = False
+            self._pending_future = self._get_executor().submit(
+                self._write_snapshot_to_disk, snapshot, self.state_path
+            )
+
+    def save(self, async_save: bool = False) -> None:
+        """
+        Persist state to disk.
+        If async_save=True, delegates to save_async().
+        If async_save=False (default), flushes any pending background write and writes synchronously.
+        """
+        if async_save:
+            self.save_async()
+            return
+
+        self.flush()
+
+        # If dirty or file does not exist yet, write snapshot synchronously
+        if self._dirty or not self.state_path.is_file():
+            with self._lock:
+                self.updated_at = time.time()
+                data = {
+                    "version": self.version,
+                    "created_at": self.created_at,
+                    "updated_at": self.updated_at,
+                    "total_clusters": self.total_clusters,
+                    "model_name": self.model_name,
+                    "similarity_threshold": self.similarity_threshold,
+                    "min_occurrences": self.min_occurrences,
+                    "completed_count": len(self.processed_ideas),
+                    "processed_ideas": dict(self.processed_ideas),
+                }
+                self._dirty = False
+                self._write_snapshot_to_disk(data, self.state_path)
+
+    def flush(self) -> None:
+        """Wait for any in-flight background save to complete, and write any remaining dirty state."""
+        with self._lock:
+            if self._pending_future is not None:
+                try:
+                    self._pending_future.result(timeout=120)
+                except Exception as e:
+                    logger.warning(f"Background save failed during flush: {e}")
+                self._pending_future = None
+
+            if self._dirty:
+                self.updated_at = time.time()
+                data = {
+                    "version": self.version,
+                    "created_at": self.created_at,
+                    "updated_at": self.updated_at,
+                    "total_clusters": self.total_clusters,
+                    "model_name": self.model_name,
+                    "similarity_threshold": self.similarity_threshold,
+                    "min_occurrences": self.min_occurrences,
+                    "completed_count": len(self.processed_ideas),
+                    "processed_ideas": dict(self.processed_ideas),
+                }
+                self._dirty = False
+                self._write_snapshot_to_disk(data, self.state_path)
+
+    def close(self) -> None:
+        """Cleanly flush and shut down background executor."""
+        self.flush()
+        with self._lock:
+            if self._executor is not None:
+                self._executor.shutdown(wait=True)
+                self._executor = None
+
+    def __enter__(self) -> "IdeaPostProcessorState":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        if hasattr(self, "_executor") and self._executor is not None:
+            try:
+                self._executor.shutdown(wait=False)
+            except Exception:
+                pass
 
     def is_processed(self, canonical_name: str) -> bool:
         """Check if an idea has already been processed in this state."""
@@ -419,10 +556,13 @@ class IdeaPostProcessorState:
         if cluster.embedding is not None and len(cluster.embedding) > 1:
             rec["embedding"] = [round(float(x), 6) for x in cluster.embedding]
         self.processed_ideas[cluster.canonical_name] = rec
+        self._dirty = True
 
     def clear(self) -> None:
         """Clear all in-memory and on-disk state."""
+        self.flush()
         self.processed_ideas.clear()
+        self._dirty = False
         if self.state_path.is_file():
             try:
                 self.state_path.unlink()
@@ -454,6 +594,7 @@ class IdeaPostProcessor:
         state_file: Optional[Path | str] = None,
         checkpoint_interval: int = 100,
         resume: bool = True,
+        async_save: bool = True,
     ):
         self.pool = pool
         self.embeddings = embeddings
@@ -467,6 +608,7 @@ class IdeaPostProcessor:
         self.state_file = Path(state_file).expanduser().resolve() if state_file else None
         self.checkpoint_interval = checkpoint_interval
         self.resume = resume
+        self.async_save = async_save
 
     @classmethod
     def from_settings(
@@ -479,6 +621,7 @@ class IdeaPostProcessor:
         state_file: Optional[Path | str] = None,
         checkpoint_interval: Optional[int] = None,
         resume: Optional[bool] = None,
+        async_save: Optional[bool] = None,
     ) -> "IdeaPostProcessor":
         """Instantiate IdeaPostProcessor using application settings."""
         eff_model = model_name or settings.resolved_dual_pass_model
@@ -499,6 +642,11 @@ class IdeaPostProcessor:
             else getattr(settings.dual_pass, "checkpoint_interval", 100)
         )
         eff_resume = resume if resume is not None else True
+        eff_async_save = (
+            async_save
+            if async_save is not None
+            else getattr(settings.dual_pass, "async_save", True)
+        )
 
         # Initialize pool if not provided
         if pool is None:
@@ -531,6 +679,7 @@ class IdeaPostProcessor:
             state_file=eff_state_file,
             checkpoint_interval=eff_interval,
             resume=eff_resume,
+            async_save=eff_async_save,
         )
 
     # --------------------------------------------------------------------------
@@ -541,10 +690,13 @@ class IdeaPostProcessor:
         self,
         store: ConceptGraphStore,
         console: Optional[Console] = None,
+        affected_concepts: Optional[Set[str]] = None,
     ) -> Dict[str, IdeaCluster]:
         """
-        Step 1a: Collect all idea objects from the graph, normalize names, and group
+        Step 1a: Collect idea objects from the graph, normalize names, and group
         ideas sharing an identical normalized name into the same cluster.
+        If affected_concepts is provided, restricts collection strictly to nodes
+        associated with those affected concepts.
         """
         status = None
         if console is not None:
@@ -555,16 +707,52 @@ class IdeaPostProcessor:
             status.start()
 
         clusters_by_norm: Dict[str, IdeaCluster] = {}
+        if affected_concepts is not None and not affected_concepts:
+            if status is not None:
+                status.stop()
+            return clusters_by_norm
+
+        clean_affected_names: Set[str] = set()
+        affected_lower_names: Set[str] = set()
+        affected_norm_names: Set[str] = set()
+        affected_node_ids: Set[str] = set()
+
+        if affected_concepts is not None:
+            for c in affected_concepts:
+                if not c:
+                    continue
+                c_clean = c[len("concept:"):].strip() if c.startswith("concept:") else c.strip()
+                if not c_clean:
+                    continue
+                clean_affected_names.add(c_clean)
+                affected_lower_names.add(c_clean.lower())
+                c_norm = normalize_idea_name(c_clean)
+                if c_norm:
+                    affected_norm_names.add(c_norm)
+                affected_node_ids.add(f"concept:{c_clean}")
+                if c.startswith("concept:"):
+                    affected_node_ids.add(c)
+
         try:
-            # 1. Inspect all Concept nodes
+            # 1. Inspect Concept nodes
             for node_id, attrs in store.graph.nodes(data=True):
                 if attrs.get("type") != "Concept" and not attrs.get("is_idea"):
                     continue
 
                 raw_name = attrs.get("name") or node_id.replace("concept:", "")
-                norm_name = normalize_idea_name(raw_name)
-                if not norm_name:
+                norm_cand = normalize_idea_name(raw_name)
+                if not norm_cand:
                     continue
+
+                if affected_concepts is not None:
+                    if (
+                        node_id not in affected_node_ids
+                        and raw_name.lower() not in affected_lower_names
+                        and norm_cand not in affected_norm_names
+                    ):
+                        continue
+
+                norm_name = norm_cand
 
                 brief = attrs.get("brief_description") or attrs.get("summary") or ""
                 detailed = attrs.get("detailed_explanation") or attrs.get("summary") or ""
@@ -823,6 +1011,18 @@ class IdeaPostProcessor:
         merged: List[IdeaCluster] = []
         consumed_indices: Set[int] = set()
 
+        # Prepare embedding matrix for vectorized fast similarity checks
+        valid_emb_indices = [
+            idx for idx, c in enumerate(clusters)
+            if c.embedding is not None and isinstance(c.embedding, np.ndarray) and c.embedding.ndim == 1 and len(c.embedding) > 1
+        ]
+        valid_emb_set = set(valid_emb_indices)
+        emb_dim = len(clusters[valid_emb_indices[0]].embedding) if valid_emb_indices else 0
+        emb_mat = np.zeros((len(clusters), emb_dim), dtype=np.float32) if emb_dim > 0 else None
+        if emb_mat is not None:
+            for idx in valid_emb_indices:
+                emb_mat[idx] = clusters[idx].embedding
+
         if console is not None and len(clusters) > 0:
             cluster_progress = Progress(
                 SpinnerColumn(),
@@ -838,31 +1038,37 @@ class IdeaPostProcessor:
         else:
             cluster_progress = nullcontext()
 
+        # Block-wise vectorized clustering (BLAS accelerated dot products in bounded RAM blocks)
+        BLOCK_SIZE = 1024
         with cluster_progress as c_prog:
             c_task = c_prog.add_task("clustering", total=len(clusters), thresh=f"{self.similarity_threshold:.2f}") if c_prog else None
 
-            for i in range(len(clusters)):
+            for start_idx in range(0, len(clusters), BLOCK_SIZE):
+                end_idx = min(start_idx + BLOCK_SIZE, len(clusters))
                 if c_prog and c_task is not None:
-                    c_prog.update(c_task, completed=i)
-                if i in consumed_indices:
-                    continue
+                    c_prog.update(c_task, completed=start_idx)
 
-                current = clusters[i]
-                consumed_indices.add(i)
+                # Compute batch similarity block (end_idx - start_idx, len(clusters)) via BLAS
+                block_sims = (emb_mat[start_idx:end_idx] @ emb_mat.T) if emb_mat is not None else None
 
-                # Search remaining clusters for cosine similarity >= threshold
-                for j in range(i + 1, len(clusters)):
-                    if j in consumed_indices:
+                for row_idx in range(end_idx - start_idx):
+                    i = start_idx + row_idx
+                    if i in consumed_indices:
                         continue
 
-                    other = clusters[j]
-                    if (
-                        current.embedding is not None
-                        and other.embedding is not None
-                        and current.embedding.shape == other.embedding.shape
-                    ):
-                        sim = float(np.dot(current.embedding, other.embedding))
-                        if sim >= self.similarity_threshold:
+                    current = clusters[i]
+                    consumed_indices.add(i)
+
+                    # Search remaining clusters for cosine similarity >= threshold (vectorized)
+                    if block_sims is not None and i in valid_emb_set:
+                        row_sims = block_sims[row_idx, i + 1:]
+                        candidates = np.where(row_sims >= self.similarity_threshold)[0]
+                        for c_rel in candidates:
+                            j = i + 1 + int(c_rel)
+                            if j in consumed_indices or j not in valid_emb_set:
+                                continue
+                            other = clusters[j]
+                            sim = float(row_sims[c_rel])
                             logger.info(
                                 f"Semantic merge ({sim:.3f} >= {self.similarity_threshold}): "
                                 f"'{other.canonical_name}' into '{current.canonical_name}'"
@@ -888,8 +1094,44 @@ class IdeaPostProcessor:
                             current.chunk_ids.update(other.chunk_ids)
                             current.max_weight = max(current.max_weight, other.max_weight)
                             consumed_indices.add(j)
+                    elif emb_mat is None or i not in valid_emb_set:
+                        for j in range(i + 1, len(clusters)):
+                            if j in consumed_indices:
+                                continue
+                            other = clusters[j]
+                            if (
+                                current.embedding is not None
+                                and other.embedding is not None
+                                and current.embedding.shape == other.embedding.shape
+                            ):
+                                sim = float(np.dot(current.embedding, other.embedding))
+                                if sim >= self.similarity_threshold:
+                                    logger.info(
+                                        f"Semantic merge ({sim:.3f} >= {self.similarity_threshold}): "
+                                        f"'{other.canonical_name}' into '{current.canonical_name}'"
+                                    )
+                                    current.was_merged = True
+                                    current.already_postprocessed = False
+                                    current.existing_node_ids.update(other.existing_node_ids)
+                                    if other.already_refined:
+                                        if not current.already_refined:
+                                            current.already_refined = True
+                                            current.refined_brief = other.refined_brief
+                                            current.refined_detailed = other.refined_detailed
+                                            current.refined_related_entities = list(other.refined_related_entities)
+                                        else:
+                                            for r_ent in other.refined_related_entities:
+                                                if r_ent not in current.refined_related_entities:
+                                                    current.refined_related_entities.append(r_ent)
+                                    current.aliases.update(other.aliases)
+                                    current.aliases.add(other.canonical_name)
+                                    for obs in other.observations:
+                                        current.add_observation(obs)
+                                    current.chunk_ids.update(other.chunk_ids)
+                                    current.max_weight = max(current.max_weight, other.max_weight)
+                                    consumed_indices.add(j)
 
-                merged.append(current)
+                    merged.append(current)
 
             if c_prog and c_task is not None:
                 c_prog.update(c_task, completed=len(clusters))
@@ -901,6 +1143,193 @@ class IdeaPostProcessor:
             )
 
         return merged
+
+    def _merge_graph_node_into_cluster(
+        self,
+        store: ConceptGraphStore,
+        cluster: IdeaCluster,
+        node_id: str,
+    ) -> None:
+        """
+        Merge an existing graph concept node into an active IdeaCluster, incorporating
+        its observations, aliases, weight, occurrences, and provenance edges.
+        """
+        attrs = store.graph.nodes.get(node_id, {})
+        if not attrs:
+            return
+
+        raw_name = (attrs.get("name") or node_id.replace("concept:", "")).strip()
+        clean_cand = clean_canonical_name(raw_name)
+        brief = attrs.get("brief_description") or attrs.get("summary") or ""
+        detailed = attrs.get("detailed_explanation") or attrs.get("summary") or ""
+        cat = attrs.get("category") or "Idea"
+        weight = int(attrs.get("weight") or 5)
+        node_month = format_idea_month(attrs.get("first_occurrence_month") or attrs.get("month"))
+
+        cluster.was_merged = True
+        cluster.already_postprocessed = False
+        cluster.existing_node_ids.add(node_id)
+        cluster.aliases.add(raw_name)
+        if clean_cand:
+            cluster.aliases.add(clean_cand)
+        cluster.max_weight = max(cluster.max_weight, weight)
+        if node_month:
+            if not cluster.first_occurrence_month or node_month < cluster.first_occurrence_month:
+                cluster.first_occurrence_month = node_month
+
+        if attrs.get("refined"):
+            cluster.already_refined = True
+            if brief and not cluster.refined_brief:
+                cluster.refined_brief = brief
+            if detailed and not cluster.refined_detailed:
+                cluster.refined_detailed = detailed
+            for rel_ent in attrs.get("related_entities") or []:
+                if rel_ent and rel_ent not in cluster.refined_related_entities:
+                    cluster.refined_related_entities.append(rel_ent)
+
+        # Gather chunk edges for node_id
+        chunk_edges = []
+        for _, target, edge_data in store.graph.out_edges(node_id, data=True):
+            if edge_data.get("relation") in ("SUPPORTED_BY", "MENTIONED_IN"):
+                chunk_edges.append((target, edge_data))
+        for source, _, edge_data in store.graph.in_edges(node_id, data=True):
+            if edge_data.get("relation") == "SUPPORTS_IDEA":
+                chunk_edges.append((source, edge_data))
+
+        seen_chunk_ids_for_node: Set[str] = set()
+        for chunk_nid, edge_data in chunk_edges:
+            chunk_node = store.graph.nodes.get(chunk_nid, {})
+            chunk_id = str(chunk_node.get("chunk_id") or edge_data.get("chunk_id") or chunk_nid.replace("chunk:", ""))
+            if chunk_id in seen_chunk_ids_for_node or chunk_id in cluster.chunk_ids:
+                continue
+            seen_chunk_ids_for_node.add(chunk_id)
+            cluster.chunk_ids.add(chunk_id)
+
+            b_id = int(chunk_node.get("book_id") or 0)
+            ch_idx = int(chunk_node.get("chapter_idx") or 0)
+            c_idx = int(chunk_node.get("chunk_idx") or 0)
+            pos = (
+                chunk_node.get("breadcrumb")
+                or f"{chunk_node.get('chapter_title', f'Chapter {ch_idx}')} > {chunk_node.get('section_title', '')}"
+            ).strip(" >")
+
+            quote = edge_data.get("quote") or ""
+            edge_brief = edge_data.get("brief_description") or brief
+            edge_detailed = edge_data.get("detailed_explanation") or detailed
+
+            book_node = store.graph.nodes.get(f"book:{b_id}", {})
+            book_pub = book_node.get("publication_date") or book_node.get("pubdate")
+            obs_month = format_idea_month(book_pub) or node_month
+
+            obs = IdeaObservation(
+                concept_name=raw_name,
+                chunk_id=chunk_id,
+                book_id=b_id,
+                chapter_idx=ch_idx,
+                chunk_idx=c_idx,
+                position_str=pos,
+                local_brief=edge_brief,
+                local_detailed=edge_detailed,
+                quote=quote,
+                weight=weight,
+                category=cat,
+                month=obs_month,
+            )
+            cluster.add_observation(obs)
+
+        if not seen_chunk_ids_for_node and not cluster.observations:
+            cluster.add_observation(
+                IdeaObservation(
+                    concept_name=raw_name,
+                    chunk_id=None,
+                    local_brief=brief,
+                    local_detailed=detailed,
+                    weight=weight,
+                    category=cat,
+                    month=node_month,
+                )
+            )
+
+    def _merge_with_existing_graph_concepts(
+        self,
+        store: ConceptGraphStore,
+        clusters: List[IdeaCluster],
+        console: Optional[Console] = None,
+    ) -> int:
+        """
+        In incremental/batch mode, check if any affected clusters semantically match (cosine similarity >= threshold)
+        existing concept nodes in the graph that were not part of the active batch.
+        If a match is found, merges the existing graph node into the affected cluster.
+        Returns the number of existing graph nodes merged.
+        """
+        if not clusters or store.graph.number_of_nodes() == 0:
+            return 0
+
+        # Collect node IDs and alias names already included in the active clusters
+        already_clustered_nids: Set[str] = set()
+        already_clustered_names: Set[str] = set()
+        for c in clusters:
+            already_clustered_nids.update(c.existing_node_ids)
+            for alias in c.aliases:
+                already_clustered_names.add(alias.lower())
+                already_clustered_nids.add(f"concept:{alias}")
+
+        # Gather existing graph concepts that have embeddings and are not already in active clusters
+        candidate_nids: List[str] = []
+        candidate_embs: List[np.ndarray] = []
+
+        for nid, attrs in store.graph.nodes(data=True):
+            if attrs.get("type") != "Concept" and not attrs.get("is_idea"):
+                continue
+            if nid in already_clustered_nids:
+                continue
+            raw_name = (attrs.get("name") or nid.replace("concept:", "")).strip()
+            if raw_name.lower() in already_clustered_names:
+                continue
+
+            emb = attrs.get("embedding")
+            if emb is not None and isinstance(emb, (list, np.ndarray)) and len(emb) > 1:
+                arr = np.array(emb, dtype=np.float32)
+                norm = float(np.linalg.norm(arr))
+                if norm > 0.0:
+                    candidate_nids.append(nid)
+                    candidate_embs.append(arr / norm)
+
+        if not candidate_embs:
+            return 0
+
+        G_mat = np.stack(candidate_embs, axis=0)  # Shape: (N_cand, D)
+        merged_count = 0
+        consumed_cand_indices: Set[int] = set()
+
+        for cluster in clusters:
+            if cluster.embedding is None or len(cluster.embedding) <= 1:
+                continue
+
+            c_emb = cluster.embedding
+            sims = G_mat @ c_emb  # Shape: (N_cand,)
+            matching_indices = np.where(sims >= self.similarity_threshold)[0]
+
+            for idx in matching_indices:
+                if idx in consumed_cand_indices:
+                    continue
+                match_nid = candidate_nids[idx]
+                sim = float(sims[idx])
+                logger.info(
+                    f"Cross-batch semantic merge ({sim:.3f} >= {self.similarity_threshold}): "
+                    f"'{match_nid}' into '{cluster.canonical_name}'"
+                )
+                self._merge_graph_node_into_cluster(store, cluster, match_nid)
+                consumed_cand_indices.add(idx)
+                G_mat[idx] = 0.0  # Zero out vector so it doesn't merge again
+                merged_count += 1
+
+        if console is not None and merged_count > 0:
+            console.print(
+                f"[bold green]✓[/bold green] [dim]Merged {merged_count} existing graph concepts into batch clusters (sim >= {self.similarity_threshold:.2f})[/dim]"
+            )
+
+        return merged_count
 
     # --------------------------------------------------------------------------
     # Step 2: Source Provenance & Observation Aggregation
@@ -1030,6 +1459,16 @@ class IdeaPostProcessor:
                     if p.returncode == 0 and p.stdout.strip():
                         resp_json = json.loads(p.stdout)
                         content = resp_json.get("message", {}).get("content", "")
+                        try:
+                            from bookeeper.processing.token_tracker import TokenTracker
+                            TokenTracker.get_instance().record_response_data(
+                                resp_json,
+                                prompt_text=f"{system_prompt}\n{user_prompt}",
+                                completion_text=content,
+                                task_type="llm",
+                            )
+                        except Exception as track_err:
+                            logger.debug(f"Failed to record token usage in postprocessor: {track_err}")
                         return ConsolidatedIdeaOutput.model_validate_json(content)
 
                 raise RuntimeError(f"Could not synthesize idea on {url}")
@@ -1484,27 +1923,55 @@ class IdeaPostProcessor:
         store: ConceptGraphStore,
         console: Optional[Console] = None,
         on_progress: Optional[Callable[[int, int, str, Dict[str, Any]], None]] = None,
+        affected_concepts: Optional[Set[str]] = None,
     ) -> IdeaPostProcessorReport:
         """
-        Execute full two-pass aggregation and synthesis pipeline on the graph:
+        Execute two-pass aggregation and synthesis pipeline on the graph:
         1. Group ideas deterministically by normalized name.
         2. Merge clusters by semantic similarity (>= 0.92).
         3. Filter out already post-processed and untouched clusters so only affected
            clusters are processed/ingested, ensuring LLM refinement runs at most once per idea.
         4. Overwrite/upsert canonical concept nodes and provenance/relational edges for affected clusters.
         Supports state file checkpointing (save every N ideas) and auto-continue.
+
+        If affected_concepts is provided (e.g. during inter-batch execution), post-processing
+        is strictly scoped to the touched concepts and their candidate merge partners in the graph,
+        bypassing the expensive full graph re-scan.
         """
         t0 = time.time()
         t_start = time.perf_counter()
 
+        if affected_concepts is not None and len(affected_concepts) == 0:
+            return IdeaPostProcessorReport(
+                total_input_concepts=0,
+                total_clusters=0,
+                multi_occurrence_clusters_count=0,
+                single_occurrence_clusters_count=0,
+                merged_clusters_count=0,
+                edges_added_count=0,
+                synthesized_ideas=[],
+                bypassed_ideas=[],
+                duration_seconds=0.0,
+            )
+
         # 1. Deterministic normalization grouping
-        clusters_by_norm = self.collect_observations_from_graph(store, console=console)
+        clusters_by_norm = self.collect_observations_from_graph(
+            store,
+            console=console,
+            affected_concepts=affected_concepts,
+        )
         initial_clusters = list(clusters_by_norm.values())
         total_input_concepts = sum(len(c.aliases) for c in initial_clusters)
 
-        # 2. Semantic similarity clustering (across all ideas in the graph)
+        # 2. Semantic similarity clustering (across candidate clusters)
         merged_clusters = self.cluster_by_semantic_similarity(initial_clusters, console=console)
         merged_diff = len(initial_clusters) - len(merged_clusters)
+
+        # If running with affected_concepts, check if any affected clusters merge with existing graph concepts
+        if affected_concepts is not None and store.graph.number_of_nodes() > 0:
+            cross_merged = self._merge_with_existing_graph_concepts(store, merged_clusters, console=console)
+            merged_diff += cross_merged
+
         total_clusters = len(merged_clusters)
 
         target_multi = [c for c in merged_clusters if c.total_occurrences >= self.min_occurrences]
@@ -1514,7 +1981,7 @@ class IdeaPostProcessor:
         state_manager: Optional[IdeaPostProcessorState] = None
         resumed_count = 0
         if self.state_file:
-            state_manager = IdeaPostProcessorState(self.state_file)
+            state_manager = IdeaPostProcessorState(self.state_file, async_save=self.async_save)
             state_manager.model_name = self.model_name
             state_manager.similarity_threshold = self.similarity_threshold
             state_manager.min_occurrences = self.min_occurrences
@@ -1552,10 +2019,16 @@ class IdeaPostProcessor:
                 f"\n• State Checkpoint File:    [bold]{state_manager.state_path}[/bold] (saves every {self.checkpoint_interval} ideas)"
                 if state_manager else ""
             )
+            scope_line = (
+                f"• Batch Affected Concepts:   [bold]{total_input_concepts}[/bold] ({len(affected_concepts)} candidates)\n"
+                if affected_concepts is not None
+                else f"• Total Concepts in Graph:   [bold]{total_input_concepts}[/bold]\n"
+            )
+            panel_title = "Batch Idea Postprocessor" if affected_concepts is not None else "Idea Postprocessor"
             header_text = (
                 f"[bold cyan]🧠 Two-Pass Idea Aggregation & Synthesis (Pass 2)[/bold cyan]\n"
                 f"• Consolidation Model:       [bold green]{self.model_name}[/bold green]\n"
-                f"• Total Concepts in Graph:   [bold]{total_input_concepts}[/bold]\n"
+                f"{scope_line}"
                 f"• Resolved Entity Clusters:  [bold]{total_clusters}[/bold] (Merged: [yellow]{merged_diff}[/yellow] via cosine sim >= {self.similarity_threshold})\n"
                 f"• Multi-Occurrence Ideas:    [bold green]{len(target_multi)}[/bold green] (filtered in for LLM consolidation, >= {self.min_occurrences} mentions)\n"
                 f"• Single-Occurrence Ideas:   [dim]{len(target_single)} (filtered out / bypassed to conserve compute)[/dim]\n"
@@ -1564,7 +2037,7 @@ class IdeaPostProcessor:
                 f"{checkpoint_info}"
                 f"{resumed_info}"
             )
-            console.print(Panel.fit(header_text, title="Idea Postprocessor", border_style="cyan"))
+            console.print(Panel.fit(header_text, title=panel_title, border_style="cyan"))
         else:
             logger.info(
                 f"Starting IdeaPostProcessor (model={self.model_name}): {total_input_concepts} raw concepts -> "
@@ -1678,12 +2151,15 @@ class IdeaPostProcessor:
                         progress.update(tot_task, completed=completed, total=num_affected, stats_line=stats_str)
                         live.update(Group(Text.from_markup(cur_text), progress))
 
-                        # Save checkpoint every checkpoint_interval (default: 100)
+                        # Save checkpoint every checkpoint_interval (default: 100) asynchronously
                         if state_manager and (completed % self.checkpoint_interval == 0 or completed == num_affected):
-                            state_manager.save()
+                            if completed == num_affected:
+                                state_manager.flush()
+                            else:
+                                state_manager.save_async()
                             if completed % self.checkpoint_interval == 0 and completed < num_affected:
                                 console.print(
-                                    f"[bold cyan][Idea Postprocessor][/bold cyan] [dim]💾 Checkpoint saved at {completed}/{num_affected} ideas -> {state_manager.state_path.name}[/dim]"
+                                    f"[bold cyan][Idea Postprocessor][/bold cyan] [dim]💾 Checkpoint saved (async) at {completed}/{num_affected} ideas -> {state_manager.state_path.name}[/dim]"
                                 )
                                 sys.stdout.flush()
 
@@ -1728,7 +2204,10 @@ class IdeaPostProcessor:
 
                     completed = idx
                     if state_manager and (completed % self.checkpoint_interval == 0 or completed == num_affected):
-                        state_manager.save()
+                        if completed == num_affected:
+                            state_manager.flush()
+                        else:
+                            state_manager.save_async()
 
                     if completed % 10 == 0 or completed == num_affected:
                         pct = (completed / num_affected * 100) if num_affected > 0 else 100.0
@@ -1746,7 +2225,7 @@ class IdeaPostProcessor:
                         })
         finally:
             if state_manager:
-                state_manager.save()
+                state_manager.close()
 
         duration = time.time() - t0
         report = IdeaPostProcessorReport(

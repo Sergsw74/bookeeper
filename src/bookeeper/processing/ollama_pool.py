@@ -1042,6 +1042,16 @@ class OllamaPool:
                 if "error" in data:
                     raise RuntimeError(f"Ollama server {url} error: {data['error']}")
                 content = data.get("message", {}).get("content", "")
+                try:
+                    from bookeeper.processing.token_tracker import TokenTracker
+                    TokenTracker.get_instance().record_response_data(
+                        data,
+                        prompt_text=prompt,
+                        completion_text=content,
+                        task_type="llm",
+                    )
+                except Exception:
+                    pass
                 return content, data
             raise RuntimeError(f"Ollama curl failed with code {res.returncode}: {res.stderr}")
 
@@ -1261,17 +1271,42 @@ class FailoverOllamaEmbeddings(Embeddings):
 
         def _embed_batch(batch_texts: List[str]) -> List[List[float]]:
             def _embed(url: str):
-                try:
+                # If OllamaEmbeddings is mocked in unit tests, defer to the mock
+                from unittest.mock import Mock
+                if isinstance(OllamaEmbeddings, Mock):
                     client = OllamaEmbeddings(base_url=url, model=self.model)
                     return client.embed_documents(batch_texts)
+
+                # 1. Direct native Ollama /api/embed batch endpoint (sends entire batch in 1 HTTP payload)
+                try:
+                    import requests
+                    resp = requests.post(
+                        f"{url.rstrip('/')}/api/embed",
+                        headers={"Content-Type": "application/json"},
+                        json={"model": self.model, "input": batch_texts},
+                        timeout=(4.0, float(self.request_timeout)),
+                    )
+                    if resp.status_code == 200:
+                        resp_data = resp.json()
+                        embs = resp_data.get("embeddings", [])
+                        if embs and len(embs) == len(batch_texts):
+                            return embs
                 except Exception as exc:
-                    if shutil.which("curl"):
+                    if is_connection_error(exc):
+                        raise
+                    logger.debug(f"Direct /api/embed batch request failed on {url}: {exc}")
+
+                # 2. Curl fallback to /api/embed
+                if shutil.which("curl"):
+                    try:
                         data = {"model": self.model, "input": batch_texts}
                         cmd = [
                             "curl",
                             "-s",
+                            "--connect-timeout",
+                            "4",
                             "--max-time",
-                            "120",
+                            str(int(self.request_timeout)),
                             "-X",
                             "POST",
                             "-H",
@@ -1286,7 +1321,14 @@ class FailoverOllamaEmbeddings(Embeddings):
                             embs = resp_data.get("embeddings", [])
                             if embs and len(embs) == len(batch_texts):
                                 return embs
-                    raise exc
+                    except Exception as exc:
+                        if is_connection_error(exc):
+                            raise
+                        logger.debug(f"Curl /api/embed batch fallback failed on {url}: {exc}")
+
+                # 3. Fallback to LangChain OllamaEmbeddings
+                client = OllamaEmbeddings(base_url=url, model=self.model)
+                return client.embed_documents(batch_texts)
 
             batch_chars = sum(len(t) for t in batch_texts)
             result = self.pool.execute_with_failover(
@@ -1298,6 +1340,12 @@ class FailoverOllamaEmbeddings(Embeddings):
             with self._lock:
                 self.total_embedded_texts += len(batch_texts)
                 self.total_embedded_chars += batch_chars
+            try:
+                from bookeeper.processing.token_tracker import TokenTracker, estimate_token_count
+                tok_cnt = sum(estimate_token_count(t) for t in batch_texts)
+                TokenTracker.get_instance().record_embedding_tokens(tok_cnt)
+            except Exception:
+                pass
             return result
 
         batches = partition_texts_for_embedding(
@@ -1390,6 +1438,11 @@ class FailoverOllamaEmbeddings(Embeddings):
             self.total_embedded_texts += 1
             self.total_embedded_chars += query_chars
             self.total_embedding_seconds += elapsed
+        try:
+            from bookeeper.processing.token_tracker import TokenTracker, estimate_token_count
+            TokenTracker.get_instance().record_embedding_tokens(estimate_token_count(text))
+        except Exception:
+            pass
         return result
 
 

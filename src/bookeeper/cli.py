@@ -38,6 +38,7 @@ from rich.table import Table
 from rich.text import Text
 
 logger = logging.getLogger(__name__)
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 from bookeeper.calibre import (
     BookParser,
@@ -48,6 +49,7 @@ from bookeeper.calibre import (
 )
 from bookeeper.config import Settings, get_settings
 from bookeeper.graph.exporters import GraphMLExporter, Neo4jExporter, ObsidianExporter
+from bookeeper.graph.sharding import GraphMigrator, ShardedGraphStore
 from bookeeper.graph.store import ConceptGraphStore
 from bookeeper.processing.chunker import ChunkStore, HierarchicalChunk, HierarchicalChunker
 from bookeeper.processing.deduplicator import EntityDeduplicator
@@ -111,6 +113,7 @@ from bookeeper.processing.graph_evaluator import (
     format_graph_comparison_table,
     format_graph_space_table,
     format_postprocessing_drift_table,
+    generate_low_p10_verification_prompt,
     get_parent_chunk_ids,
     load_raw_ideas_from_states,
     run_graph_space_comparison,
@@ -138,6 +141,7 @@ app = typer.Typer(
 )
 console = Console()
 logger = logging.getLogger(__name__)
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 
 
@@ -1675,6 +1679,49 @@ def build_graph(
         "--state-cache-dir",
         help="Directory containing existing book state files (book_*_state.json) to use as read-only local cache for chunking and raw chunk analysis.",
     ),
+    export_graphml: bool = typer.Option(
+        False,
+        "--export-graphml",
+        help="Export graph in GraphML format for Gephi/Cytoscape (default: False).",
+    ),
+    hierarchical_cover: Optional[bool] = typer.Option(
+        None,
+        "--hierarchical-cover/--no-hierarchical-cover",
+        help="Enable or disable Section-Aware Hierarchical Semantic Cover to prune redundant chunks (default: config).",
+    ),
+    cover_threshold: Optional[float] = typer.Option(
+        None,
+        "--cover-threshold",
+        help="Cosine similarity threshold within section (>=) to mark chunk redundant/covered (default: config or 0.92).",
+    ),
+    cover_window: Optional[int] = typer.Option(
+        None,
+        "--cover-window",
+        help="Sliding window size (recent section chunks) to compare against for redundancy (default: config or 3).",
+    ),
+    skip_references: Optional[bool] = typer.Option(
+        None,
+        "--skip-references/--no-skip-references",
+        help="Automatically bypass References, Bibliography, and Boilerplate in scientific papers (default: config or True).",
+    ),
+    mmr: Optional[bool] = typer.Option(
+        None,
+        "--mmr/--no-mmr",
+        hidden=True,
+        help="Deprecated alias for --hierarchical-cover.",
+    ),
+    mmr_lambda: Optional[float] = typer.Option(
+        None,
+        "--mmr-lambda",
+        hidden=True,
+        help="Deprecated MMR parameter.",
+    ),
+    mmr_ratio: Optional[float] = typer.Option(
+        None,
+        "--mmr-ratio",
+        hidden=True,
+        help="Deprecated MMR parameter.",
+    ),
 ):
     """
     Ingest sections, perform semantic chunking, extract concepts via Ollama,
@@ -1716,6 +1763,13 @@ def build_graph(
     skip_limbo_chunks = _resolve_opt(skip_limbo_chunks)
     max_batch_chunk_size = _resolve_opt(max_batch_chunk_size)
     state_cache_dir = _resolve_opt(state_cache_dir)
+    export_graphml = _resolve_opt(export_graphml, False)
+    hierarchical_cover = _resolve_opt(hierarchical_cover)
+    if hierarchical_cover is None and mmr is not None:
+        hierarchical_cover = _resolve_opt(mmr)
+    cover_threshold = _resolve_opt(cover_threshold)
+    cover_window = _resolve_opt(cover_window)
+    skip_references = _resolve_opt(skip_references)
 
     cfg = _get_effective_settings(
         config_path,
@@ -1749,16 +1803,41 @@ def build_graph(
     has_cleaned = False
     has_cleaned_neo4j = False
 
-    effective_state_cache = state_cache_dir or cfg.state_cache_dir
-    state_cache = BookStateCache(effective_state_cache)
-    if state_cache.is_enabled():
-        console.print(
-            f"[dim]Local State Cache Directory: [bold cyan]{state_cache.cache_dir}[/bold cyan] "
-            f"({len(state_cache._id_to_file)} book state file(s) indexed)[/dim]"
+    mode_label = "From Scratch" if from_scratch else ("Resume" if resume else ("Continue" if continue_run else "Standard"))
+    console.print(
+        Panel.fit(
+            f"[bold cyan]📚 Starting Knowledge Graph Build Pipeline[/bold cyan]\n"
+            f"• Output Directory: [bold]{output_dir}[/bold]\n"
+            f"• Mode: [bold green]{mode_label}[/bold green]\n"
+            f"• LLM Model: [bold green]{cfg.llm_model}[/bold green]"
+            + (f" (fallback: [yellow]{cfg.llm_model_fallback}[/yellow])" if cfg.llm_model_fallback else "")
+            + f"\n• Embedding Model: [bold cyan]{cfg.embedding_model}[/bold cyan]",
+            title="bookeeper build-graph",
+            border_style="cyan",
         )
+    )
+
+    effective_state_cache = state_cache_dir or cfg.state_cache_dir
+    state_cache_path = Path(effective_state_cache).expanduser().resolve() if effective_state_cache else None
+    if state_cache_path and state_cache_path.is_dir():
+        console.print(f"[dim cyan]• Scanning local state cache at {state_cache_path.name}...[/dim cyan]")
+        state_cache = BookStateCache(effective_state_cache)
+        if state_cache.is_enabled():
+            console.print(
+                f"[dim green]✓ Local State Cache:[/dim green] [bold cyan]{state_cache.cache_dir}[/bold cyan] "
+                f"({len(state_cache._id_to_file)} book state file(s) indexed)"
+            )
+    else:
+        state_cache = BookStateCache(effective_state_cache)
 
     tracker_path = Path(state_file) if state_file else cfg.resolved_state_file
     tracker = ProgressTracker(tracker_path)
+    completed_ids_count = len(tracker.get_completed_ids("build_graph"))
+    skipped_ids_count = len(tracker.get_skipped_ids("build_graph"))
+    console.print(
+        f"[dim]• Progress Tracker checkpoint: [bold cyan]{tracker_path.name}[/bold cyan] "
+        f"({completed_ids_count} completed, {skipped_ids_count} skipped)[/dim]"
+    )
 
     if from_scratch:
         tracker.clear("build_graph", preserve_skipped=not retry_skipped)
@@ -1775,6 +1854,25 @@ def build_graph(
         if graph_file.is_file():
             try:
                 graph_file.unlink()
+            except Exception:
+                pass
+        spine_file = output_dir / "knowledge_graph_spine.json"
+        if spine_file.is_file():
+            try:
+                spine_file.unlink()
+            except Exception:
+                pass
+        manifest_file = output_dir / "shards_manifest.json"
+        if manifest_file.is_file():
+            try:
+                manifest_file.unlink()
+            except Exception:
+                pass
+        shards_dir = output_dir / "shards"
+        if shards_dir.is_dir():
+            try:
+                import shutil
+                shutil.rmtree(shards_dir)
             except Exception:
                 pass
         if graphml_dest.is_file():
@@ -1828,13 +1926,32 @@ def build_graph(
                 has_cleaned_neo4j = False
 
     store = ConceptGraphStore()
-    if not from_scratch and graph_file.is_file():
+    sharded_spine = output_dir / "knowledge_graph_spine.json"
+    sharded_manifest = output_dir / "shards_manifest.json"
+    is_sharded_available = sharded_spine.is_file() and sharded_manifest.is_file()
+    has_existing_kg = graph_file.is_file() or is_sharded_available
+
+    if not from_scratch and has_existing_kg:
+        load_target = sharded_spine if is_sharded_available else graph_file
+        target_size_mb = (load_target.stat().st_size / (1024 * 1024)) if load_target.is_file() else 0.0
+        target_label = "sharded Knowledge Graph Spine" if is_sharded_available else "Knowledge Graph"
+        console.print(f"[dim cyan]• Loading {target_label} ({load_target.name}, {target_size_mb:,.1f} MB)...[/dim cyan]")
+        t_load_start = time.perf_counter()
         try:
             store.load(graph_file)
-            console.print(f"[dim]Loaded existing graph with {store.graph.number_of_nodes()} nodes.[/dim]")
-        except Exception:
-            pass
+            dur_load = time.perf_counter() - t_load_start
+            if store.is_sharded:
+                stats = store.stats()
+                console.print(
+                    f"[bold green]✓[/bold green] [dim]Loaded sharded graph ({dur_load:.1f}s): {len(store.graph):,} spine nodes, "
+                    f"{stats['total_nodes']:,} total nodes across {len(store.manifest.shards) if store.manifest else 0} shard(s).[/dim]"
+                )
+            else:
+                console.print(f"[bold green]✓[/bold green] [dim]Loaded existing graph ({dur_load:.1f}s) with {store.graph.number_of_nodes():,} nodes.[/dim]")
+        except Exception as e:
+            console.print(f"[dim yellow]Notice: Could not load existing graph ({e}). Starting fresh store.[/dim yellow]")
 
+    console.print(f"[dim cyan]• Connecting to book source ({calibre_path or books_dir or 'Calibre'})...[/dim cyan]")
     client = get_book_client(cfg, calibre_path=calibre_path, books_dir=books_dir)
 
     # Local DB Staging: Copy metadata.db locally to bypass SMB network roundtrips and latency
@@ -1859,13 +1976,16 @@ def build_graph(
 
         # Check if an existing staged database already exists locally from a previous session
         if resume and not reset_progress and not fresh_db and staged_target.is_file() and staged_target.stat().st_size > 0:
+            staged_size_mb = staged_target.stat().st_size / (1024 * 1024)
+            console.print(f"[dim cyan]• Verifying local staged database integrity ({staged_target.name}, {staged_size_mb:.1f} MB)...[/dim cyan]")
             try:
                 CalibreClient._verify_sqlite_integrity(staged_target, allow_index_warnings=True)
                 client.staged_db_path = staged_target
                 client.is_staged = True
                 console.print(
-                    f"[bold cyan]Found existing local staged database at {staged_target}.[/bold cyan] "
-                    f"[dim]Reusing local SSD database for instant queries and avoiding re-downloading.[/dim]"
+                    f"[dim green]✓ Verified local staged database:[/dim green] [bold cyan]{staged_target}[/bold cyan] "
+                    f"[dim]({staged_size_mb:.1f} MB, instant SSD queries)[/dim]\n"
+                    f"[bold cyan]Found existing local staged database at {staged_target}.[/bold cyan]"
                 )
             except Exception as e:
                 console.print(
@@ -1922,8 +2042,16 @@ def build_graph(
                 client.cleanup_staged(delete_file=False)
                 should_stage = False
 
+    console.print("[dim cyan]• Initializing Ollama server pool...[/dim cyan]")
     extractor = KnowledgeExtractor.from_settings(cfg)
     _print_pool_configuration(cfg, console, show_embeddings=True)
+
+    # Initialize TokenTracker for session and whole-knowledge-graph token accounting
+    from bookeeper.processing.token_tracker import TokenTracker
+    token_tracker = TokenTracker.get_instance()
+    token_tracker.reset_session()
+    token_stats_file = cfg.resolved_output_dir / "token_usage_stats.json"
+    token_tracker.load_cumulative(token_stats_file)
 
     if not skip_warmup:
         _perform_ollama_warmup(extractor, console)
@@ -1933,12 +2061,14 @@ def build_graph(
     # distribute embedding requests across all available embedding nodes in the pool.
     embeddings: Optional[FailoverOllamaEmbeddings] = None
     try:
+        console.print("[dim cyan]• Initializing shared embedding model pool...[/dim cyan]")
         embeddings = FailoverOllamaEmbeddings.from_settings(cfg)
         chunker = HierarchicalChunker(embeddings=embeddings)
     except Exception as e:
         console.print(f"[dim yellow]Warning: Embeddings init skipped ({e}); using paragraph chunker.[/dim yellow]")
         chunker = HierarchicalChunker()
 
+    console.print("[dim cyan]• Initializing entity deduplicator & seeding from graph...[/dim cyan]")
     deduplicator = EntityDeduplicator.from_settings(
         cfg,
         embedding_model=cfg.embedding_model,
@@ -2109,7 +2239,7 @@ def build_graph(
 
             # Check if knowledge graph was manually wiped / deleted externally while checkpoint remains
             pure_completed = tracker_completed - tracker_skipped
-            if (not graph_file.is_file() or len(graph_book_ids) == 0) and pure_completed:
+            if (not has_existing_kg or len(graph_book_ids) == 0) and pure_completed:
                 console.print(
                     f"[bold yellow]Notice: Knowledge graph is empty (0 books in graph), but progress tracker recorded "
                     f"{len(pure_completed)} completed book(s). Resetting checkpoint to match empty graph.[/bold yellow]"
@@ -2217,8 +2347,9 @@ def build_graph(
         )
         obs = ObsidianExporter(vault_dest)
         obs.export(store, clean=True)
-        gml = GraphMLExporter(graphml_dest)
-        gml.export(store)
+        if export_graphml:
+            gml = GraphMLExporter(graphml_dest)
+            gml.export(store)
         if should_export_neo4j and not has_cleaned_neo4j:
             try:
                 neo_exp = Neo4jExporter.from_config(cfg.neo4j)
@@ -2291,10 +2422,11 @@ def build_graph(
     ran_batch_postproc_on_last_book = False
     has_cleaned_neo4j = bool(has_cleaned_neo4j)
     batch_size_books = cfg.batch_books if cfg.recent_ideas.enabled else 10
+    batch_touched_concepts: Set[str] = set()
     try:
         for book_idx, binfo in enumerate(books_to_process, start=1):
             # Reload knowledge graph at the start of each new batch to synchronize with previous batch state
-            if completed_in_session > 0 and (completed_in_session % batch_size_books == 0) and graph_file.is_file():
+            if completed_in_session > 0 and (completed_in_session % batch_size_books == 0) and (graph_file.is_file() or ((output_dir / "shards_manifest.json").is_file() and (output_dir / "knowledge_graph_spine.json").is_file())):
                 preserved_dirty_nodes = set(store.dirty_nodes)
                 preserved_dirty_edges = set(store.dirty_edges)
                 preserved_removed_nodes = set(store.removed_nodes)
@@ -2573,15 +2705,10 @@ def build_graph(
 
                     book_state.set_total_chunks(len(chunks))
 
-                    # Seed active book_state from state_cache if available
-                    if state_cache.is_enabled():
-                        cached_extractions_seeded = state_cache.populate_state_from_cache(book_state)
-                        if cached_extractions_seeded > 0:
-                            console.print(
-                                f"  [bold green]⚡ Reused {cached_extractions_seeded} raw chunk analyses from state cache ({state_cache.cache_dir.name}).[/bold green]"
-                            )
+                    # Note: State cache extractions are deferred until AFTER Semantic Routing and MMR
+                    # diverse chunk selection so that redundant chunks are pruned before cache lookup.
 
-                    # 1. Restore any already processed or failed chunks from previous run (or state cache)
+                    # 1. Restore any already processed or failed chunks from previous run in current session
                     restored_from_state = 0
                     restored_failed = 0
                     for chk in chunks:
@@ -2591,14 +2718,12 @@ def build_graph(
                             extraction = SectionExtraction(**raw_extraction)
                             dur = cached_rec.get("duration", 0.0)
                             srv = cached_rec.get("server_used", "cached")
-                            restored_status = "skipped_limbo" if srv == "skipped_limbo" else "extracted"
+                            restored_status = "skipped_limbo" if srv == "skipped_limbo" else ("skipped_cover" if srv in ("skipped_cover", "skipped_mmr") else "extracted")
                             with stats_lock:
-                                if srv not in ("semantic_fastpath", "skipped_limbo"):
-                                    durations.append(dur)
                                 if srv == "semantic_fastpath":
                                     book_assigned_chunks += 1
                                     session_assigned_chunks += 1
-                                elif srv == "skipped_limbo":
+                                elif srv in ("skipped_limbo", "skipped_mmr", "skipped_cover"):
                                     book_skipped_chunks += 1
                                     session_skipped_chunks += 1
                                 extracted_results.append({
@@ -2659,137 +2784,378 @@ def build_graph(
                     limbo_candidate_map: Dict[str, Tuple[str, str]] = {}
                     should_skip_limbo = bool(cfg.skip_limbo_chunks or cfg.recent_ideas.skip_limbo_chunks)
                     if cfg.recent_ideas.enabled and unprocessed_fresh and embeddings is not None:
-                        idea_index = IdeaEmbeddingIndex.build_from_graph(store, embeddings=embeddings)
-                        if (idea_index.vectors is not None and len(idea_index.idea_names) > 0) or active_neo4j_exporter is not None:
-                            routing_engine = SemanticRoutingEngine(
-                                store=store,
-                                idea_index=idea_index,
-                                embeddings=embeddings,
-                                unassigned_threshold=cfg.similarity_unassigned_threshold,
-                                high_confidence_threshold=cfg.similarity_high_confidence_threshold,
-                                neo4j_exporter=active_neo4j_exporter,
-                                max_batch_chunk_size=recovery_th,
+                        routing_task = None
+                        try:
+                            routing_task = progress.add_task(
+                                f"[cyan]⚡ Semantic Routing: Comparing {len(unprocessed_fresh)} chunks against Idea index...[/cyan]",
+                                total=len(unprocessed_fresh),
+                                completed=0,
                             )
-                            routing = routing_engine.route_chunks(unprocessed_fresh)
-                            if routing.embeddings_updated:
+                        except Exception:
+                            pass
+
+                        def _on_route_emb_progress(count: int):
+                            if routing_task is not None:
+                                try:
+                                    progress.advance(routing_task, advance=count)
+                                except Exception:
+                                    pass
+
+                        try:
+                            idea_index = IdeaEmbeddingIndex.build_from_graph(store, embeddings=embeddings)
+                            if (idea_index.vectors is not None and len(idea_index.idea_names) > 0) or active_neo4j_exporter is not None:
+                                routing_engine = SemanticRoutingEngine(
+                                    store=store,
+                                    idea_index=idea_index,
+                                    embeddings=embeddings,
+                                    unassigned_threshold=cfg.similarity_unassigned_threshold,
+                                    high_confidence_threshold=cfg.similarity_high_confidence_threshold,
+                                    neo4j_exporter=active_neo4j_exporter,
+                                    max_batch_chunk_size=recovery_th,
+                                )
+                                routing = routing_engine.route_chunks(
+                                    unprocessed_fresh,
+                                    on_progress=_on_route_emb_progress,
+                                )
+                                if routing.embeddings_updated:
+                                    try:
+                                        chunk_store.save_chunks(bid, btitle, chunks)
+                                    except Exception as e:
+                                        logger.debug(f"Could not save updated chunk embeddings to ChunkStore: {e}")
+
+                                # Priority 2: High confidence chunks (Fast-path: direct assignment, skip LLM extraction completely!)
+                                for rc in routing.high_confidence:
+                                    h_chk = rc.chunk
+                                    h_idea = rc.matched_idea
+                                    if h_idea:
+                                        batch_touched_concepts.add(h_idea)
+                                        routing_engine.integrate_high_confidence_chunk(
+                                            rc,
+                                            book_id=bid,
+                                            publication_date=bpubdate,
+                                        )
+                                        sec_node_id = store.add_section(
+                                            book_id=bid,
+                                            chapter_idx=h_chk.chapter_idx,
+                                            title=h_chk.section_title,
+                                            text=h_chk.text,
+                                        )
+                                        store.add_chunk(h_chk)
+                                        store.add_section_concept_link(
+                                            section_node_id=sec_node_id,
+                                            concept_name=h_idea,
+                                            summary=rc.matched_idea_summary,
+                                            quote=h_chk.text[:200] if h_chk.text else "",
+                                        )
+                                        book_state.mark_chunk_processed(
+                                            chunk_id=h_chk.chunk_id,
+                                            chunk_idx=h_chk.chunk_idx,
+                                            section_title=h_chk.section_title,
+                                            extraction_dict={"concepts": [{"name": h_idea, "summary": rc.matched_idea_summary, "category": "Idea"}]},
+                                            duration=0.0,
+                                            server_used="semantic_fastpath",
+                                            auto_save=False,
+                                        )
+                                        with stats_lock:
+                                            book_assigned_chunks += 1
+                                            session_assigned_chunks += 1
+                                            extracted_results.append({
+                                                "status": "extracted",
+                                                "chunk": h_chk,
+                                                "extraction": SectionExtraction(
+                                                    concepts=[Concept(name=h_idea, summary=rc.matched_idea_summary, category="Idea")],
+                                                    extracted_ideas=[],
+                                                ),
+                                                "duration": 0.0,
+                                                "server_used": "semantic_fastpath",
+                                            })
+                                        progress.advance(book_task, advance=1)
+                                        with display_lock:
+                                            console.print(
+                                                f"  [bold green]⚡ [{h_chk.section_title[:24]} p{h_chk.chunk_idx}][/bold green] "
+                                                f"High-confidence match ({rc.similarity:.2f}) -> directly assigned to '[bold cyan]{h_idea}[/bold cyan]' (skipped LLM)."
+                                            )
+                                if routing.high_confidence:
+                                    book_state.save()
+
+                                # Priority 3: Limbo chunks (either skip completely if --skip-limbo-chunks enabled, or validate via LLM)
+                                if should_skip_limbo:
+                                    for rc in routing.limbo:
+                                        l_chk = rc.chunk
+                                        sec_node_id = store.add_section(
+                                            book_id=bid,
+                                            chapter_idx=l_chk.chapter_idx,
+                                            title=l_chk.section_title,
+                                            text=l_chk.text,
+                                        )
+                                        store.add_chunk(l_chk)
+                                        book_state.mark_chunk_processed(
+                                            chunk_id=l_chk.chunk_id,
+                                            chunk_idx=l_chk.chunk_idx,
+                                            section_title=l_chk.section_title,
+                                            extraction_dict={"concepts": [], "extracted_ideas": []},
+                                            duration=0.0,
+                                            server_used="skipped_limbo",
+                                            auto_save=False,
+                                        )
+                                        with stats_lock:
+                                            book_skipped_chunks += 1
+                                            session_skipped_chunks += 1
+                                            extracted_results.append({
+                                                "status": "skipped_limbo",
+                                                "chunk": l_chk,
+                                                "extraction": SectionExtraction(concepts=[], extracted_ideas=[]),
+                                                "duration": 0.0,
+                                                "server_used": "skipped_limbo",
+                                            })
+                                        progress.advance(book_task, advance=1)
+                                        with display_lock:
+                                            console.print(
+                                                f"  [dim yellow]⏭ [{l_chk.section_title[:24]} p{l_chk.chunk_idx}][/dim yellow] "
+                                                f"Limbo chunk ({rc.similarity:.2f}) skipped (--skip-limbo-chunks enabled)."
+                                            )
+                                    if routing.limbo:
+                                        book_state.save()
+                                else:
+                                    for rc in routing.limbo:
+                                        if rc.matched_idea:
+                                            limbo_candidate_map[rc.chunk.chunk_id] = (rc.matched_idea, rc.matched_idea_summary)
+
+                                # Order LLM extraction queue: Priority 1 (Unassigned, including size-recovered limbo chunks) first
+                                unprocessed_fresh = routing.get_llm_queue_chunks(skip_limbo=should_skip_limbo)
+                                _update_progress_description()
+                                if routing.recovered_from_limbo_count > 0:
+                                    with display_lock:
+                                        for rc in routing.recovered_from_limbo:
+                                            r_chk = rc.chunk
+                                            r_sec = getattr(r_chk, "section_title", "")[:24]
+                                            r_idx = getattr(r_chk, "chunk_idx", 0)
+                                            r_sz = get_chunk_size(r_chk)
+                                            console.print(
+                                                f"  [bold cyan]↺ [{r_sec} p{r_idx}][/bold cyan] "
+                                                f"Chunk size {r_sz} >= {recovery_th}: recovered from limbo ({rc.similarity:.2f}) -> restored to unprocessed (Priority 1 queue)."
+                                            )
+                                if routing.high_confidence_count > 0 or routing.limbo_count > 0 or routing.recovered_from_limbo_count > 0:
+                                    limbo_desc = "skipped" if should_skip_limbo else "Priority 3 validation"
+                                    recov_desc = f" ({routing.recovered_from_limbo_count} recovered from limbo by size)" if routing.recovered_from_limbo_count > 0 else ""
+                                    console.print(
+                                        f"  [dim cyan]Semantic Chunk Routing: {routing.unassigned_count} unassigned{recov_desc} (Priority 1 brand-new ideas), "
+                                        f"{routing.high_confidence_count} high-confidence (Priority 2 direct assignment), "
+                                        f"{routing.limbo_count} limbo ({limbo_desc}).[/dim cyan]"
+                                    )
+                        finally:
+                            if routing_task is not None:
+                                try:
+                                    progress.remove_task(routing_task)
+                                except Exception:
+                                    pass
+
+                    # Step 2.5: Section-Aware Hierarchical Semantic Cover
+                    # Prunes redundant narrative elaborations and repetitive experimental tables within sections,
+                    # while preserving all novel conceptual contributions and anchors.
+                    effective_enable_cover = (
+                        cfg.enable_hierarchical_cover if hierarchical_cover is None else hierarchical_cover
+                    )
+                    effective_cover_thresh = (
+                        cfg.cover_similarity_threshold if cover_threshold is None else cover_threshold
+                    )
+                    effective_cover_win = (
+                        cfg.cover_window_size if cover_window is None else cover_window
+                    )
+                    effective_skip_refs = (
+                        cfg.skip_references_sections if skip_references is None else skip_references
+                    )
+
+                    if effective_enable_cover and len(unprocessed_fresh) > 1 and embeddings is not None:
+                        import inspect
+                        import numpy as np
+                        from bookeeper.processing.hierarchical_cover import hierarchical_semantic_cover
+
+                        # 1. Ensure all candidate chunks have embeddings
+                        missing_embs = [c for c in unprocessed_fresh if not getattr(c, "embedding", None)]
+                        if missing_embs:
+                            emb_task = None
+                            try:
+                                emb_task = progress.add_task(
+                                    f"[cyan]⚡ Computing missing chunk embeddings for Hierarchical Cover (0/{len(missing_embs)})[/cyan]",
+                                    total=len(missing_embs),
+                                    completed=0,
+                                )
+                            except Exception:
+                                pass
+
+                            completed_emb_count = 0
+
+                            def _on_emb_progress(count: int):
+                                nonlocal completed_emb_count
+                                completed_emb_count += count
+                                if emb_task is not None:
+                                    try:
+                                        progress.update(
+                                            emb_task,
+                                            completed=completed_emb_count,
+                                            description=f"[cyan]⚡ Computing missing chunk embeddings for Hierarchical Cover ({completed_emb_count}/{len(missing_embs)})[/cyan]",
+                                        )
+                                    except Exception:
+                                        pass
+
+                            try:
+                                m_texts = [c.text for c in missing_embs]
+                                if hasattr(embeddings, "embed_documents"):
+                                    sig = inspect.signature(embeddings.embed_documents)
+                                    if "on_progress" in sig.parameters:
+                                        m_vecs = embeddings.embed_documents(m_texts, on_progress=_on_emb_progress)
+                                    else:
+                                        batch_size = 16
+                                        m_vecs = []
+                                        for i in range(0, len(m_texts), batch_size):
+                                            sub_batch = m_texts[i : i + batch_size]
+                                            sub_res = embeddings.embed_documents(sub_batch)
+                                            m_vecs.extend(sub_res)
+                                            _on_emb_progress(len(sub_batch))
+                                else:
+                                    m_vecs = []
+                                    for t in m_texts:
+                                        m_vecs.append(embeddings.embed_query(t))
+                                        _on_emb_progress(1)
+
+                                for c, v in zip(missing_embs, m_vecs):
+                                    c.embedding = v
+
+                                # Save updated embeddings back to chunk_store so they are cached
                                 try:
                                     chunk_store.save_chunks(bid, btitle, chunks)
                                 except Exception as e:
                                     logger.debug(f"Could not save updated chunk embeddings to ChunkStore: {e}")
+                            except Exception as e:
+                                logger.warning(f"Failed to compute missing embeddings for Hierarchical Cover: {e}")
+                            finally:
+                                if emb_task is not None:
+                                    try:
+                                        progress.remove_task(emb_task)
+                                    except Exception:
+                                        pass
 
-                            # Priority 2: High confidence chunks (Fast-path: direct assignment, skip LLM extraction completely!)
-                            for rc in routing.high_confidence:
-                                h_chk = rc.chunk
-                                h_idea = rc.matched_idea
-                                if h_idea:
-                                    routing_engine.integrate_high_confidence_chunk(
-                                        rc,
-                                        book_id=bid,
-                                        publication_date=bpubdate,
-                                    )
-                                    sec_node_id = store.add_section(
-                                        book_id=bid,
-                                        chapter_idx=h_chk.chapter_idx,
-                                        title=h_chk.section_title,
-                                        text=h_chk.text,
-                                    )
-                                    store.add_chunk(h_chk)
-                                    store.add_section_concept_link(
-                                        section_node_id=sec_node_id,
-                                        concept_name=h_idea,
-                                        summary=rc.matched_idea_summary,
-                                        quote=h_chk.text[:200] if h_chk.text else "",
-                                    )
-                                    book_state.mark_chunk_processed(
-                                        chunk_id=h_chk.chunk_id,
-                                        chunk_idx=h_chk.chunk_idx,
-                                        section_title=h_chk.section_title,
-                                        extraction_dict={"concepts": [{"name": h_idea, "summary": rc.matched_idea_summary, "category": "Idea"}]},
-                                        duration=0.0,
-                                        server_used="semantic_fastpath",
-                                    )
-                                    with stats_lock:
-                                        book_assigned_chunks += 1
-                                        session_assigned_chunks += 1
-                                        extracted_results.append({
-                                            "status": "extracted",
-                                            "chunk": h_chk,
-                                            "extraction": SectionExtraction(
-                                                concepts=[Concept(name=h_idea, summary=rc.matched_idea_summary, category="Idea")],
-                                                extracted_ideas=[],
-                                            ),
-                                            "duration": 0.0,
-                                            "server_used": "semantic_fastpath",
-                                        })
-                                    progress.advance(book_task, advance=1)
-                                    with display_lock:
-                                        console.print(
-                                            f"  [bold green]⚡ [{h_chk.section_title[:24]} p{h_chk.chunk_idx}][/bold green] "
-                                            f"High-confidence match ({rc.similarity:.2f}) -> directly assigned to '[bold cyan]{h_idea}[/bold cyan]' (skipped LLM)."
-                                        )
+                        cover_selected, cover_skipped, cover_decisions = hierarchical_semantic_cover(
+                            chunks=unprocessed_fresh,
+                            similarity_threshold=effective_cover_thresh,
+                            skip_references=effective_skip_refs,
+                            min_section_chunks=cfg.cover_min_section_chunks,
+                            sliding_window_size=effective_cover_win,
+                        )
 
-                            # Priority 3: Limbo chunks (either skip completely if --skip-limbo-chunks enabled, or validate via LLM)
-                            if should_skip_limbo:
-                                for rc in routing.limbo:
-                                    l_chk = rc.chunk
-                                    sec_node_id = store.add_section(
-                                        book_id=bid,
-                                        chapter_idx=l_chk.chapter_idx,
-                                        title=l_chk.section_title,
-                                        text=l_chk.text,
-                                    )
-                                    store.add_chunk(l_chk)
-                                    book_state.mark_chunk_processed(
-                                        chunk_id=l_chk.chunk_id,
-                                        chunk_idx=l_chk.chunk_idx,
-                                        section_title=l_chk.section_title,
-                                        extraction_dict={"concepts": [], "extracted_ideas": []},
-                                        duration=0.0,
-                                        server_used="skipped_limbo",
-                                    )
-                                    with stats_lock:
-                                        book_skipped_chunks += 1
-                                        session_skipped_chunks += 1
-                                        extracted_results.append({
-                                            "status": "skipped_limbo",
-                                            "chunk": l_chk,
-                                            "extraction": SectionExtraction(concepts=[], extracted_ideas=[]),
-                                            "duration": 0.0,
-                                            "server_used": "skipped_limbo",
-                                        })
-                                    progress.advance(book_task, advance=1)
-                                    with display_lock:
-                                        console.print(
-                                            f"  [dim yellow]⏭ [{l_chk.section_title[:24]} p{l_chk.chunk_idx}][/dim yellow] "
-                                            f"Limbo chunk ({rc.similarity:.2f}) skipped (--skip-limbo-chunks enabled)."
-                                        )
-                            else:
-                                for rc in routing.limbo:
-                                    if rc.matched_idea:
-                                        limbo_candidate_map[rc.chunk.chunk_id] = (rc.matched_idea, rc.matched_idea_summary)
-
-                            # Order LLM extraction queue: Priority 1 (Unassigned, including size-recovered limbo chunks) first
-                            unprocessed_fresh = routing.get_llm_queue_chunks(skip_limbo=should_skip_limbo)
-                            _update_progress_description()
-                            if routing.recovered_from_limbo_count > 0:
-                                with display_lock:
-                                    for rc in routing.recovered_from_limbo:
-                                        r_chk = rc.chunk
-                                        r_sec = getattr(r_chk, "section_title", "")[:24]
-                                        r_idx = getattr(r_chk, "chunk_idx", 0)
-                                        r_sz = get_chunk_size(r_chk)
-                                        console.print(
-                                            f"  [bold cyan]↺ [{r_sec} p{r_idx}][/bold cyan] "
-                                            f"Chunk size {r_sz} >= {recovery_th}: recovered from limbo ({rc.similarity:.2f}) -> restored to unprocessed (Priority 1 queue)."
-                                        )
-                            if routing.high_confidence_count > 0 or routing.limbo_count > 0 or routing.recovered_from_limbo_count > 0:
-                                limbo_desc = "skipped" if should_skip_limbo else "Priority 3 validation"
-                                recov_desc = f" ({routing.recovered_from_limbo_count} recovered from limbo by size)" if routing.recovered_from_limbo_count > 0 else ""
-                                console.print(
-                                    f"  [dim cyan]Semantic Chunk Routing: {routing.unassigned_count} unassigned{recov_desc} (Priority 1 brand-new ideas), "
-                                    f"{routing.high_confidence_count} high-confidence (Priority 2 direct assignment), "
-                                    f"{routing.limbo_count} limbo ({limbo_desc}).[/dim cyan]"
+                        # Record skipped redundant / reference chunks into graph and state
+                        skip_task = None
+                        if len(cover_skipped) > 5:
+                            try:
+                                skip_task = progress.add_task(
+                                    f"[yellow]⏭ Marking {len(cover_skipped)} redundant/reference chunks as skipped...[/yellow]",
+                                    total=len(cover_skipped),
+                                    completed=0,
                                 )
+                            except Exception:
+                                pass
+
+                        for s_chk in cover_skipped:
+                            sec_node_id = store.add_section(
+                                book_id=bid,
+                                chapter_idx=s_chk.chapter_idx,
+                                title=s_chk.section_title,
+                                text=s_chk.text,
+                            )
+                            store.add_chunk(s_chk)
+                            book_state.mark_chunk_processed(
+                                chunk_id=s_chk.chunk_id,
+                                chunk_idx=s_chk.chunk_idx,
+                                section_title=s_chk.section_title,
+                                extraction_dict={"concepts": [], "extracted_ideas": []},
+                                duration=0.0,
+                                server_used="skipped_cover",
+                                auto_save=False,
+                            )
+                            with stats_lock:
+                                book_skipped_chunks += 1
+                                session_skipped_chunks += 1
+                                extracted_results.append({
+                                    "status": "skipped_cover",
+                                    "chunk": s_chk,
+                                    "extraction": SectionExtraction(concepts=[], extracted_ideas=[]),
+                                    "duration": 0.0,
+                                    "server_used": "skipped_cover",
+                                })
+                            progress.advance(book_task, advance=1)
+                            if skip_task is not None:
+                                try:
+                                    progress.advance(skip_task, advance=1)
+                                except Exception:
+                                    pass
+
+                        if cover_skipped:
+                            book_state.save()
+
+                        if skip_task is not None:
+                            try:
+                                progress.remove_task(skip_task)
+                            except Exception:
+                                pass
+
+                        unprocessed_fresh = cover_selected
+                        _update_progress_description()
+
+                        with display_lock:
+                            cover_pct = (len(cover_skipped) / (len(cover_selected) + len(cover_skipped))) * 100.0 if (len(cover_selected) + len(cover_skipped)) > 0 else 0.0
+                            total_skipped_now = book_skipped_chunks
+                            total_pct = (total_skipped_now / len(chunks)) * 100.0 if chunks else 0.0
+                            console.print(
+                                f"  [bold cyan]🎯 Hierarchical Semantic Cover (τ={effective_cover_thresh:.2f}):[/bold cyan] "
+                                f"Selected [bold green]{len(cover_selected)}[/bold green] anchor/distinct chunks for LLM extraction, "
+                                f"skipped [bold yellow]{len(cover_skipped)}[/bold yellow] redundant/reference chunks "
+                                f"({cover_pct:.1f}% cover pruned | [bold green]{total_pct:.1f}% total skipped[/bold green] across article)."
+                            )
+
+                    # Check state cache for cover-selected diverse chunks (reusing LLM results with 0ms latency)
+                    if state_cache.is_enabled() and unprocessed_fresh:
+                        cached_hits: List[HierarchicalChunk] = []
+                        uncached_fresh: List[HierarchicalChunk] = []
+                        for chk in unprocessed_fresh:
+                            c_rec = state_cache.get_cached_raw_analysis(bid, chk.chunk_id, btitle)
+                            if c_rec and c_rec.get("status") in ("extracted", "assigned") and "extraction" in c_rec:
+                                raw_ext = c_rec.get("extraction", {"concepts": []})
+                                extraction = SectionExtraction(**raw_ext)
+                                dur = c_rec.get("duration", 0.0)
+                                srv = c_rec.get("server_used", "cached")
+                                book_state.mark_chunk_processed(
+                                    chunk_id=chk.chunk_id,
+                                    chunk_idx=chk.chunk_idx,
+                                    section_title=chk.section_title,
+                                    extraction_dict=raw_ext,
+                                    duration=dur,
+                                    server_used=srv,
+                                    auto_save=False,
+                                )
+                                with stats_lock:
+                                    extracted_results.append({
+                                        "status": "extracted",
+                                        "chunk": chk,
+                                        "extraction": extraction,
+                                        "duration": dur,
+                                        "server_used": f"{srv} (cached)" if "cached" not in srv else srv,
+                                    })
+                                progress.advance(book_task, advance=1)
+                                cached_hits.append(chk)
+                            else:
+                                uncached_fresh.append(chk)
+
+                        if cached_hits:
+                            book_state.save()
+                            state_cache.reused_books_count += 1
+                            state_cache.reused_extractions_count += len(cached_hits)
+                            with display_lock:
+                                console.print(
+                                    f"  [bold green]⚡ Reused {len(cached_hits)} raw chunk analyses from state cache ({state_cache.cache_dir.name}) for MMR-selected chunks.[/bold green]"
+                                )
+                        unprocessed_fresh = uncached_fresh
+                        _update_progress_description()
 
                     fresh_batches = batch_chunks_by_context_size(
                         unprocessed_fresh,
@@ -2922,7 +3288,10 @@ def build_graph(
                                         extraction_dict=extraction.model_dump(),
                                         duration=chunk_dur,
                                         server_used=srv,
+                                        auto_save=False,
                                     )
+                                if chunk_batch:
+                                    book_state.save()
 
                                 model_tag = f" [{target_model}]" if is_fallback_attempt else ""
                                 with display_lock:
@@ -3221,6 +3590,7 @@ def build_graph(
 
                         for concept in extraction.concepts:
                             canonical_concept = next(resolved_concept_iter, None) or deduplicator.resolve_concept(concept)
+                            batch_touched_concepts.add(canonical_concept.name)
                             store.add_concept(canonical_concept, embedding=canonical_concept.embedding)
                             if canonical_concept.embedding and len(canonical_concept.embedding) > 1:
                                 upserted_ideas_for_neo4j[canonical_concept.name] = {
@@ -3271,6 +3641,7 @@ def build_graph(
                                     f"(neither quote nor concept name present in chunk text)"
                                 )
                             for rel_name in canonical_concept.related_concepts:
+                                batch_touched_concepts.add(rel_name)
                                 store.add_concept_relation(
                                     src_concept_name=canonical_concept.name,
                                     tgt_concept_name=rel_name,
@@ -3278,6 +3649,7 @@ def build_graph(
 
                         if chk.chunk_id in limbo_candidate_map:
                             matched_cand_idea, matched_cand_summary = limbo_candidate_map[chk.chunk_id]
+                            batch_touched_concepts.add(matched_cand_idea)
                             store.add_idea_support_link(
                                 concept_name=matched_cand_idea,
                                 chunk=chk,
@@ -3475,15 +3847,24 @@ def build_graph(
                 should_dual_pass = cfg.dual_pass.enabled if dual_pass is None else dual_pass
                 if is_batch_end and not interrupted and store.graph.number_of_nodes() > 0:
                     t_batch_start = time.perf_counter()
+                    # Collect any additional concepts marked dirty in store
+                    for nid in store.dirty_nodes:
+                        if nid.startswith("concept:"):
+                            batch_touched_concepts.add(nid[len("concept:"):])
+
                     if should_dual_pass:
-                        console.print(f"\n  [bold cyan]═══ Running Inter-Batch Dual-Pass Idea Consolidation (Batch size: {batch_size}) ═══[/bold cyan]")
+                        console.print(f"\n  [bold cyan]═══ Running Inter-Batch Dual-Pass Idea Consolidation (Batch size: {batch_size}, Affected concepts: {len(batch_touched_concepts)}) ═══[/bold cyan]")
                         try:
                             postprocessor = IdeaPostProcessor.from_settings(
                                 cfg,
                                 pool=extractor.pool,
                                 embeddings=embeddings,
                             )
-                            pp_report = postprocessor.process_graph(store, console=console)
+                            pp_report = postprocessor.process_graph(
+                                store,
+                                console=console,
+                                affected_concepts=batch_touched_concepts,
+                            )
                             store.save(graph_file, link_chunks=False)
                             if book_idx == len(books_to_process):
                                 ran_batch_postproc_on_last_book = True
@@ -3493,6 +3874,8 @@ def build_graph(
                             )
                         except Exception as e:
                             console.print(f"  [bold yellow]⚠ Inter-Batch Idea Postprocessor failed:[/bold yellow] {e}")
+                        finally:
+                            batch_touched_concepts.clear()
 
                     # Export ONLY affected nodes (chunks, ideas, books, sections) and relationships to Neo4j after each batch
                     should_export_neo4j = cfg.neo4j.enabled if export_neo4j is None else export_neo4j
@@ -3575,14 +3958,23 @@ def build_graph(
         if store.graph.number_of_nodes() > 0:
             should_dual_pass = cfg.dual_pass.enabled if dual_pass is None else dual_pass
             if should_dual_pass and not interrupted and not ran_batch_postproc_on_last_book:
-                console.print("\n[bold cyan]═══ Running Dual-Pass Idea Postprocessor & Synthesis ═══[/bold cyan]")
+                for nid in store.dirty_nodes:
+                    if nid.startswith("concept:"):
+                        batch_touched_concepts.add(nid[len("concept:"):])
+                console.print(
+                    f"\n[bold cyan]═══ Running Dual-Pass Idea Postprocessor & Synthesis (Affected concepts: {len(batch_touched_concepts)}) ═══[/bold cyan]"
+                )
                 try:
                     postprocessor = IdeaPostProcessor.from_settings(
                         cfg,
                         pool=extractor.pool,
                         embeddings=embeddings,
                     )
-                    pp_report = postprocessor.process_graph(store, console=console)
+                    pp_report = postprocessor.process_graph(
+                        store,
+                        console=console,
+                        affected_concepts=batch_touched_concepts if batch_touched_concepts else None,
+                    )
                     console.print(
                         f"[bold green]✓ Idea Postprocessing Complete ({pp_report.duration_seconds:.2f}s):[/bold green] "
                         f"{pp_report.total_clusters} clusters ({pp_report.multi_occurrence_clusters_count} synthesized, "
@@ -3591,6 +3983,19 @@ def build_graph(
                     )
                 except Exception as e:
                     console.print(f"[bold red]✗ Idea Postprocessor failed:[/bold red] {e}")
+                finally:
+                    batch_touched_concepts.clear()
+
+            if embeddings is not None and not interrupted:
+                try:
+                    store.backfill_missing_embeddings(
+                        embeddings=embeddings,
+                        include_ideas=True,
+                        include_chunks=False,
+                        console=console,
+                    )
+                except Exception as e:
+                    logger.debug(f"Could not backfill remaining idea embeddings: {e}")
 
             store.save(graph_file, link_chunks=False)
             if not interrupted:
@@ -3601,11 +4006,12 @@ def build_graph(
                 except Exception as e:
                     console.print(f"[bold yellow]⚠ Obsidian export skipped or incomplete:[/bold yellow] {e}")
 
-                try:
-                    gml = GraphMLExporter(graphml_dest)
-                    gml.export(store)
-                except Exception as e:
-                    console.print(f"[bold yellow]⚠ GraphML export skipped or incomplete:[/bold yellow] {e}")
+                if export_graphml:
+                    try:
+                        gml = GraphMLExporter(graphml_dest)
+                        gml.export(store)
+                    except Exception as e:
+                        console.print(f"[bold yellow]⚠ GraphML export skipped or incomplete:[/bold yellow] {e}")
 
                 should_export_neo4j = cfg.neo4j.enabled if export_neo4j is None else export_neo4j
                 neo_clean = final_clean or (cfg.neo4j.clean_export and not has_cleaned_neo4j)
@@ -3651,6 +4057,11 @@ def build_graph(
             _print_ollama_server_stats(pools_to_report, console=console)
 
         if interrupted:
+            try:
+                token_tracker.save_cumulative(token_stats_file, books_processed=completed_in_session)
+                token_tracker.print_summary_table(console=console, pricing_config=cfg.pricing)
+            except Exception as tok_err:
+                logger.debug(f"Could not persist token stats on interrupt: {tok_err}")
             console.print(
                 f"[bold yellow]Graph build stopped by user.[/bold yellow] "
                 f"Completed in this session: [bold green]{completed_in_session}[/bold green] book(s). "
@@ -3659,9 +4070,23 @@ def build_graph(
             raise typer.Exit(code=130)
 
     # Persist graph to JSON and exports
-    console.print(f"\n[bold green]✓ Knowledge Graph persisted to:[/bold green] {graph_file}")
+    if store.is_sharded:
+        console.print(
+            f"\n[bold green]✓ Sharded Knowledge Graph persisted to:[/bold green] {store.sharded_dir} "
+            f"(Spine: knowledge_graph_spine.json, {len(store.manifest.shards) if store.manifest else 0} shards)"
+        )
+    else:
+        console.print(f"\n[bold green]✓ Knowledge Graph persisted to:[/bold green] {graph_file}")
     console.print(f"[bold green]✓ Obsidian Markdown Vault exported to:[/bold green] {vault_dest}")
-    console.print(f"[bold green]✓ GraphML exported to:[/bold green] {graphml_dest}")
+    if export_graphml:
+        console.print(f"[bold green]✓ GraphML exported to:[/bold green] {graphml_dest}")
+
+    # Save and display comprehensive token usage and multi-tier pricing summary
+    try:
+        token_tracker.save_cumulative(token_stats_file, books_processed=completed_in_session)
+        token_tracker.print_summary_table(console=console, pricing_config=cfg.pricing)
+    except Exception as tok_err:
+        logger.debug(f"Could not persist final token stats: {tok_err}")
 
     # Display final graph statistics
     st = store.stats()
@@ -3818,8 +4243,10 @@ def stats(
     """Display metrics for the current Knowledge Graph."""
     cfg = get_settings(config_path)
     store = ConceptGraphStore()
-    graph_file = cfg.resolved_output_dir / "knowledge_graph.json"
-    if not graph_file.is_file():
+    output_dir = cfg.resolved_output_dir
+    graph_file = output_dir / "knowledge_graph.json"
+    has_sharded = (output_dir / "shards_manifest.json").is_file() and (output_dir / "knowledge_graph_spine.json").is_file()
+    if not graph_file.is_file() and not has_sharded:
         console.print(f"[yellow]No graph found at {graph_file}[/yellow]")
         return
 
@@ -3922,7 +4349,11 @@ def export_obsidian_command(
     """
     cfg = get_settings(config_path)
     target_graph_file = Path(graph_file).expanduser().resolve() if graph_file else cfg.resolved_output_dir / "knowledge_graph.json"
-    if not target_graph_file.is_file():
+    sharded_spine = (target_graph_file.parent if target_graph_file.suffix == ".json" else target_graph_file) / "knowledge_graph_spine.json"
+    sharded_manifest = (target_graph_file.parent if target_graph_file.suffix == ".json" else target_graph_file) / "shards_manifest.json"
+    has_sharded = sharded_spine.is_file() and sharded_manifest.is_file()
+
+    if not target_graph_file.is_file() and not has_sharded:
         console.print(
             f"[bold red]Knowledge graph file not found at {target_graph_file}[/bold red]\n"
             f"[yellow]Please run 'bookeeper build-graph' first to generate knowledge_graph.json.[/yellow]"
@@ -3971,14 +4402,23 @@ def export_command(
         "--backfill-embeddings/--no-backfill-embeddings",
         help="Automatically backfill missing embeddings on existing Idea and Chunk nodes before exporting.",
     ),
+    export_graphml: bool = typer.Option(
+        False,
+        "--graphml",
+        help="Also export GraphML format for Gephi/Cytoscape (default: False).",
+    ),
 ):
     """
-    Export current Knowledge Graph to all destinations (Obsidian, GraphML, and Neo4j)
+    Export current Knowledge Graph to external destinations (Obsidian, Neo4j, and optional GraphML)
     based strictly on existing knowledge_graph.json without continuing book processing.
     """
     cfg = get_settings(config_path)
     target_graph_file = Path(graph_file).expanduser().resolve() if graph_file else cfg.resolved_output_dir / "knowledge_graph.json"
-    if not target_graph_file.is_file():
+    sharded_spine = (target_graph_file.parent if target_graph_file.suffix == ".json" else target_graph_file) / "knowledge_graph_spine.json"
+    sharded_manifest = (target_graph_file.parent if target_graph_file.suffix == ".json" else target_graph_file) / "shards_manifest.json"
+    has_sharded = sharded_spine.is_file() and sharded_manifest.is_file()
+
+    if not target_graph_file.is_file() and not has_sharded:
         console.print(
             f"[bold red]Knowledge graph file not found at {target_graph_file}[/bold red]\n"
             f"[yellow]Please run 'bookeeper build-graph' first to generate knowledge_graph.json.[/yellow]"
@@ -4027,9 +4467,10 @@ def export_command(
     obs.export(store, clean=effective_clean)
     console.print(f"[bold green]✓ Obsidian Vault exported to{clean_note}:[/bold green] {target_vault}")
 
-    gml = GraphMLExporter(graphml_dest)
-    gml.export(store)
-    console.print(f"[bold green]✓ GraphML exported to:[/bold green] {graphml_dest}")
+    if export_graphml:
+        gml = GraphMLExporter(graphml_dest)
+        gml.export(store)
+        console.print(f"[bold green]✓ GraphML exported to:[/bold green] {graphml_dest}")
 
     should_neo4j = cfg.neo4j.enabled if export_neo4j is None else export_neo4j
     if should_neo4j:
@@ -4090,7 +4531,11 @@ def export_neo4j_command(
 
     # Load Knowledge Graph
     target_graph_file = Path(graph_file).expanduser().resolve() if graph_file else cfg.resolved_output_dir / "knowledge_graph.json"
-    if not target_graph_file.is_file():
+    sharded_spine = (target_graph_file.parent if target_graph_file.suffix == ".json" else target_graph_file) / "knowledge_graph_spine.json"
+    sharded_manifest = (target_graph_file.parent if target_graph_file.suffix == ".json" else target_graph_file) / "shards_manifest.json"
+    has_sharded = sharded_spine.is_file() and sharded_manifest.is_file()
+
+    if not target_graph_file.is_file() and not has_sharded:
         console.print(
             f"[bold red]Knowledge graph file not found at {target_graph_file}[/bold red]\n"
             f"[yellow]Please run 'bookeeper build-graph' first to generate knowledge_graph.json.[/yellow]"
@@ -4196,6 +4641,276 @@ def export_neo4j_command(
         f"[bold green]✓ Successfully exported Knowledge Graph to Neo4j{clean_note}[/bold green] "
         f"[dim]({target_uri}, db: {target_database})[/dim]\n"
     )
+
+
+@app.command("export-graphml")
+def export_graphml_command(
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o", help="Destination path for GraphML file (default: output/knowledge_graph.graphml)."
+    ),
+    graph_file: Optional[str] = typer.Option(
+        None, "--graph-file", "-g", help="Source knowledge_graph.json path."
+    ),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+):
+    """
+    Export current Knowledge Graph to GraphML XML format on-demand for Gephi, Cytoscape, or yEd.
+    """
+    cfg = get_settings(config_path)
+    target_graph = Path(graph_file).expanduser().resolve() if graph_file else cfg.resolved_output_dir / "knowledge_graph.json"
+    if not target_graph.is_file():
+        console.print(f"[bold red]Knowledge graph file not found at {target_graph}[/bold red]")
+        raise typer.Exit(1)
+
+    store = ConceptGraphStore()
+    with console.status(f"[bold cyan]Loading graph from {target_graph}...[/bold cyan]"):
+        try:
+            store.load(target_graph)
+        except Exception as e:
+            console.print(f"[bold red]Failed to load knowledge graph:[/bold red] {e}")
+            raise typer.Exit(1)
+
+    dest = Path(output).expanduser().resolve() if output else cfg.resolved_output_dir / "knowledge_graph.graphml"
+    node_count = store.graph.number_of_nodes()
+    edge_count = store.graph.number_of_edges()
+    console.print(f"[bold cyan]Exporting {node_count:,} nodes and {edge_count:,} edges to GraphML: {dest}...[/bold cyan]")
+
+    try:
+        gml = GraphMLExporter(dest)
+        gml.export(store)
+        console.print(f"[bold green]✓ GraphML export complete:[/bold green] [cyan]{dest}[/cyan]")
+    except Exception as e:
+        console.print(f"[bold red]✗ GraphML export failed:[/bold red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command("shard-graph")
+def shard_graph_command(
+    graph_file: Optional[str] = typer.Option(
+        None, "--graph-file", "-g", help="Path to source monolithic knowledge_graph.json (default: output_dir/knowledge_graph.json)."
+    ),
+    output_dir: Optional[str] = typer.Option(
+        None, "--output-dir", "-o", help="Destination folder for Spine and Shards (default: source graph parent directory)."
+    ),
+    shard_size_mb: int = typer.Option(
+        1000, "--shard-size-mb", help="Maximum file size limit per shard in MB (default: 1000 MB = 1 GB)."
+    ),
+    dtype: str = typer.Option(
+        "float16", "--dtype", help="Vector compression precision for Base64 binary: 'float16' (~7.3x reduction) or 'float32' (~3.7x)."
+    ),
+    backup: bool = typer.Option(
+        True, "--backup/--no-backup", help="Preserve safety copy (knowledge_graph.json.bak) before migration (default: True)."
+    ),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+):
+    """
+    Migrate a monolithic knowledge graph into a high-performance Spine + Sharded graph.
+    - Compresses all dense vector embeddings to Float16 Base64 binary (~7.3x smaller).
+    - Splits heavy chunk nodes and edges into 1 GB payload shards.
+    - Preserves lightweight semantic spine (Books, Sections, Ideas, Clusters) for fast in-memory indexing.
+    - Zero compute cost: runs 100% offline without invoking LLMs or embedding models.
+    """
+    cfg = get_settings(config_path)
+    target_graph = (
+        Path(graph_file).expanduser().resolve()
+        if graph_file
+        else cfg.resolved_output_dir / "knowledge_graph.json"
+    )
+    dest = Path(output_dir).expanduser().resolve() if output_dir else target_graph.parent
+
+    if not target_graph.is_file():
+        console.print(f"[bold red]Knowledge graph file not found at:[/bold red] {target_graph}")
+        raise typer.Exit(1)
+
+    console.print(
+        Panel.fit(
+            f"[bold cyan]🗜️ Knowledge Graph Sharding & Float16 Compression Migration[/bold cyan]\n"
+            f"• Source Graph: [bold]{target_graph}[/bold]\n"
+            f"• Output Directory: [bold]{dest}[/bold]\n"
+            f"• Max Shard Size Limit: [bold yellow]{shard_size_mb} MB[/bold yellow]\n"
+            f"• Embedding Precision: [bold green]{dtype} (Base64 raw binary)[/bold green]\n"
+            f"• Safety Backup: [bold]{'Enabled (.json.bak)' if backup else 'Disabled'}[/bold]",
+            title="bookeeper shard-graph",
+            border_style="cyan",
+        )
+    )
+
+    try:
+        report = GraphMigrator.migrate_monolithic_graph(
+            source_path=target_graph,
+            output_dir=dest,
+            target_shard_size_mb=shard_size_mb,
+            dtype=dtype,
+            make_backup=backup,
+            console=console,
+        )
+    except Exception as e:
+        console.print(f"[bold red]✗ Migration failed:[/bold red] {e}")
+        raise typer.Exit(1)
+
+    # Summary table
+    t = Table(title="Knowledge Graph Sharding & Compression Summary", border_style="cyan", show_header=True)
+    t.add_column("Metric", style="bold")
+    t.add_column("Monolithic Baseline", justify="right")
+    t.add_column("Spine + Shards", justify="right")
+    t.add_column("Optimization / Delta", justify="right", style="bold green")
+
+    orig_mb = report.original_size_bytes / 1e6
+    migrated_mb = report.total_sharded_size_bytes / 1e6
+    saved_mb = orig_mb - migrated_mb
+    saved_pct = (saved_mb / orig_mb * 100.0) if orig_mb > 0 else 0.0
+
+    t.add_row(
+        "Total Disk Footprint",
+        f"{orig_mb:,.1f} MB ({report.original_size_bytes / 1e9:.2f} GB)",
+        f"{migrated_mb:,.1f} MB ({report.total_sharded_size_bytes / 1e9:.2f} GB)",
+        f"-{saved_mb:,.1f} MB ({saved_pct:.1f}% reduction)",
+    )
+    t.add_row(
+        "Spine Graph Size (In-Memory)",
+        f"{orig_mb:,.1f} MB",
+        f"{report.spine_size_bytes / 1e6:,.1f} MB",
+        f"{report.original_size_bytes / report.spine_size_bytes:.1f}x lighter memory footprint"
+        if report.spine_size_bytes > 0
+        else "-",
+    )
+    t.add_row(
+        "Active Memory / Shard",
+        f"{orig_mb:,.1f} MB (entire graph)",
+        f"~{report.total_sharded_size_bytes / max(1, report.num_shards) / 1e6:,.1f} MB / shard",
+        f"Capped at {shard_size_mb} MB max",
+    )
+    t.add_row(
+        "Total Nodes",
+        f"{report.original_nodes:,}",
+        f"{report.total_nodes_migrated:,} ({report.spine_nodes:,} spine + {report.total_nodes_migrated - report.spine_nodes:,} payload)",
+        "✅ 100% Verified Parity" if report.verified else "❌ Discrepancy",
+    )
+    t.add_row(
+        "Total Relationships",
+        f"{report.original_edges:,}",
+        f"{report.total_edges_migrated:,} ({report.spine_edges:,} spine + {report.total_edges_migrated - report.spine_edges:,} payload)",
+        "✅ 100% Verified Parity" if report.verified else "❌ Discrepancy",
+    )
+    t.add_row(
+        "Generated Shards",
+        "1 monolithic file",
+        f"{report.num_shards} payload shard(s)",
+        f"shards/shard_0001.json .. shard_{report.num_shards:04d}.json",
+    )
+    t.add_row(
+        "Migration Duration",
+        "-",
+        f"{report.duration_seconds:.2f}s",
+        f"{report.original_nodes / max(0.01, report.duration_seconds):,.0f} nodes/sec",
+    )
+    console.print(t)
+    console.print(
+        f"\n[bold green]✓ Migration successfully completed in {report.duration_seconds:.2f}s![/bold green] "
+        f"Spine and {report.num_shards} shard(s) ready in [bold cyan]{dest}[/bold cyan].\n"
+    )
+
+
+@app.command("inspect-shards")
+def inspect_shards_command(
+    directory: Optional[str] = typer.Option(
+        None, "--dir", "-d", help="Directory containing shards_manifest.json (default: config output_dir)."
+    ),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+):
+    """
+    Inspect the Spine and Shards structure of a partitioned Knowledge Graph.
+    Displays detailed breakdown of shard files, node/edge counts, file sizes, and memory usage.
+    """
+    cfg = get_settings(config_path)
+    target_dir = Path(directory).expanduser().resolve() if directory else cfg.resolved_output_dir
+    manifest_path = target_dir / "shards_manifest.json"
+
+    if not manifest_path.is_file():
+        console.print(f"[bold yellow]No shard manifest found at:[/bold yellow] {manifest_path}")
+        console.print("[dim]Run 'bookeeper shard-graph' to partition your knowledge graph.[/dim]")
+        raise typer.Exit(1)
+
+    store = ShardedGraphStore(target_dir)
+    store.load_spine()
+    m = store.manifest
+
+    console.print(
+        Panel.fit(
+            f"[bold cyan]🔍 Sharded Knowledge Graph Manifest Overview[/bold cyan]\n"
+            f"• Location: [bold]{target_dir}[/bold]\n"
+            f"• Created: [dim]{m.created_at}[/dim]\n"
+            f"• Target Shard Limit: [bold yellow]{m.target_shard_size_mb} MB[/bold yellow]\n"
+            f"• Vector Dtype: [bold green]{m.embedding_dtype} (Base64 packed)[/bold green]\n"
+            f"• Total Books: [bold]{m.total_books:,}[/bold]\n"
+            f"• Total Nodes: [bold]{m.total_nodes:,}[/bold] ({m.total_spine_nodes:,} Spine, {m.total_payload_nodes:,} Payload)\n"
+            f"• Total Relationships: [bold]{m.total_edges:,}[/bold] ({m.total_spine_edges:,} Spine, {m.total_payload_edges:,} Payload)",
+            title="bookeeper inspect-shards",
+            border_style="cyan",
+        )
+    )
+
+    t = Table(title="Payload Shards Distribution", border_style="cyan", show_header=True)
+    t.add_column("Shard ID", style="bold cyan")
+    t.add_column("Filename", style="dim")
+    t.add_column("File Size", justify="right")
+    t.add_column("Books Contained", justify="right")
+    t.add_column("Nodes", justify="right")
+    t.add_column("Relationships", justify="right")
+
+    for sh in m.shards:
+        t.add_row(
+            sh["shard_id"],
+            sh["filename"],
+            f"{sh['file_size_bytes'] / 1e6:,.1f} MB",
+            f"{len(sh.get('books', []))} books",
+            f"{sh.get('node_count', 0):,}",
+            f"{sh.get('edge_count', 0):,}",
+        )
+    console.print(t)
+
+
+@app.command("unshard-graph")
+def unshard_graph_command(
+    directory: Optional[str] = typer.Option(
+        None, "--dir", "-d", help="Directory containing shards_manifest.json (default: config output_dir)."
+    ),
+    output: Optional[str] = typer.Option(
+        None, "--output", "-o", help="Destination monolithic JSON file (default: output_dir/knowledge_graph_reconstructed.json)."
+    ),
+    decompress_embeddings: bool = typer.Option(
+        False, "--decompress-embeddings", help="Decompress Base64 binary embeddings back to raw JSON float lists."
+    ),
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+):
+    """
+    Reconstruct a single monolithic knowledge_graph.json from the Spine and Shards.
+    Useful for external tooling or backup archives.
+    """
+    cfg = get_settings(config_path)
+    target_dir = Path(directory).expanduser().resolve() if directory else cfg.resolved_output_dir
+    manifest_path = target_dir / "shards_manifest.json"
+
+    if not manifest_path.is_file():
+        console.print(f"[bold red]Shard manifest not found at:[/bold red] {manifest_path}")
+        raise typer.Exit(1)
+
+    dest = Path(output).expanduser().resolve() if output else target_dir / "knowledge_graph_reconstructed.json"
+
+    try:
+        out_path = GraphMigrator.export_monolithic_from_shards(
+            base_dir=target_dir,
+            output_file=dest,
+            decompress_embeddings=decompress_embeddings,
+            console=console,
+        )
+        size_mb = out_path.stat().st_size / 1e6
+        console.print(
+            f"\n[bold green]✓ Reconstructed Monolithic Knowledge Graph:[/bold green] [bold cyan]{out_path}[/bold cyan] ({size_mb:,.1f} MB)\n"
+        )
+    except Exception as e:
+        console.print(f"[bold red]✗ Unsharding failed:[/bold red] {e}")
+        raise typer.Exit(1)
 
 
 @app.command("build-rag")
@@ -4412,6 +5127,9 @@ def _execute_single_verification(
     tau: Optional[float] = None,
     states_dir: Optional[str] = None,
     tau_loss: Optional[float] = None,
+    low_p10_prompt: bool = False,
+    low_p10_output: Optional[str] = None,
+    low_p10_target_chars: int = 1_000_000,
     cfg: Optional[Settings] = None,
 ) -> Optional[Dict[str, Any]]:
     """
@@ -5050,19 +5768,32 @@ def _execute_single_verification(
             if cand_path_a:
                 if cand_path_a.is_file():
                     target_graph_a = cand_path_a
-                elif cand_path_a.is_dir() and (cand_path_a / "knowledge_graph.json").is_file():
-                    target_graph_a = cand_path_a / "knowledge_graph.json"
+                elif cand_path_a.is_dir():
+                    cand_spine = cand_path_a / "knowledge_graph_spine.json"
+                    cand_kg = cand_path_a / "knowledge_graph.json"
+                    if cand_spine.is_file():
+                        target_graph_a = cand_spine
+                    elif cand_kg.is_file():
+                        target_graph_a = cand_kg
             else:
+                default_spine = cfg.resolved_output_dir / "knowledge_graph_spine.json"
                 default_kg = cfg.resolved_output_dir / "knowledge_graph.json"
-                if default_kg.is_file():
+                if default_spine.is_file():
+                    target_graph_a = default_spine
+                elif default_kg.is_file():
                     target_graph_a = default_kg
 
         if not target_graph_b:
             if cand_path_b:
                 if cand_path_b.is_file():
                     target_graph_b = cand_path_b
-                elif cand_path_b.is_dir() and (cand_path_b / "knowledge_graph.json").is_file():
-                    target_graph_b = cand_path_b / "knowledge_graph.json"
+                elif cand_path_b.is_dir():
+                    cand_spine_b = cand_path_b / "knowledge_graph_spine.json"
+                    cand_kg_b = cand_path_b / "knowledge_graph.json"
+                    if cand_spine_b.is_file():
+                        target_graph_b = cand_spine_b
+                    elif cand_kg_b.is_file():
+                        target_graph_b = cand_kg_b
 
         if not target_graph_a or not target_graph_a.is_file():
             console.print(
@@ -5085,9 +5816,17 @@ def _execute_single_verification(
 
         store_a = ConceptGraphStore()
         store_b = ConceptGraphStore()
-        with console.status(f"[bold cyan]Loading Graph A from {target_graph_a}...[/bold cyan]"):
+        parent_a = target_graph_a.parent if target_graph_a.is_file() else target_graph_a
+        is_sharded_a = (parent_a / "shards_manifest.json").is_file() and (parent_a / "knowledge_graph_spine.json").is_file()
+        desc_a = f"{target_graph_a} (Spine & Shards)" if is_sharded_a else str(target_graph_a)
+
+        parent_b = target_graph_b.parent if target_graph_b.is_file() else target_graph_b
+        is_sharded_b = (parent_b / "shards_manifest.json").is_file() and (parent_b / "knowledge_graph_spine.json").is_file()
+        desc_b = f"{target_graph_b} (Spine & Shards)" if is_sharded_b else str(target_graph_b)
+
+        with console.status(f"[bold cyan]Loading Graph A from {desc_a}...[/bold cyan]"):
             store_a.load(target_graph_a)
-        with console.status(f"[bold cyan]Loading Graph B from {target_graph_b}...[/bold cyan]"):
+        with console.status(f"[bold cyan]Loading Graph B from {desc_b}...[/bold cyan]"):
             store_b.load(target_graph_b)
 
         effective_blocks = blocks if blocks is not None else 20
@@ -5322,6 +6061,12 @@ def _execute_single_verification(
     # Mode: 'graph' or 'kg' (Knowledge Graph Embedding Space Suite & Decision Matrix)
     if effective_mode in ("graph", "kg", "graph-space", "graph_space"):
         effective_tau = float(tau if tau is not None else 0.75)
+        effective_low_p10_prompt = bool(
+            low_p10_prompt or getattr(cfg.verification, "low_p10_prompt", False)
+        )
+        effective_low_p10_output = low_p10_output or getattr(cfg.verification, "low_p10_output", None)
+        if effective_low_p10_prompt and not effective_low_p10_output:
+            effective_low_p10_output = str(cfg.resolved_output_dir / "low_p10_verification_prompt.txt")
         temp_backup_targets: List[ResolvedBackupTarget] = []
 
         try:
@@ -5361,18 +6106,31 @@ def _execute_single_verification(
             if not target_graph_a:
                 if cand_path_a and cand_path_a.is_file():
                     target_graph_a = cand_path_a
-                elif cand_path_a and cand_path_a.is_dir() and (cand_path_a / "knowledge_graph.json").is_file():
-                    target_graph_a = cand_path_a / "knowledge_graph.json"
+                elif cand_path_a and cand_path_a.is_dir():
+                    cand_spine = cand_path_a / "knowledge_graph_spine.json"
+                    cand_kg = cand_path_a / "knowledge_graph.json"
+                    if cand_spine.is_file():
+                        target_graph_a = cand_spine
+                    elif cand_kg.is_file():
+                        target_graph_a = cand_kg
                 else:
+                    default_spine = cfg.resolved_output_dir / "knowledge_graph_spine.json"
                     default_kg = cfg.resolved_output_dir / "knowledge_graph.json"
-                    if default_kg.is_file():
+                    if default_spine.is_file():
+                        target_graph_a = default_spine
+                    elif default_kg.is_file():
                         target_graph_a = default_kg
 
             if not target_graph_b and cand_path_b:
                 if cand_path_b.is_file():
                     target_graph_b = cand_path_b
-                elif cand_path_b and cand_path_b.is_dir() and (cand_path_b / "knowledge_graph.json").is_file():
-                    target_graph_b = cand_path_b / "knowledge_graph.json"
+                elif cand_path_b and cand_path_b.is_dir():
+                    cand_spine_b = cand_path_b / "knowledge_graph_spine.json"
+                    cand_kg_b = cand_path_b / "knowledge_graph.json"
+                    if cand_spine_b.is_file():
+                        target_graph_b = cand_spine_b
+                    elif cand_kg_b.is_file():
+                        target_graph_b = cand_kg_b
 
             if not target_graph_a or not target_graph_a.is_file():
                 console.print(
@@ -5381,16 +6139,17 @@ def _execute_single_verification(
                 raise typer.Exit(1)
 
             store_a = ConceptGraphStore()
-            with console.status(f"[bold cyan]Loading Graph A from {target_graph_a}...[/bold cyan]"):
+            parent_a = target_graph_a.parent if target_graph_a.is_file() else target_graph_a
+            is_sharded_a = (parent_a / "shards_manifest.json").is_file() and (parent_a / "knowledge_graph_spine.json").is_file()
+            desc_a = f"{target_graph_a} (Spine & Shards)" if is_sharded_a else str(target_graph_a)
+            with console.status(f"[bold cyan]Loading Graph A from {desc_a}...[/bold cyan]"):
                 store_a.load(target_graph_a)
 
             # Initialize embeddings provider if needed
             embeddings = None
             try:
                 embedding_model_name = getattr(cfg, "embedding_model", "nomic-embed-text")
-                verifier_servers = cfg.resolved_verification_servers
-                pool = OllamaPool(servers=verifier_servers, cooldown_seconds=0, max_tasks_per_server=2)
-                embeddings = FailoverOllamaEmbeddings(model=embedding_model_name, pool=pool)
+                embeddings = FailoverOllamaEmbeddings.from_settings(cfg, model=embedding_model_name)
             except Exception as e:
                 logger.debug(f"Could not initialize FailoverOllamaEmbeddings: {e}")
 
@@ -5448,6 +6207,9 @@ def _execute_single_verification(
                         states_dir_a=resolved_states_dir,
                         states_dir_b=resolved_states_dir_b or resolved_states_dir,
                         tau_loss=effective_tau_loss,
+                        generate_low_p10_prompt=effective_low_p10_prompt,
+                        low_p10_prompt_output=effective_low_p10_output,
+                        low_p10_target_chars=low_p10_target_chars,
                     )
                 console.print(format_graph_comparison_table(kg_report))
                 report_dict = kg_report.model_dump()
@@ -5463,11 +6225,32 @@ def _execute_single_verification(
                         states_dir=resolved_states_dir,
                         tau_loss=effective_tau_loss,
                         book_id=book_id,
+                        generate_low_p10_prompt=effective_low_p10_prompt,
+                        low_p10_prompt_output=effective_low_p10_output,
+                        low_p10_target_chars=low_p10_target_chars,
                     )
                 console.print(format_graph_space_table(metrics))
                 if metrics.postprocessing_drift:
                     console.print(format_postprocessing_drift_table(metrics.postprocessing_drift))
                 report_dict = metrics.model_dump()
+
+            if effective_low_p10_prompt and report_dict.get("low_p10_prompt_path"):
+                p_path = report_dict["low_p10_prompt_path"]
+                c_cnt = report_dict.get("low_p10_prompt_chunks_count", 0)
+                ch_cnt = report_dict.get("low_p10_prompt_chars_count", 0)
+                approx_tokens = ch_cnt // 4
+                console.print(
+                    Panel(
+                        f"[bold green]✓ Low-P10 Verification Prompt saved to:[/bold green] [bold cyan]{p_path}[/bold cyan]\n\n"
+                        f"  • Total Chunks Included: [bold]{c_cnt:,}[/bold]\n"
+                        f"  • Prompt Size: [bold]{ch_cnt:,}[/bold] characters (~{approx_tokens:,} tokens)\n"
+                        f"  • Content: Tail lowest-proximity literature passages relative to Knowledge Graph ideas\n"
+                        f"  • Audit Objective: Verify whether chunks contain specific, non-generic conceptual ideas or generic boilerplate\n\n"
+                        f"[dim]Copy or feed this prompt into a frontier model (Gemini 1.5 Pro, Claude 3.5 Sonnet, GPT-4o) to audit knowledge graph blind spots.[/dim]",
+                        title="[bold yellow]🤖 Frontier Model Low-P10 Audit Prompt[/bold yellow]",
+                        border_style="yellow",
+                    )
+                )
 
             # Clean up temporary folders immediately after verification to spare memory
             if temp_backup_targets:
@@ -5542,9 +6325,7 @@ def _execute_single_verification(
         embeddings = None
         try:
             embedding_model_name = getattr(cfg, "embedding_model", "nomic-embed-text")
-            verifier_servers = cfg.resolved_verification_servers
-            pool = OllamaPool(servers=verifier_servers, cooldown_seconds=0, max_tasks_per_server=2)
-            embeddings = FailoverOllamaEmbeddings(model=embedding_model_name, pool=pool)
+            embeddings = FailoverOllamaEmbeddings.from_settings(cfg, model=embedding_model_name)
         except Exception as e:
             logger.debug(f"Could not initialize FailoverOllamaEmbeddings: {e}")
 
@@ -5922,6 +6703,16 @@ def verify_command(
         "--tau-loss",
         help="Cosine similarity cutoff below which a raw idea is considered dropped in drift verification (default: 0.70).",
     ),
+    low_p10_prompt: bool = typer.Option(
+        False,
+        "--low-p10-prompt",
+        help="Generate a ~1M verification prompt for high-capability models evaluating lowest-p10 proximity chunks in KG verification.",
+    ),
+    low_p10_output: Optional[str] = typer.Option(
+        None,
+        "--low-p10-output",
+        help="Optional destination path for generated low-p10 verification prompt (default: output_dir/low_p10_verification_prompt.txt).",
+    ),
 ):
     """
     Verify Knowledge Graph factual integrity, chunking correctness, or chunk Oracle alignment.
@@ -6039,6 +6830,8 @@ def verify_command(
                 tau=getattr(v, "tau", tau),
                 states_dir=getattr(v, "states_dir", states_dir),
                 tau_loss=getattr(v, "tau_loss", tau_loss),
+                low_p10_prompt=getattr(v, "low_p10_prompt", low_p10_prompt) if getattr(v, "low_p10_prompt", None) is not None else low_p10_prompt,
+                low_p10_output=getattr(v, "low_p10_output", low_p10_output) if getattr(v, "low_p10_output", None) is not None else low_p10_output,
             )
             reports.append((v_mode, v_report, rep))
 
@@ -6076,6 +6869,10 @@ def verify_command(
             debug_output = first_v.debug_output
         if stats_output is None:
             stats_output = first_v.stats_output
+        if low_p10_prompt is False and getattr(first_v, "low_p10_prompt", None) is True:
+            low_p10_prompt = True
+        if low_p10_output is None and getattr(first_v, "low_p10_output", None):
+            low_p10_output = first_v.low_p10_output
 
     return _execute_single_verification(
         cfg=cfg,
@@ -6105,6 +6902,8 @@ def verify_command(
         tau=tau,
         states_dir=states_dir,
         tau_loss=tau_loss,
+        low_p10_prompt=low_p10_prompt,
+        low_p10_output=low_p10_output,
     )
 
 
@@ -6432,9 +7231,7 @@ def ab_compare_command(
             embeddings = None
             try:
                 embedding_model_name = getattr(cfg, "embedding_model", "nomic-embed-text")
-                verifier_servers = cfg.resolved_verification_servers
-                pool = OllamaPool(servers=verifier_servers, cooldown_seconds=0, max_tasks_per_server=2)
-                embeddings = FailoverOllamaEmbeddings(model=embedding_model_name, pool=pool)
+                embeddings = FailoverOllamaEmbeddings.from_settings(cfg, model=embedding_model_name)
             except Exception as e:
                 logger.debug(f"Could not initialize FailoverOllamaEmbeddings: {e}")
 
@@ -6589,6 +7386,11 @@ def remove_book_cmd(
         "--export-obsidian",
         help="Custom export directory for Obsidian Markdown vault to refresh after removal.",
     ),
+    export_graphml: bool = typer.Option(
+        False,
+        "--export-graphml",
+        help="Also update GraphML file (knowledge_graph.graphml) after book removal (default: False).",
+    ),
 ):
     """
     Remove an unprocessed or unwanted book from the Knowledge Graph.
@@ -6600,7 +7402,8 @@ def remove_book_cmd(
     graph_file = output_dir / "knowledge_graph.json"
     tracker = ProgressTracker(cfg.resolved_state_file)
 
-    if not graph_file.is_file():
+    has_sharded = (output_dir / "shards_manifest.json").is_file() and (output_dir / "knowledge_graph_spine.json").is_file()
+    if not graph_file.is_file() and not has_sharded:
         console.print(f"[bold yellow]Knowledge graph file not found at {graph_file}.[/bold yellow]")
         raise typer.Exit(1)
 
@@ -6616,8 +7419,9 @@ def remove_book_cmd(
         graphml_dest = output_dir / "knowledge_graph.graphml"
         obs = ObsidianExporter(vault_dest)
         obs.export(store, clean=True)
-        gml = GraphMLExporter(graphml_dest)
-        gml.export(store)
+        if export_graphml:
+            gml = GraphMLExporter(graphml_dest)
+            gml.export(store)
 
         console.print(
             f"[bold green]✓ Successfully removed Book #{book_id} from Knowledge Graph:[/bold green] "
@@ -6664,6 +7468,11 @@ def postprocess_ideas_command(
     checkpoint_interval: int = typer.Option(
         100, "--checkpoint-interval", help="Save postprocessor state checkpoint every N ideas (default: 100)."
     ),
+    export_graphml: bool = typer.Option(
+        False,
+        "--export-graphml",
+        help="Also export knowledge_graph.graphml (default: False).",
+    ),
 ):
     """
     Execute Two-Pass Idea Aggregation and Synthesis on a Knowledge Graph:
@@ -6677,7 +7486,11 @@ def postprocess_ideas_command(
     output_dir = cfg.resolved_output_dir
     target_graph = Path(graph_file).expanduser().resolve() if graph_file else output_dir / "knowledge_graph.json"
 
-    if not target_graph.is_file():
+    sharded_spine = (target_graph.parent if target_graph.suffix == ".json" else target_graph) / "knowledge_graph_spine.json"
+    sharded_manifest = (target_graph.parent if target_graph.suffix == ".json" else target_graph) / "shards_manifest.json"
+    has_sharded = sharded_spine.is_file() and sharded_manifest.is_file()
+
+    if not target_graph.is_file() and not has_sharded:
         console.print(f"[bold red]Knowledge graph file not found at {target_graph}.[/bold red]")
         raise typer.Exit(1)
 
@@ -6707,7 +7520,10 @@ def postprocess_ideas_command(
     store = ConceptGraphStore()
     with console.status(f"[bold cyan]Loading Knowledge Graph from {target_graph.name}...[/bold cyan]", spinner="dots"):
         store.load(target_graph)
-    console.print(f"[bold green]✓[/bold green] [dim]Loaded Knowledge Graph: {len(store.graph.nodes)} nodes, {len(store.graph.edges)} edges[/dim]")
+    if store.is_sharded:
+        console.print(f"[bold green]✓[/bold green] [dim]Loaded Sharded Knowledge Graph: {len(store.graph.nodes):,} spine nodes, {len(store.graph.edges):,} spine edges[/dim]")
+    else:
+        console.print(f"[bold green]✓[/bold green] [dim]Loaded Knowledge Graph: {len(store.graph.nodes):,} nodes, {len(store.graph.edges):,} edges[/dim]")
 
     postprocessor = IdeaPostProcessor.from_settings(
         cfg,
@@ -6727,11 +7543,12 @@ def postprocess_ideas_command(
 
     # Refresh Obsidian vault & GraphML
     vault_dest = Path(export_obsidian) if export_obsidian else output_dir / "obsidian_vault"
-    graphml_dest = output_dir / "knowledge_graph.graphml"
     obs = ObsidianExporter(vault_dest)
     obs.export(store, clean=False)
-    gml = GraphMLExporter(graphml_dest)
-    gml.export(store)
+    if export_graphml:
+        graphml_dest = output_dir / "knowledge_graph.graphml"
+        gml = GraphMLExporter(graphml_dest)
+        gml.export(store)
 
     console.print(
         f"\n[bold green]✓ Dual-Pass Idea Aggregation & Synthesis Complete ({report.duration_seconds:.2f}s):[/bold green]\n"
@@ -6939,6 +7756,11 @@ def rebuild_graph_command(
         "--state-cache-dir",
         help="Directory containing existing book state files (book_*_state.json) to use as source state directory.",
     ),
+    export_graphml: bool = typer.Option(
+        False,
+        "--export-graphml",
+        help="Also export knowledge_graph.graphml (default: False).",
+    ),
 ):
     """
     Fast, offline rebuild of the Knowledge Graph directly from existing per-book state checkpoints (.book_states).
@@ -6959,6 +7781,7 @@ def rebuild_graph_command(
     dedup = _resolve_opt(dedup, True)
     books_dir = _resolve_opt(books_dir)
     state_cache_dir = _resolve_opt(state_cache_dir)
+    export_graphml = _resolve_opt(export_graphml, False)
 
     cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir)
     output_dir = cfg.resolved_output_dir
@@ -6987,6 +7810,25 @@ def rebuild_graph_command(
         if graph_file.is_file():
             try:
                 graph_file.unlink()
+            except Exception:
+                pass
+        spine_file = output_dir / "knowledge_graph_spine.json"
+        if spine_file.is_file():
+            try:
+                spine_file.unlink()
+            except Exception:
+                pass
+        manifest_file = output_dir / "shards_manifest.json"
+        if manifest_file.is_file():
+            try:
+                manifest_file.unlink()
+            except Exception:
+                pass
+        shards_dir = output_dir / "shards"
+        if shards_dir.is_dir():
+            try:
+                import shutil
+                shutil.rmtree(shards_dir)
             except Exception:
                 pass
         if graphml_dest.is_file():
@@ -7216,8 +8058,9 @@ def rebuild_graph_command(
 
     obs = ObsidianExporter(vault_dest)
     obs.export(store, clean=False)
-    gml = GraphMLExporter(graphml_dest)
-    gml.export(store)
+    if export_graphml:
+        gml = GraphMLExporter(graphml_dest)
+        gml.export(store)
 
     if should_export_neo4j:
         try:
@@ -8112,6 +8955,8 @@ def generate_questions_command(
     calibre_path: Optional[str] = typer.Option(None, "--calibre-path", help="Calibre library path or SMB mount."),
     books_dir: Optional[str] = typer.Option(None, "--books-dir", help="Path to folder containing books/articles."),
     timeout: int = typer.Option(180, "--timeout", "-t", help="Timeout in seconds per LLM request for question synthesis (default: 180s)."),
+    hierarchical_cover: bool = typer.Option(True, "--hierarchical-cover/--no-hierarchical-cover", help="Enable or disable Section-Aware Hierarchical Semantic Cover for diverse outlining chunk selection (default: True)."),
+    mmr: Optional[bool] = typer.Option(None, "--mmr/--no-mmr", hidden=True, help="Deprecated alias for --hierarchical-cover."),
 ):
     """
     Generate an evaluation question library for N books using the capable verification model.
@@ -8149,7 +8994,8 @@ def generate_questions_command(
         })
 
     out_file = Path(output).expanduser().resolve() if output else (cfg.resolved_output_dir / "question_library.json")
-    generator = QuestionGenerator(settings=cfg, model_name=model, timeout=timeout, console=console)
+    effective_gen_cover = hierarchical_cover if mmr is None else mmr
+    generator = QuestionGenerator(settings=cfg, model_name=model, timeout=timeout, console=console, enable_hierarchical_cover=effective_gen_cover)
 
     library = generator.generate_library(
         books=books_to_eval,

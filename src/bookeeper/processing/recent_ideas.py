@@ -401,6 +401,15 @@ class IdeaEmbeddingIndex:
         Extract all Concept/Idea nodes from knowledge graph and reuse or compute their embeddings.
         Newly computed embeddings are cached back onto the Concept/Idea nodes in store.graph.
         """
+        from bookeeper.graph.embedding_codec import get_node_embedding
+
+        # Check if store already has an up-to-date cached IdeaEmbeddingIndex
+        if store and hasattr(store, "_cached_idea_index") and store._cached_idea_index is not None:
+            cached_count = getattr(store, "_cached_idea_count", -1)
+            curr_count = sum(1 for _, a in store.graph.nodes(data=True) if a.get("type") == "Concept" or a.get("is_idea")) if store.graph else 0
+            if cached_count == curr_count:
+                return store._cached_idea_index
+
         names: List[str] = []
         texts: List[str] = []
         node_ids: List[str] = []
@@ -436,7 +445,7 @@ class IdeaEmbeddingIndex:
                     node_ids.append(node_id)
                     months[clean_name] = month
 
-                    existing_emb = attrs.get("embedding")
+                    existing_emb = get_node_embedding(attrs, return_numpy=False)
                     if isinstance(existing_emb, (list, np.ndarray)) and len(existing_emb) > 1:
                         cached_vecs[idx] = [float(x) for x in existing_emb]
                     else:
@@ -525,7 +534,7 @@ class IdeaEmbeddingIndex:
             keys = np.arange(len(names), dtype=np.int64)
             usearch_index.add(keys, normalized)
 
-        return cls(
+        res_idx = cls(
             idea_names=names,
             idea_summaries=texts,
             idea_months=months,
@@ -534,6 +543,10 @@ class IdeaEmbeddingIndex:
             embedded_count=len(newly_embedded),
             index=usearch_index,
         )
+        if store:
+            store._cached_idea_index = res_idx
+            store._cached_idea_count = len(names)
+        return res_idx
 
     def find_best_match(self, query_vec: np.ndarray) -> Tuple[Optional[str], float, str]:
         """
@@ -739,6 +752,7 @@ class RecentIdeaChunkRouter:
         self,
         chunks: Sequence[Any],
         batch_size: int = 64,
+        on_progress: Optional[Callable[[int], None]] = None,
     ) -> BatchRoutingResult:
         """
         Reuse cached chunk embeddings (or compute missing ones) and route each chunk
@@ -766,10 +780,21 @@ class RecentIdeaChunkRouter:
             return result
 
         # Check which chunks already have cached embeddings from chunking / ChunkStore
+        from bookeeper.graph.embedding_codec import get_node_embedding
+
         cached_vecs: Dict[int, List[float]] = {}
         missing_indices: List[int] = []
         for idx, chk in enumerate(chunks):
-            existing_emb = chk.get("embedding") if isinstance(chk, dict) else getattr(chk, "embedding", None)
+            existing_emb = None
+            if isinstance(chk, dict):
+                existing_emb = get_node_embedding(chk, return_numpy=False)
+            else:
+                raw_emb = getattr(chk, "embedding", None)
+                if isinstance(raw_emb, (list, np.ndarray)) and len(raw_emb) > 1:
+                    existing_emb = raw_emb
+                elif hasattr(chk, "__dict__"):
+                    existing_emb = get_node_embedding(chk.__dict__, return_numpy=False)
+
             if isinstance(existing_emb, (list, np.ndarray)) and len(existing_emb) > 1:
                 cached_vecs[idx] = [float(x) for x in existing_emb]
             else:
@@ -807,6 +832,7 @@ class RecentIdeaChunkRouter:
                             missing_texts,
                             batch_size=min(batch_size, 16),
                             max_batch_chars=12000,
+                            on_progress=on_progress,
                         )
                     except Exception as e:
                         logger.warning(f"Error embedding chunks across pool: {e}")
@@ -821,6 +847,8 @@ class RecentIdeaChunkRouter:
                         try:
                             v = self.embeddings.embed_documents(sub_batch)
                             computed_raw.extend(v)
+                            if on_progress is not None:
+                                on_progress(len(sub_batch))
                         except Exception as e:
                             logger.warning(f"Error embedding chunks batch {b_idx}: {e}")
                             for _ in sub_batch:
@@ -997,9 +1025,14 @@ class SemanticRoutingEngine:
                 max_batch_chunk_size=self.max_batch_chunk_size,
             )
 
-    def route_chunks(self, chunks: Sequence[Any], batch_size: int = 64) -> BatchRoutingResult:
+    def route_chunks(
+        self,
+        chunks: Sequence[Any],
+        batch_size: int = 64,
+        on_progress: Optional[Callable[[int], None]] = None,
+    ) -> BatchRoutingResult:
         """Route chunks into UNASSIGNED, HIGH_CONFIDENCE, or LIMBO priorities."""
-        return self.router.route_chunks(chunks, batch_size=batch_size)
+        return self.router.route_chunks(chunks, batch_size=batch_size, on_progress=on_progress)
 
     def integrate_high_confidence_chunk(
         self,

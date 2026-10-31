@@ -1238,6 +1238,41 @@ def test_multi_server_embedding_distribution_across_all_pool_nodes():
         assert calls_by_url["http://localhost:11434"] == 2
 
 
+def test_failover_ollama_embeddings_fast_failover_when_primary_offline():
+    """
+    Verify that when the primary embedding server is completely offline (connection refused/timeout),
+    FailoverOllamaEmbeddings fails over cleanly to the available secondary server without hanging.
+    """
+    import urllib.error
+    from unittest.mock import patch
+
+    servers = [
+        OllamaServerConfig(url="http://dead-node:11434", priority=1, capability=["embedding"]),
+        OllamaServerConfig(url="http://live-node:11434", priority=2, capability=["embedding"]),
+    ]
+    pool = OllamaPool(servers=servers, cooldown_seconds=600)
+    embeddings = FailoverOllamaEmbeddings(pool=pool, model="nomic-embed-text")
+
+    def mock_post(url, **kwargs):
+        if "dead-node" in url:
+            raise requests.exceptions.ConnectTimeout("Connection timed out to dead-node")
+        # Live node succeeds
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"embeddings": [[0.1, 0.2, 0.3]]}
+        return mock_resp
+
+    with patch("requests.post", side_effect=mock_post):
+        res = embeddings.embed_documents(["Test idea text"], batch_size=1)
+        assert len(res) == 1
+        assert res[0] == [0.1, 0.2, 0.3]
+        # dead-node should now be in cooldown
+        dead_node = pool.nodes[0]
+        assert dead_node.failed_at is not None
+        assert not dead_node.is_eligible(600)
+
+
+
 
 
 

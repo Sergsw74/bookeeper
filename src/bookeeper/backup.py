@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 # Standard artifact directories and filenames in the output folder
 KNOWLEDGE_FILES = {
     "knowledge_graph.json",
-    "knowledge_graph.graphml",
+    "knowledge_graph_spine.json",
+    "shards_manifest.json",
     ".bookeeper_state.json",
     "concept_embeddings.npz",
     "verification_report.json",
@@ -37,6 +38,7 @@ KNOWLEDGE_DIR_NAMES = {
     "obsidian_vault",
     ".book_states",
     "chunks",
+    "shards",
     "lightrag",
 }
 
@@ -75,6 +77,7 @@ EXCLUDED_EXTENSIONS = {
     ".tar",
     ".gz",
     ".tgz",
+    ".graphml",
 }
 
 EXCLUDED_EXACT_FILENAMES = {
@@ -501,6 +504,15 @@ def clean_knowledge_artifacts(target_dir: Path) -> Dict[str, int]:
             except Exception as e:
                 logger.warning(f"Failed to remove {fp}: {e}")
 
+    # Remove optional exported GraphML if present
+    gml = target_dir / "knowledge_graph.graphml"
+    if gml.is_file():
+        try:
+            gml.unlink()
+            stats["files_removed"] += 1
+        except Exception:
+            pass
+
     # Remove any verification/cross-check reports
     for rp in target_dir.glob("*verification_report*.json"):
         if rp.is_file():
@@ -754,7 +766,13 @@ def inspect_backup(archive_path: Path) -> Dict[str, Any]:
 
     # Category summaries
     categories = {
-        "graph": [e for e in content_entries if e["path"].startswith("knowledge_graph.")],
+        "graph": [
+            e
+            for e in content_entries
+            if e["path"].startswith("knowledge_graph.")
+            or e["path"] in ("knowledge_graph_spine.json", "shards_manifest.json")
+            or e["path"].startswith("shards/")
+        ],
         "obsidian": [e for e in content_entries if e["path"].startswith("obsidian_vault/")],
         "book_states": [e for e in content_entries if e["path"].startswith(".book_states/")],
         "chunks": [e for e in content_entries if e["path"].startswith("chunks/")],

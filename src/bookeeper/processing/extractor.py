@@ -613,6 +613,18 @@ class KnowledgeExtractor:
                 if isinstance(content, str):
                     input_chars += len(content)
 
+        prompt_parts = []
+        for m in messages:
+            c = getattr(m, "content", "")
+            if isinstance(c, str):
+                prompt_parts.append(c)
+            elif isinstance(c, list):
+                for sub in c:
+                    prompt_parts.append(str(sub.get("text", sub) if isinstance(sub, dict) else sub))
+            else:
+                prompt_parts.append(str(m))
+        full_prompt_text = "\n".join(prompt_parts)
+
         def _invoke(url: str):
             # 1. Direct curl invocation with format="json" for maximum reliability with Ollama
             if shutil.which("curl"):
@@ -654,6 +666,16 @@ class KnowledgeExtractor:
                     if res.returncode == 0 and res.stdout.strip():
                         data = json.loads(res.stdout)
                         content = data.get("message", {}).get("content", "")
+                        try:
+                            from bookeeper.processing.token_tracker import TokenTracker
+                            TokenTracker.get_instance().record_response_data(
+                                data,
+                                prompt_text=full_prompt_text,
+                                completion_text=content,
+                                task_type="llm",
+                            )
+                        except Exception as track_err:
+                            logger.debug(f"Failed to record token usage: {track_err}")
                         if "<think>" in content and "</think>" in content:
                             content = content.split("</think>")[-1].strip()
                         if content and content.strip():
@@ -691,7 +713,15 @@ class KnowledgeExtractor:
                     client_kwargs={"timeout": timeout_float},
                 )
                 chain = llm.with_structured_output(schema_cls)
-                return chain.invoke(messages)
+                inv_res = chain.invoke(messages)
+                try:
+                    from bookeeper.processing.token_tracker import TokenTracker, estimate_token_count
+                    p_toks = estimate_token_count(full_prompt_text)
+                    o_toks = estimate_token_count(str(inv_res))
+                    TokenTracker.get_instance().record_llm_tokens(input_tokens=p_toks, output_tokens=o_toks)
+                except Exception as track_err:
+                    logger.debug(f"Failed to record fallback token usage: {track_err}")
+                return inv_res
             except Exception as exc:
                 raise exc
 

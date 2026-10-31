@@ -17,6 +17,7 @@ from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 
 RUSSIAN_VOWELS = set("аеёиоуыэюяАЕЁИОУЫЭЮЯ")
@@ -122,6 +123,20 @@ class BookParser:
         return all(cls.is_graphical_format(f) for f in content_files)
 
     @classmethod
+    def sanitize_surrogates(cls, text: Optional[str]) -> str:
+        """
+        Recombine valid UTF-16 surrogate pairs into standard 4-byte Unicode characters,
+        and replace any isolated/malformed surrogates (U+D800 to U+DFFF) with replacement characters.
+        Prevents 'utf-8 codec can't encode characters: surrogates not allowed' errors in PDF/math fonts.
+        """
+        if not text or not isinstance(text, str):
+            return text or ""
+        try:
+            return text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+        except Exception:
+            return "".join(c if not (0xD800 <= ord(c) <= 0xDFFF) else "\ufffd" for c in text)
+
+    @classmethod
     def repair_mojibake(cls, text: Optional[str]) -> str:
         """
         Detect and repair common character encoding corruption / mojibake:
@@ -133,7 +148,7 @@ class BookParser:
         if not text or not isinstance(text, str):
             return text or ""
 
-        s = text
+        s = cls.sanitize_surrogates(text)
 
         # 1. Whole-string fast checks if applicable
         for enc in ("cp1252", "latin1"):
@@ -482,6 +497,8 @@ class BookParser:
         """Extract pages from PDF batched into sequential sections."""
         path = Path(pdf_path).expanduser().resolve()
         try:
+            import logging
+            logging.getLogger("pypdf").setLevel(logging.ERROR)
             from pypdf import PdfReader
         except ImportError as e:
             raise ImportError("pypdf is required to parse PDF files. Install with `pip install pypdf`") from e

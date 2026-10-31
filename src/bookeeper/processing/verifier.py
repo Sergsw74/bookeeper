@@ -571,6 +571,16 @@ class IdeaVerifier:
                             content = data.get("message", {}).get("content", "")
                             if not content and "thinking" in data.get("message", {}):
                                 content = data["message"]["thinking"]
+                            try:
+                                from bookeeper.processing.token_tracker import TokenTracker
+                                TokenTracker.get_instance().record_response_data(
+                                    data,
+                                    prompt_text=prompt,
+                                    completion_text=content,
+                                    task_type="llm",
+                                )
+                            except Exception:
+                                pass
                             parsed = _parse_verification_text(content)
                             if parsed:
                                 return parsed

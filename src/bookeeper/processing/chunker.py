@@ -185,7 +185,7 @@ class HierarchicalChunker:
                 continue
 
             # Create macro parent chunk ID and text for this subsection
-            sub_h = hashlib.sha256(sub_text.encode("utf-8")).hexdigest()[:8]
+            sub_h = hashlib.sha256(sub_text.encode("utf-8", "replace")).hexdigest()[:8]
             parent_chunk_id = f"b{book_id}_c{section.chapter_idx}_sub{sub_idx}_{sub_h}"
             parent_text = sub_text[:3000]
 
@@ -213,7 +213,7 @@ class HierarchicalChunker:
                 if len(chunk_text) < self.min_chunk_chars and raw_chunks_with_emb and len(raw_chunks_with_emb) > 1:
                     continue
 
-                h = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()[:8]
+                h = hashlib.sha256(chunk_text.encode("utf-8", "replace")).hexdigest()[:8]
                 cid = f"b{book_id}_c{section.chapter_idx}_p{global_chunk_idx}_{h}"
 
                 chunk = HierarchicalChunk(

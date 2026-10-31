@@ -369,6 +369,16 @@ class BenchmarkJudge:
                 if "error" in data:
                     raise RuntimeError(f"Ollama server {url} error: {data['error']}")
                 content = data.get("message", {}).get("content", "")
+                try:
+                    from bookeeper.processing.token_tracker import TokenTracker
+                    TokenTracker.get_instance().record_response_data(
+                        data,
+                        prompt_text=prompt,
+                        completion_text=content,
+                        task_type="llm",
+                    )
+                except Exception:
+                    pass
                 cleaned = _clean_json_str(content)
                 return json.loads(cleaned)
 

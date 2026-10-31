@@ -360,6 +360,11 @@ def test_build_graph_chronological_batch_integration(tmp_path: Path):
 
         # Verify Knowledge Graph has concept with earliest month 1999-08
         kg_path = out_dir / "knowledge_graph.json"
+        if not kg_path.is_file():
+            kg_path = out_dir / "knowledge_graph_spine.json"
+        if not kg_path.is_file():
+            print("STDOUT WAS:\n", res.stdout)
+            print("OUT DIR FILES:\n", list(out_dir.glob("**/*")))
         assert kg_path.is_file()
         store = ConceptGraphStore()
         store.load(kg_path)

@@ -16,6 +16,17 @@ from bookeeper.processing.extractor import (
 )
 
 from bookeeper.processing.rolling_semantic_chunker import RollingWindowSemanticChunker
+from bookeeper.processing.hierarchical_cover import (
+    CoverDecision,
+    compute_cosine_similarity,
+    hierarchical_semantic_cover,
+    is_reference_or_boilerplate_chunk,
+)
+from bookeeper.processing.token_tracker import (
+    TokenCounts,
+    TokenTracker,
+    estimate_token_count,
+)
 from bookeeper.processing.idea_postprocessor import (
     ConsolidatedIdeaOutput,
     IdeaCluster,
@@ -40,6 +51,13 @@ __all__ = [
     "HierarchicalChunk",
     "HierarchicalChunker",
     "RollingWindowSemanticChunker",
+    "hierarchical_semantic_cover",
+    "compute_cosine_similarity",
+    "is_reference_or_boilerplate_chunk",
+    "CoverDecision",
+    "TokenCounts",
+    "TokenTracker",
+    "estimate_token_count",
     "BookMetadata",
     "Concept",
     "ExtractedIdea",

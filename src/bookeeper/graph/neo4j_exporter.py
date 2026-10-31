@@ -35,6 +35,7 @@ except ImportError:
 
 from bookeeper.calibre.parser import BookParser
 from bookeeper.config import Neo4jConfig
+from bookeeper.graph.embedding_codec import get_node_embedding
 from bookeeper.graph.store import ConceptGraphStore
 
 logger = logging.getLogger(__name__)
@@ -698,12 +699,14 @@ class Neo4jExporter:
             if not name:
                 continue
             nid = str(item.get("id") or f"concept:{name}")
-            emb = item.get("embedding")
-            clean_emb = [float(x) for x in emb] if emb else None
+            clean_emb = get_node_embedding(item, return_numpy=False)
             if clean_emb and not detected_dim:
                 detected_dim = len(clean_emb)
 
-            props = clean_neo4j_properties(item, exclude_keys={"id", "embedding"})
+            props = clean_neo4j_properties(
+                item,
+                exclude_keys={"id", "embedding", "embedding_b64", "embedding_dim", "embedding_dtype"},
+            )
             props["id"] = nid
             props["name"] = name
             props["type"] = "Concept"
@@ -896,21 +899,25 @@ class Neo4jExporter:
 
             if incremental_mode:
                 for u_id, v_id in dirty_edge_set:
-                    if g.has_node(u_id):
+                    if store.has_node(u_id):
                         dirty_node_set.add(u_id)
-                    if g.has_node(v_id):
+                    if store.has_node(v_id):
                         dirty_node_set.add(v_id)
-                target_nodes_iter = [
-                    (nid, g.nodes[nid]) for nid in dirty_node_set if g.has_node(nid)
-                ]
-                target_edges_iter = [
-                    (u_id, v_id, g.edges[u_id, v_id])
-                    for (u_id, v_id) in dirty_edge_set
-                    if g.has_edge(u_id, v_id)
-                ]
+                target_nodes_iter = []
+                for nid in dirty_node_set:
+                    ndata = store.get_node_data(nid) if hasattr(store, "get_node_data") else (g.nodes[nid] if g.has_node(nid) else None)
+                    if ndata is not None:
+                        target_nodes_iter.append((nid, ndata))
+
+                target_edges_iter = []
+                for (u_id, v_id) in dirty_edge_set:
+                    if g.has_edge(u_id, v_id):
+                        target_edges_iter.append((u_id, v_id, g.edges[u_id, v_id]))
+                    elif getattr(store, "is_sharded", False) and store.active_shard_graph and store.active_shard_graph.has_edge(u_id, v_id):
+                        target_edges_iter.append((u_id, v_id, store.active_shard_graph.edges[u_id, v_id]))
             else:
-                target_nodes_iter = list(g.nodes(data=True))
-                target_edges_iter = list(g.edges(data=True))
+                target_nodes_iter = list(store.iter_all_nodes(data=True)) if getattr(store, "is_sharded", False) else list(g.nodes(data=True))
+                target_edges_iter = list(store.iter_all_edges(data=True)) if getattr(store, "is_sharded", False) else list(g.edges(data=True))
 
             total_nodes = len(target_nodes_iter)
             total_edges = len(target_edges_iter)
@@ -929,18 +936,22 @@ class Neo4jExporter:
                 primary_label = sanitize_label(attrs.get("type", "Entity"))
                 is_idea = bool(attrs.get("is_idea", False) or attrs.get("tag") == "idea" or primary_label in ("Concept", "Idea"))
                 distinct_labels.add(primary_label)
-                raw_emb = attrs.get("embedding")
+                raw_emb = get_node_embedding(attrs, return_numpy=False)
                 if is_idea:
                     distinct_labels.add("Idea")
-                    if isinstance(raw_emb, (list, tuple)) and len(raw_emb) > 0:
+                    if raw_emb and len(raw_emb) > 0:
                         idea_vector_dim = len(raw_emb)
                 elif primary_label == "Chunk":
-                    if isinstance(raw_emb, (list, tuple)) and len(raw_emb) > 0:
+                    if raw_emb and len(raw_emb) > 0:
                         chunk_vector_dim = len(raw_emb)
 
                 # Export embeddings on :Idea and :Chunk nodes
-                excl = None if (is_idea or primary_label == "Chunk") else {"embedding"}
+                excl = {"embedding_b64", "embedding_dim", "embedding_dtype"}
+                if not (is_idea or primary_label == "Chunk"):
+                    excl.add("embedding")
                 props = clean_neo4j_properties(attrs, exclude_keys=excl)
+                if (is_idea or primary_label == "Chunk") and raw_emb:
+                    props["embedding"] = raw_emb
                 props["id"] = node_id  # Guarantee primary key property
 
                 group_key = (primary_label, is_idea)

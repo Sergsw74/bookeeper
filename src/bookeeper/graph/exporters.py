@@ -448,11 +448,14 @@ class GraphMLExporter:
         try:
             # Ensure all attribute values are primitive strings/ints for GraphML writer
             g_copy = nx.DiGraph()
-            for n, attrs in store.graph.nodes(data=True):
+            nodes_iter = store.iter_all_nodes(data=True) if getattr(store, "is_sharded", False) else store.graph.nodes(data=True)
+            edges_iter = store.iter_all_edges(data=True) if getattr(store, "is_sharded", False) else store.graph.edges(data=True)
+
+            for n, attrs in nodes_iter:
                 clean_attrs = {_clean_str(k): _clean_xml_attr(v) for k, v in attrs.items()}
                 g_copy.add_node(_clean_str(n), **clean_attrs)
 
-            for u, v, attrs in store.graph.edges(data=True):
+            for u, v, attrs in edges_iter:
                 clean_attrs = {_clean_str(k): _clean_xml_attr(val) for k, val in attrs.items()}
                 g_copy.add_edge(_clean_str(u), _clean_str(v), **clean_attrs)
 
@@ -473,11 +476,14 @@ class GEXFExporter:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             g_copy = nx.DiGraph()
-            for n, attrs in store.graph.nodes(data=True):
+            nodes_iter = store.iter_all_nodes(data=True) if getattr(store, "is_sharded", False) else store.graph.nodes(data=True)
+            edges_iter = store.iter_all_edges(data=True) if getattr(store, "is_sharded", False) else store.graph.edges(data=True)
+
+            for n, attrs in nodes_iter:
                 clean_attrs = {_clean_str(k): _clean_xml_attr(v) for k, v in attrs.items()}
                 g_copy.add_node(_clean_str(n), **clean_attrs)
 
-            for u, v, attrs in store.graph.edges(data=True):
+            for u, v, attrs in edges_iter:
                 clean_attrs = {_clean_str(k): _clean_xml_attr(val) for k, val in attrs.items()}
                 g_copy.add_edge(_clean_str(u), _clean_str(v), **clean_attrs)
 

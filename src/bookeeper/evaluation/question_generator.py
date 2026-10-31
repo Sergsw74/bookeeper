@@ -21,6 +21,12 @@ from pydantic import BaseModel, Field, model_validator
 from bookeeper.calibre.parser import BookParser
 from bookeeper.config import Settings
 from bookeeper.processing.extractor import OllamaPool
+from bookeeper.processing.hierarchical_cover import (
+    CoverDecision,
+    _cosine_sim,
+    hierarchical_semantic_cover,
+    is_reference_or_boilerplate_chunk,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +177,12 @@ class QuestionGenerator:
         pool: Optional[OllamaPool] = None,
         timeout: int = 120,
         console: Optional[Any] = None,
+        embeddings: Optional[Any] = None,
+        enable_hierarchical_cover: Optional[bool] = None,
+        cover_threshold: Optional[float] = None,
+        skip_references: Optional[bool] = None,
+        enable_mmr: Optional[bool] = None,
+        mmr_lambda: Optional[float] = None,
     ):
         self.settings = settings
         self.model_name = model_name or getattr(settings, "resolved_verifier_model", settings.llm_model)
@@ -183,6 +195,32 @@ class QuestionGenerator:
         )
         self.timeout = timeout
         self.console = console or (Console() if Console else None)
+
+        if enable_hierarchical_cover is not None:
+            self.enable_hierarchical_cover = enable_hierarchical_cover
+        elif enable_mmr is not None:
+            self.enable_hierarchical_cover = enable_mmr
+        else:
+            self.enable_hierarchical_cover = getattr(settings, "enable_hierarchical_cover", True)
+
+        self.cover_threshold = (
+            cover_threshold if cover_threshold is not None
+            else getattr(settings, "cover_similarity_threshold", 0.92)
+        )
+        self.skip_references = (
+            skip_references if skip_references is not None
+            else getattr(settings, "skip_references_sections", True)
+        )
+        self.enable_mmr = self.enable_hierarchical_cover
+        self.mmr_lambda = mmr_lambda if mmr_lambda is not None else getattr(settings, "mmr_lambda", 0.6)
+
+        self.embeddings = embeddings
+        if self.embeddings is None and self.enable_hierarchical_cover:
+            try:
+                from bookeeper.processing.ollama_pool import FailoverOllamaEmbeddings
+                self.embeddings = FailoverOllamaEmbeddings.from_settings(settings)
+            except Exception as e:
+                logger.debug(f"Could not initialize FailoverOllamaEmbeddings for QuestionGenerator: {e}")
 
     def display_setup_overview(self, books: List[Dict[str, Any]], questions_per_book: int) -> None:
         """Display selected book titles, pool nodes, and synthesis parameters."""
@@ -297,6 +335,16 @@ class QuestionGenerator:
                 if "error" in data:
                     raise RuntimeError(f"Ollama server {url} error: {data['error']}")
                 content = data.get("message", {}).get("content", "")
+                try:
+                    from bookeeper.processing.token_tracker import TokenTracker
+                    TokenTracker.get_instance().record_response_data(
+                        data,
+                        prompt_text=prompt,
+                        completion_text=content,
+                        task_type="llm",
+                    )
+                except Exception:
+                    pass
                 cleaned = _clean_json_str(content)
                 parsed = json.loads(cleaned)
                 if isinstance(parsed, list):
@@ -313,9 +361,22 @@ class QuestionGenerator:
             task_type="verification",
         )
 
-    def extract_book_sample_context(self, file_path: Union[Path, str], max_chars: int = 12000) -> Tuple[List[str], str]:
+    def extract_book_sample_context(
+        self,
+        file_path: Union[Path, str],
+        max_chars: int = 12000,
+        book_title: Optional[str] = None,
+        enable_hierarchical_cover: Optional[bool] = None,
+        cover_threshold: Optional[float] = None,
+        skip_references: Optional[bool] = None,
+        lambda_param: Optional[float] = None,
+        enable_mmr: Optional[bool] = None,
+    ) -> Tuple[List[str], str]:
         """
         Extract outline (chapter/section titles) and sampled excerpt text from book.
+        Applies section-aware hierarchical semantic cover to maximize information diversity
+        across chapters while skipping redundant snippets and reference/bibliography boilerplate.
+        Can be disabled via enable_hierarchical_cover=False.
         """
         p = Path(file_path).expanduser().resolve()
         if not p.is_file():
@@ -329,20 +390,107 @@ class QuestionGenerator:
         sections = BookParser.parse(p)
         titles = [s.title for s in sections if s.title]
 
-        sampled_parts = []
-        chars_collected = 0
-        # Sample across beginning, middle, and later chapters
+        # 1. Initial selection for outlining chunks: sample candidate snippets across chapters
         step = max(1, len(sections) // 6)
+        candidates: List[Dict[str, Any]] = []
         for idx in range(0, len(sections), step):
             s = sections[idx]
             txt = s.text.strip() if s.text else ""
             if len(txt) > 80:
                 header = f"\n[Chapter/Section: {s.title}]\n" if s.title else "\n"
                 snippet = txt[:1800]
-                sampled_parts.append(f"{header}{snippet}")
-                chars_collected += len(snippet)
-                if chars_collected >= max_chars:
-                    break
+                candidates.append({
+                    "title": s.title or "",
+                    "snippet": snippet,
+                    "header": header,
+                    "full_block": f"{header}{snippet}",
+                    "section_title": s.title or "",
+                    "text": snippet,
+                })
+
+        if not candidates:
+            return titles[:20], ""
+
+        eff_cover = self.enable_hierarchical_cover if enable_hierarchical_cover is None else enable_hierarchical_cover
+        if eff_cover is None and enable_mmr is not None:
+            eff_cover = enable_mmr
+        eff_threshold = self.cover_threshold if cover_threshold is None else cover_threshold
+        eff_skip_ref = self.skip_references if skip_references is None else skip_references
+
+        selected_candidates = candidates
+        query_text = book_title or (titles[0] if titles else p.stem.replace("_", " "))
+        embeddings_client = getattr(self, "embeddings", None)
+
+        if eff_cover and len(candidates) > 1:
+            # First filter out reference / bibliography boilerplate
+            if eff_skip_ref:
+                non_ref = [c for c in candidates if not is_reference_or_boilerplate_chunk(c)]
+                if non_ref:
+                    candidates = non_ref
+
+            if embeddings_client is not None and len(candidates) > 1:
+                try:
+                    logger.info(
+                        f"Applying hierarchical semantic cover across {len(candidates)} outlining candidates for '{query_text}' (tau={eff_threshold})..."
+                    )
+                    if self.console:
+                        self.console.print(
+                            f"  [dim cyan]Hierarchical Cover: Evaluating {len(candidates)} candidates for '[bold white]{query_text}[/bold white]' (tau={eff_threshold:.2f})...[/dim cyan]"
+                        )
+
+                    chunk_texts = [c["snippet"] for c in candidates]
+                    cand_vecs = embeddings_client.embed_documents(chunk_texts)
+
+                    if cand_vecs and len(cand_vecs) == len(candidates):
+                        import numpy as np
+
+                        chosen: List[Dict[str, Any]] = []
+                        chosen_vecs: List[np.ndarray] = []
+
+                        for cand, vec in zip(candidates, cand_vecs):
+                            arr = np.asarray(vec, dtype=np.float32)
+                            if not chosen_vecs:
+                                chosen.append(cand)
+                                chosen_vecs.append(arr)
+                                continue
+
+                            sims = [_cosine_sim(arr, cv) for cv in chosen_vecs]
+                            max_sim = max(sims) if sims else 0.0
+
+                            if max_sim < eff_threshold:
+                                chosen.append(cand)
+                                chosen_vecs.append(arr)
+
+                        selected_candidates = chosen if chosen else candidates
+                        status_done = (
+                            f"Hierarchical Cover complete: Retained {len(selected_candidates)} distinct snippets "
+                            f"from {len(candidates)} candidates (tau={eff_threshold:.2f})"
+                        )
+                        logger.info(status_done)
+                        if self.console:
+                            self.console.print(
+                                f"  [bold green]✓[/bold green] [dim cyan]{status_done}[/dim cyan]"
+                            )
+                except Exception as e:
+                    logger.warning(
+                        f"Hierarchical cover selection on outlining chunks failed: {e}. Preserving sequential sampling."
+                    )
+                    selected_candidates = candidates
+            else:
+                selected_candidates = candidates
+        elif not eff_cover:
+            logger.debug(f"Hierarchical cover disabled for '{query_text}'. Preserving sequential sampling.")
+            logger.debug(f"MMR chunk selection disabled for '{query_text}'. Preserving sequential sampling.")
+
+        # 3. Assemble sampled excerpt text up to max_chars
+        sampled_parts = []
+        chars_collected = 0
+        for item in selected_candidates:
+            block = item["full_block"]
+            sampled_parts.append(block)
+            chars_collected += len(item["snippet"])
+            if chars_collected >= max_chars:
+                break
 
         return titles[:20], "".join(sampled_parts)
 
@@ -361,7 +509,7 @@ class QuestionGenerator:
         sample_text = ""
         if book_path:
             try:
-                outline, sample_text = self.extract_book_sample_context(book_path)
+                outline, sample_text = self.extract_book_sample_context(book_path, book_title=book_title)
             except Exception as e:
                 logger.warning(f"Could not extract outline from {book_path}: {e}")
 

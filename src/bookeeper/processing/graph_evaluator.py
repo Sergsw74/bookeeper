@@ -6,6 +6,7 @@ the semantic literature universe (raw chunks U) using cosine projection geometry
 distributional percentiles, Hausdorff blind spots, and Vendi spectral entropy diversity.
 """
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
@@ -15,6 +16,7 @@ from pydantic import BaseModel, Field
 from rich.console import Console
 from rich.table import Table
 
+from bookeeper.graph.embedding_codec import get_node_embedding
 from bookeeper.graph.store import ConceptGraphStore
 from bookeeper.processing.memory_guard import (
     DEFAULT_MAX_MEMORY_BYTES,
@@ -132,6 +134,11 @@ class GraphSpaceMetrics(BaseModel):
         None, description="Post-processing idea drift and semantic alignment metrics."
     )
 
+    # Low-P10 Verification Prompt
+    low_p10_prompt_path: Optional[str] = Field(None, description="Path to generated low-p10 verification prompt if requested.")
+    low_p10_prompt_chunks_count: Optional[int] = Field(None, description="Number of low-p10 chunks included in verification prompt.")
+    low_p10_prompt_chars_count: Optional[int] = Field(None, description="Character count of generated low-p10 verification prompt.")
+
 
 class GraphSpaceComparisonReport(BaseModel):
     """
@@ -179,6 +186,11 @@ class GraphSpaceComparisonReport(BaseModel):
     decision_pass: bool
     pass_reason: str
     gate_checklist: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+
+    # Low-P10 Verification Prompt
+    low_p10_prompt_path: Optional[str] = Field(None, description="Path to generated low-p10 verification prompt if requested.")
+    low_p10_prompt_chunks_count: Optional[int] = Field(None, description="Number of low-p10 chunks included in verification prompt.")
+    low_p10_prompt_chars_count: Optional[int] = Field(None, description="Character count of generated low-p10 verification prompt.")
 
 
 # ==============================================================================
@@ -793,19 +805,23 @@ def get_parent_chunk_ids(store: ConceptGraphStore) -> Set[str]:
 def extract_concept_embeddings(store: ConceptGraphStore) -> Tuple[List[str], np.ndarray]:
     """
     Extracts all Idea/Concept node IDs and their stored vector embeddings.
+    Transparently supports both legacy float arrays and compact Base64 binary vectors.
     """
+    from bookeeper.graph.embedding_codec import get_node_embedding
+
     names: List[str] = []
     vec_arrays: List[np.ndarray] = []
 
-    for node_id, attrs in store.graph.nodes(data=True):
+    node_source = store.iter_all_nodes(data=True) if hasattr(store, "iter_all_nodes") else store.graph.nodes(data=True)
+    for node_id, attrs in node_source:
         ntype = attrs.get("type", "")
         is_idea = bool(attrs.get("is_idea") or attrs.get("tag") == "idea" or ntype in ("Concept", "Idea"))
         if is_idea:
-            emb = attrs.get("embedding")
-            if isinstance(emb, (list, tuple, np.ndarray)) and len(emb) > 1:
+            emb = get_node_embedding(attrs, return_numpy=True)
+            if emb is not None and len(emb) > 1:
                 clean_name = attrs.get("name") or str(node_id).replace("concept:", "")
                 names.append(str(clean_name))
-                vec_arrays.append(np.asarray(emb, dtype=np.float32))
+                vec_arrays.append(emb)
 
     if not vec_arrays:
         return names, np.empty((0, 0), dtype=np.float32)
@@ -815,21 +831,27 @@ def extract_concept_embeddings(store: ConceptGraphStore) -> Tuple[List[str], np.
 
 def extract_chunk_embeddings_and_weights(
     store: ConceptGraphStore,
+    chunks_dir: Optional[Union[Path, str]] = None,
 ) -> Tuple[List[str], np.ndarray, np.ndarray]:
     """
     Extracts all Chunk node IDs, their stored vector embeddings, and chunk character weights.
+    Seamlessly streams chunk nodes across Spine and Shards (or falls back to persistent chunks_dir
+    when chunks are not embedded in graph nodes).
     """
+    from bookeeper.graph.embedding_codec import get_node_embedding
+
     chunk_ids: List[str] = []
     vec_arrays: List[np.ndarray] = []
     weights: List[float] = []
 
-    for node_id, attrs in store.graph.nodes(data=True):
+    node_source = store.iter_all_nodes(data=True) if hasattr(store, "iter_all_nodes") else store.graph.nodes(data=True)
+    for node_id, attrs in node_source:
         if attrs.get("type") == "Chunk":
-            emb = attrs.get("embedding")
-            if isinstance(emb, (list, tuple, np.ndarray)) and len(emb) > 1:
+            emb = get_node_embedding(attrs, return_numpy=True)
+            if emb is not None and len(emb) > 1:
                 cid = attrs.get("chunk_id") or str(node_id).replace("chunk:", "")
                 chunk_ids.append(str(cid))
-                vec_arrays.append(np.asarray(emb, dtype=np.float32))
+                vec_arrays.append(emb)
                 c_len = attrs.get("char_count")
                 if c_len is not None and int(c_len) > 0:
                     weights.append(float(c_len))
@@ -837,18 +859,275 @@ def extract_chunk_embeddings_and_weights(
                     txt = attrs.get("text") or ""
                     weights.append(float(len(txt)) if len(txt) > 0 else 1.0)
 
+    # Fallback to persistent chunks storage if graph has no loaded chunks
+    if not vec_arrays and chunks_dir is not None:
+        cdir = Path(chunks_dir).expanduser().resolve()
+        if cdir.is_dir():
+            for cfile in sorted(cdir.glob("book_*_chunks.json")):
+                try:
+                    with open(cfile, "r", encoding="utf-8") as f:
+                        cdata = json.load(f)
+                    for citem in cdata.get("chunks", []):
+                        emb = get_node_embedding(citem, return_numpy=True)
+                        if emb is not None and len(emb) > 1:
+                            cid = citem.get("chunk_id") or f"chunk_{len(chunk_ids)}"
+                            chunk_ids.append(str(cid))
+                            vec_arrays.append(emb)
+                            c_len = citem.get("char_count")
+                            if c_len is not None and int(c_len) > 0:
+                                weights.append(float(c_len))
+                            else:
+                                txt = citem.get("text") or ""
+                                weights.append(float(len(txt)) if len(txt) > 0 else 1.0)
+                except Exception as e:
+                    logger.debug(f"Could not load chunks from {cfile}: {e}")
+
     if not vec_arrays:
         return chunk_ids, np.empty((0, 0), dtype=np.float32), np.empty(0, dtype=np.float64)
 
     return chunk_ids, np.vstack(vec_arrays), np.asarray(weights, dtype=np.float64)
 
 
-def extract_chunk_embeddings(store: ConceptGraphStore) -> Tuple[List[str], np.ndarray]:
+def extract_chunk_embeddings(
+    store: ConceptGraphStore,
+    chunks_dir: Optional[Union[Path, str]] = None,
+) -> Tuple[List[str], np.ndarray]:
     """
     Extracts all Chunk node IDs and their stored vector embeddings.
     """
-    cids, mat, _ = extract_chunk_embeddings_and_weights(store)
+    cids, mat, _ = extract_chunk_embeddings_and_weights(store, chunks_dir=chunks_dir)
     return cids, mat
+
+
+def load_chunk_metadata_map(
+    store: ConceptGraphStore,
+    chunks_dir: Optional[Union[Path, str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Builds a lookup mapping chunk_id -> dict with metadata (text, book_id, book_title, section_title).
+    Sources from graph chunk nodes, falling back to chunks_dir.
+    """
+    meta_map: Dict[str, Dict[str, Any]] = {}
+    node_source = store.iter_all_nodes(data=True) if hasattr(store, "iter_all_nodes") else store.graph.nodes(data=True)
+    for node_id, attrs in node_source:
+        if attrs.get("type") == "Chunk":
+            cid = str(attrs.get("chunk_id") or node_id).replace("chunk:", "")
+            meta_map[cid] = {
+                "chunk_id": cid,
+                "text": attrs.get("text") or "",
+                "book_id": attrs.get("book_id"),
+                "book_title": attrs.get("book_title") or "",
+                "section_title": attrs.get("section_title") or attrs.get("chapter_title") or "",
+                "char_count": attrs.get("char_count") or len(attrs.get("text") or ""),
+            }
+
+    if chunks_dir is not None:
+        cdir = Path(chunks_dir).expanduser().resolve()
+        if cdir.is_dir():
+            for cfile in sorted(cdir.glob("book_*_chunks.json")):
+                try:
+                    with open(cfile, "r", encoding="utf-8") as f:
+                        cdata = json.load(f)
+                    b_id = cdata.get("book_id")
+                    b_title = cdata.get("book_title") or ""
+                    for citem in cdata.get("chunks", []):
+                        cid = str(citem.get("chunk_id"))
+                        existing = meta_map.get(cid)
+                        if not existing or not existing.get("text"):
+                            meta_map[cid] = {
+                                "chunk_id": cid,
+                                "text": citem.get("text") or "",
+                                "book_id": citem.get("book_id", b_id),
+                                "book_title": citem.get("book_title", b_title) or b_title,
+                                "section_title": citem.get("section_title") or citem.get("chapter_title") or "",
+                                "char_count": citem.get("char_count") or len(citem.get("text") or ""),
+                            }
+                        else:
+                            if not existing.get("book_title") and b_title:
+                                existing["book_title"] = b_title
+                            if not existing.get("section_title"):
+                                existing["section_title"] = citem.get("section_title") or citem.get("chapter_title") or ""
+                except Exception as e:
+                    logger.debug(f"Could not load chunk metadata from {cfile}: {e}")
+
+    return meta_map
+
+
+def generate_low_p10_verification_prompt(
+    store: ConceptGraphStore,
+    universe_store: Optional[ConceptGraphStore] = None,
+    chunks_dir: Optional[Union[Path, str]] = None,
+    output_path: Optional[Union[Path, str]] = None,
+    target_prompt_chars: int = 1_000_000,
+    u_ids: Optional[List[str]] = None,
+    u_mat: Optional[np.ndarray] = None,
+    g_mat: Optional[np.ndarray] = None,
+    u_weights: Optional[np.ndarray] = None,
+    tau: float = 0.75,
+    strict_p10: bool = False,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Generates a ~1M verification benchmark prompt for high-capability frontier models
+    evaluating lowest-p10 proximity chunks from Knowledge Graph verification.
+
+    The prompt asks the model to audit whether these worst-covered literature passages
+    contain specific, non-generic conceptual ideas (which were missed by the extraction pipeline),
+    or if they are legitimately generic / narrative boilerplate.
+
+    Expected output format in prompt:
+    1. Percentage of chunks with ideas out of provided examples.
+    2. Total count of missed ideas.
+    3. Itemized breakdown of missed ideas per chunk.
+    """
+    if g_mat is None:
+        _, g_mat = extract_concept_embeddings(store)
+    if u_mat is None or u_ids is None or u_weights is None:
+        u_target = universe_store if universe_store is not None else store
+        u_ids, u_mat, u_weights = extract_chunk_embeddings_and_weights(u_target, chunks_dir=chunks_dir)
+
+    if len(u_mat) == 0 or len(g_mat) == 0:
+        logger.warning("Cannot generate low-p10 prompt: empty chunk or idea embeddings.")
+        return "", {"file": None, "chunks_count": 0, "chars_count": 0}
+
+    # 1. Cosine similarity of each chunk to nearest graph idea
+    sims = compute_max_cosine_sim_batched(u_mat, g_mat)
+    p10 = compute_weighted_percentile(sims, u_weights, 10.0)
+
+    # 2. Sort chunks ascending by proximity (worst Hausdorff / most isolated chunks first)
+    sorted_indices = np.argsort(sims)
+
+    # 3. Load chunk text and metadata lookup map
+    meta_map = load_chunk_metadata_map(universe_store or store, chunks_dir=chunks_dir)
+
+    # 4. Filter candidate chunks: P10 first, then expand up to target_prompt_chars unless strict_p10
+    candidate_indices: List[int] = []
+    p10_count = 0
+    for idx in sorted_indices:
+        if sims[idx] <= p10:
+            candidate_indices.append(idx)
+            p10_count += 1
+        elif not strict_p10:
+            candidate_indices.append(idx)
+
+    delim = "=" * 80
+    rendered_chunks: List[str] = []
+    selected_indices: List[int] = []
+    total_chunk_chars = 0
+
+    # Leave ~3,500 chars for header and instruction framing
+    available_chars_for_chunks = max(1000, target_prompt_chars - 3500)
+
+    for idx in candidate_indices:
+        cid = u_ids[idx]
+        sim_val = float(sims[idx])
+        meta = meta_map.get(cid, {})
+        txt = meta.get("text", "").strip()
+        if not txt:
+            continue
+
+        b_title = meta.get("book_title") or "Unknown Work"
+        b_id = meta.get("book_id", "")
+        b_info = f"{b_title} (ID: {b_id})" if b_id != "" else b_title
+        sec_title = meta.get("section_title") or "General / Body"
+
+        block = (
+            f"{delim}\n"
+            f"CHUNK [CHUNK_INDEX_PLACEHOLDER] | ID: {cid}\n"
+            f"Book: {b_info} | Section: {sec_title}\n"
+            f"Nearest Concept Cosine Proximity: {sim_val:.4f}\n"
+            f"Character Count: {len(txt):,} chars\n"
+            f"{delim}\n"
+            f"{txt}\n"
+        )
+        block_len = len(block)
+        if total_chunk_chars + block_len > available_chars_for_chunks and len(selected_indices) > 0:
+            break
+        selected_indices.append(idx)
+        rendered_chunks.append(block)
+        total_chunk_chars += block_len
+
+    num_chunks = len(selected_indices)
+    final_blocks = []
+    for i, blk in enumerate(rendered_chunks, start=1):
+        final_blocks.append(blk.replace("[CHUNK_INDEX_PLACEHOLDER]", f"#{i} of {num_chunks}"))
+    chunks_content = "\n".join(final_blocks)
+
+    min_sim = float(sims[selected_indices[0]]) if selected_indices else 0.0
+    max_sim = float(sims[selected_indices[-1]]) if selected_indices else 0.0
+    p10_in_selected = sum(1 for idx in selected_indices if sims[idx] <= p10)
+
+    prompt = (
+        f"# KNOWLEDGE GRAPH BLIND SPOT AUDIT (LOW-P10 / TAIL PROXIMITY CHUNKS)\n\n"
+        f"## 1. AUDIT CONTEXT & OBJECTIVE\n"
+        f"You are an expert scientific and conceptual auditor evaluating an automated Knowledge Graph extraction pipeline.\n"
+        f"The {num_chunks:,} literature text chunks provided below represent the hardest, lowest-proximity passages\n"
+        f"relative to our extracted Knowledge Graph concepts (sorted strictly in ascending order from the most isolated\n"
+        f"blind spot chunks upward).\n\n"
+        f"### Benchmark Scope:\n"
+        f"- Total Chunks Provided: {num_chunks:,}\n"
+        f"- Total Prompt Size: ~{len(chunks_content):,} characters\n"
+        f"- Cosine Proximity Range: {min_sim:.4f} to {max_sim:.4f} (Literature coverage radius τ = {tau:.2f})\n"
+        f"- Knowledge Graph P10 Cutoff: {p10:.4f} ({p10_in_selected:,} chunks in bottom decile)\n\n"
+        f"## 2. EVALUATION TASK\n"
+        f"Your task is to critically analyze each chunk and verify:\n"
+        f"Does this chunk contain GENUINE, SPECIFIC CONCEPTUAL IDEAS that were missed by our pipeline,\n"
+        f"or is it legitimately devoid of specific ideas (generic framing, narrative boilerplate, introductory fluff)?\n\n"
+        f"### CRITERIA:\n"
+        f"- **GENUINE SPECIFIC IDEA (Positive / Missed)**:\n"
+        f"  Contains concrete, non-generic conceptual substance, such as:\n"
+        f"  * A clear conceptual definition or novel theoretical construct.\n"
+        f"  * A specific mathematical formulation, equation, or quantitative law.\n"
+        f"  * An algorithmic mechanism, architecture, protocol, or workflow.\n"
+        f"  * An empirical scientific finding, hypothesis, or experimental deduction.\n"
+        f"  * A distinct ontological distinction or domain-specific causal relationship.\n"
+        f"- **GENERIC / EMPTY PASSAGE (Negative / Correctly Omitted)**:\n"
+        f"  Does NOT contain any distinct, specific ideas. This includes:\n"
+        f"  * Boilerplate, author affiliations, acknowledgments, or bibliography/references.\n"
+        f"  * High-level rhetoric, introductory transitions, or framing ('In this section we discuss...').\n"
+        f"  * Common knowledge, vague truisms, or high-level summaries without actionable substance.\n"
+        f"  * Incidental anecdotes or biographical details lacking conceptual insight.\n\n"
+        f"## 3. REQUIRED RESPONSE FORMAT\n"
+        f"You MUST format your response strictly as follows:\n\n"
+        f"### SUMMARY METRICS\n"
+        f"- **Total Chunks Evaluated**: {num_chunks}\n"
+        f"- **Percentage of Chunks with Specific Ideas**: [Percentage]% ([Count] of {num_chunks} chunks contain genuine specific ideas)\n"
+        f"- **Percentage of Generic / Boilerplate Chunks**: [Percentage]% ([Count] of {num_chunks} chunks are generic boilerplate)\n"
+        f"- **Total Number of Missed Ideas Identified**: [Count] (Total count of substantive concepts missed by the graph)\n\n"
+        f"### ITEMIZED MISSED IDEAS BREAKDOWN\n"
+        f"(For every chunk that contains one or more genuine specific ideas, provide:)\n"
+        f"- **Chunk #[Index]** (ID: `[chunk_id]`, Book: \"[book_title]\"):\n"
+        f"  * **Missed Idea Name**: [Concise concept title]\n"
+        f"  * **Category**: [Definition | Mathematical Formulation | Mechanism / Protocol | Empirical Finding | Theoretical Claim]\n"
+        f"  * **Specific Substance**: [1–2 sentences explaining the specific non-generic idea]\n"
+        f"  * **Exact Quote**: \"[Direct quotation from chunk text supporting this idea]\"\n\n"
+        f"### SYSTEMATIC PATTERN ANALYSIS\n"
+        f"- **Missed Idea Characteristics**: What shared properties or phrasing caused these specific ideas to be missed?\n"
+        f"- **Generic Chunk Characteristics**: What makes the negative chunks legitimately skippable boilerplate?\n\n"
+        f"---\n\n"
+        f"## 4. LITERATURE CHUNKS TO AUDIT\n\n"
+        f"{chunks_content}\n\n"
+        f"---\n"
+        f"# END OF CHUNKS AUDIT PROMPT\n"
+    )
+
+    out_file: Optional[Path] = None
+    if output_path is not None:
+        out_file = Path(output_path).expanduser().resolve()
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_file, "w", encoding="utf-8") as f:
+            f.write(prompt)
+
+    meta_dict = {
+        "file": str(out_file) if out_file else None,
+        "chunks_count": num_chunks,
+        "chars_count": len(prompt),
+        "min_similarity": round(min_sim, 4),
+        "max_similarity": round(max_sim, 4),
+        "p10_cutoff": round(float(p10), 4),
+        "p10_chunks_count": p10_in_selected,
+        "target_chars": target_prompt_chars,
+    }
+    return prompt, meta_dict
 
 
 def ensure_graph_embeddings(
@@ -862,24 +1141,49 @@ def ensure_graph_embeddings(
     backfilling from chunks_dir or embedding model if necessary.
     """
     _, g_mat = extract_concept_embeddings(store)
-    _, u_mat = extract_chunk_embeddings(store)
+    _, u_mat = extract_chunk_embeddings(store, chunks_dir=chunks_dir)
 
-    needs_ideas = len(g_mat) == 0
+    node_source = store.iter_all_nodes(data=True) if hasattr(store, "iter_all_nodes") else store.graph.nodes(data=True)
+    total_idea_nodes = 0
+    for _, attrs in node_source:
+        ntype = attrs.get("type", "")
+        if bool(attrs.get("is_idea") or attrs.get("tag") == "idea" or ntype in ("Concept", "Idea")):
+            total_idea_nodes += 1
+
+    needs_ideas = len(g_mat) < total_idea_nodes
     needs_chunks = len(u_mat) == 0
 
     if (needs_ideas or needs_chunks) and (embeddings is not None or chunks_dir is not None):
-        msg = "[bold cyan]Populating missing embeddings for graph space evaluation...[/bold cyan]"
+        missing_ideas_count = max(0, total_idea_nodes - len(g_mat))
+        msg_parts = []
+        if needs_ideas:
+            msg_parts.append(f"{missing_ideas_count:,} concept idea(s)")
+        if needs_chunks:
+            msg_parts.append("chunk(s)")
+        msg = f"[bold cyan]Populating missing embeddings for {', '.join(msg_parts)} for graph space evaluation...[/bold cyan]"
         if console:
             console.print(msg)
         else:
             logger.info(msg)
-        store.backfill_missing_embeddings(
+        bf_res = store.backfill_missing_embeddings(
             embeddings=embeddings,
             include_ideas=needs_ideas,
             include_chunks=needs_chunks,
             chunks_dir=chunks_dir,
             console=console,
         )
+        if bf_res.get("ideas_embedded", 0) > 0 or bf_res.get("chunks_embedded", 0) > 0:
+            target_save = getattr(store, "graph_path", None)
+            if store.is_sharded and store.sharded_dir:
+                try:
+                    store.save(store.sharded_dir)
+                except Exception as e:
+                    logger.debug(f"Could not auto-save sharded graph after backfilling: {e}")
+            elif target_save:
+                try:
+                    store.save(target_save)
+                except Exception as e:
+                    logger.debug(f"Could not auto-save graph after backfilling: {e}")
 
 
 def run_graph_space_evaluation(
@@ -892,10 +1196,14 @@ def run_graph_space_evaluation(
     states_dir: Optional[Union[Path, str]] = None,
     tau_loss: float = 0.70,
     book_id: Optional[Union[int, str]] = None,
+    generate_low_p10_prompt: bool = False,
+    low_p10_prompt_output: Optional[Union[Path, str]] = None,
+    low_p10_target_chars: int = 1_000_000,
 ) -> GraphSpaceMetrics:
     """
     Executes a single Graph Space evaluation on a Knowledge Graph.
     If states_dir is provided or book states are found, also calculates post-processing idea drift metrics.
+    If generate_low_p10_prompt is True, generates a ~1M context verification benchmark prompt for frontier models.
     """
     ensure_graph_embeddings(store, embeddings=embeddings, chunks_dir=chunks_dir, console=console)
     _, g_mat = extract_concept_embeddings(store)
@@ -903,7 +1211,7 @@ def run_graph_space_evaluation(
     u_target = universe_store if universe_store is not None else store
     if universe_store is not None:
         ensure_graph_embeddings(universe_store, embeddings=embeddings, chunks_dir=chunks_dir, console=console)
-    u_ids, u_mat, u_weights = extract_chunk_embeddings_and_weights(u_target)
+    u_ids, u_mat, u_weights = extract_chunk_embeddings_and_weights(u_target, chunks_dir=chunks_dir)
 
     if len(u_mat) == 0:
         raise ValueError("Universe chunk embeddings are missing. Provide a graph with stored chunks or configure chunks_dir.")
@@ -920,6 +1228,24 @@ def run_graph_space_evaluation(
         parent_chunk_mask=parent_mask,
         chunk_weights=u_weights,
     )
+
+    # Generate low-p10 prompt if requested
+    if generate_low_p10_prompt:
+        _, p_meta = generate_low_p10_verification_prompt(
+            store=store,
+            universe_store=universe_store,
+            chunks_dir=chunks_dir,
+            output_path=low_p10_prompt_output,
+            target_prompt_chars=low_p10_target_chars,
+            u_ids=u_ids,
+            u_mat=u_mat,
+            g_mat=g_mat,
+            u_weights=u_weights,
+            tau=tau,
+        )
+        raw["low_p10_prompt_path"] = p_meta.get("file")
+        raw["low_p10_prompt_chunks_count"] = p_meta.get("chunks_count")
+        raw["low_p10_prompt_chars_count"] = p_meta.get("chars_count")
 
     # Calculate post-processing idea drift if state cache directory is available
     post_drift: Optional[PostProcessingDriftMetrics] = None
@@ -956,6 +1282,9 @@ def run_graph_space_comparison(
     states_dir_a: Optional[Union[Path, str]] = None,
     states_dir_b: Optional[Union[Path, str]] = None,
     tau_loss: float = 0.70,
+    generate_low_p10_prompt: bool = False,
+    low_p10_prompt_output: Optional[Union[Path, str]] = None,
+    low_p10_target_chars: int = 1_000_000,
 ) -> GraphSpaceComparisonReport:
     """
     Runs end-to-end Graph Space Comparison between Store A and Store B over their combined Universe.
@@ -967,8 +1296,8 @@ def run_graph_space_comparison(
     _, g1_mat = extract_concept_embeddings(store_a)
     _, g2_mat = extract_concept_embeddings(store_b)
 
-    cids_a, u1_mat, w_a = extract_chunk_embeddings_and_weights(store_a)
-    cids_b, u2_mat, w_b = extract_chunk_embeddings_and_weights(store_b)
+    cids_a, u1_mat, w_a = extract_chunk_embeddings_and_weights(store_a, chunks_dir=chunks_dir)
+    cids_b, u2_mat, w_b = extract_chunk_embeddings_and_weights(store_b, chunks_dir=chunks_dir)
 
     if len(u1_mat) == 0 and len(u2_mat) > 0:
         u1_mat = u2_mat
@@ -1040,6 +1369,22 @@ def run_graph_space_comparison(
         report.delta_forward_retention = drift_b.forward_retention - drift_a.forward_retention
         report.delta_backward_fidelity = drift_b.backward_fidelity - drift_a.backward_fidelity
         report.delta_symmetric_drift_score = drift_b.symmetric_idea_drift_score - drift_a.symmetric_idea_drift_score
+
+    if generate_low_p10_prompt:
+        _, p_meta = generate_low_p10_verification_prompt(
+            store=store_b,
+            chunks_dir=chunks_dir,
+            output_path=low_p10_prompt_output,
+            target_prompt_chars=low_p10_target_chars,
+            u_ids=cids_b,
+            u_mat=u2_mat,
+            g_mat=g2_mat,
+            u_weights=w_b,
+            tau=tau,
+        )
+        report.low_p10_prompt_path = p_meta.get("file")
+        report.low_p10_prompt_chunks_count = p_meta.get("chunks_count")
+        report.low_p10_prompt_chars_count = p_meta.get("chars_count")
 
     return report
 
@@ -1179,13 +1524,15 @@ def run_postprocessing_drift_evaluation(
         for n_id, attrs in store.graph.nodes(data=True):
             ntype = attrs.get("type", "")
             is_idea = bool(attrs.get("is_idea") or attrs.get("tag") == "idea" or ntype in ("Concept", "Idea"))
-            if is_idea and attrs.get("embedding"):
-                # Check associated chunks or book_ids
-                b_ids = attrs.get("book_ids") or []
-                if isinstance(b_ids, (list, set)) and target_bid in b_ids:
-                    filtered_p_vecs.append(np.asarray(attrs["embedding"], dtype=np.float32))
-                elif attrs.get("book_id") == target_bid:
-                    filtered_p_vecs.append(np.asarray(attrs["embedding"], dtype=np.float32))
+            if is_idea:
+                emb = get_node_embedding(attrs, return_numpy=True)
+                if emb is not None and len(emb) > 1:
+                    # Check associated chunks or book_ids
+                    b_ids = attrs.get("book_ids") or []
+                    if isinstance(b_ids, (list, set)) and target_bid in b_ids:
+                        filtered_p_vecs.append(emb)
+                    elif attrs.get("book_id") == target_bid:
+                        filtered_p_vecs.append(emb)
         if filtered_p_vecs:
             p_mat = np.vstack(filtered_p_vecs)
 
@@ -1211,15 +1558,15 @@ def run_postprocessing_drift_evaluation(
     kg_concept_emb_map: Dict[str, np.ndarray] = {}
     for _, attrs in store.graph.nodes(data=True):
         c_name = str(attrs.get("name") or "").strip().lower()
-        c_emb = attrs.get("embedding")
-        if c_name and isinstance(c_emb, (list, tuple, np.ndarray)) and len(c_emb) > 1:
-            kg_concept_emb_map[c_name] = np.asarray(c_emb, dtype=np.float32)
+        c_emb = get_node_embedding(attrs, return_numpy=True)
+        if c_name and c_emb is not None and len(c_emb) > 1:
+            kg_concept_emb_map[c_name] = c_emb
 
     for idx, c in enumerate(raw_concepts):
         # 1. Check if concept embedded in state record itself
-        c_emb = c.get("embedding")
-        if isinstance(c_emb, (list, tuple, np.ndarray)) and len(c_emb) > 1:
-            raw_vecs.append(np.asarray(c_emb, dtype=np.float32))
+        c_emb = get_node_embedding(c, return_numpy=True)
+        if c_emb is not None and len(c_emb) > 1:
+            raw_vecs.append(c_emb)
             continue
 
         # 2. Check if identical name is in KG

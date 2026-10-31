@@ -9,6 +9,7 @@ import os
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
 
@@ -470,6 +471,13 @@ class BookProcessingState:
                 if rec.get("server_used") == "skipped_limbo" or rec.get("status") == "skipped_limbo"
             )
 
+    @contextmanager
+    def batch_updates(self):
+        """Context manager to perform multiple state updates in memory, persisting to disk once on exit."""
+        with self._lock:
+            yield
+            self.save()
+
     def mark_chunk_processed(
         self,
         chunk_id: str,
@@ -478,6 +486,7 @@ class BookProcessingState:
         extraction_dict: Dict[str, Any],
         duration: float,
         server_used: str,
+        auto_save: bool = True,
     ) -> None:
         """Mark a chunk as successfully extracted and persist."""
         with self._lock:
@@ -486,8 +495,8 @@ class BookProcessingState:
 
             if server_used == "semantic_fastpath":
                 chunk_status = "assigned"
-            elif server_used == "skipped_limbo":
-                chunk_status = "skipped_limbo"
+            elif server_used in ("skipped_limbo", "skipped_cover", "skipped_mmr"):
+                chunk_status = server_used
             else:
                 chunk_status = "extracted"
 
@@ -504,7 +513,48 @@ class BookProcessingState:
             }
             self.data["assigned_chunks_count"] = self.assigned_chunks_count
             self.data["skipped_chunks_count"] = self.skipped_chunks_count
-            self.save()
+            if auto_save:
+                self.save()
+
+    def mark_chunks_processed_batch(
+        self,
+        chunk_records: List[Dict[str, Any]],
+        auto_save: bool = True,
+    ) -> None:
+        """Mark multiple chunks as processed in one joined in-memory update and persist once."""
+        if not chunk_records:
+            return
+        with self._lock:
+            processed = self.data.setdefault("processed_chunks", {})
+            retried = self.data.setdefault("retried_chunks", {})
+            now = time.time()
+            for rec in chunk_records:
+                cid = rec["chunk_id"]
+                self.unstack_chunk(cid)
+                retried.pop(cid, None)
+
+                srv = rec.get("server_used", "extracted")
+                if srv == "semantic_fastpath":
+                    status = "assigned"
+                elif srv in ("skipped_limbo", "skipped_cover", "skipped_mmr"):
+                    status = srv
+                else:
+                    status = "extracted"
+
+                processed[cid] = {
+                    "chunk_id": cid,
+                    "chunk_idx": rec.get("chunk_idx", 0),
+                    "section_title": rec.get("section_title", ""),
+                    "status": status,
+                    "duration": rec.get("duration", 0.0),
+                    "server_used": srv,
+                    "extraction": rec.get("extraction_dict", {"concepts": []}),
+                    "completed_at": now,
+                }
+            self.data["assigned_chunks_count"] = self.assigned_chunks_count
+            self.data["skipped_chunks_count"] = self.skipped_chunks_count
+            if auto_save:
+                self.save()
 
     def mark_chunk_retried(
         self,

@@ -161,6 +161,22 @@ neo4j:
   clean_export: false                 # Set to true to perform a clean start (delete all content before export)
 
 # ==============================================================================
+# Dual-Pass Idea Aggregation & Synthesis Configuration
+# ==============================================================================
+# Automatically groups and aggregates semantically similar concepts across books,
+# resolves aliases, and synthesizes unified multi-occurrence idea definitions.
+dual_pass:
+  enabled: true
+  model: "llama3.1:8b"              # Dedicated model for consolidation (defaults to llm_model if omitted)
+  similarity_threshold: 0.92        # Cosine similarity threshold for concept cluster merging
+  max_quotes: 5                     # Maximum representative quotes retained per cluster
+  min_occurrences: 2                # Minimum occurrences (N >= 2) to trigger LLM synthesis
+  temperature: 0.1                  # Low temperature for precise synthesis
+  state_file: null                  # Custom path for state checkpoint JSON (defaults to output_dir/.bookeeper_dual_pass_state.json)
+  checkpoint_interval: 100          # Save postprocessing state checkpoint every N ideas
+  async_save: true                  # Fast asynchronous non-blocking background checkpoint persistence
+
+# ==============================================================================
 # Multi-Verification Configuration
 # ==============================================================================
 # Array of verifiers with mode and specific parameters for each verifier.
@@ -176,6 +192,10 @@ verifiers:
   - mode: "chunking"
     distance_threshold: 0.20          # Cosine distance threshold for semantic chunk expansion
     max_examples: 20
+  - mode: "kg"
+    tau: 0.75                         # Semantic proximity radius threshold
+    low_p10_prompt: false             # Set to true to generate ~1M prompt for frontier models auditing bottom p10 blind spots
+    low_p10_output: null              # Optional destination path (default: output_dir/low_p10_verification_prompt.txt)
 
 # Legacy single-verifier configuration (retained for backward compatibility;
 # synchronized with the default verifier in verifiers list above).
@@ -187,3 +207,54 @@ verification:
   temperature: 0.0                  # Low temperature for strict factual evaluation
   max_examples: 20                  # Maximum discrepancy examples to report
   cooldown_seconds: 60              # Cooldown period in seconds for verification (default: 60s; retries faster)
+  tau: 0.75                         # Proximity threshold for 'kg'/'graph' mode
+  low_p10_prompt: false             # Generate ~1M verification prompt for frontier models evaluating lowest-p10 tail chunks
+  low_p10_output: null              # Optional destination path for low-p10 verification prompt
+
+# ==============================================================================
+# Section-Aware Hierarchical Semantic Cover Settings
+# ==============================================================================
+# Prunes redundant narrative elaborations and repetitive experimental tables within
+# the same section/chapter, while preserving all novel conceptual contributions.
+enable_hierarchical_cover: true
+cover_similarity_threshold: 0.92        # Cosine similarity threshold (>=) within section to mark chunk redundant/covered
+cover_window_size: 3                    # Number of recent section chunks to compare against (prevents distant paragraph absorption)
+cover_min_section_chunks: 2             # Sections with fewer chunks are always kept (anchor preservation)
+skip_references_sections: true          # Automatically bypasses References, Bibliography, and Boilerplate in scientific white papers
+
+# ==============================================================================
+# Token Usage & Financial Cost Estimation Settings
+# ==============================================================================
+# Token metrics are gathered across 4 segregated sections:
+# 1. Tokens for embeddings
+# 2. Input tokens (prompt)
+# 3. Output tokens (completion)
+# 4. Cache tokens (prompt cache read / hits)
+#
+# Statistics are persisted strictly in token counts inside output/token_usage_stats.json.
+# Prices are NOT saved to the stats file; they are computed dynamically and printed
+# in the terminal at the end of each session for human reliability and cost tracking.
+#
+# Optional custom unit rates (in USD per 1M tokens):
+pricing:
+  embedding: 0.02                   # Cost per 1M embedding tokens ($)
+  input: 0.15                       # Cost per 1M input / prompt tokens ($)
+  output: 0.60                      # Cost per 1M output / completion tokens ($)
+  cache: 0.075                      # Cost per 1M prompt cache read tokens ($)
+
+  # Optional custom comparative pricing tiers:
+  # tier1:
+  #   embedding: 0.02
+  #   input: 0.14
+  #   output: 0.28
+  #   cache: 0.014
+  # tier2:
+  #   embedding: 0.10
+  #   input: 0.15
+  #   output: 0.60
+  #   cache: 0.075
+  # tier3:
+  #   embedding: 0.15
+  #   input: 2.50
+  #   output: 10.00
+  #   cache: 1.25

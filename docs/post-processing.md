@@ -134,13 +134,17 @@ In large knowledge bases (e.g. 16,000+ ideas):
   ```
 - This skips redundant LLM inference completely and completes in seconds.
 
-### Auto-Save Every 100 Ideas
+### Auto-Save Every 100 Ideas & Non-Blocking Async Checkpointing
 Because synthesizing multi-occurrence ideas across large graphs can take significant time, Bookkeeper persists progress checkpoints inside `.bookeeper_dual_pass_state.json`:
 - **Periodic Checkpoints**: Automatically saved to disk **every 100 ideas** (`checkpoint_interval = 100` by default), upon final completion, and if interrupted via `Ctrl+C`.
-- **Atomic File Writes**: Writes state to a temporary file before renaming to prevent corruption on sudden termination.
+- **High-Performance C-Accelerated Serialization (`orjson`)**: In large corpora (e.g. 70,000+ ideas), standard library `json.dump(..., indent=2)` produces massive ~500 MB state files and freezes the main execution thread for 12–15 seconds per checkpoint. Bookkeeper leverages `orjson` (with a compact standard json fallback), shrinking disk footprint by ~45% (down to ~275 MB) and dropping serialization time to ~0.5 seconds.
+- **Non-Blocking Background Persistence (`async_save: true`)**: Checkpoint snapshots are dispatched asynchronously to a dedicated background worker (`ThreadPoolExecutor(max_workers=1)`). The main processing loop continues in `< 0.02 ms`, eliminating UI pauses, worker starvation, and IO bottlenecks.
+- **Checkpoint Coalescing & Dirty Tracking**: If a background file write is still active when the next checkpoint triggers, intermediate saves coalesce cleanly without queue buildup or lock contention. Clean states with no new processed ideas are skipped automatically.
+- **Atomic File Writes & Guaranteed Flush**: Writes state to a temporary file before renaming to prevent corruption on abrupt termination. Full persistence is guaranteed by flushing all pending background writes upon task completion or `Ctrl+C`.
 
-Customize the save interval:
+Customize checkpoint settings via CLI:
 ```bash
+# Set save interval:
 bookeeper postprocess-ideas --checkpoint-interval 50
 ```
 
@@ -197,6 +201,7 @@ dual_pass:
   temperature: 0.1                    # LLM temperature
   state_file: null                    # Custom path for state checkpoint JSON
   checkpoint_interval: 100            # Save checkpoint every N ideas
+  async_save: true                    # Asynchronous non-blocking background state checkpointing
 ```
 
 ---

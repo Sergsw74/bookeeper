@@ -24,6 +24,7 @@ from bookeeper.processing.graph_evaluator import (
     extract_concept_embeddings,
     format_graph_comparison_table,
     format_graph_space_table,
+    generate_low_p10_verification_prompt,
     get_parent_chunk_ids,
     run_graph_space_comparison,
     run_graph_space_evaluation,
@@ -840,6 +841,86 @@ def test_cli_verify_mode_kg_with_states(tmp_path: Path):
     assert "postprocessing_drift" in data
     assert data["postprocessing_drift"]["forward_retention"] >= 0.99
     assert data["postprocessing_drift"]["backward_fidelity"] >= 0.99
+
+
+def test_generate_low_p10_verification_prompt(mock_stores_with_embeddings, tmp_path):
+    """Verifies generation, content structure, formatting, and file persistence of low-p10 verification prompts."""
+    store_a, _ = mock_stores_with_embeddings
+    out_file = tmp_path / "low_p10_prompt.txt"
+
+    prompt, meta = generate_low_p10_verification_prompt(
+        store=store_a,
+        output_path=out_file,
+        target_prompt_chars=1_000_000,
+        tau=0.75,
+    )
+
+    assert out_file.is_file()
+    assert meta["file"] == str(out_file)
+    assert meta["chunks_count"] > 0
+    assert meta["chars_count"] == len(prompt)
+
+    # Core instruction & expected answer requirements
+    assert "KNOWLEDGE GRAPH BLIND SPOT AUDIT" in prompt
+    assert "GENUINE SPECIFIC IDEA" in prompt
+    assert "Percentage of Chunks with Specific Ideas" in prompt
+    assert "Total Number of Missed Ideas Identified" in prompt
+    assert "ITEMIZED MISSED IDEAS BREAKDOWN" in prompt
+    assert "================================================================================" in prompt
+    assert "CHUNK #" in prompt
+    assert "Nearest Concept Cosine Proximity:" in prompt
+
+
+def test_generate_low_p10_prompt_budget_capping(mock_stores_with_embeddings):
+    """Verifies that low-p10 prompt generation strictly respects custom character size budgets."""
+    store_a, _ = mock_stores_with_embeddings
+
+    # Request a tiny budget (~2500 chars)
+    prompt, meta = generate_low_p10_verification_prompt(
+        store=store_a,
+        target_prompt_chars=4000,
+    )
+
+    assert meta["chunks_count"] >= 1
+    assert len(prompt) <= 5000  # Within small overhead bounds
+
+
+def test_cli_verify_kg_mode_low_p10_prompt(mock_stores_with_embeddings, tmp_path):
+    """Tests CLI execution of 'bookeeper verify --mode kg --low-p10-prompt'."""
+    store_a, _ = mock_stores_with_embeddings
+    kg_path = tmp_path / "knowledge_graph.json"
+    store_a.save(kg_path)
+
+    prompt_dest = tmp_path / "custom_low_p10.txt"
+    report_dest = tmp_path / "kg_report.json"
+
+    res = runner.invoke(app, [
+        "verify",
+        "--graph-file", str(kg_path),
+        "--mode", "kg",
+        "--low-p10-prompt",
+        "--low-p10-output", str(prompt_dest),
+        "--output", str(report_dest),
+    ])
+
+    assert res.exit_code == 0, f"Error: {res.stdout}"
+    assert "Low-P10 Verification Prompt saved to:" in res.stdout
+    assert "custom_low_p10.txt" in res.stdout
+    assert prompt_dest.is_file()
+
+    with open(prompt_dest, "r", encoding="utf-8") as f:
+        prompt_content = f.read()
+
+    assert "Percentage of Chunks with Specific Ideas" in prompt_content
+    assert "Total Number of Missed Ideas Identified" in prompt_content
+
+    with open(report_dest, "r", encoding="utf-8") as f:
+        rep_data = json.load(f)
+
+    assert rep_data.get("low_p10_prompt_path") == str(prompt_dest)
+    assert rep_data.get("low_p10_prompt_chunks_count") > 0
+    assert rep_data.get("low_p10_prompt_chars_count") > 0
+
 
 
 

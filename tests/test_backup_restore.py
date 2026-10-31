@@ -106,7 +106,7 @@ def test_collect_knowledge_files(mock_output_dir: Path):
 
     # Verify required knowledge files are present
     assert "knowledge_graph.json" in rel_names
-    assert "knowledge_graph.graphml" in rel_names
+    assert "knowledge_graph.graphml" not in rel_names
     assert ".bookeeper_state.json" in rel_names
     assert "verification_report.json" in rel_names
     assert "obsidian_vault/00_Index.md" in rel_names
@@ -127,13 +127,13 @@ def test_create_and_restore_zip(mock_output_dir: Path, tmp_path: Path):
     assert res["format"] == "zip"
     assert res["destination"] == zip_dest
     assert zip_dest.is_file()
-    assert res["total_files"] == 8  # 8 knowledge files
+    assert res["total_files"] == 7  # 7 knowledge files (GraphML is external export only)
 
     # Inspect
     info = inspect_backup(zip_dest)
     assert info["format"] == "zip"
-    assert info["total_files"] == 8
-    assert info["categories"]["graph"] == 2
+    assert info["total_files"] == 7
+    assert info["categories"]["graph"] == 1
     assert info["categories"]["obsidian"] == 2
     assert info["categories"]["book_states"] == 1
     assert info["categories"]["chunks"] == 1
@@ -143,7 +143,7 @@ def test_create_and_restore_zip(mock_output_dir: Path, tmp_path: Path):
     restore_target = tmp_path / "restored_zip"
     rest_res = restore_backup(zip_dest, target_dir=restore_target)
 
-    assert rest_res["files_restored"] == 8
+    assert rest_res["files_restored"] == 7
     assert (restore_target / "knowledge_graph.json").is_file()
     assert (restore_target / "obsidian_vault" / "00_Index.md").is_file()
     assert (restore_target / ".book_states" / "book_1_state.json").is_file()
@@ -159,19 +159,19 @@ def test_create_and_restore_7z(mock_output_dir: Path, tmp_path: Path):
     assert res["format"] == "7z"
     assert res["destination"] == sevenz_dest
     assert sevenz_dest.is_file()
-    assert res["total_files"] == 8
+    assert res["total_files"] == 7
 
     # Inspect
     info = inspect_backup(sevenz_dest)
     assert info["format"] == "7z"
-    assert info["total_files"] == 8
-    assert info["categories"]["graph"] == 2
+    assert info["total_files"] == 7
+    assert info["categories"]["graph"] == 1
 
     # Restore into clean directory
     restore_target = tmp_path / "restored_7z"
     rest_res = restore_backup(sevenz_dest, target_dir=restore_target)
 
-    assert rest_res["files_restored"] == 8
+    assert rest_res["files_restored"] == 7
     assert (restore_target / "knowledge_graph.json").is_file()
     assert (restore_target / "obsidian_vault" / "Books" / "Test Book.md").is_file()
     assert (restore_target / ".bookeeper_state.json").is_file()
@@ -212,7 +212,7 @@ def test_dry_run_restore(mock_output_dir: Path, tmp_path: Path):
 
     assert res["dry_run"] is True
     assert not target.exists()
-    assert res["inspection"]["total_files"] == 8
+    assert res["inspection"]["total_files"] == 7
 
 
 def test_cli_backup_and_restore(mock_output_dir: Path, tmp_path: Path):

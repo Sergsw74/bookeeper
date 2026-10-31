@@ -26,7 +26,14 @@ Bookkeeper extracts structured ideas, architectural principles, domain patterns,
   - [Incremental Batch Neo4j Sync](#incremental-batch-neo4j-sync)
   - [Automatic Missing Embeddings Backfill](#automatic-missing-embeddings-backfill)
   - [Unified Export (`export`)](#unified-export-export)
-- [12. Next Steps](#12-next-steps)
+- [12. Token Usage Statistics & Multi-Tier Cost Estimation](#12-token-usage-statistics--multi-tier-cost-estimation)
+  - [Four Segregated Token Categories](#four-segregated-token-categories)
+  - [Three Price Types for Each Section](#three-price-types-for-each-section)
+  - [Comparative 3-Tier Industry Pricing Models](#comparative-3-tier-industry-pricing-models)
+  - [Configuring Custom Pricing](#configuring-custom-pricing)
+  - [Strict Token-Only Persistence (`output/token_usage_stats.json`)](#strict-token-only-persistence-outputtoken_usage_statsjson)
+- [13. Section-Aware Hierarchical Semantic Cover & Deduplication](#13-section-aware-hierarchical-semantic-cover--deduplication)
+- [14. Next Steps](#14-next-steps)
 
 ---
 
@@ -225,7 +232,7 @@ When ingesting large collections of books, you may need to stop execution at any
 - **Sub-Second Signal Delivery (150ms Loop)**: Python worker thread futures use non-blocking `f.result(timeout=0.15)` polling. Pressing `Ctrl+C` delivers `SIGINT` to the main thread immediately rather than blocking indefinitely on background HTTP requests.
 - **Worker Thread Teardown**: The custom `DaemonThreadPoolExecutor` promptly discards pending queue tasks upon interrupt, avoiding Python `atexit` hangs.
 - **Bypasses Heavy Downstream Exporters**:
-  - Under normal completion, `build-graph` and `rebuild-graph` automatically invoke full Obsidian vault generation, GraphML serializations, and Neo4j database synchronization.
+  - Under normal completion, `build-graph` and `rebuild-graph` automatically invoke full Obsidian vault generation and Neo4j database synchronization (GraphML is decoupled and exportable on-demand via `--export-graphml` or `bookeeper export-graphml`).
   - On `Ctrl+C`, Bookkeeper immediately skips these heavy downstream operations to prevent slow terminal freezes or corrupt partial vault writes.
 - **Preserves In-Flight Checkpoints**: Any book that finished Step 4 before the interrupt remains safely recorded in `.book_states/book_<id>_state.json` and `output/knowledge_graph.json`. You can resume seamlessly with `bookeeper build-graph --continue`.
 - **Clean Exit Code**: Returns standard POSIX interrupt exit code `130` (`typer.Exit(code=130)`).
@@ -254,7 +261,7 @@ bookeeper rebuild-graph --limit 5
 
 ### Why use `rebuild-graph`?
 - **Zero Compute Cost**: Does not call Ollama or embedding models.
-- **Clean Slate Guarantee**: Wipes old `knowledge_graph.json`, Obsidian notes, and GraphML before reconstituting nodes, relationships, grounding links, and sequence edges.
+- **Clean Slate Guarantee**: Wipes old `knowledge_graph.json` and Obsidian notes before reconstituting nodes, relationships, grounding links, and sequence edges.
 - **Preserves Skipped Book Memorization**: Keeps failed/skipped format history intact in `.bookeeper_state.json`.
 
 ---
@@ -276,7 +283,7 @@ This command:
 2. Identifies and removes **orphan concepts** that were exclusively mentioned in this book.
 3. Clears the book from `.bookeeper_state.json` (allowing clean re-indexing if needed).
 4. Deletes its cached `.book_states/book_42_state.json`.
-5. Refreshes `knowledge_graph.json`, Obsidian notes, and GraphML exports.
+5. Refreshes `knowledge_graph.json` and Obsidian notes (and GraphML if `--export-graphml` was specified).
 
 ---
 
@@ -321,6 +328,25 @@ Vault Structure:
 - `Books/`: One note per book with metadata, author, and section outline.
 - `Sections/`: Notes for chapters and sub-sections with breadcrumbs.
 - `Concepts/`: Dedicated note per canonical concept with definition, quotes, and linked chunks.
+
+### GraphML Export (`export-graphml`)
+
+GraphML is strictly an on-demand export format (for visual network analysis in Gephi, Cytoscape, or yEd) and is **not** part of the internal knowledge graph:
+
+```bash
+# Export the knowledge graph to default destination (output/knowledge_graph.graphml):
+bookeeper export-graphml
+
+# Export to a custom destination file:
+bookeeper export-graphml --output ~/Desktop/graph.graphml
+```
+
+You can also request GraphML export during `build-graph`, `rebuild-graph`, or `export` by passing the `--export-graphml` / `--graphml` flag:
+```bash
+bookeeper build-graph --export-graphml
+bookeeper rebuild-graph --export-graphml
+bookeeper export --graphml
+```
 
 ### Neo4j Property Graph (`export-neo4j`)
 
@@ -375,7 +401,190 @@ bookeeper export --clean --backfill-embeddings
 
 ---
 
-## 12. Next Steps
+## 12. Token Usage Statistics & Multi-Tier Cost Estimation
+
+Bookkeeper includes a built-in token accounting and financial cost estimation subsystem that automatically gathers token telemetry during `build-graph` and prints transparent metrics at the end of each session.
+
+### Four Segregated Token Categories
+
+Token counts are strictly segregated into four categories:
+
+1. **Tokens for Embeddings**: Dense vector embeddings generated for text chunks, book sections, seed ideas, and semantic search routing.
+2. **Input Tokens (Prompt)**: Prompt tokens consumed across metadata normalization, simultaneous chunk idea extraction, and two-pass postprocessing synthesis.
+3. **Output Tokens (Completion)**: Generation tokens produced by the LLM in structured JSON format.
+4. **Cache Tokens (Prompt Cache Read)**: Tokens retrieved from prompt cache / prefix reuse (reported by local Ollama engines or OpenAI/vLLM endpoints).
+
+### Three Price Types for Each Section
+
+For each of the four categories, Bookkeeper computes three types of prices:
+1. **Unit Price Rate**: Cost per 1,000,000 tokens ($/1M).
+2. **Approximate Session Cost ($)**: Real-time financial expenditure incurred during the current `build-graph` execution.
+3. **Approximate Whole Graph Cost ($)**: Cumulative financial expenditure across all processed books and sessions forming the entire Knowledge Graph.
+
+### Comparative 3-Tier Industry Pricing Models
+
+To provide human reliability and realistic cost projection, Bookkeeper displays an equivalent cloud pricing matrix across three standard industry tiers:
+
+| Tier | Profile & Reference Models | Embeddings ($/1M) | Input ($/1M) | Output ($/1M) | Cache ($/1M) |
+|---|---|---|---|---|---|
+| **Tier 1** | **Budget / Local / DeepSeek** | $0.02 | $0.14 | $0.28 | $0.014 |
+| **Tier 2** | **Standard / GPT-4o-mini / Haiku** | $0.10 | $0.15 | $0.60 | $0.075 |
+| **Tier 3** | **Flagship / GPT-4o / Claude Sonnet** | $0.15 | $2.50 | $10.00 | $1.250 |
+
+> [!TIP]
+> When running local open-weight models via Ollama (e.g. `nomic-embed-text` and `qwen2.5:3b` / `llama3.1:8b`), compute is local and free. The pricing matrix illustrates the exact financial value saved compared to commercial cloud APIs.
+
+### Configuring Custom Pricing
+
+You can specify custom pricing rates or override the comparative tiers directly in `config.yaml`:
+
+```yaml
+# Optional custom unit rates (in USD per 1M tokens):
+pricing:
+  embedding: 0.05       # Cost per 1M embedding tokens
+  input: 0.20           # Cost per 1M prompt input tokens
+  output: 0.80          # Cost per 1M completion output tokens
+  cache: 0.05           # Cost per 1M prompt cache read tokens
+
+  # Or customize comparative tiers:
+  tier1:
+    embedding: 0.02
+    input: 0.14
+    output: 0.28
+    cache: 0.014
+```
+
+### Strict Token-Only Persistence (`output/token_usage_stats.json`)
+
+To preserve historical accuracy across model changes or currency adjustments, **only token counts** are saved to persistent storage. No monetary amounts or price tags are ever hardcoded in the stats file.
+
+```json
+{
+  "updated_at": 1730303960.0,
+  "updated_at_iso": "2026-10-30T09:00:00Z",
+  "sessions_count": 8,
+  "cumulative": {
+    "embedding_tokens": 1420500,
+    "input_tokens": 4810200,
+    "output_tokens": 790400,
+    "cache_tokens": 125000,
+    "total_tokens": 7146100
+  },
+  "last_session": {
+    "duration_seconds": 184.2,
+    "books_processed": 5,
+    "tokens": {
+      "embedding_tokens": 180200,
+      "input_tokens": 620400,
+      "output_tokens": 105200,
+      "cache_tokens": 18000,
+      "total_tokens": 923800
+    }
+  }
+}
+```
+
+The file automatically updates and accumulates with every `build-graph` run (including graceful Ctrl+C cancellation).
+
+---
+
+## 13. Section-Aware Hierarchical Semantic Cover & Deduplication
+
+In scientific white papers, AI preprints (arXiv), and technical literature, ~50–60% of chunks (detailed experimental setups, step-by-step benchmark traces, training logs, and reference/bibliography lists) do not introduce novel foundational concepts.
+
+Bookkeeper uses **Section-Aware Hierarchical Semantic Cover** instead of flat global MMR to guarantee lossless conceptual retention while eliminating redundant LLM compute:
+
+1. **Section-Stratified Anchoring**: Every chapter/section retains its conceptual anchor chunk; no section is starved or penalized by an artificial global centroid.
+2. **Guaranteed Semantic Coverage Radius ($\tau_{\text{cover}} \ge 0.82$)**: Within each section, chunks are evaluated sequentially against recent anchors in that section. A chunk is skipped as redundant *only if* an existing extracted chunk covers it with cosine similarity $\ge \tau_{\text{cover}}$. This guarantees skipped chunks are within the evaluation coverage radius ($\tau_{\text{eval}} = 0.75$), keeping $R_{\text{skipped}} \ge 90\%$.
+3. **Automatic Scientific Boilerplate Filtering**: Identifies and bypasses bibliography, references, author contributions, and acknowledgments sections without LLM hallucination risk or token spend.
+
+### Configuration & CLI Switches
+
+You can configure or disable Hierarchical Semantic Cover via CLI, `config.yaml`, or environment variables:
+
+```bash
+# Ingestion: build knowledge graph with hierarchical cover
+uv run bookeeper build-graph --hierarchical-cover --cover-threshold 0.92 --cover-window 3 --skip-references
+
+# Disable hierarchical cover (process all surviving chunks):
+uv run bookeeper build-graph --no-hierarchical-cover
+
+# Question generation: outline sampling with hierarchical cover
+uv run bookeeper generate-questions 5 --hierarchical-cover
+```
+
+In `config.yaml`:
+```yaml
+# Section-Aware Hierarchical Semantic Cover & Deduplication
+enable_hierarchical_cover: true       # Prune redundant elaborations within sections
+cover_similarity_threshold: 0.92      # Cosine similarity (>=) to mark chunk redundant (default: 0.92)
+cover_window_size: 3                  # Number of recent section chunks to compare against (default: 3)
+cover_min_section_chunks: 2           # Min chunks in a section before pruning applies
+skip_references_sections: true        # Automatically bypass bibliography / references
+```
+
+---
+
+## 14. Spine & Sharded Architecture (1 GB Shard Limits & Float16 Compression)
+
+As knowledge graphs grow across hundreds of books, monolithic JSON graphs (`knowledge_graph.json`) can reach 10–15+ GB. Text chunks and high-dimensional vector embeddings account for >90% of this file size and memory footprint.
+
+Bookkeeper provides a **Spine + Sharded Knowledge Graph architecture** that drastically optimizes memory, disk, and ingestion speed:
+
+1. **Lightweight Semantic Spine (`knowledge_graph_spine.json`)**:
+   - Contains all `Book`, `Section`, `Concept`, `Idea`, and `Cluster` nodes and semantic relationships (`HAS_SECTION`, `RELATES_TO`, `DISCUSSES`, `SYNONYM_OF`).
+   - Weighs only **~50–200 MB** for hundreds of books.
+   - Loads into RAM in milliseconds, enabling instant traversals, clustering, and graph algorithms.
+2. **Hard-Limited Payload Shards (`shards/shard_XXXX.json`)**:
+   - Stores heavy `Chunk` nodes, chunk text, and chunk-to-concept provenance edges.
+   - Binned deterministically by Book ID and strictly capped by target size (**1 GB / 1000 MB per shard**).
+   - Loaded on-demand through an LRU cache (default: 2 active shards, ~1–2 GB RAM maximum).
+3. **Float16 Base64 Embedding Compression**:
+   - Dense vectors are packed into raw IEEE 754 half-precision binary and stored as Base64 strings:
+     ```json
+     {
+       "embedding_b64": "v+fvvv7//z8...",
+       "embedding_dim": 768,
+       "embedding_dtype": "float16"
+     }
+     ```
+   - **~7.3x reduction** in embedding file size with negligible cosine error ($< 10^{-4}$).
+   - Bypasses Python `list[float]` pointer overhead, freeing gigabytes of heap memory.
+
+### Offline Lossless Migration (`shard-graph`)
+
+Migrate an existing monolithic `knowledge_graph.json` into the Spine + Shards structure without running any LLM inference:
+
+```bash
+# Migrate with default 1 GB limit and Float16 compression:
+bookeeper shard-graph
+
+# Migrate with custom shard limit (e.g. 500 MB) and explicit output directory:
+bookeeper shard-graph --graph-file output/knowledge_graph.json --shard-size-mb 500 --dtype float16
+
+# Disable automatic safety backup (.json.bak):
+bookeeper shard-graph --no-backup
+```
+
+### Inspecting Shards (`inspect-shards`)
+
+Display a detailed audit table of your Spine and Shards:
+
+```bash
+bookeeper inspect-shards
+```
+
+### Reconstructing Monolithic Graph (`unshard-graph`)
+
+If you ever need to reconstruct a single monolithic `knowledge_graph.json` for an external legacy tool:
+
+```bash
+bookeeper unshard-graph --output output/knowledge_graph_reconstructed.json
+```
+
+---
+
+## 15. Next Steps
 
 - 🔍 **[Decoupled Hybrid RAG](rag.md)** — Index pre-computed chunks with LightRAG and perform interactive queries.
 - 🧪 **[Two-Pass Idea Post-Processing (Experimental POC)](post-processing.md)** — Second-pass entity clustering and synthesis.

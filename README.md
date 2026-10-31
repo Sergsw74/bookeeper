@@ -12,12 +12,12 @@ The documentation is split into specialized subchapters stored in the [`docs/`](
 
 | Chapter | Description |
 | :--- | :--- |
-| 🔄 **[Recommended Workflow](docs/workflow.md)** | **Start here**: Calibration via small A/B tests, building knowledge graph, export, and optional POC post-processing. |
+| 🔄 **[Recommended Workflow](docs/workflow.md)** | **Start here**: Calibration via small A/B tests, building knowledge graph, export, and optional post-processing. |
 | 🚀 **[Getting Started](docs/get-started.md)** | Prerequisites, installation (`uv`/`pip`), configuration walkthrough, and basic commands. |
 | 🏗️ **[Building the Knowledge Graph](docs/building-graph.md)** | Graph extraction pipeline, chronological ingestion, 3-tier semantic routing, offline rebuilds, pruning, incremental Neo4j sync, and index suspension. |
 | 🌐 **[Interactive Web UI & Search](docs/ui.md)** | **Idea Search & Explorer**: Interactive Cytoscape Neo4j graph, dedicated **💡 Ideas Page** (exact, embedded vector search, modernity range filter), Obsidian note panel, and embedded LightRAG WebUI. |
 | 🔍 **[Decoupled Hybrid RAG](docs/rag.md)** | LightRAG vector/graph indexing from cached chunks and multi-mode querying (`hybrid`, `local`, `global`). |
-| 🧪 **[Two-Pass Idea Post-Processing (POC)](docs/post-processing.md)** | **Experimental POC**: second-pass entity synthesis, clustering, at-most-once LLM refinement, and state checkpointing. |
+| 🔄 **[Two-Pass Idea Post-Processing](docs/post-processing.md)** | Concept clustering ($\ge 0.92$), alias resolution, concise macro-definition synthesis, and state checkpointing. |
 | 🔬 **[A/B Testing & Benchmarking](docs/ab-tests.md)** | Automated test harness, same-branch vs branch-vs-branch testing, configuration overlays, delta reporting, and live cross-check status monitor. |
 | 🛡️ **[Factual Verification & Auditing](docs/verification.md)** | Multi-mode verification suite: Ideas Grounding, Chunk Coherence, Dual-KG Cross-Checking, Oracle QA probes, and Graph Embedding Space & Skipping Leverage (`--mode graph` / `kg`). |
 
@@ -35,7 +35,7 @@ Bookkeeper provides a rich set of CLI commands. Below is a high-level overview o
 | **`rebuild-graph`** | `bookeeper rebuild-graph` | Fast offline rebuild of the graph from `.book_states/` in seconds without LLM inference, with sub-step progress and safe cancellation. | [Building Graph](docs/building-graph.md) |
 | **`query`** | `bookeeper query "Explain Paxos"` | Queries the library using LightRAG hybrid retrieval (local entity graphs + global summaries). | [Hybrid RAG](docs/rag.md) |
 | **`build-rag`** | `bookeeper build-rag` | Indexes pre-computed SSD chunks into LightRAG independently from book ingestion. | [Hybrid RAG](docs/rag.md) |
-| **`postprocess-ideas`** | `bookeeper postprocess-ideas` | **(Experimental POC)** At-most-once LLM synthesis of multi-occurrence ideas with untouched cluster skipping and state checkpointing. | [Post-Processing](docs/post-processing.md) |
+| **`postprocess-ideas`** | `bookeeper postprocess-ideas` | At-most-once LLM synthesis of multi-occurrence ideas with untouched cluster skipping, BLAS vector clustering, and state checkpointing. | [Post-Processing](docs/post-processing.md) |
 | **`verify`** | `bookeeper verify --mode graph --tau 0.75` | Audits factual grounding of ideas, chunk boundary coherence, cross-KG NLI entailment, graph embedding space (`--mode graph`), or post-processing idea drift (`--mode drift`) under 10 GB memory guard. | [Verification](docs/verification.md) |
 | **`verifiers`** | `bookeeper verifiers` | Runs all configured verification suites from `config.yaml` concurrently. | [Verification](docs/verification.md) |
 | **`simulate-thresholds`** | `bookeeper simulate-thresholds -p "0.60:0.90,0.65:0.90"` | Fast offline simulation of chunk routing, graph space metrics, and post-processing drift across threshold pairs (<0.2s/run) with Mermaid charts. | [Threshold Simulator](docs/threshold-simulator.md) |
@@ -136,7 +136,7 @@ bookeeper/
 │   ├── get-started.md        # Installation, configuration, and basic commands
 │   ├── building-graph.md     # Graph extraction, rebuilds, exports, and pruning
 │   ├── rag.md                # Decoupled LightRAG indexing and querying
-│   ├── post-processing.md    # Two-pass idea aggregation and state checkpointing (POC)
+│   ├── post-processing.md    # Two-pass idea aggregation, clustering, and state checkpointing
 │   ├── ab-tests.md           # Automated A/B testing harness and overlays
 │   └── verification.md       # Grounding audits, cross-checking, and Oracle testing
 ├── config.yaml               # User configuration (Ollama pool, Calibre, Neo4j, LightRAG, Verifier)

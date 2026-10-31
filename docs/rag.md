@@ -205,6 +205,6 @@ When indexing with `bookeeper build-rag`, Bookkeeper renders a live Rich progres
 ## 6. Next Steps
 
 - 🏗️ **[Building the Knowledge Graph](building-graph.md)** — Manage book ingestion, chunk caches, and graph exports.
-- 🧪 **[Two-Pass Idea Post-Processing (Experimental POC)](post-processing.md)** — Second-pass entity clustering and synthesis.
+- 🔄 **[Two-Pass Idea Post-Processing](post-processing.md)** — Second-pass entity clustering and synthesis.
 - 🛡️ **[Factual Verification & Auditing](verification.md)** — Auditing factual grounding and chunk coherence.
 - 🏠 **[Return to Documentation Index](../README.md)**

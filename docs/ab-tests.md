@@ -407,5 +407,5 @@ Options:
 - ⚡ **[Threshold Simulation & Sweep Engine](threshold-simulator.md)** — Sweep routing thresholds and simulate idea drift offline in seconds.
 - 💾 **[Backup & Restore Subsystem](backup-restore.md)** — Create milestone archives and run A/B audits vs historical backups.
 - 🏗️ **[Building the Knowledge Graph](building-graph.md)** — Core graph extraction options and rebuilds.
-- 🧪 **[Two-Pass Idea Post-Processing (Experimental POC)](post-processing.md)** — Experimental synthesis details.
+- 🔄 **[Two-Pass Idea Post-Processing](post-processing.md)** — Idea clustering, alias resolution, and macro-definition synthesis.
 - 🏠 **[Return to Documentation Index](../README.md)**

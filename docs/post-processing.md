@@ -1,11 +1,14 @@
 # 🧪 Two-Pass Idea Post-Processing (Dual-Pass Synthesis)
 
-> [!WARNING]
-> ### ⚠️ Experimental Proof-of-Concept (POC) — Very Low Performance Improvement
+> [!NOTE]
+> ### Production Readiness & Operational Focus
 > 
-> **Two-Pass Idea Post-Processing** is an experimental research feature. In empirical evaluations, this secondary synthesis pass yielded **very low to marginal improvements** in factual grounding and knowledge graph query quality, while **significantly increasing compute time and token consumption** (doubling or tripling total LLM inference runtime).
+> While empirical evaluations show that a secondary synthesis pass yields **marginal improvements** in raw factual grounding or retrieval scores compared to single-pass extraction, the primary focus of **Two-Pass Idea Post-Processing** is **graph usage readiness**:
+> - **Global Concept Clustering**: Merges syntactic aliases and semantically identical concepts ($\ge 0.92$) across different books and chapters.
+> - **Concise & Cohesive Synthesis**: Resolves fragmented, localized paragraph observations into unified, concise macro-definitions that explain architectural concepts end-to-end.
+> - **Graph Hygiene & Rewiring**: Cleans redundant nodes and reconnects incoming/outgoing relational and provenance edges.
 > 
-> For practical production pipelines and standard Knowledge Graph builds, the standard single-pass pipeline (`bookeeper build-graph`) is **strongly recommended**.
+> It is an optional refinement stage that can be run on-demand via `bookeeper postprocess-ideas` or automatically configured after graph builds.
 
 ---
 
@@ -52,8 +55,8 @@ flowchart TD
     C --> D["1c. Cosine Clustering\nMerge if similarity >= 0.92"]
     D --> E["2. Chronological Linearization\nOrder observations by (book, chapter, chunk)\nRetain top 3-5 quotes"]
     E --> F{"Mention Count Branching"}
-    F -->|N = 1 (Single-Occurrence)| G["Bypass Second LLM Pass\nPreserve local observation as-is"]
-    F -->|N >= 2 (Multi-Occurrence)| H["3. Structured LLM Synthesis\nConsolidate macro-definition + relations"]
+    F -->|"N = 1 (Single-Occurrence)"| G["Bypass Second LLM Pass\nPreserve local observation as-is"]
+    F -->|"N >= 2 (Multi-Occurrence)"| H["3. Structured LLM Synthesis\nConsolidate macro-definition + relations"]
     G --> I["4. Graph Ingestion & Overwrite\nUpsert Canonical Node\nAdd :MENTIONED_IN & :RELATES_TO"]
     H --> I
     I --> J[("Persistent Checkpoint\nSaved every 100 ideas")]

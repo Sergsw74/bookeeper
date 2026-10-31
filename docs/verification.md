@@ -209,7 +209,7 @@ bookeeper verify --mode graph --compare-graph ./output/knowledge_graph.json --ta
 
 #### Core Metric Suite for Knowledge Graph Space
 
-To eliminate distortion caused by chunk size variance (e.g. short 200-char transitional chunks vs dense 1,500-char technical explanations), all metrics are **size-weighted by chunk character length** $w_i = \text{char\_count}(c_i)$, measuring actual text volume rather than arbitrary chunk boundary counts:
+To eliminate distortion caused by chunk size variance (e.g. short 200-char transitional chunks vs dense 1,500-char technical explanations), all metrics are **size-weighted by chunk character length** $w_i = \text{len}(c_i)$, measuring actual text volume rather than arbitrary chunk boundary counts:
 
 | Metric | Category | Size-Weighted Formula / Definition | Operational Purpose |
 | :--- | :--- | :--- | :--- |
@@ -398,5 +398,5 @@ Options:
 
 - 🔬 **[A/B Testing & Benchmarking](ab-tests.md)** — Use verification in automated regression tests.
 - 🏗️ **[Building the Knowledge Graph](building-graph.md)** — Graph extraction and options.
-- 🧪 **[Two-Pass Idea Post-Processing (Experimental POC)](post-processing.md)** — Experimental synthesis details.
+- 🔄 **[Two-Pass Idea Post-Processing](post-processing.md)** — Concept clustering, alias resolution, and macro-definition synthesis.
 - 🏠 **[Return to Documentation Index](../README.md)**

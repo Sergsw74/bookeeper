@@ -223,7 +223,7 @@ bookeeper build-graph --export-neo4j --clean-export
 | `--no-lightrag` | Disable simultaneous LightRAG indexing to accelerate graph extraction. | False |
 | `--export-neo4j` | Automatically upsert the updated graph into Neo4j upon completion. | False |
 | `--clean-export` | Purge existing Neo4j graph before upserting. | False |
-| `--dual-pass` | Run experimental second-pass idea consolidation (POC). | False |
+| `--dual-pass` | Run second-pass idea clustering and concise macro-definition synthesis. | False |
 
 ### Graceful Immediate Cancellation (Ctrl+C / SIGINT)
 
@@ -587,6 +587,6 @@ bookeeper unshard-graph --output output/knowledge_graph_reconstructed.json
 ## 15. Next Steps
 
 - 🔍 **[Decoupled Hybrid RAG](rag.md)** — Index pre-computed chunks with LightRAG and perform interactive queries.
-- 🧪 **[Two-Pass Idea Post-Processing (Experimental POC)](post-processing.md)** — Second-pass entity clustering and synthesis.
+- 🔄 **[Two-Pass Idea Post-Processing](post-processing.md)** — Second-pass entity clustering and concise synthesis.
 - 🛡️ **[Factual Verification & Auditing](verification.md)** — Verify factual grounding and coherence of your graph.
 - 🏠 **[Return to Documentation Index](../README.md)**

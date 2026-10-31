@@ -50,9 +50,9 @@ flowchart TD
         CHRONO["Chronological Replay of Chunks"]
         ROUTE{"Query Native HNSW Index\nMax Cosine Similarity"}
         
-        ROUTE -->|< low| UNASSIGNED["Unassigned (Parent Chunk)\nAdd Concept to Index & Graph"]
-        ROUTE -->|>= high| HIGH["High Confidence\nDirect Assignment (No New Concept)"]
-        ROUTE -->|in [low, high)| LIMBO["Limbo Chunk\nSkip if skip_limbo=True"]
+        ROUTE -->|"< low"| UNASSIGNED["Unassigned (Parent Chunk)\nAdd Concept to Index & Graph"]
+        ROUTE -->|">= high"| HIGH["High Confidence\nDirect Assignment (No New Concept)"]
+        ROUTE -->|"in [low, high)"| LIMBO["Limbo Chunk\nSkip if skip_limbo=True"]
 
         EVAL["Evaluate Graph Space\n(Chamfer μ, σ, p10, Cov_τ, L_comp, Vendi)"]
         POST["Post-Processing Deduplication (0.92)\nIdea Drift (Forward, Backward, Centroid)"]

@@ -214,12 +214,12 @@ You can monitor real-time extraction progress in the terminal:
 
 Dive deeper into specific subsystems:
 
-- 🔄 **[Recommended Workflow](workflow.md)** — Start here: Calibration via small A/B tests, full graph build, exports, and optional POC post-processing.
+- 🔄 **[Recommended Workflow](workflow.md)** — Start here: Calibration via small A/B tests, full graph build, exports, and optional post-processing.
 - 💾 **[Backup & Restore Subsystem](backup-restore.md)** — Standalone backup engine, full vs knowledge scopes, integrity audits, and A/B evaluations against archives.
 - ⚡ **[Threshold Simulation & Sweep Engine](threshold-simulator.md)** — Offline replay of chunk routing across threshold pairs with graph space metrics and idea drift in milliseconds.
 - 🏗️ **[Building the Knowledge Graph](building-graph.md)** — Comprehensive options for `build-graph`, instant offline rebuilds via `rebuild-graph`, concept significance weighting, and Neo4j exports.
 - 🔍 **[Decoupled Hybrid RAG](rag.md)** — Indexing cached chunks with LightRAG and interactive querying across local and global modes.
-- 🧪 **[Two-Pass Idea Post-Processing (Experimental POC)](post-processing.md)** — Secondary synthesis pass over multi-occurrence ideas, clustering, and state checkpointing.
+- 🔄 **[Two-Pass Idea Post-Processing](post-processing.md)** — Secondary synthesis pass over multi-occurrence ideas, clustering, and state checkpointing.
 - 🔬 **[A/B Testing & Benchmarking](ab-tests.md)** — Automated regression test harness, same-branch vs branch-to-branch comparisons, and config overlays.
 - 🛡️ **[Factual Verification & Auditing](verification.md)** — Multi-mode verification audits (Ideas Grounding, Chunking Coherence, Graph Space Coverage, and Post-Processing Idea Drift).
 - 🏠 **[Return to Documentation Index](../README.md)**

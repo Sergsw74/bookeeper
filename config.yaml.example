@@ -196,6 +196,7 @@ verifiers:
     tau: 0.75                         # Semantic proximity radius threshold
     low_p10_prompt: false             # Set to true to generate ~1M prompt for frontier models auditing bottom p10 blind spots
     low_p10_output: null              # Optional destination path (default: output_dir/low_p10_verification_prompt.txt)
+    low_p10_max_chunks: 500           # Maximum number of tail chunks to include in verification prompt (default: 500)
 
 # Legacy single-verifier configuration (retained for backward compatibility;
 # synchronized with the default verifier in verifiers list above).
@@ -210,6 +211,7 @@ verification:
   tau: 0.75                         # Proximity threshold for 'kg'/'graph' mode
   low_p10_prompt: false             # Generate ~1M verification prompt for frontier models evaluating lowest-p10 tail chunks
   low_p10_output: null              # Optional destination path for low-p10 verification prompt
+  low_p10_max_chunks: 500           # Maximum number of tail chunks to include in verification prompt (default: 500)
 
 # ==============================================================================
 # Section-Aware Hierarchical Semantic Cover Settings

@@ -244,16 +244,16 @@ Comparing **Threshold Coverage ($\text{Cov}_\tau$)** against the **Extraction (P
 The bottom decile of semantic coverage ($p_{10}$) captures chunks whose text lies farthest from any concept in the Knowledge Graph. To rigorously verify whether these tail chunks represent **genuine omissions** (missed domain insights) or **justified skips** (indices, copyright notices, math derivations, tabular noise), Bookkeeper can automatically generate a ~1M context verification audit prompt for frontier models (e.g., Gemini 1.5 Pro, Claude 3.5 Sonnet, GPT-4o):
 
 ```bash
-# Generate low-p10 audit prompt to default output/low_p10_verification_prompt.txt:
+# Generate low-p10 audit prompt to default output/low_p10_verification_prompt.txt (up to 500 chunks):
 bookeeper verify --mode kg --low-p10-prompt
 
-# Specify custom prompt output file and evaluate candidate graph:
-bookeeper verify --mode kg --low-p10-prompt --low-p10-output ./output/p10_eval_prompt.txt
+# Specify custom prompt output file and custom chunk limit (e.g. 250 chunks):
+bookeeper verify --mode kg --low-p10-prompt --low-p10-limit 250 --low-p10-output ./output/p10_eval_prompt.txt
 ```
 
 **Key Features:**
 1. **Targeted Tail Sampling**: Extracts the lowest 10% proximity chunks ranked strictly by cosine similarity against all Knowledge Graph concept nodes.
-2. **Sequential Token Budget Packing**: Progressively packs chunks up to a ~1,000,000 character ceiling (~250,000 tokens), preserving complete chunk texts without truncation.
+2. **Sequential Token Budget & Chunk Count Packing**: Progressively packs chunks up to a ~1,000,000 character ceiling (~250,000 tokens) and bounded by chunk count limit (`--low-p10-limit`, default: 500 chunks), preserving complete chunk texts without truncation.
 3. **Structured Chunk Delimiters**: Formats each chunk with clear bounding banners:
    ```text
    ================================================================================
@@ -390,6 +390,7 @@ Options:
   --tau-loss FLOAT                Cosine similarity cutoff for dropped ideas in drift mode (default: 0.70).
   --low-p10-prompt                Generate ~1M context verification audit prompt for tail p10 chunks.
   --low-p10-output PATH           Custom output path for low-p10 prompt (default: output/low_p10_verification_prompt.txt).
+  --low-p10-limit INTEGER         Maximum number of worst-proximity chunks to include in low-p10 prompt (default: 500).
 ```
 
 ---

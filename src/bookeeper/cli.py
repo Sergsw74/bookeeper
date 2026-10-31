@@ -5130,6 +5130,7 @@ def _execute_single_verification(
     low_p10_prompt: bool = False,
     low_p10_output: Optional[str] = None,
     low_p10_target_chars: int = 1_000_000,
+    low_p10_max_chunks: Optional[int] = None,
     cfg: Optional[Settings] = None,
 ) -> Optional[Dict[str, Any]]:
     """
@@ -6067,6 +6068,11 @@ def _execute_single_verification(
         effective_low_p10_output = low_p10_output or getattr(cfg.verification, "low_p10_output", None)
         if effective_low_p10_prompt and not effective_low_p10_output:
             effective_low_p10_output = str(cfg.resolved_output_dir / "low_p10_verification_prompt.txt")
+        effective_low_p10_max_chunks = int(
+            low_p10_max_chunks
+            if low_p10_max_chunks is not None
+            else getattr(cfg.verification, "low_p10_max_chunks", 500)
+        )
         temp_backup_targets: List[ResolvedBackupTarget] = []
 
         try:
@@ -6210,6 +6216,7 @@ def _execute_single_verification(
                         generate_low_p10_prompt=effective_low_p10_prompt,
                         low_p10_prompt_output=effective_low_p10_output,
                         low_p10_target_chars=low_p10_target_chars,
+                        low_p10_max_chunks=effective_low_p10_max_chunks,
                     )
                 console.print(format_graph_comparison_table(kg_report))
                 report_dict = kg_report.model_dump()
@@ -6228,6 +6235,7 @@ def _execute_single_verification(
                         generate_low_p10_prompt=effective_low_p10_prompt,
                         low_p10_prompt_output=effective_low_p10_output,
                         low_p10_target_chars=low_p10_target_chars,
+                        low_p10_max_chunks=effective_low_p10_max_chunks,
                     )
                 console.print(format_graph_space_table(metrics))
                 if metrics.postprocessing_drift:
@@ -6713,6 +6721,12 @@ def verify_command(
         "--low-p10-output",
         help="Optional destination path for generated low-p10 verification prompt (default: output_dir/low_p10_verification_prompt.txt).",
     ),
+    low_p10_limit: Optional[int] = typer.Option(
+        None,
+        "--low-p10-limit",
+        "--low-p10-max-chunks",
+        help="Maximum number of worst-proximity chunks to include in low-p10 verification prompt (default: 500).",
+    ),
 ):
     """
     Verify Knowledge Graph factual integrity, chunking correctness, or chunk Oracle alignment.
@@ -6832,6 +6846,7 @@ def verify_command(
                 tau_loss=getattr(v, "tau_loss", tau_loss),
                 low_p10_prompt=getattr(v, "low_p10_prompt", low_p10_prompt) if getattr(v, "low_p10_prompt", None) is not None else low_p10_prompt,
                 low_p10_output=getattr(v, "low_p10_output", low_p10_output) if getattr(v, "low_p10_output", None) is not None else low_p10_output,
+                low_p10_max_chunks=getattr(v, "low_p10_max_chunks", low_p10_limit) if getattr(v, "low_p10_max_chunks", None) is not None else low_p10_limit,
             )
             reports.append((v_mode, v_report, rep))
 
@@ -6873,6 +6888,8 @@ def verify_command(
             low_p10_prompt = True
         if low_p10_output is None and getattr(first_v, "low_p10_output", None):
             low_p10_output = first_v.low_p10_output
+        if low_p10_limit is None and getattr(first_v, "low_p10_max_chunks", None) is not None:
+            low_p10_limit = first_v.low_p10_max_chunks
 
     return _execute_single_verification(
         cfg=cfg,
@@ -6904,6 +6921,7 @@ def verify_command(
         tau_loss=tau_loss,
         low_p10_prompt=low_p10_prompt,
         low_p10_output=low_p10_output,
+        low_p10_max_chunks=low_p10_limit,
     )
 
 

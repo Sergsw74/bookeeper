@@ -922,5 +922,52 @@ def test_cli_verify_kg_mode_low_p10_prompt(mock_stores_with_embeddings, tmp_path
     assert rep_data.get("low_p10_prompt_chars_count") > 0
 
 
+def test_generate_low_p10_prompt_chunk_limit(mock_stores_with_embeddings):
+    """Verifies that low-p10 prompt generation strictly limits chunk count to max_chunks (default 500)."""
+    store_a, _ = mock_stores_with_embeddings
+
+    # Request limit of 2 chunks despite large character budget
+    prompt, meta = generate_low_p10_verification_prompt(
+        store=store_a,
+        target_prompt_chars=1_000_000,
+        max_chunks=2,
+    )
+
+    assert meta["chunks_count"] == 2
+    assert meta["max_chunks"] == 2
+    assert "Total Chunks Provided: 2" in prompt
+    assert "#2 of 2" in prompt
+    assert "#3 of" not in prompt
+
+
+def test_cli_verify_kg_mode_low_p10_prompt_with_limit(mock_stores_with_embeddings, tmp_path):
+    """Tests CLI flag --low-p10-limit capping chunk count."""
+    store_a, _ = mock_stores_with_embeddings
+    kg_path = tmp_path / "knowledge_graph.json"
+    store_a.save(kg_path)
+
+    prompt_dest = tmp_path / "custom_p10_limited.txt"
+    report_dest = tmp_path / "kg_report_limited.json"
+
+    res = runner.invoke(app, [
+        "verify",
+        "--graph-file", str(kg_path),
+        "--mode", "kg",
+        "--low-p10-prompt",
+        "--low-p10-limit", "2",
+        "--low-p10-output", str(prompt_dest),
+        "--output", str(report_dest),
+    ])
+
+    assert res.exit_code == 0, f"Error: {res.stdout}"
+    assert prompt_dest.is_file()
+
+    with open(report_dest, "r", encoding="utf-8") as f:
+        rep_data = json.load(f)
+
+    assert rep_data.get("low_p10_prompt_chunks_count") == 2
+
+
+
 
 

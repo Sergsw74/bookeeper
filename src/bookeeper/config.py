@@ -294,6 +294,10 @@ class SingleVerifierConfig(BaseModel):
         default=None,
         description="Optional destination path for generated low-p10 verification prompt.",
     )
+    low_p10_max_chunks: int = Field(
+        default=500,
+        description="Maximum number of worst-proximity chunks to include in low-p10 verification prompt (default: 500).",
+    )
 
     @property
     def resolved_distance_threshold(self) -> Optional[float]:
@@ -365,6 +369,10 @@ class VerificationConfig(BaseModel):
     low_p10_output: Optional[str] = Field(
         default=None,
         description="Optional destination path for generated low-p10 verification prompt.",
+    )
+    low_p10_max_chunks: int = Field(
+        default=500,
+        description="Maximum number of worst-proximity chunks to include in low-p10 verification prompt (default: 500).",
     )
     verifiers: List[SingleVerifierConfig] = Field(
         default_factory=list,

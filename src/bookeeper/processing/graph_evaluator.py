@@ -959,6 +959,7 @@ def generate_low_p10_verification_prompt(
     chunks_dir: Optional[Union[Path, str]] = None,
     output_path: Optional[Union[Path, str]] = None,
     target_prompt_chars: int = 1_000_000,
+    max_chunks: int = 500,
     u_ids: Optional[List[str]] = None,
     u_mat: Optional[np.ndarray] = None,
     g_mat: Optional[np.ndarray] = None,
@@ -973,6 +974,10 @@ def generate_low_p10_verification_prompt(
     The prompt asks the model to audit whether these worst-covered literature passages
     contain specific, non-generic conceptual ideas (which were missed by the extraction pipeline),
     or if they are legitimately generic / narrative boilerplate.
+
+    Parameters:
+        target_prompt_chars: Target character budget for entire prompt (default: 1,000,000 chars / ~250k tokens).
+        max_chunks: Maximum number of worst-proximity chunks to include in prompt (default: 500).
 
     Expected output format in prompt:
     1. Percentage of chunks with ideas out of provided examples.
@@ -1018,6 +1023,8 @@ def generate_low_p10_verification_prompt(
     available_chars_for_chunks = max(1000, target_prompt_chars - 3500)
 
     for idx in candidate_indices:
+        if len(selected_indices) >= max_chunks:
+            break
         cid = u_ids[idx]
         sim_val = float(sims[idx])
         meta = meta_map.get(cid, {})
@@ -1126,6 +1133,7 @@ def generate_low_p10_verification_prompt(
         "p10_cutoff": round(float(p10), 4),
         "p10_chunks_count": p10_in_selected,
         "target_chars": target_prompt_chars,
+        "max_chunks": max_chunks,
     }
     return prompt, meta_dict
 
@@ -1199,6 +1207,7 @@ def run_graph_space_evaluation(
     generate_low_p10_prompt: bool = False,
     low_p10_prompt_output: Optional[Union[Path, str]] = None,
     low_p10_target_chars: int = 1_000_000,
+    low_p10_max_chunks: int = 500,
 ) -> GraphSpaceMetrics:
     """
     Executes a single Graph Space evaluation on a Knowledge Graph.
@@ -1237,6 +1246,7 @@ def run_graph_space_evaluation(
             chunks_dir=chunks_dir,
             output_path=low_p10_prompt_output,
             target_prompt_chars=low_p10_target_chars,
+            max_chunks=low_p10_max_chunks,
             u_ids=u_ids,
             u_mat=u_mat,
             g_mat=g_mat,
@@ -1285,6 +1295,7 @@ def run_graph_space_comparison(
     generate_low_p10_prompt: bool = False,
     low_p10_prompt_output: Optional[Union[Path, str]] = None,
     low_p10_target_chars: int = 1_000_000,
+    low_p10_max_chunks: int = 500,
 ) -> GraphSpaceComparisonReport:
     """
     Runs end-to-end Graph Space Comparison between Store A and Store B over their combined Universe.
@@ -1376,6 +1387,7 @@ def run_graph_space_comparison(
             chunks_dir=chunks_dir,
             output_path=low_p10_prompt_output,
             target_prompt_chars=low_p10_target_chars,
+            max_chunks=low_p10_max_chunks,
             u_ids=cids_b,
             u_mat=u2_mat,
             g_mat=g2_mat,

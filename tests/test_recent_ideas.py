@@ -78,6 +78,19 @@ def test_partition_books_into_batches():
     assert [b["id"] for b in batches[2]] == list(range(20, 25))
 
 
+def test_batch_books_setting_independent_of_recent_ideas():
+    """Verify cfg.batch_books is respected regardless of whether recent_ideas is enabled or disabled."""
+    from bookeeper.config import Settings
+
+    cfg = Settings(batch_books=20, recent_ideas={"enabled": False})
+    assert cfg.batch_books == 20
+    assert cfg.recent_ideas.batch_books == 20
+
+    cfg2 = Settings(batch_books=25, recent_ideas={"enabled": True})
+    assert cfg2.batch_books == 25
+    assert cfg2.recent_ideas.batch_books == 25
+
+
 def test_store_idea_month_earlier_date_wins():
     """Verify ConceptGraphStore records first_occurrence_month and earlier date always wins."""
     store = ConceptGraphStore()

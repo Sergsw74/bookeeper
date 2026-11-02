@@ -2,6 +2,7 @@
 Directed Concept Knowledge Graph store implemented with NetworkX DiGraph.
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -191,6 +192,7 @@ class ConceptGraphStore:
                 "summary": "",
                 "weight": 5,
                 "occurrences": 1,
+                "has_formula": False,
             }
             if month:
                 node_attrs["first_occurrence_month"] = month
@@ -260,6 +262,7 @@ class ConceptGraphStore:
         brief = BookParser.repair_mojibake(getattr(concept, "brief_description", "") or concept.summary)
         detailed = BookParser.repair_mojibake(getattr(concept, "detailed_explanation", "") or concept.summary)
         weight = getattr(concept, "weight", 5)
+        has_formula = bool(getattr(concept, "has_formula", False))
         emb = embedding if embedding is not None else getattr(concept, "embedding", None)
 
         if not self.graph.has_node(node_id):
@@ -275,6 +278,7 @@ class ConceptGraphStore:
                 "summary": brief or detailed,
                 "weight": weight,
                 "occurrences": 1,
+                "has_formula": has_formula,
             }
             if emb:
                 node_attrs["embedding"] = [round(float(x), 6) for x in emb]
@@ -284,6 +288,7 @@ class ConceptGraphStore:
             node_data["occurrences"] += 1
             node_data["is_idea"] = True
             node_data["tag"] = "idea"
+            node_data["has_formula"] = bool(node_data.get("has_formula", False) or has_formula)
             # Update weight to the highest observed significance
             node_data["weight"] = max(node_data.get("weight", 0), weight)
             if not node_data.get("refined"):
@@ -348,6 +353,7 @@ class ConceptGraphStore:
             "chunk_idx": chunk_idx,
             "prev_chunk_id": prev_chunk_id,
             "next_chunk_id": next_chunk_id,
+            "has_formula": bool(_get("has_formula", False)),
         }
         if emb and len(emb) > 1:
             chunk_attrs["embedding"] = [round(float(x), 6) for x in emb]
@@ -631,6 +637,7 @@ class ConceptGraphStore:
                 "summary": brief_description or detailed_explanation,
                 "weight": 5,
                 "occurrences": 1,
+                "has_formula": False,
             }
             if month:
                 node_attrs["first_occurrence_month"] = month
@@ -702,6 +709,7 @@ class ConceptGraphStore:
                 summary=summary,
                 weight=weight,
                 occurrences=1,
+                has_formula=False,
             )
 
         self.graph.add_edge(
@@ -712,6 +720,134 @@ class ConceptGraphStore:
             quote=quote,
         )
         self.mark_edge_dirty(section_node_id, concept_node_id)
+
+    def add_formula(
+        self,
+        formula: Any,
+        chunk: Optional[Any] = None,
+        concept_name: Optional[str] = None,
+    ) -> str:
+        """
+        Add or update a Formula node (distinct from Concept/Idea) and connect to Chunk and/or Concept.
+        Edge: (:Chunk) -[:CONTAINS_FORMULA]-> (:Formula)
+        Edge: (:Formula) -[:APPEARS_IN]-> (:Chunk)
+        Edge: (:Concept) -[:HAS_FORMULA]-> (:Formula)
+        Edge: (:Formula) -[:FORMULATES_IDEA]-> (:Concept)
+        """
+        def _get(obj: Any, key: str, default: Any = None) -> Any:
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
+        raw_latex = str(_get(formula, "raw_latex", "") or _get(formula, "latex", "") or str(formula)).strip()
+        normalized_latex = str(_get(formula, "normalized_latex", "") or raw_latex).strip()
+        label = str(_get(formula, "label", "") or _get(formula, "name", "")).strip()
+        quote = str(_get(formula, "supporting_quote", "") or _get(formula, "quote", "")).strip()
+        lhs = str(_get(formula, "lhs", "")).strip()
+        rhs = str(_get(formula, "rhs", "")).strip()
+
+        # Stable hash identifier based on normalized or raw LaTeX
+        key_str = normalized_latex or raw_latex
+        formula_hash = hashlib.sha256(key_str.encode("utf-8")).hexdigest()[:12]
+        node_id = f"formula:{formula_hash}"
+
+        target_g = self.active_shard_graph if (self.is_sharded and self.active_shard_graph is not None) else self.graph
+
+        if not target_g.has_node(node_id):
+            node_attrs: Dict[str, Any] = {
+                "type": "Formula",
+                "tag": "formula",
+                "tags": ["formula", "math"],
+                "is_formula": True,
+                "is_idea": False,
+                "name": label or raw_latex[:80],
+                "label": label,
+                "raw_latex": raw_latex,
+                "normalized_latex": normalized_latex,
+                "lhs": lhs,
+                "rhs": rhs,
+                "supporting_quote": quote,
+                "has_formula": True,
+                "occurrences": 1,
+            }
+            target_g.add_node(node_id, **node_attrs)
+        else:
+            node_data = target_g.nodes[node_id]
+            node_data["occurrences"] = node_data.get("occurrences", 1) + 1
+            if label and not node_data.get("label"):
+                node_data["label"] = label
+                node_data["name"] = label
+            if quote and not node_data.get("supporting_quote"):
+                node_data["supporting_quote"] = quote
+            if lhs and not node_data.get("lhs"):
+                node_data["lhs"] = lhs
+            if rhs and not node_data.get("rhs"):
+                node_data["rhs"] = rhs
+
+        if self.is_sharded:
+            self.active_shard_dirty = True
+        self.mark_node_dirty(node_id)
+
+        # Connect to chunk if provided
+        if chunk is not None:
+            chunk_node_id = self.add_chunk(chunk)
+            target_g.add_edge(
+                chunk_node_id,
+                node_id,
+                relation="CONTAINS_FORMULA",
+                raw_latex=raw_latex,
+                quote=quote,
+            )
+            target_g.add_edge(
+                node_id,
+                chunk_node_id,
+                relation="APPEARS_IN",
+                raw_latex=raw_latex,
+                quote=quote,
+            )
+            self.mark_edge_dirty(chunk_node_id, node_id)
+            self.mark_edge_dirty(node_id, chunk_node_id)
+
+        # Connect to concept if provided
+        if concept_name:
+            concept_node_id = f"concept:{concept_name}"
+            if target_g.has_node(concept_node_id):
+                target_g.nodes[concept_node_id]["has_formula"] = True
+                self.mark_node_dirty(concept_node_id)
+            target_g.add_edge(
+                concept_node_id,
+                node_id,
+                relation="HAS_FORMULA",
+            )
+            target_g.add_edge(
+                node_id,
+                concept_node_id,
+                relation="FORMULATES_IDEA",
+            )
+            self.mark_edge_dirty(concept_node_id, node_id)
+            self.mark_edge_dirty(node_id, concept_node_id)
+
+        return node_id
+
+    def get_formula(self, formula_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve formula node attributes by formula ID or node ID."""
+        nid = formula_id if formula_id.startswith("formula:") else f"formula:{formula_id}"
+        target_g = self.active_shard_graph if (self.is_sharded and self.active_shard_graph is not None) else self.graph
+        if target_g.has_node(nid):
+            return dict(target_g.nodes[nid])
+        return None
+
+    def get_chunk_formulas(self, chunk_id: str) -> List[Dict[str, Any]]:
+        """Retrieve all formulas contained in a specific chunk."""
+        cid = chunk_id if chunk_id.startswith("chunk:") else f"chunk:{chunk_id}"
+        target_g = self.active_shard_graph if (self.is_sharded and self.active_shard_graph is not None) else self.graph
+        if not target_g.has_node(cid):
+            return []
+        formulas = []
+        for _, tgt, edata in target_g.out_edges(cid, data=True):
+            if edata.get("relation") == "CONTAINS_FORMULA" and target_g.has_node(tgt):
+                formulas.append(dict(target_g.nodes[tgt]))
+        return formulas
 
     def add_concept_relation(
         self,

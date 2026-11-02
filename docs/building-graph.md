@@ -198,10 +198,13 @@ bookeeper build-graph --retry-failed
 # 9. Wipe checkpoint state, delete existing graph, and rebuild from scratch:
 bookeeper build-graph --from-scratch
 
-# 10. Accelerate extraction by skipping ambiguous limbo chunks:
+# 10. Rebuild graph from scratch while retaining extracted book states and cached chunks:
+bookeeper build-graph --from-scratch --keep-book-cache
+
+# 11. Accelerate extraction by skipping ambiguous limbo chunks:
 bookeeper build-graph --skip-limbo-chunks
 
-# 11. Automatically export to Neo4j with clean start:
+# 12. Automatically export to Neo4j with clean start:
 bookeeper build-graph --export-neo4j --clean-export
 ```
 
@@ -213,6 +216,7 @@ bookeeper build-graph --export-neo4j --clean-export
 | `--continue` | Continue from the next book relative to the existing graph. | False |
 | `--all` | Force processing across all available books. | False |
 | `--from-scratch` | Wipe existing graph, chunk cache, and checkpoints to rebuild from scratch. | False |
+| `--keep-book-cache`, `--keep-cache` | Retain existing per-book state checkpoints (`.book_states`) and cached chunks even when starting `--from-scratch`. | False |
 | `--book-id`, `-b` | Process a single specific Calibre book ID. | None |
 | `--file`, `-f` | Direct path to a standalone EPUB/PDF file to ingest. | None |
 | `--books-dir` | Path to folder of books/papers to use as source instead of Calibre. | From config |
@@ -490,21 +494,28 @@ The file automatically updates and accumulates with every `build-graph` run (inc
 
 ## 13. Section-Aware Hierarchical Semantic Cover & Deduplication
 
-In scientific white papers, AI preprints (arXiv), and technical literature, ~50–60% of chunks (detailed experimental setups, step-by-step benchmark traces, training logs, and reference/bibliography lists) do not introduce novel foundational concepts.
+> [!TIP]
+> For an in-depth guide on the complete 4-tier filtering conveyor (Math Shield, Structural/Regex Boilerplate, Semantic Routing, and Redundancy Cover), along with full empirical benchmark comparisons and optimal configuration profiles, see **[Chunk Filtering & Semantic Pruning](filters.md)**.
+
+In scientific white papers, AI preprints (arXiv), and technical literature, ~30–50% of chunks (detailed experimental setups, step-by-step benchmark traces, training logs, and reference/bibliography lists) do not introduce novel foundational concepts.
 
 Bookkeeper uses **Section-Aware Hierarchical Semantic Cover** instead of flat global MMR to guarantee lossless conceptual retention while eliminating redundant LLM compute:
 
 1. **Section-Stratified Anchoring**: Every chapter/section retains its conceptual anchor chunk; no section is starved or penalized by an artificial global centroid.
-2. **Guaranteed Semantic Coverage Radius ($\tau_{\text{cover}} \ge 0.82$)**: Within each section, chunks are evaluated sequentially against recent anchors in that section. A chunk is skipped as redundant *only if* an existing extracted chunk covers it with cosine similarity $\ge \tau_{\text{cover}}$. This guarantees skipped chunks are within the evaluation coverage radius ($\tau_{\text{eval}} = 0.75$), keeping $R_{\text{skipped}} \ge 90\%$.
-3. **Automatic Scientific Boilerplate Filtering**: Identifies and bypasses bibliography, references, author contributions, and acknowledgments sections without LLM hallucination risk or token spend.
+2. **Guaranteed Semantic Coverage Radius ($\tau_{\text{cover}} \ge 0.95$)**: Within each section, chunks are evaluated sequentially against recent anchors in that section. A chunk is skipped as redundant *only if* an existing extracted chunk covers it with cosine similarity $\ge \tau_{\text{cover}}$. Based on extensive Pareto analysis, $\tau = 0.95$ prunes 35.17% of universe chunks while preserving 99.58% semantic alignment and peak skipped retention.
+3. **Priority 1 Math Shield**: Chunks containing mathematical formulas, theorems, LaTeX, or Unicode equations are strictly shielded from pruning.
+4. **Automatic Scientific Boilerplate Filtering**: Identifies and bypasses bibliography, references, author contributions, and acknowledgments sections without LLM hallucination risk or token spend.
 
 ### Configuration & CLI Switches
 
 You can configure or disable Hierarchical Semantic Cover via CLI, `config.yaml`, or environment variables:
 
 ```bash
-# Ingestion: build knowledge graph with hierarchical cover
-uv run bookeeper build-graph --hierarchical-cover --cover-threshold 0.92 --cover-window 3 --skip-references
+# Ingestion: build knowledge graph with recommended optimal hierarchical cover (tau = 0.95)
+uv run bookeeper build-graph --hierarchical-cover --cover-threshold 0.95 --cover-window 3 --skip-references
+
+# Conservative near-lossless extraction (tau = 0.96):
+uv run bookeeper build-graph --hierarchical-cover --cover-threshold 0.96
 
 # Disable hierarchical cover (process all surviving chunks):
 uv run bookeeper build-graph --no-hierarchical-cover
@@ -517,7 +528,7 @@ In `config.yaml`:
 ```yaml
 # Section-Aware Hierarchical Semantic Cover & Deduplication
 enable_hierarchical_cover: true       # Prune redundant elaborations within sections
-cover_similarity_threshold: 0.92      # Cosine similarity (>=) to mark chunk redundant (default: 0.92)
+cover_similarity_threshold: 0.95      # Cosine similarity (>=) to mark chunk redundant (Optimal: 0.95, Conservative: 0.96)
 cover_window_size: 3                  # Number of recent section chunks to compare against (default: 3)
 cover_min_section_chunks: 2           # Min chunks in a section before pruning applies
 skip_references_sections: true        # Automatically bypass bibliography / references

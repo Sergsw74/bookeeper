@@ -371,3 +371,199 @@ def test_build_graph_reuses_cached_chunks_and_raw_extractions(tmp_path: Path):
         # Verify LLM was NOT invoked because extraction was reused from cache
         assert mock_extractor.extract_section.call_count == 0
         assert mock_extractor.extract_sections_batch.call_count == 0
+
+
+def test_build_graph_from_scratch_with_and_without_keep_book_cache(tmp_path: Path):
+    """
+    Verify --from-scratch with --keep-book-cache retains .book_states and cached chunks,
+    whereas --from-scratch alone purges both.
+    """
+    output_dir = tmp_path / "output_test"
+    active_states_dir = output_dir / ".book_states"
+    active_states_dir.mkdir(parents=True)
+    state_file = active_states_dir / "book_1_state.json"
+    state_file.write_text(json.dumps({"book_id": "1", "processed_chunks": {}}), encoding="utf-8")
+
+    chunks_dir = output_dir / "chunks"
+    chunks_dir.mkdir(parents=True)
+    chunk_file = chunks_dir / "chunks_1.json"
+    chunk_file.write_text(json.dumps([{"chunk_id": "c1", "text": "sample"}]), encoding="utf-8")
+
+    kg_file = output_dir / "knowledge_graph.json"
+    kg_file.write_text(json.dumps({"nodes": [], "edges": []}), encoding="utf-8")
+
+    mock_client = MagicMock()
+    mock_client.is_available.return_value = True
+    mock_client.list_books.return_value = []
+
+    with patch("bookeeper.cli.get_book_client", return_value=mock_client), \
+         patch("bookeeper.cli._get_effective_settings") as mock_settings:
+        cfg = Settings(output_dir=str(output_dir))
+        mock_settings.return_value = cfg
+
+        # 1. Run with --from-scratch AND --keep-book-cache
+        res1 = runner.invoke(
+            app,
+            [
+                "build-graph",
+                "--all",
+                "--from-scratch",
+                "--keep-book-cache",
+                "--skip-warmup",
+            ],
+        )
+
+        assert res1.exit_code == 0
+        assert "Preserving existing per-book state checkpoints" in res1.output
+        # State file and chunk file must STILL EXIST
+        assert state_file.exists()
+        assert chunk_file.exists()
+        # Knowledge graph file must have been wiped
+        assert not kg_file.exists()
+
+        # 2. Run with --from-scratch WITHOUT --keep-book-cache
+        res2 = runner.invoke(
+            app,
+            [
+                "build-graph",
+                "--all",
+                "--from-scratch",
+                "--skip-warmup",
+            ],
+        )
+
+        assert res2.exit_code == 0
+        assert "deleting all book states and cached chunks" in res2.output or "Deleted" in res2.output
+        # State file and chunk file must NOW BE PURGED
+        assert not state_file.exists()
+        assert not chunk_file.exists()
+
+
+def test_recover_skipped_formula_chunks_unmarks_from_processed(tmp_path: Path):
+    """Verify recover_skipped_formula_chunks unmarks skipped chunks that have mathematical formulas."""
+    book_state = BookProcessingState(book_id="test", state_dir=tmp_path)
+
+    # 1. Chunk with math formula previously marked skipped_cover
+    math_chunk = HierarchicalChunk(
+        book_id=1,
+        book_title="Test Book",
+        chapter_idx=0,
+        chunk_id="chk_math",
+        chunk_idx=1,
+        text=r"The objective is \min_\theta \mathbb{E}[\|\hat{y} - y\|^2] + \lambda \|\theta\|_2^2",
+        section_title="Loss Definition",
+    )
+    book_state.mark_chunk_processed(
+        chunk_id="chk_math",
+        chunk_idx=1,
+        section_title="Loss Definition",
+        extraction_dict={"concepts": []},
+        duration=0.0,
+        server_used="skipped_cover",
+    )
+
+    # 2. Regular narrative chunk previously marked skipped_cover (no formulas)
+    prose_chunk = HierarchicalChunk(
+        book_id=1,
+        book_title="Test Book",
+        chapter_idx=0,
+        chunk_id="chk_prose",
+        chunk_idx=2,
+        text="This chapter provides an introduction to our neural network architecture.",
+        section_title="Intro",
+    )
+    book_state.mark_chunk_processed(
+        chunk_id="chk_prose",
+        chunk_idx=2,
+        section_title="Intro",
+        extraction_dict={"concepts": []},
+        duration=0.0,
+        server_used="skipped_cover",
+    )
+
+    # 3. Extracted chunk (server_used: "ollama") with formulas (should NOT be recovered because it is already extracted!)
+    extracted_chunk = HierarchicalChunk(
+        book_id=1,
+        book_title="Test Book",
+        chapter_idx=0,
+        chunk_id="chk_extracted",
+        chunk_idx=3,
+        text=r"f(x) = \sigma(W x + b)",
+        section_title="Model",
+    )
+    book_state.mark_chunk_processed(
+        chunk_id="chk_extracted",
+        chunk_idx=3,
+        section_title="Model",
+        extraction_dict={"concepts": [{"name": "Sigmoid Layer"}]},
+        duration=1.2,
+        server_used="ollama",
+    )
+
+    assert book_state.is_chunk_processed("chk_math")
+    assert book_state.is_chunk_processed("chk_prose")
+    assert book_state.is_chunk_processed("chk_extracted")
+
+    recovered = book_state.recover_skipped_formula_chunks([math_chunk, prose_chunk, extracted_chunk])
+
+    # Only chk_math should be recovered
+    assert recovered == ["chk_math"]
+    assert not book_state.is_chunk_processed("chk_math")  # Unmarked -> returned to unprocessed!
+    assert book_state.is_chunk_processed("chk_prose")     # Preserved as skipped
+    assert book_state.is_chunk_processed("chk_extracted") # Preserved as extracted
+
+
+def test_cached_extraction_preserved_when_chunk_skipped_and_restored(tmp_path: Path):
+    """
+    Verify that when an already extracted chunk is marked as skipped (e.g. by chunk similarity cover),
+    its substantive extraction is preserved in cached_extraction, allowing it to be restored without LLM calls.
+    """
+    book_state = BookProcessingState(book_id="cache_test", state_dir=tmp_path)
+
+    # 1. Chunk is extracted by LLM in run 1
+    sample_extraction = {
+        "concepts": [{"name": "Attention Mechanism", "summary": "Key-value-query weighting"}],
+        "extracted_ideas": [{"idea_statement": "Attention connects queries to keys."}],
+    }
+    book_state.mark_chunk_processed(
+        chunk_id="c_1",
+        chunk_idx=1,
+        section_title="Architecture",
+        extraction_dict=sample_extraction,
+        duration=1.5,
+        server_used="gpu-node",
+    )
+    assert book_state.is_chunk_processed("c_1")
+    rec1 = book_state.get_processed_chunk("c_1")
+    assert rec1["status"] == "extracted"
+    assert rec1["server_used"] == "gpu-node"
+
+    # 2. In run 2, chunk is skipped by hierarchical cover -> marked skipped_cover
+    # Its substantive extraction must NOT be deleted or lost!
+    substantive = book_state.get_cached_substantive_extraction("c_1")
+    assert substantive is not None
+    assert substantive["concepts"][0]["name"] == "Attention Mechanism"
+
+    book_state.mark_chunk_processed(
+        chunk_id="c_1",
+        chunk_idx=1,
+        section_title="Architecture",
+        extraction_dict={"concepts": [], "extracted_ideas": []},
+        duration=0.0,
+        server_used="skipped_cover",
+        cached_extraction=substantive,
+    )
+
+    rec2 = book_state.get_processed_chunk("c_1")
+    assert rec2["status"] == "skipped_cover"
+    assert rec2["server_used"] == "skipped_cover"
+    # Cached extraction remains preserved on the chunk record!
+    assert "cached_extraction" in rec2
+    assert rec2["cached_extraction"]["concepts"][0]["name"] == "Attention Mechanism"
+
+    # 3. In run 3, chunk similarity is turned off -> chunk is selected again!
+    # It restores the preserved substantive extraction with 0ms LLM latency!
+    substantive_restored = book_state.get_cached_substantive_extraction("c_1")
+    assert substantive_restored is not None
+    assert substantive_restored["concepts"][0]["name"] == "Attention Mechanism"
+

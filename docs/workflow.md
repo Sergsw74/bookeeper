@@ -41,6 +41,7 @@ Before launching a full extraction run across hundreds of books, **always run an
 ### Why Calibrate First?
 - Digital libraries vary dramatically in technical density, vocabulary, and formatting (e.g. computer science textbooks vs. mathematical papers vs. narrative history).
 - Testing on a small sample lets you discover the ideal balance between:
+  - **Chunk Filtering & Semantic Pruning**: Tuning conveyor filters and intra-section cover threshold ($\tau = 0.95$ recommended, $\tau = 0.96$ conservative) to eliminate 27–35% redundant LLM load without concept loss (see **[Chunk Filtering Guide](filters.md)**).
   - **Model Capacity vs. Speed**: e.g., evaluating whether `qwen2.5:3b` captures sufficient depth or if `llama3.1:8b` is required.
   - **Chunk Size & Overlap**: Testing whether smaller semantic chunks retain seam context or if larger windows are needed.
   - **Factual Grounding Recall**: Checking verification recall on a fast 1% sample before processing the whole library.
@@ -81,6 +82,7 @@ bookeeper build-graph --no-lightrag
 ```
 
 ### Best Practices:
+- **Hierarchical Semantic Cover (`--hierarchical-cover --cover-threshold 0.95`)**: Prunes ~35% redundant narrative exposition while safeguarding all mathematical formulas and theorems (see **[Chunk Filtering Guide](filters.md)**).
 - **Use `--no-lightrag`**: Bypasses heavy vector indexing during ingestion so Ollama focuses 100% of GPU compute on concept extraction.
 - **Use `--skip-limbo-chunks`**: Accelerates extraction by bypassing ambiguous chunks ($0.65 \le \text{similarity} < 0.90$), prioritizing brand-new ideas and high-confidence direct matches.
 - **Incremental Neo4j Sync**: Automatically syncs dirty nodes and edges to Neo4j every 10 books (`batch_books: 10`).

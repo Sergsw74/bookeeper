@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 from bookeeper.calibre.parser import BookParser
 from bookeeper.config import Settings
+from bookeeper.processing.filters import has_mathematical_formula
 from bookeeper.processing.ollama_pool import OllamaPool
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,10 @@ class Concept(BaseModel):
             "6-8: specific, advanced architectural approaches or paradigms (e.g. 'RAG', weight=7; 'Event Sourcing', weight=7). "
             "9-10: highly specific, novel, or deep architectural/philosophical concepts (e.g. 'SmartRAG', weight=9; 'Deterministic Simulation Testing', weight=10)."
         ),
+    )
+    has_formula: bool = Field(
+        default=False,
+        description="Whether this concept encapsulates or contains a mathematical formula.",
     )
     _embedding: Optional[List[float]] = PrivateAttr(default=None)
 
@@ -164,7 +169,11 @@ class ExtractedIdea(BaseModel):
     )
     idea_type: str = Field(
         default="Definition",
-        description="Type classification: 'Definition' | 'Argument' | 'Mechanism' | 'Example'.",
+        description="Type classification: 'Definition' | 'Argument' | 'Mechanism' | 'Example' | 'Formula' | 'Mathematical Formulation' | 'Theoretical Claim' | 'Empirical Finding' | 'Protocol'.",
+    )
+    has_formula: bool = Field(
+        default=False,
+        description="Whether this idea encapsulates or contains a mathematical formula.",
     )
 
     @model_validator(mode="before")
@@ -179,16 +188,78 @@ class ExtractedIdea(BaseModel):
                     BookParser.repair_mojibake(e) if isinstance(e, str) else e
                     for e in data["key_entities"]
                 ]
+            if "has_formula" in data:
+                data["has_formula"] = bool(data["has_formula"])
             if "idea_type" in data and isinstance(data["idea_type"], str):
-                val = data["idea_type"].strip().capitalize()
-                if val in {"Definition", "Argument", "Mechanism", "Example"}:
+                raw_type = data["idea_type"].strip()
+                val = raw_type.title()
+                valid_types = {
+                    "Definition",
+                    "Argument",
+                    "Mechanism",
+                    "Example",
+                    "Formula",
+                    "Mathematical Formulation",
+                    "Theoretical Claim",
+                    "Empirical Finding",
+                    "Protocol",
+                }
+                if val in valid_types:
                     data["idea_type"] = val
+                    if val in ("Formula", "Mathematical Formulation"):
+                        data["has_formula"] = True
+                elif any(m in raw_type.lower() for m in ("math", "formul", "loss", "equation", "objective")):
+                    data["idea_type"] = "Formula" if "formul" in raw_type.lower() else "Mathematical Formulation"
+                    data["has_formula"] = True
+                elif any(m in raw_type.lower() for m in ("theor", "proof", "lemma", "theorem", "bound")):
+                    data["idea_type"] = "Theoretical Claim"
+                elif any(m in raw_type.lower() for m in ("empir", "find", "result", "ablation", "collapse")):
+                    data["idea_type"] = "Empirical Finding"
+                elif any(m in raw_type.lower() for m in ("proto", "rule", "gate", "policy", "invariant")):
+                    data["idea_type"] = "Protocol"
+                elif any(m in raw_type.lower() for m in ("mech", "algo", "loop", "pipeline")):
+                    data["idea_type"] = "Mechanism"
         return data
 
     def to_concept(self) -> Concept:
         """Convert extracted idea into canonical Concept representation for knowledge graph."""
-        name = self.key_entities[0] if self.key_entities else self.idea_statement[:60].strip()
+        generic_umbrella_words = {
+            "model", "framework", "method", "approach", "algorithm", "architecture",
+            "paper", "system", "loss", "gradient", "experiment", "evaluation",
+            "benchmark", "dataset", "baseline", "results", "analysis",
+        }
+        name = ""
+        # 1. Inspect key_entities: avoid picking a bare generic umbrella word as concept title
+        if self.key_entities:
+            first_candidate = self.key_entities[0].strip()
+            # If the first candidate is in the generic umbrella list, try to find a better entity
+            if first_candidate.lower() in generic_umbrella_words:
+                for alt in self.key_entities[1:]:
+                    alt_clean = alt.strip()
+                    if alt_clean.lower() not in generic_umbrella_words and len(alt_clean) >= 3:
+                        name = alt_clean
+                        break
+            if not name:
+                name = first_candidate
+
+        if not name:
+            name = self.idea_statement[:60].strip()
+
+        # If name is still just a bare generic umbrella word, enrich it with idea_type
+        if name.strip().lower() in generic_umbrella_words:
+            name = f"{name} ({self.idea_type})"
+
         related = [e for e in self.key_entities if e != name]
+        high_weight_types = {
+            "Formula",
+            "Mathematical Formulation",
+            "Theoretical Claim",
+            "Empirical Finding",
+            "Mechanism",
+            "Protocol",
+            "Argument",
+        }
+        w = 8 if (self.has_formula or self.idea_type in {"Formula", "Mathematical Formulation", "Theoretical Claim"}) else (7 if self.idea_type in high_weight_types else 5)
         return Concept(
             name=name,
             brief_description=self.idea_statement,
@@ -196,8 +267,283 @@ class ExtractedIdea(BaseModel):
             category=self.idea_type,
             supporting_quote=self.source_quote,
             related_concepts=related,
-            weight=7 if self.idea_type in {"Argument", "Mechanism"} else 5,
+            weight=w,
+            has_formula=self.has_formula,
         )
+
+
+class ExtractedFormula(BaseModel):
+    """
+    Mathematical formula entity extracted verbatim from text using LaTeX/math heuristics.
+    Formula is a distinct entity type from Idea/Concept.
+    """
+
+    raw_latex: str = Field(
+        description="Exact raw LaTeX, equation line, or mathematical formulation extracted from the chunk.",
+    )
+    normalized_latex: str = Field(
+        default="",
+        description="Cleaned, normalized representation of the mathematical formula.",
+    )
+    label: str = Field(
+        default="",
+        description="Label, equation number, or conceptual name associated with the formula (e.g. 'Option Bellman Loss', 'Eq. 1').",
+    )
+    lhs: str = Field(
+        default="",
+        description="Left-hand side of equation if applicable.",
+    )
+    rhs: str = Field(
+        default="",
+        description="Right-hand side of equation if applicable.",
+    )
+    supporting_quote: str = Field(
+        default="",
+        description="Verbatim sentence or passage in the chunk containing the formula.",
+    )
+    has_formula: bool = Field(
+        default=True,
+        description="Always True for formula entities.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def sanitize_formula(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            for k in ("raw_latex", "normalized_latex", "label", "lhs", "rhs", "supporting_quote"):
+                if k in data and isinstance(data[k], str):
+                    data[k] = BookParser.repair_mojibake(data[k])
+            raw = data.get("raw_latex", "")
+            if not data.get("normalized_latex") and raw:
+                data["normalized_latex"] = normalize_latex_formula(raw)
+            if not data.get("lhs") and raw:
+                lhs, rhs = split_formula_sides(raw)
+                if lhs:
+                    data["lhs"] = lhs
+                if rhs:
+                    data["rhs"] = rhs
+            data["has_formula"] = True
+        return data
+
+
+# ==============================================================================
+# LaTeX and Mathematical Formula Heuristics & Reconciler
+# ==============================================================================
+
+DISPLAY_MATH_REGEX = re.compile(
+    r"(?:"
+    r"\$\$(.+?)\$\$|"
+    r"\\\[(.+?)\\\]|"
+    r"\\begin\{(?:equation\*?|align\*?|gather\*?|multline\*?)\}(.+?)\\end\{(?:equation\*?|align\*?|gather\*?|multline\*?)\}"
+    r")",
+    re.DOTALL,
+)
+
+INLINE_MATH_REGEX = re.compile(
+    r"(?:\$([^\$\n]{3,250})\$|\\\(([^\)\n]{3,250})\\\))"
+)
+
+EQUATION_LINE_REGEX = re.compile(
+    r"^[ \t]*([\w,\(\)\{\}\\\^\*\[\]\s\-]{1,50}\s*(?:=|\\approx|\\sim|\\le|\\ge|<=|>=|==|≤|≥|≠|≈|∼|∝|∈)\s*.{3,300})[ \t]*$",
+    re.MULTILINE,
+)
+
+MATH_SYMBOL_REGEX = re.compile(
+    r"(?:\\[a-zA-Z]+|[_\^][a-zA-Z0-9{}]|[=≤≥≠≈∼∝∈∉∀∃∑∫∏∂∇√αβγδεθλμστφχψωΓΔΘΛΞΠΣΥΦΨΩ]|\b(?:tr|Cov|Var|argmax|argmin|diag|det)\b|\bE\s*[\[(])"
+)
+
+
+def normalize_latex_formula(raw: str) -> str:
+    """Normalize LaTeX formula string by stripping outer delimiters and excessive whitespace."""
+    if not raw:
+        return ""
+    text = raw.strip()
+    if text.startswith("$$") and text.endswith("$$") and len(text) >= 4:
+        text = text[2:-2].strip()
+    elif text.startswith("\\[") and text.endswith("\\]") and len(text) >= 4:
+        text = text[2:-2].strip()
+    elif text.startswith("$") and text.endswith("$") and len(text) >= 2:
+        text = text[1:-1].strip()
+    elif text.startswith("\\(") and text.endswith("\\)") and len(text) >= 4:
+        text = text[2:-2].strip()
+    # Collapse multiple whitespace/newlines
+    text = re.sub(r"\s+", " ", text).strip()
+    # Strip trailing punctuation often found in text equations
+    text = re.sub(r"[,;.]\s*$", "", text)
+    return text
+
+
+def split_formula_sides(raw: str) -> Tuple[str, str]:
+    """Split formula into left-hand side (LHS) and right-hand side (RHS) across relation operators."""
+    norm = normalize_latex_formula(raw)
+    for op in ("=", "\\approx", "\\sim", "\\le", "\\ge", "≤", "≥", "≠", "≈", "∼", "∝", "∈", "==", "<=", ">="):
+        if op in norm:
+            parts = norm.split(op, 1)
+            return parts[0].strip(), parts[1].strip()
+    return "", ""
+
+
+def extract_raw_formulas_from_text(text: str) -> List[ExtractedFormula]:
+    """
+    Verbatim extraction of mathematical formulas directly from chunk text using LaTeX and equation heuristics.
+    Anchor each formula to its exact supporting quote/context in the chunk.
+    """
+    if not text:
+        return []
+
+    extracted: List[ExtractedFormula] = []
+    seen_formulas: Set[str] = set()
+
+    # 1. LaTeX display math ($$ ... $$, \[ ... \], \begin{equation} ... \end{equation})
+    for m in DISPLAY_MATH_REGEX.finditer(text):
+        content = next((g for g in m.groups() if g is not None), "").strip()
+        norm = normalize_latex_formula(content)
+        if norm and len(norm) >= 3 and norm not in seen_formulas:
+            seen_formulas.add(norm)
+            lhs, rhs = split_formula_sides(norm)
+            quote = m.group(0).strip()
+            extracted.append(
+                ExtractedFormula(
+                    raw_latex=content,
+                    normalized_latex=norm,
+                    lhs=lhs,
+                    rhs=rhs,
+                    supporting_quote=quote,
+                    has_formula=True,
+                )
+            )
+
+    # 2. LaTeX inline math ($ ... $, \( ... \))
+    for m in INLINE_MATH_REGEX.finditer(text):
+        content = next((g for g in m.groups() if g is not None), "").strip()
+        norm = normalize_latex_formula(content)
+        if norm and len(norm) >= 3 and MATH_SYMBOL_REGEX.search(norm):
+            if not any(norm in prev.normalized_latex or prev.normalized_latex in norm for prev in extracted):
+                seen_formulas.add(norm)
+                lhs, rhs = split_formula_sides(norm)
+                quote = m.group(0).strip()
+                extracted.append(
+                    ExtractedFormula(
+                        raw_latex=content,
+                        normalized_latex=norm,
+                        lhs=lhs,
+                        rhs=rhs,
+                        supporting_quote=quote,
+                        has_formula=True,
+                    )
+                )
+
+    # 3. Standalone equation lines (markdown / OCR / plain text math equations)
+    for m in EQUATION_LINE_REGEX.finditer(text):
+        line = m.group(1).strip()
+        norm = normalize_latex_formula(line)
+        if norm and len(norm) >= 5 and MATH_SYMBOL_REGEX.search(norm):
+            if not any(norm in prev.normalized_latex or prev.normalized_latex in norm for prev in extracted):
+                seen_formulas.add(norm)
+                lhs, rhs = split_formula_sides(norm)
+                extracted.append(
+                    ExtractedFormula(
+                        raw_latex=line,
+                        normalized_latex=norm,
+                        lhs=lhs,
+                        rhs=rhs,
+                        supporting_quote=line,
+                        has_formula=True,
+                    )
+                )
+
+    return extracted
+
+
+def reconcile_formulas_and_ideas(
+    chunk_text: str,
+    raw_formulas: List[ExtractedFormula],
+    ideas: List[ExtractedIdea],
+) -> Tuple[List[ExtractedFormula], List[ExtractedIdea]]:
+    """
+    Reconciles raw formulas extracted via LaTeX with LLM-extracted ideas.
+    - Every genuine conceptual idea extracted by the LLM is retained as a first-class Concept.
+      The LLM's conceptual understanding, titles, and explanations must NEVER be deleted or dropped.
+    - If an idea formulates or references a mathematical equation, mark idea.has_formula = True,
+      associate it with the exact raw formula, and use the LLM's concept title to enrich the formula label.
+    - Raw formula preserves exact verbatim LaTeX, while LLM idea preserves conceptual meaning.
+    - Promotes substantive unmatched formulas into first-class ExtractedIdea concepts to guarantee
+      mathematical formulations and formal equations are never dropped from the knowledge graph.
+    """
+    if not raw_formulas:
+        return raw_formulas, ideas
+
+    reconciled_ideas: List[ExtractedIdea] = []
+    matched_formula_indices: Set[int] = set()
+
+    for idea in ideas:
+        matched_formula: Optional[ExtractedFormula] = None
+
+        # Check if idea matches or references any raw formula
+        for idx, f in enumerate(raw_formulas):
+            if f.raw_latex in idea.source_quote or (f.lhs and f.lhs in idea.source_quote):
+                matched_formula = f
+                matched_formula_indices.add(idx)
+            elif f.normalized_latex in normalize_latex_formula(idea.source_quote):
+                matched_formula = f
+                matched_formula_indices.add(idx)
+            elif f.lhs and f.lhs in idea.idea_statement and any(sym in idea.idea_statement for sym in ("=", "≈", "∼", "≤", "≥")):
+                matched_formula = f
+                matched_formula_indices.add(idx)
+
+            if matched_formula:
+                # Enrich formula label from LLM conceptual key entities if formula has no label
+                if not f.label and idea.key_entities:
+                    for ent in idea.key_entities:
+                        if not any(sym in ent for sym in ("=", "\\", "$", "∼")):
+                            f.label = ent
+                            break
+                if not f.label and idea.idea_statement:
+                    f.label = idea.idea_statement[:60].strip()
+                break
+
+        # Mark has_formula on the idea if it formulated or referenced math
+        if matched_formula or idea.idea_type in ("Formula", "Mathematical Formulation") or any(
+            f.raw_latex in idea.source_quote or (f.lhs and f.lhs in idea.source_quote) or (f.lhs and f.lhs in idea.idea_statement)
+            for f in raw_formulas
+        ):
+            idea.has_formula = True
+            if idea.idea_type not in ("Mathematical Formulation", "Theoretical Claim"):
+                idea.idea_type = "Mathematical Formulation"
+
+        # ALWAYS retain the LLM's conceptual idea!
+        reconciled_ideas.append(idea)
+
+    # Promote substantive unmatched formulas into first-class ExtractedIdea concepts
+    for idx, f in enumerate(raw_formulas):
+        if idx in matched_formula_indices:
+            continue
+        # Check if formula is substantive (has relation operator with LHS and RHS, or long equation)
+        is_substantive = bool(f.lhs and f.rhs) or (
+            len(f.normalized_latex) >= 6
+            and any(c in f.normalized_latex for c in ("=", "\\le", "\\ge", "≤", "≥", "<", ">", "\\approx", "\\sim"))
+        )
+        if not is_substantive and len(ideas) > 0:
+            continue  # Don't promote trivial inline symbols if chunk already has ideas
+
+        formula_label = f.label.strip() if f.label else ""
+        if not formula_label:
+            if f.lhs and len(f.lhs) <= 40 and not any(sym in f.lhs for sym in ("\\", "$", "\n")):
+                formula_label = f"{f.lhs.strip()} Formulation"
+            else:
+                clean_norm = f.normalized_latex.replace("$", "").strip()
+                formula_label = f"Formula: {clean_norm[:35]}"
+
+        synth_idea = ExtractedIdea(
+            source_quote=f.supporting_quote or f.raw_latex,
+            idea_statement=f"Mathematical formulation for {formula_label}: {f.raw_latex}",
+            key_entities=[formula_label, "Mathematical Formulation"],
+            idea_type="Mathematical Formulation",
+            has_formula=True,
+        )
+        reconciled_ideas.append(synth_idea)
+
+    return raw_formulas, reconciled_ideas
 
 
 class SectionExtraction(BaseModel):
@@ -210,6 +556,10 @@ class SectionExtraction(BaseModel):
     concepts: List[Concept] = Field(
         default_factory=list,
         description="List of technical ideas, concepts, and architectural patterns discussed.",
+    )
+    formulas: List[ExtractedFormula] = Field(
+        default_factory=list,
+        description="List of mathematical formulas extracted from the chunk.",
     )
 
     @model_validator(mode="before")
@@ -248,7 +598,7 @@ class SectionExtraction(BaseModel):
                         continue
                     parsed_concepts.append(concept_obj)
                     cat = concept_obj.category.capitalize() if concept_obj.category else "Definition"
-                    idea_type = cat if cat in {"Definition", "Argument", "Mechanism", "Example"} else "Definition"
+                    idea_type = cat if cat in {"Definition", "Argument", "Mechanism", "Example", "Formula"} else "Definition"
                     entities = [concept_obj.name] + [r for r in concept_obj.related_concepts if r != concept_obj.name]
                     synthesized_ideas.append(
                         ExtractedIdea(
@@ -256,10 +606,51 @@ class SectionExtraction(BaseModel):
                             idea_statement=concept_obj.brief_description or concept_obj.detailed_explanation or concept_obj.name,
                             key_entities=entities,
                             idea_type=idea_type,
+                            has_formula=concept_obj.has_formula,
                         )
                     )
                 data["concepts"] = parsed_concepts
                 data["extracted_ideas"] = synthesized_ideas
+
+            # Case 3: Both ideas_raw and concepts_raw empty, but formulas present -> synthesize ideas and concepts
+            elif not ideas_raw and not concepts_raw and (data.get("formulas") or []):
+                formulas_raw = data.get("formulas") or []
+                synthesized_ideas = []
+                synthesized_concepts = []
+                for f_item in formulas_raw:
+                    if isinstance(f_item, dict):
+                        f_obj = ExtractedFormula(**f_item)
+                    elif isinstance(f_item, ExtractedFormula):
+                        f_obj = f_item
+                    else:
+                        continue
+                    label = f_obj.label.strip() if f_obj.label else ""
+                    if not label:
+                        if f_obj.lhs and len(f_obj.lhs) <= 40 and not any(sym in f_obj.lhs for sym in ("\\", "$", "\n")):
+                            label = f"{f_obj.lhs.strip()} Formulation"
+                        else:
+                            clean_norm = f_obj.normalized_latex.replace("$", "").strip()
+                            label = f"Formula: {clean_norm[:35]}"
+                    idea = ExtractedIdea(
+                        source_quote=f_obj.supporting_quote or f_obj.raw_latex,
+                        idea_statement=f"Mathematical formulation for {label}: {f_obj.raw_latex}",
+                        key_entities=[label, "Mathematical Formulation"],
+                        idea_type="Mathematical Formulation",
+                        has_formula=True,
+                    )
+                    synthesized_ideas.append(idea)
+                    synthesized_concepts.append(idea.to_concept())
+                data["extracted_ideas"] = synthesized_ideas
+                data["concepts"] = synthesized_concepts
+
+            if "formulas" in data and isinstance(data["formulas"], list):
+                parsed_f = []
+                for item in data["formulas"]:
+                    if isinstance(item, dict):
+                        parsed_f.append(ExtractedFormula(**item))
+                    elif isinstance(item, ExtractedFormula):
+                        parsed_f.append(item)
+                data["formulas"] = parsed_f
         return data
 
 
@@ -277,6 +668,10 @@ class ChunkExtraction(BaseModel):
     concepts: List[Concept] = Field(
         default_factory=list,
         description="List of technical concepts and architectural patterns discussed in this chunk.",
+    )
+    formulas: List[ExtractedFormula] = Field(
+        default_factory=list,
+        description="List of mathematical formulas extracted from this specific chunk.",
     )
 
     @model_validator(mode="before")
@@ -318,7 +713,7 @@ class ChunkExtraction(BaseModel):
                         continue
                     parsed_concepts.append(concept_obj)
                     cat = concept_obj.category.capitalize() if concept_obj.category else "Definition"
-                    idea_type = cat if cat in {"Definition", "Argument", "Mechanism", "Example"} else "Definition"
+                    idea_type = cat if cat in {"Definition", "Argument", "Mechanism", "Example", "Formula"} else "Definition"
                     entities = [concept_obj.name] + [r for r in concept_obj.related_concepts if r != concept_obj.name]
                     synthesized_ideas.append(
                         ExtractedIdea(
@@ -326,10 +721,20 @@ class ChunkExtraction(BaseModel):
                             idea_statement=concept_obj.brief_description or concept_obj.detailed_explanation or concept_obj.name,
                             key_entities=entities,
                             idea_type=idea_type,
+                            has_formula=concept_obj.has_formula,
                         )
                     )
                 data["concepts"] = parsed_concepts
                 data["extracted_ideas"] = synthesized_ideas
+
+            if "formulas" in data and isinstance(data["formulas"], list):
+                parsed_f = []
+                for item in data["formulas"]:
+                    if isinstance(item, dict):
+                        parsed_f.append(ExtractedFormula(**item))
+                    elif isinstance(item, ExtractedFormula):
+                        parsed_f.append(item)
+                data["formulas"] = parsed_f
         return data
 
 
@@ -845,25 +1250,37 @@ class KnowledgeExtractor:
         Supports parent macro context for hierarchical RAG understanding.
         """
         system_text = (
-            "You are an expert knowledge-graph extractor. Your goal is to extract core intellectual ideas from the provided book chunk.\n\n"
+            "You are an expert knowledge-graph extractor. Your goal is to extract core intellectual ideas, mathematical formulations, empirical findings, and architectural mechanisms from the provided book chunk.\n\n"
             "Rules:\n"
             "1. Every idea must be anchored by an exact verbatim quote from the text.\n"
             '2. The "idea_statement" must be a concise, self-contained factual claim (1–2 sentences).\n'
             "3. Do not invent details not present in the chunk.\n"
-            "4. Extract only distinct, meaningful concepts (usually 1 to 3 per chunk). If the chunk contains no standalone ideas, output an empty list.\n"
-            "5. Return strictly valid JSON matching the schema below.\n"
+            "4. Extract only distinct, meaningful concepts (usually 1 to 4 per chunk). Specifically capture:\n"
+            "   - Mathematical Formulations & Objectives: Key loss equations, optimization objectives, error bounds, and theorem/lemma statements.\n"
+            "   - Empirical Findings & Failure Modes: Discovered empirical trade-offs, scaling limits, ablation drops, and behavioral vulnerabilities.\n"
+            "   - Protocols & Algorithmic Loops: Architectural workflows, decision gates, formal verification rules, and agent interaction patterns.\n"
+            "   - Conceptual Definitions & Core Arguments.\n"
+            "   If the chunk contains no standalone ideas or is generic boilerplate, output an empty list.\n"
+            "5. Specificity in Key Entities (CRITICAL: Primary Entity is the Concept Title):\n"
+            "   - The FIRST entry in 'key_entities' becomes the canonical title of the concept in the Knowledge Graph.\n"
+            "   - NEVER use the paper's overarching framework, library, tool, system, or book name (e.g., 'Grasp', 'EvoAlloc', 'LLaVA', 'Model', 'Gradient', 'Paper') as the primary key entity.\n"
+            "   - Instead, name the specific mechanism, mathematical formulation, rule, or empirical finding (e.g. 'Mutagenic LUMO-Threshold Rule', 'Reasoning-First XML Trace Protocol', 'Answer-First JSON Degradation').\n"
+            "6. Dense Math & Symbolic Code Chunks:\n"
+            "   - When a chunk contains mathematical equations, proofs, bounds (e.g. spectral radius bound rho_P < 1), or formal code (Lean 4, Prolog logic predicates), extract the specific mathematical bound, loss formulation, or logical deduction as a named concept rather than skipping it or outputting empty.\n"
+            "7. Return strictly valid JSON matching the schema below.\n"
             "Output Format:\n"
             "{\n"
             '  "extracted_ideas": [\n'
             "    {\n"
             '      "source_quote": "Exact verbatim sentence from the chunk",\n'
             '      "idea_statement": "Concise summary of the concept or argument",\n'
-            '      "key_entities": ["Topic A", "Concept B"],\n'
-            '      "idea_type": "Definition" | "Argument" | "Mechanism" | "Example"\n'
+            '      "key_entities": ["Specific Concept Title", "Secondary Topic"],\n'
+            '      "idea_type": "Definition" | "Argument" | "Mechanism" | "Example" | "Mathematical Formulation" | "Theoretical Claim" | "Empirical Finding" | "Protocol"\n'
             "    }\n"
             "  ]\n"
             "}\n\n"
-            "Example:\n"
+            "Examples:\n"
+            "Example 1 (Mechanism):\n"
             "Chunk:\n"
             '"Systems theory demonstrates that complex networks exhibit emergent properties. In ant colonies, no single ant understands the global architecture of the nest, yet through simple local pheromone interactions, highly coordinated structures arise spontaneously."\n\n'
             "Response:\n"
@@ -874,6 +1291,34 @@ class KnowledgeExtractor:
             '      "idea_statement": "Complex coordination emerges from local rules without central leadership.",\n'
             '      "key_entities": ["Systems Theory", "Emergence", "Self-organization"],\n'
             '      "idea_type": "Mechanism"\n'
+            "    }\n"
+            "  ]\n"
+            "}\n\n"
+            "Example 2 (Mathematical Formulation):\n"
+            "Chunk:\n"
+            '"We define the option-conditioned multi-step temporal-difference loss over interval k as LQh,phi = E_{(s_t, s_{t+k}, g)} [(Q_h(s_t, g, phi(s_t, s_{t+k})) - R_h(s_{t:t+k}, g) - gamma V_h(s_{t+k}, g))^2]."\n\n'
+            "Response:\n"
+            "{\n"
+            '  "extracted_ideas": [\n'
+            "    {\n"
+            '      "source_quote": "We define the option-conditioned multi-step temporal-difference loss over interval k as LQh,phi = E_{(s_t, s_{t+k}, g)} [(Q_h(s_t, g, phi(s_t, s_{t+k})) - R_h(s_{t:t+k}, g) - gamma V_h(s_{t+k}, g))^2].",\n'
+            '      "idea_statement": "Option-conditioned multi-step TD objective measures squared Bellman error over k-step transition subgoals.",\n'
+            '      "key_entities": ["Hierarchical TD Loss", "Option-Conditioned Q-Learning", "Subgoal Transition Interval"],\n'
+            '      "idea_type": "Mathematical Formulation"\n'
+            "    }\n"
+            "  ]\n"
+            "}\n\n"
+            "Example 3 (Empirical Finding):\n"
+            "Chunk:\n"
+            '"Under constrained JSON formats, placing the answer field before the rationale forces the model to prematurely commit to a single incorrect path, causing accuracy to collapse from 82% to 41%."\n\n'
+            "Response:\n"
+            "{\n"
+            '  "extracted_ideas": [\n'
+            "    {\n"
+            '      "source_quote": "Under constrained JSON formats, placing the answer field before the rationale forces the model to prematurely commit to a single incorrect path, causing accuracy to collapse from 82% to 41%.",\n'
+            '      "idea_statement": "Answer-first structured JSON schemas induce premature commitment, halving reasoning accuracy compared to reasoning-first generation.",\n'
+            '      "key_entities": ["Answer-First JSON Degradation", "Reasoning-First XML Trace Protocol", "Format Sensitivity"],\n'
+            '      "idea_type": "Empirical Finding"\n'
             "    }\n"
             "  ]\n"
             "}"
@@ -914,6 +1359,12 @@ class KnowledgeExtractor:
 
         chunk_chars = len(text)
 
+        # Check if chunk contains mathematical formulas and pre-extract raw formulas
+        chunk_has_formula = has_mathematical_formula(text)
+        raw_formulas: List[ExtractedFormula] = []
+        if chunk_has_formula:
+            raw_formulas = extract_raw_formulas_from_text(text)
+
         try:
             result = self._execute_structured_invoke(
                 SectionExtraction,
@@ -943,14 +1394,21 @@ class KnowledgeExtractor:
                     if val_quote:
                         idea.source_quote = val_quote
                     validated_ideas.append(idea)
+
+            if raw_formulas:
+                raw_formulas, validated_ideas = reconcile_formulas_and_ideas(
+                    text, raw_formulas, validated_ideas
+                )
+
             extraction_obj.extracted_ideas = validated_ideas
             extraction_obj.concepts = [i.to_concept() for i in validated_ideas]
+            extraction_obj.formulas = raw_formulas
             return extraction_obj
         except Exception as e:
             if raise_on_error:
                 raise
             logger.warning(f"Section extraction LLM call failed across all pool servers for '{section_title}': {e}")
-            return SectionExtraction(concepts=[], extracted_ideas=[])
+            return SectionExtraction(concepts=[], extracted_ideas=[], formulas=raw_formulas)
 
     def extract_ideas(
         self,
@@ -1084,15 +1542,26 @@ class KnowledgeExtractor:
 
         # Multi-chunk simultaneous extraction with appropriate XML chunk tags
         system_text = (
-            "You are an expert knowledge-graph extractor. Your goal is to extract core intellectual ideas from the provided book chunks.\n"
+            "You are an expert knowledge-graph extractor. Your goal is to extract core intellectual ideas, mathematical formulations, empirical findings, and architectural mechanisms from the provided book chunks.\n"
             'Multiple chunks are provided simultaneously, each enclosed within <chunk id="..." section="..." index="..."> ... </chunk> tags.\n\n'
             "Rules:\n"
             "1. Process each chunk independently and return separate extracted ideas for each chunk id.\n"
             "2. Every idea must be anchored by an exact verbatim quote from that specific chunk's text.\n"
             '3. The "idea_statement" must be a concise, self-contained factual claim (1–2 sentences).\n'
             "4. Do not invent details not present in the chunk. Do not mix quotes or concepts across different chunks.\n"
-            "5. Extract only distinct, meaningful concepts (usually 1 to 3 per chunk). If a chunk contains no standalone ideas, output an empty list of extracted ideas for that chunk id.\n"
-            "6. Return strictly valid JSON matching the schema below.\n\n"
+            "5. Extract only distinct, meaningful concepts (usually 1 to 4 per chunk). Specifically capture:\n"
+            "   - Mathematical Formulations & Objectives: Key loss equations, optimization objectives, error bounds, and theorem/lemma statements.\n"
+            "   - Empirical Findings & Ablations: Discovered empirical trade-offs, scaling limits, ablation drops, and behavioral vulnerabilities.\n"
+            "   - Protocols & Algorithmic Loops: Architectural workflows, decision gates, formal verification rules, and agent interaction patterns.\n"
+            "   - Conceptual Definitions & Core Arguments.\n"
+            "   If a chunk contains no standalone ideas or is generic boilerplate, output an empty list of extracted ideas for that chunk id.\n"
+            "6. Specificity in Key Entities (CRITICAL: Primary Entity is the Concept Title):\n"
+            "   - The FIRST entry in 'key_entities' becomes the canonical title of the concept in the Knowledge Graph.\n"
+            "   - NEVER use the paper's overarching framework, library, tool, system, or book name (e.g., 'Grasp', 'EvoAlloc', 'LLaVA', 'Model', 'Gradient', 'Paper') as the primary key entity.\n"
+            "   - Instead, name the specific mechanism, mathematical formulation, rule, or empirical finding (e.g. 'Mutagenic LUMO-Threshold Rule', 'Reasoning-First XML Trace Protocol', 'Answer-First JSON Degradation').\n"
+            "7. Dense Math & Symbolic Code Chunks:\n"
+            "   - When a chunk contains mathematical equations, proofs, bounds (e.g. spectral radius bound rho_P < 1), or formal code (Lean 4, Prolog logic predicates), extract the specific mathematical bound, loss formulation, or logical deduction as a named concept rather than skipping it or outputting empty.\n"
+            "8. Return strictly valid JSON matching the schema below.\n\n"
             "Output Format:\n"
             "{\n"
             '  "chunks": [\n'
@@ -1102,8 +1571,8 @@ class KnowledgeExtractor:
             "        {\n"
             '          "source_quote": "Exact verbatim sentence from this specific chunk",\n'
             '          "idea_statement": "Concise summary of the concept or argument",\n'
-            '          "key_entities": ["Topic A", "Concept B"],\n'
-            '          "idea_type": "Definition" | "Argument" | "Mechanism" | "Example"\n'
+            '          "key_entities": ["Specific Concept Title", "Secondary Topic"],\n'
+            '          "idea_type": "Definition" | "Argument" | "Mechanism" | "Example" | "Mathematical Formulation" | "Theoretical Claim" | "Empirical Finding" | "Protocol"\n'
             "        }\n"
             "      ]\n"
             "    }\n"
@@ -1151,12 +1620,22 @@ class KnowledgeExtractor:
 
         chunk_blocks = []
         total_input_chars = len(loc)
+        chunk_raw_formulas: Dict[str, List[ExtractedFormula]] = {}
         for c in chunks:
             cid = _get_id(c)
             csec = BookParser.repair_mojibake(_get_section(c))
             csub = BookParser.repair_mojibake(_get_subtitle(c))
             cidx = _get_idx(c)
             ctext = BookParser.repair_mojibake(_get_text(c))
+            c_has_formula = bool(
+                getattr(c, "has_formula", False)
+                or (isinstance(c, dict) and c.get("has_formula", False))
+                or has_mathematical_formula(ctext)
+            )
+            if c_has_formula:
+                chunk_raw_formulas[cid] = extract_raw_formulas_from_text(ctext)
+            else:
+                chunk_raw_formulas[cid] = []
             tag_attrs = f'id="{cid}"'
             if csec:
                 tag_attrs += f' section="{csec}"'
@@ -1228,9 +1707,17 @@ class KnowledgeExtractor:
                             if val_quote:
                                 idea.source_quote = val_quote
                             validated_ideas.append(idea)
+
+                    raw_formulas = chunk_raw_formulas.get(cid, [])
+                    if raw_formulas:
+                        raw_formulas, validated_ideas = reconcile_formulas_and_ideas(
+                            ctext, raw_formulas, validated_ideas
+                        )
+
                     results[cid] = SectionExtraction(
                         extracted_ideas=validated_ideas,
                         concepts=[i.to_concept() for i in validated_ideas],
+                        formulas=raw_formulas,
                     )
                 else:
                     # Missing from batch output: fallback to single extraction
@@ -1252,7 +1739,11 @@ class KnowledgeExtractor:
                         )
                         results[cid] = single_res
                     except Exception:
-                        results[cid] = SectionExtraction(concepts=[], extracted_ideas=[])
+                        results[cid] = SectionExtraction(
+                            concepts=[],
+                            extracted_ideas=[],
+                            formulas=chunk_raw_formulas.get(cid, []),
+                        )
 
             return results
 
@@ -1261,7 +1752,11 @@ class KnowledgeExtractor:
                 raise
             logger.warning(f"Batch chunk extraction LLM call failed across pool servers: {e}")
             return {
-                _get_id(c): SectionExtraction(concepts=[], extracted_ideas=[])
+                _get_id(c): SectionExtraction(
+                    concepts=[],
+                    extracted_ideas=[],
+                    formulas=chunk_raw_formulas.get(_get_id(c), []),
+                )
                 for c in chunks
             }
 

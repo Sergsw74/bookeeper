@@ -320,3 +320,90 @@ def test_question_generator_hierarchical_cover_disabled_switch(tmp_path: Path):
     assert "Quick test text." in sample
     # embed_documents should not be called when cover is disabled
     mock_embeddings.embed_documents.assert_not_called()
+
+
+def test_reference_detection_by_dois_and_venues():
+    """Verify bibliography detection with DOIs, ArXiv IDs, and publication venues without bracket citations."""
+    bib_text = """
+    Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. Attention is all you need. In Advances in Neural Information Processing Systems, 2017.
+    Deng, J. et al. ImageNet: A Large-Scale Hierarchical Image Database. In CVPR, 2009. doi: 10.1109/CVPR.2009.5206848.
+    Devlin, J. et al. BERT: Pre-training of deep bidirectional transformers. arXiv:1810.04805, 2018. https://arxiv.org/abs/1810.04805
+    """
+    chunk = DummyChunk(
+        chunk_id="ref_venues",
+        text=bib_text,
+        section_title="Pages 14-15",
+    )
+    assert is_reference_or_boilerplate_chunk(chunk)
+
+
+def test_technical_boilerplate_code_header_and_license():
+    """Verify C header dumps and license boilerplate are identified as boilerplate."""
+    c_code = """
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #ifndef _AGENT_CORE_H
+    #define _AGENT_CORE_H
+    typedef struct { int id; } Agent;
+    #endif
+    """
+    chunk_code = DummyChunk(chunk_id="code_1", text=c_code)
+    assert is_reference_or_boilerplate_chunk(chunk_code)
+
+    lic_text = "Copyright (c) 2024. All rights reserved. Permission is hereby granted, free of charge, to any person obtaining a copy..."
+    chunk_lic = DummyChunk(chunk_id="lic_1", text=lic_text)
+    assert is_reference_or_boilerplate_chunk(chunk_lic)
+
+
+def test_mathematical_formulation_never_flagged_as_boilerplate():
+    """Verify complex mathematical and theoretical equations are NOT classified as boilerplate."""
+    math_text = r"""
+    We define the multi-step temporal-difference loss for option-conditioned hierarchical Q-learning over transition interval k:
+    LQh,ϕω = E_{(s_t, s_{t+k}, g) \sim D} [Q_h(s_t, g, \phi_\omega(s_t, s_{t+k})) - R_h(s_{t:t+k}, g) - \gamma V_h(s_{t+k}, g)]^2.
+    Using the character identity \chi_u(a+y) = \chi_u(a)\chi_u(y), we obtain (\Phi_a H_u)(y) = \chi_u(a)/64 H_u(y).
+    """
+    chunk_math = DummyChunk(chunk_id="math_1", text=math_text, section_title="3. Theoretical Bounds")
+    assert not is_reference_or_boilerplate_chunk(chunk_math)
+
+
+def test_short_reference_slices_and_diagram_ocr_dumps():
+    """Verify short isolated reference slices and diagram OCR layout dumps are classified as boilerplate."""
+    # 1. Short citation fragment with arXiv
+    arxiv_slice = "Single- minus gluon tree amplitudes are nonzero.arXiv preprint arXiv:2602.12176, 2026. Prannay Hebbar, Yogendra Manawat, Samuel Verboomen."
+    assert is_reference_or_boilerplate_chunk(DummyChunk(chunk_id="ref_slice_1", text=arxiv_slice))
+
+    # 2. Short citation fragment with InProceedings
+    inproc_slice = "InProceedings of the 30th ACM SIGSOFT International Symposium on Software Testing and Analysis (ISSTA), pages 12-24."
+    assert is_reference_or_boilerplate_chunk(DummyChunk(chunk_id="ref_slice_2", text=inproc_slice))
+
+    # 3. Author list fragment
+    author_list = "Vineet Kumar, Ronald Tony, Darshita Rathore, Vipasha Rana, Bhuvanesh Mandora, . Kanishka, Chetna Ban."
+    assert is_reference_or_boilerplate_chunk(DummyChunk(chunk_id="ref_slice_3", text=author_list))
+
+    # 4. Diagram OCR layout dump (many short lines with glyphs)
+    diagram_ocr = "\n".join([
+        "Sym | Asym Perfect / Partial / Hidden",
+        "MiracleAquaWar",
+        "LostSpaceSnakeGo AntWar",
+        "Generals",
+        "Rollman",
+        "2P / Asym / ●",
+        "AntWar2",
+        "Agent for Agent Iteration Loop",
+        "Read",
+        "Write",
+        "Replay",
+        "Rule Replay Dictionary",
+        "SDK & Demo Leaderboard",
+        "Game Pack",
+        "Replays",
+        "History",
+    ])
+    assert is_reference_or_boilerplate_chunk(DummyChunk(chunk_id="ocr_1", text=diagram_ocr))
+
+    # 5. Tokenizer / dataset benchmark noise
+    token_noise = "You made me very low @-@ spirited last night , by your manner of talking — You are my only friend @-@ intimate."
+    assert is_reference_or_boilerplate_chunk(DummyChunk(chunk_id="token_1", text=token_noise))
+
+

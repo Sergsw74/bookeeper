@@ -1568,6 +1568,11 @@ def build_graph(
         "--from-scratch",
         help="Start build entirely from scratch: wipes progress checkpoint state, deletes all per-book states (.book_states), purges cached chunks, deletes existing knowledge graph files, and starts indexing from the first book.",
     ),
+    keep_book_cache: bool = typer.Option(
+        False,
+        "--keep-book-cache",
+        help="When used with --from-scratch, preserves per-book state checkpoints (.book_states) and cached chunks, only resetting the global progress tracker and knowledge graph.",
+    ),
     clean_chunks: bool = typer.Option(
         False,
         "--clean-chunks",
@@ -1737,6 +1742,7 @@ def build_graph(
     retry_skipped = _resolve_opt(retry_skipped, False)
     reset_progress = _resolve_opt(reset_progress, False)
     from_scratch = _resolve_opt(from_scratch, False)
+    keep_book_cache = _resolve_opt(keep_book_cache, False)
     clean_chunks = _resolve_opt(clean_chunks, False)
     start_from_id = _resolve_opt(start_from_id)
     state_file = _resolve_opt(state_file)
@@ -1843,13 +1849,19 @@ def build_graph(
         tracker.clear("build_graph", preserve_skipped=not retry_skipped)
         preserved_cnt = len(tracker.get_skipped_ids("build_graph")) if not retry_skipped else 0
         preserved_str = f" (preserving {preserved_cnt} skipped books in skip list)" if preserved_cnt > 0 else ""
-        console.print(
-            f"[bold yellow]Restarting build entirely from scratch: clearing progress tracker checkpoint, resetting knowledge graph, deleting all book states and cached chunks{preserved_str}...[/bold yellow]"
-        )
+        if keep_book_cache:
+            console.print(
+                f"[dim green]Preserving existing per-book state checkpoints (.book_states) and cached chunks (--keep-book-cache active).[/dim green]"
+            )
+        else:
+            console.print(
+                f"[bold yellow]Restarting build entirely from scratch: clearing progress tracker checkpoint, resetting knowledge graph, deleting all book states and cached chunks{preserved_str}...[/bold yellow]"
+            )
         reset_progress = True
         resume = False
         continue_run = False
-        rechunk = True
+        if not keep_book_cache:
+            rechunk = True
         should_clean = True
         if graph_file.is_file():
             try:
@@ -1881,36 +1893,37 @@ def build_graph(
             except Exception:
                 pass
 
-        # 1. Mandatory cleanup: delete all per-book state checkpoints (.book_states)
-        candidate_state_dirs = {
-            output_dir / ".book_states",
-            getattr(cfg, "resolved_output_dir", output_dir) / ".book_states",
-        }
-        # Explicit protection: ensure state_cache_dir is never included or purged during cleanups
-        if state_cache.is_enabled():
-            sc_dir = state_cache.cache_dir
+        if not keep_book_cache:
+            # 1. Mandatory cleanup: delete all per-book state checkpoints (.book_states)
             candidate_state_dirs = {
-                d for d in candidate_state_dirs
-                if d != sc_dir and not (sc_dir and d.is_relative_to(sc_dir))
+                output_dir / ".book_states",
+                getattr(cfg, "resolved_output_dir", output_dir) / ".book_states",
             }
-            console.print(f"[dim green]Preserving external state cache directory: {sc_dir}[/dim green]")
+            # Explicit protection: ensure state_cache_dir is never included or purged during cleanups
+            if state_cache.is_enabled():
+                sc_dir = state_cache.cache_dir
+                candidate_state_dirs = {
+                    d for d in candidate_state_dirs
+                    if d != sc_dir and not (sc_dir and d.is_relative_to(sc_dir))
+                }
+                console.print(f"[dim green]Preserving external state cache directory: {sc_dir}[/dim green]")
 
-        total_purged_states = 0
-        for b_sdir in candidate_state_dirs:
-            total_purged_states += BookProcessingState.clean_all(b_sdir)
-        if total_purged_states > 0:
-            console.print(
-                f"[bold yellow]Deleted {total_purged_states} per-book state checkpoint file(s) from .book_states.[/bold yellow]"
-            )
+            total_purged_states = 0
+            for b_sdir in candidate_state_dirs:
+                total_purged_states += BookProcessingState.clean_all(b_sdir)
+            if total_purged_states > 0:
+                console.print(
+                    f"[bold yellow]Deleted {total_purged_states} per-book state checkpoint file(s) from .book_states.[/bold yellow]"
+                )
 
-        # 2. Chunks cleanup: delete all persistent cached chunks
-        target_chunks_path = Path(chunks_dir).expanduser().resolve() if chunks_dir else cfg.resolved_chunks_dir
-        cs = ChunkStore(target_chunks_path)
-        purged_chunks = cs.clean_all()
-        if purged_chunks > 0:
-            console.print(
-                f"[bold yellow]Deleted {purged_chunks} cached chunk file(s) from {target_chunks_path}.[/bold yellow]"
-            )
+            # 2. Chunks cleanup: delete all persistent cached chunks
+            target_chunks_path = Path(chunks_dir).expanduser().resolve() if chunks_dir else cfg.resolved_chunks_dir
+            cs = ChunkStore(target_chunks_path)
+            purged_chunks = cs.clean_all()
+            if purged_chunks > 0:
+                console.print(
+                    f"[bold yellow]Deleted {purged_chunks} cached chunk file(s) from {target_chunks_path}.[/bold yellow]"
+                )
 
         # 3. Neo4j cleanup: ensure Neo4j database is completely wiped for a clean start synchronized with KG
         if should_export_neo4j:
@@ -2421,7 +2434,7 @@ def build_graph(
     book_state = None
     ran_batch_postproc_on_last_book = False
     has_cleaned_neo4j = bool(has_cleaned_neo4j)
-    batch_size_books = cfg.batch_books if cfg.recent_ideas.enabled else 10
+    batch_size_books = cfg.batch_books
     batch_touched_concepts: Set[str] = set()
     try:
         for book_idx, binfo in enumerate(books_to_process, start=1):
@@ -2705,80 +2718,237 @@ def build_graph(
 
                     book_state.set_total_chunks(len(chunks))
 
-                    # Note: State cache extractions are deferred until AFTER Semantic Routing and MMR
-                    # diverse chunk selection so that redundant chunks are pruned before cache lookup.
+                    # Section-Aware Hierarchical Semantic Cover & Conveyor Filtering
+                    # Evaluated across all non-failed candidate chunks of the book to guarantee
+                    # filter settings verification runs fast without removing cached extractions.
+                    effective_enable_cover = (
+                        cfg.enable_hierarchical_cover if hierarchical_cover is None else hierarchical_cover
+                    )
+                    effective_cover_thresh = (
+                        cfg.cover_similarity_threshold if cover_threshold is None else cover_threshold
+                    )
+                    effective_cover_win = (
+                        cfg.cover_window_size if cover_window is None else cover_window
+                    )
+                    effective_skip_refs = (
+                        cfg.skip_references_sections if skip_references is None else skip_references
+                    )
 
-                    # 1. Restore any already processed or failed chunks from previous run in current session
+                    # 1. Ensure all candidate chunks have embeddings
+                    missing_embs = [c for c in chunks if not getattr(c, "embedding", None)]
+                    if missing_embs and embeddings is not None:
+                        emb_task = None
+                        try:
+                            emb_task = progress.add_task(
+                                f"[cyan]⚡ Computing missing chunk embeddings for Hierarchical Cover (0/{len(missing_embs)})[/cyan]",
+                                total=len(missing_embs),
+                                completed=0,
+                            )
+                        except Exception:
+                            pass
+
+                        completed_emb_count = 0
+
+                        def _on_emb_progress(count: int):
+                            nonlocal completed_emb_count
+                            completed_emb_count += count
+                            if emb_task is not None:
+                                try:
+                                    progress.update(
+                                        emb_task,
+                                        completed=completed_emb_count,
+                                        description=f"[cyan]⚡ Computing missing chunk embeddings for Hierarchical Cover ({completed_emb_count}/{len(missing_embs)})[/cyan]",
+                                    )
+                                except Exception:
+                                    pass
+
+                        try:
+                            m_texts = [c.text for c in missing_embs]
+                            if hasattr(embeddings, "embed_documents"):
+                                import inspect
+                                sig = inspect.signature(embeddings.embed_documents)
+                                if "on_progress" in sig.parameters:
+                                    m_vecs = embeddings.embed_documents(m_texts, on_progress=_on_emb_progress)
+                                else:
+                                    batch_size = 16
+                                    m_vecs = []
+                                    for i in range(0, len(m_texts), batch_size):
+                                        sub_batch = m_texts[i : i + batch_size]
+                                        sub_res = embeddings.embed_documents(sub_batch)
+                                        m_vecs.extend(sub_res)
+                                        _on_emb_progress(len(sub_batch))
+                            else:
+                                m_vecs = []
+                                for t in m_texts:
+                                    m_vecs.append(embeddings.embed_query(t))
+                                    _on_emb_progress(1)
+
+                            for c, v in zip(missing_embs, m_vecs):
+                                c.embedding = v
+
+                            try:
+                                chunk_store.save_chunks(bid, btitle, chunks)
+                            except Exception as e:
+                                logger.debug(f"Could not save updated chunk embeddings to ChunkStore: {e}")
+                        except Exception as e:
+                            logger.warning(f"Failed to compute missing embeddings for Hierarchical Cover: {e}")
+                        finally:
+                            if emb_task is not None:
+                                try:
+                                    progress.remove_task(emb_task)
+                                except Exception:
+                                    pass
+
+                    candidate_chunks = [c for c in chunks if not book_state.is_chunk_failed(c.chunk_id)]
+                    failed_chunks = [c for c in chunks if book_state.is_chunk_failed(c.chunk_id)]
+
+                    filter_conveyor = cfg.get_chunk_filter_conveyor(
+                        skip_references=effective_skip_refs,
+                        include_chunk_similarity=False,
+                    )
+
+                    if cfg.filter.enabled and (effective_enable_cover or (filter_conveyor and len(filter_conveyor.filters) > 0)):
+                        from bookeeper.processing.hierarchical_cover import hierarchical_semantic_cover
+                        cover_selected, cover_skipped, cover_decisions = hierarchical_semantic_cover(
+                            chunks=candidate_chunks,
+                            similarity_threshold=effective_cover_thresh,
+                            skip_references=effective_skip_refs,
+                            min_section_chunks=cfg.cover_min_section_chunks,
+                            sliding_window_size=effective_cover_win,
+                            filter_conveyor=filter_conveyor,
+                            enable_chunk_similarity=bool(effective_enable_cover and cfg.filter.chunk_similarity.enabled),
+                        )
+                    else:
+                        cover_selected = list(candidate_chunks)
+                        cover_skipped = []
+                        cover_decisions = []
+
+                    # 2. Record skipped redundant / reference chunks into graph and state (preserving any cached extractions)
+                    for s_chk in cover_skipped:
+                        sec_node_id = store.add_section(
+                            book_id=bid,
+                            chapter_idx=s_chk.chapter_idx,
+                            title=s_chk.section_title,
+                            text=s_chk.text,
+                        )
+                        store.add_chunk(s_chk)
+                        existing_substantive = book_state.get_cached_substantive_extraction(s_chk.chunk_id)
+                        book_state.mark_chunk_processed(
+                            chunk_id=s_chk.chunk_id,
+                            chunk_idx=s_chk.chunk_idx,
+                            section_title=s_chk.section_title,
+                            extraction_dict={"concepts": [], "extracted_ideas": []},
+                            duration=0.0,
+                            server_used="skipped_cover",
+                            auto_save=False,
+                            cached_extraction=existing_substantive,
+                        )
+                        with stats_lock:
+                            book_skipped_chunks += 1
+                            session_skipped_chunks += 1
+                            extracted_results.append({
+                                "status": "skipped_cover",
+                                "chunk": s_chk,
+                                "extraction": SectionExtraction(concepts=[], extracted_ideas=[]),
+                                "duration": 0.0,
+                                "server_used": "skipped_cover",
+                            })
+                        progress.advance(book_task, advance=1)
+
+                    if cover_skipped:
+                        book_state.save()
+
+                    # 3. Restore cover-selected chunks that were already processed in state (cache hit)
                     restored_from_state = 0
-                    restored_failed = 0
-                    for chk in chunks:
-                        if book_state.is_chunk_processed(chk.chunk_id):
-                            cached_rec = book_state.get_processed_chunk(chk.chunk_id)
-                            raw_extraction = cached_rec.get("extraction", {"concepts": []})
-                            extraction = SectionExtraction(**raw_extraction)
-                            dur = cached_rec.get("duration", 0.0)
-                            srv = cached_rec.get("server_used", "cached")
-                            restored_status = "skipped_limbo" if srv == "skipped_limbo" else ("skipped_cover" if srv in ("skipped_cover", "skipped_mmr") else "extracted")
+                    unprocessed_fresh: List[HierarchicalChunk] = []
+                    unprocessed_retries: List[Tuple[HierarchicalChunk, int]] = []
+
+                    for chk in cover_selected:
+                        cached_rec = book_state.get_processed_chunk(chk.chunk_id)
+                        substantive_ext = book_state.get_cached_substantive_extraction(chk.chunk_id)
+                        srv = cached_rec.get("server_used", "") if cached_rec else ""
+
+                        is_cached_hit = False
+                        if cached_rec and not str(srv).startswith("skipped_"):
+                            is_cached_hit = True
+                        elif substantive_ext:
+                            is_cached_hit = True
+
+                        if is_cached_hit:
+                            raw_ext = substantive_ext or (cached_rec.get("extraction", {"concepts": []}) if cached_rec else {"concepts": []})
+                            extraction = SectionExtraction(**raw_ext)
+                            dur = cached_rec.get("duration", 0.0) if cached_rec else 0.0
+                            actual_srv = srv if (cached_rec and not str(srv).startswith("skipped_")) else "cached"
+                            restored_status = "assigned" if actual_srv == "semantic_fastpath" else "extracted"
+
                             with stats_lock:
-                                if srv == "semantic_fastpath":
+                                if actual_srv == "semantic_fastpath":
                                     book_assigned_chunks += 1
                                     session_assigned_chunks += 1
-                                elif srv in ("skipped_limbo", "skipped_mmr", "skipped_cover"):
-                                    book_skipped_chunks += 1
-                                    session_skipped_chunks += 1
                                 extracted_results.append({
                                     "status": restored_status,
                                     "chunk": chk,
                                     "extraction": extraction,
                                     "duration": dur,
-                                    "server_used": srv,
+                                    "server_used": actual_srv,
                                 })
+
+                            if cached_rec and str(srv).startswith("skipped_"):
+                                book_state.mark_chunk_processed(
+                                    chunk_id=chk.chunk_id,
+                                    chunk_idx=chk.chunk_idx,
+                                    section_title=chk.section_title,
+                                    extraction_dict=raw_ext,
+                                    duration=dur,
+                                    server_used=actual_srv,
+                                    auto_save=False,
+                                )
                             restored_from_state += 1
-                        elif book_state.is_chunk_failed(chk.chunk_id):
-                            failed_rec = book_state.get_failed_chunk(chk.chunk_id)
-                            with stats_lock:
-                                extracted_results.append({
-                                    "status": "failed_chunk",
-                                    "chunk": chk,
-                                    "extraction": SectionExtraction(concepts=[]),
-                                    "duration": 0.0,
-                                    "server_used": failed_rec.get("server_used", "failed_cache"),
-                                    "error": failed_rec.get("error", "Poison chunk failed 6 attempts"),
-                                })
-                            restored_failed += 1
-
-                    if restored_from_state > 0 or restored_failed > 0:
-                        progress.advance(book_task, advance=restored_from_state + restored_failed)
-                        console.print(
-                            f"  [bold cyan]↺ Resuming Book #{bid}: {restored_from_state} processed chunk(s) restored from state"
-                            f"{f', {restored_failed} previously failed poison chunk(s)' if restored_failed else ''}.[/bold cyan]"
-                        )
-                        _update_progress_description()
-
-                    fresh_queue: queue.Queue[Tuple[List[HierarchicalChunk], int, Set[str]]] = queue.Queue()
-                    deferred_retries: List[Tuple[List[HierarchicalChunk], int, Set[str]]] = []
-                    retry_queue: queue.Queue[Tuple[List[HierarchicalChunk], int, Set[str]]] = queue.Queue()
-
-                    # Check if any previously skipped limbo chunks should be recovered from state by size
-                    recovery_th = cfg.effective_limbo_recovery_size
-                    if recovery_th is not None and recovery_th > 0:
-                        recovered_prev = book_state.recover_skipped_limbo_chunks(chunks, threshold=recovery_th)
-                        if recovered_prev:
-                            console.print(
-                                f"  [bold cyan]↺ Recovered {len(recovered_prev)} previously skipped limbo chunk(s) "
-                                f"(size >= {recovery_th}) -> restored to unprocessed queue.[/bold cyan]"
-                            )
-
-                    unprocessed_fresh: List[HierarchicalChunk] = []
-                    unprocessed_retries: List[Tuple[HierarchicalChunk, int]] = []
-
-                    for chk in chunks:
-                        if not book_state.is_chunk_processed(chk.chunk_id) and not book_state.is_chunk_failed(chk.chunk_id):
+                            progress.advance(book_task, advance=1)
+                        else:
                             init_attempt = book_state.get_initial_attempt(chk.chunk_id)
                             if init_attempt == 0:
                                 unprocessed_fresh.append(chk)
                             else:
                                 unprocessed_retries.append((chk, init_attempt))
+
+                    # 4. Restore failed poison chunks
+                    restored_failed = 0
+                    for f_chk in failed_chunks:
+                        failed_rec = book_state.get_failed_chunk(f_chk.chunk_id)
+                        with stats_lock:
+                            extracted_results.append({
+                                "status": "failed_chunk",
+                                "chunk": f_chk,
+                                "extraction": SectionExtraction(concepts=[]),
+                                "duration": 0.0,
+                                "server_used": failed_rec.get("server_used", "failed_cache"),
+                                "error": failed_rec.get("error", "Poison chunk failed 6 attempts"),
+                            })
+                        restored_failed += 1
+                        progress.advance(book_task, advance=1)
+
+                    if cover_skipped:
+                        with display_lock:
+                            cover_pct = (len(cover_skipped) / len(candidate_chunks)) * 100.0 if candidate_chunks else 0.0
+                            console.print(
+                                f"  [bold cyan]🎯 Hierarchical Semantic Cover (τ={effective_cover_thresh:.2f}):[/bold cyan] "
+                                f"Selected [bold green]{len(cover_selected)}[/bold green] chunks ({restored_from_state} restored from cache, {len(unprocessed_fresh)} fresh for LLM), "
+                                f"skipped [bold yellow]{len(cover_skipped)}[/bold yellow] redundant/reference chunks "
+                                f"([bold yellow]{cover_pct:.1f}% skipped[/bold yellow])."
+                            )
+
+                    if restored_from_state > 0 or restored_failed > 0:
+                        console.print(
+                            f"  [bold cyan]↺ Resuming Book #{bid}: {restored_from_state} processed chunk(s) restored from state"
+                            f"{f', {restored_failed} previously failed poison chunk(s)' if restored_failed else ''}.[/bold cyan]"
+                        )
+                    _update_progress_description()
+
+                    fresh_queue: queue.Queue[Tuple[List[HierarchicalChunk], int, Set[str]]] = queue.Queue()
+                    deferred_retries: List[Tuple[List[HierarchicalChunk], int, Set[str]]] = []
+                    retry_queue: queue.Queue[Tuple[List[HierarchicalChunk], int, Set[str]]] = queue.Queue()
+                    recovery_th = cfg.effective_limbo_recovery_size
 
                     # Semantic chunk routing if recent ideas are enabled
                     limbo_candidate_map: Dict[str, Tuple[str, str]] = {}
@@ -2950,168 +3120,7 @@ def build_graph(
                                 except Exception:
                                     pass
 
-                    # Step 2.5: Section-Aware Hierarchical Semantic Cover
-                    # Prunes redundant narrative elaborations and repetitive experimental tables within sections,
-                    # while preserving all novel conceptual contributions and anchors.
-                    effective_enable_cover = (
-                        cfg.enable_hierarchical_cover if hierarchical_cover is None else hierarchical_cover
-                    )
-                    effective_cover_thresh = (
-                        cfg.cover_similarity_threshold if cover_threshold is None else cover_threshold
-                    )
-                    effective_cover_win = (
-                        cfg.cover_window_size if cover_window is None else cover_window
-                    )
-                    effective_skip_refs = (
-                        cfg.skip_references_sections if skip_references is None else skip_references
-                    )
 
-                    if effective_enable_cover and len(unprocessed_fresh) > 1 and embeddings is not None:
-                        import inspect
-                        import numpy as np
-                        from bookeeper.processing.hierarchical_cover import hierarchical_semantic_cover
-
-                        # 1. Ensure all candidate chunks have embeddings
-                        missing_embs = [c for c in unprocessed_fresh if not getattr(c, "embedding", None)]
-                        if missing_embs:
-                            emb_task = None
-                            try:
-                                emb_task = progress.add_task(
-                                    f"[cyan]⚡ Computing missing chunk embeddings for Hierarchical Cover (0/{len(missing_embs)})[/cyan]",
-                                    total=len(missing_embs),
-                                    completed=0,
-                                )
-                            except Exception:
-                                pass
-
-                            completed_emb_count = 0
-
-                            def _on_emb_progress(count: int):
-                                nonlocal completed_emb_count
-                                completed_emb_count += count
-                                if emb_task is not None:
-                                    try:
-                                        progress.update(
-                                            emb_task,
-                                            completed=completed_emb_count,
-                                            description=f"[cyan]⚡ Computing missing chunk embeddings for Hierarchical Cover ({completed_emb_count}/{len(missing_embs)})[/cyan]",
-                                        )
-                                    except Exception:
-                                        pass
-
-                            try:
-                                m_texts = [c.text for c in missing_embs]
-                                if hasattr(embeddings, "embed_documents"):
-                                    sig = inspect.signature(embeddings.embed_documents)
-                                    if "on_progress" in sig.parameters:
-                                        m_vecs = embeddings.embed_documents(m_texts, on_progress=_on_emb_progress)
-                                    else:
-                                        batch_size = 16
-                                        m_vecs = []
-                                        for i in range(0, len(m_texts), batch_size):
-                                            sub_batch = m_texts[i : i + batch_size]
-                                            sub_res = embeddings.embed_documents(sub_batch)
-                                            m_vecs.extend(sub_res)
-                                            _on_emb_progress(len(sub_batch))
-                                else:
-                                    m_vecs = []
-                                    for t in m_texts:
-                                        m_vecs.append(embeddings.embed_query(t))
-                                        _on_emb_progress(1)
-
-                                for c, v in zip(missing_embs, m_vecs):
-                                    c.embedding = v
-
-                                # Save updated embeddings back to chunk_store so they are cached
-                                try:
-                                    chunk_store.save_chunks(bid, btitle, chunks)
-                                except Exception as e:
-                                    logger.debug(f"Could not save updated chunk embeddings to ChunkStore: {e}")
-                            except Exception as e:
-                                logger.warning(f"Failed to compute missing embeddings for Hierarchical Cover: {e}")
-                            finally:
-                                if emb_task is not None:
-                                    try:
-                                        progress.remove_task(emb_task)
-                                    except Exception:
-                                        pass
-
-                        cover_selected, cover_skipped, cover_decisions = hierarchical_semantic_cover(
-                            chunks=unprocessed_fresh,
-                            similarity_threshold=effective_cover_thresh,
-                            skip_references=effective_skip_refs,
-                            min_section_chunks=cfg.cover_min_section_chunks,
-                            sliding_window_size=effective_cover_win,
-                        )
-
-                        # Record skipped redundant / reference chunks into graph and state
-                        skip_task = None
-                        if len(cover_skipped) > 5:
-                            try:
-                                skip_task = progress.add_task(
-                                    f"[yellow]⏭ Marking {len(cover_skipped)} redundant/reference chunks as skipped...[/yellow]",
-                                    total=len(cover_skipped),
-                                    completed=0,
-                                )
-                            except Exception:
-                                pass
-
-                        for s_chk in cover_skipped:
-                            sec_node_id = store.add_section(
-                                book_id=bid,
-                                chapter_idx=s_chk.chapter_idx,
-                                title=s_chk.section_title,
-                                text=s_chk.text,
-                            )
-                            store.add_chunk(s_chk)
-                            book_state.mark_chunk_processed(
-                                chunk_id=s_chk.chunk_id,
-                                chunk_idx=s_chk.chunk_idx,
-                                section_title=s_chk.section_title,
-                                extraction_dict={"concepts": [], "extracted_ideas": []},
-                                duration=0.0,
-                                server_used="skipped_cover",
-                                auto_save=False,
-                            )
-                            with stats_lock:
-                                book_skipped_chunks += 1
-                                session_skipped_chunks += 1
-                                extracted_results.append({
-                                    "status": "skipped_cover",
-                                    "chunk": s_chk,
-                                    "extraction": SectionExtraction(concepts=[], extracted_ideas=[]),
-                                    "duration": 0.0,
-                                    "server_used": "skipped_cover",
-                                })
-                            progress.advance(book_task, advance=1)
-                            if skip_task is not None:
-                                try:
-                                    progress.advance(skip_task, advance=1)
-                                except Exception:
-                                    pass
-
-                        if cover_skipped:
-                            book_state.save()
-
-                        if skip_task is not None:
-                            try:
-                                progress.remove_task(skip_task)
-                            except Exception:
-                                pass
-
-                        unprocessed_fresh = cover_selected
-                        _update_progress_description()
-
-                        with display_lock:
-                            cover_pct = (len(cover_skipped) / (len(cover_selected) + len(cover_skipped))) * 100.0 if (len(cover_selected) + len(cover_skipped)) > 0 else 0.0
-                            total_skipped_now = book_skipped_chunks
-                            total_pct = (total_skipped_now / len(chunks)) * 100.0 if chunks else 0.0
-                            console.print(
-                                f"  [bold cyan]🎯 Hierarchical Semantic Cover (τ={effective_cover_thresh:.2f}):[/bold cyan] "
-                                f"Selected [bold green]{len(cover_selected)}[/bold green] anchor/distinct chunks for LLM extraction, "
-                                f"skipped [bold yellow]{len(cover_skipped)}[/bold yellow] redundant/reference chunks "
-                                f"({cover_pct:.1f}% cover pruned | [bold green]{total_pct:.1f}% total skipped[/bold green] across article)."
-                            )
 
                     # Check state cache for cover-selected diverse chunks (reusing LLM results with 0ms latency)
                     if state_cache.is_enabled() and unprocessed_fresh:
@@ -3842,7 +3851,7 @@ def build_graph(
                 console.print(f"  [dim green]✓ Book #{bid} concepts integrated and graph checkpoint saved ({book_total_dur:.1f}s).[/dim green]")
 
                 # Inter-batch post-processing & incremental Neo4j export of affected nodes
-                batch_size = cfg.batch_books if cfg.recent_ideas.enabled else 10
+                batch_size = batch_size_books
                 is_batch_end = (completed_in_session % batch_size == 0) or (book_idx == len(books_to_process))
                 should_dual_pass = cfg.dual_pass.enabled if dual_pass is None else dual_pass
                 if is_batch_end and not interrupted and store.graph.number_of_nodes() > 0:

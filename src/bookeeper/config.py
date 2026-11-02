@@ -510,6 +510,111 @@ class TokenPricingConfig(BaseModel):
     )
 
 
+class ChunkSimilarityFilterConfig(BaseModel):
+    """Configuration for chunk-to-chunk semantic redundancy filter (Hierarchical Cover)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable drop by chunk similarity within sections (hierarchical cover).",
+    )
+    threshold: float = Field(
+        default=0.92,
+        description="Cosine similarity threshold (>=) within section to drop chunk as redundant.",
+    )
+    window_size: int = Field(
+        default=3,
+        description="Window of recent section chunks to compare against.",
+    )
+    min_section_chunks: int = Field(
+        default=2,
+        description="Minimum chunks in a section before similarity pruning applies.",
+    )
+
+
+class IdeaSimilarityFilterConfig(BaseModel):
+    """Configuration for semantic filtering / routing against existing Knowledge Graph ideas."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable filter / semantic routing by idea similarity.",
+    )
+    unassigned_threshold: float = Field(
+        default=0.72,
+        description="Similarity (< threshold) treated as brand new idea (continues to LLM).",
+    )
+    high_confidence_threshold: float = Field(
+        default=0.87,
+        description="Similarity (>= threshold) directly assigned to idea (retained, skips LLM).",
+    )
+    skip_limbo_chunks: bool = Field(
+        default=True,
+        description="Skip limbo chunks between unassigned and high confidence from LLM processing.",
+    )
+    max_batch_chunk_size: Optional[int] = Field(
+        default=1024,
+        description="Chunks >= this size (chars) recover from limbo into processing queue.",
+    )
+
+
+class FilterConfig(BaseModel):
+    """Configuration for the fine-grained chunk filter conveyor pipeline."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = Field(
+        default=True,
+        description="Master switch for the chunk filter conveyor. If false, bypasses all chunk filters (100% chunks kept).",
+    )
+    # 1. Chunk Similarity Filter (Drop redundant chunks within section)
+    chunk_similarity: ChunkSimilarityFilterConfig = Field(
+        default_factory=ChunkSimilarityFilterConfig,
+        description="Drop by chunk similarity (redundancy pruning within section).",
+    )
+    # 2. Idea Similarity Filter (Filter by similarity to existing Knowledge Graph ideas)
+    idea_similarity: IdeaSimilarityFilterConfig = Field(
+        default_factory=IdeaSimilarityFilterConfig,
+        description="Filter by idea similarity (semantic routing against existing ideas).",
+    )
+
+    # 3. Content & Structure Conveyor Filters
+    skip_references_sections: bool = Field(
+        default=True,
+        description="Automatically bypass References, Bibliography, and Acknowledgments sections in scientific white papers.",
+    )
+    detect_formulas: bool = Field(
+        default=True,
+        description="Detect mathematical formulas in chunks, set chunk.has_formula flag, and shield math from diagram filters.",
+    )
+    retain_formulas: bool = Field(
+        default=True,
+        description="Immediately retain chunks containing mathematical formulas (FilterDecision.RETAIN).",
+    )
+    reference_sections: bool = Field(
+        default=True,
+        description="Filter out References and Bibliography sections in scientific papers.",
+    )
+    bibliographic: bool = Field(
+        default=True,
+        description="Filter out citation lists, DOIs, arXiv headers, and reference slices.",
+    )
+    technical_boilerplate: bool = Field(
+        default=True,
+        description="Filter out code headers, licenses, and web scrape noise.",
+    )
+    dataset_stimulus: bool = Field(
+        default=True,
+        description="Filter out questionnaire items and benchmark token noise.",
+    )
+    diagram_ocr: bool = Field(
+        default=True,
+        description="Filter out diagram OCR fragments and visual table scraps.",
+    )
+
+
 class Settings(BaseSettings):
     """Application settings for bookeeper."""
 
@@ -558,6 +663,80 @@ class Settings(BaseSettings):
             for alias in ("download_dir", "downloads_dir", "source_dir"):
                 if alias in data and "books_dir" not in data:
                     data["books_dir"] = data.pop(alias)
+            # Support filters as alias for filter
+            if "filters" in data and "filter" not in data:
+                data["filter"] = data.pop("filters")
+            # If flat filter settings provided at top-level, merge them into filter block
+            flat_to_filter = {
+                "skip_references_sections": "skip_references_sections",
+                "filter_detect_formulas": "detect_formulas",
+                "filter_retain_formulas": "retain_formulas",
+                "retain_formulas": "retain_formulas",
+                "retain_on_formula": "retain_formulas",
+                "filter_reference_sections": "reference_sections",
+                "filter_bibliographic": "bibliographic",
+                "filter_technical_boilerplate": "technical_boilerplate",
+                "filter_dataset_stimulus": "dataset_stimulus",
+                "filter_diagram_ocr": "diagram_ocr",
+            }
+            filter_dict = dict(data.get("filter") or {})
+            for flat_k, sub_k in flat_to_filter.items():
+                if flat_k in data and sub_k not in filter_dict:
+                    filter_dict[sub_k] = data[flat_k]
+
+            # Merge chunk similarity settings into filter.chunk_similarity
+            chunk_sim_dict = dict(filter_dict.get("chunk_similarity") or {})
+            if "enable_hierarchical_cover" in data:
+                chunk_sim_dict["enabled"] = data["enable_hierarchical_cover"]
+            if "cover_similarity_threshold" in data:
+                chunk_sim_dict["threshold"] = data["cover_similarity_threshold"]
+            if "cover_window_size" in data:
+                chunk_sim_dict["window_size"] = data["cover_window_size"]
+            if "cover_min_section_chunks" in data:
+                chunk_sim_dict["min_section_chunks"] = data["cover_min_section_chunks"]
+            if chunk_sim_dict:
+                filter_dict["chunk_similarity"] = chunk_sim_dict
+
+            # Merge idea similarity settings into filter.idea_similarity
+            idea_sim_dict = dict(filter_dict.get("idea_similarity") or {})
+            if "similarity_unassigned_threshold" in data:
+                idea_sim_dict["unassigned_threshold"] = data["similarity_unassigned_threshold"]
+            if "similarity_high_confidence_threshold" in data:
+                idea_sim_dict["high_confidence_threshold"] = data["similarity_high_confidence_threshold"]
+            if "skip_limbo_chunks" in data:
+                idea_sim_dict["skip_limbo_chunks"] = data["skip_limbo_chunks"]
+            if "max_batch_chunk_size" in data:
+                idea_sim_dict["max_batch_chunk_size"] = data["max_batch_chunk_size"]
+
+            # Also check recent_ideas block if provided
+            recent_ideas_obj = data.get("recent_ideas")
+            if isinstance(recent_ideas_obj, dict):
+                for k, v in recent_ideas_obj.items():
+                    if k == "similarity_unassigned_threshold":
+                        idea_sim_dict["unassigned_threshold"] = v
+                    elif k == "similarity_high_confidence_threshold":
+                        idea_sim_dict["high_confidence_threshold"] = v
+                    elif k == "skip_limbo_chunks":
+                        idea_sim_dict["skip_limbo_chunks"] = v
+                    elif k == "max_batch_chunk_size":
+                        idea_sim_dict["max_batch_chunk_size"] = v
+            elif recent_ideas_obj is not None:
+                if getattr(recent_ideas_obj, "max_batch_chunk_size", None) is not None:
+                    idea_sim_dict["max_batch_chunk_size"] = recent_ideas_obj.max_batch_chunk_size
+                if getattr(recent_ideas_obj, "similarity_unassigned_threshold", None) is not None:
+                    idea_sim_dict["unassigned_threshold"] = recent_ideas_obj.similarity_unassigned_threshold
+                if getattr(recent_ideas_obj, "similarity_high_confidence_threshold", None) is not None:
+                    idea_sim_dict["high_confidence_threshold"] = recent_ideas_obj.similarity_high_confidence_threshold
+                if getattr(recent_ideas_obj, "skip_limbo_chunks", None) is not None:
+                    idea_sim_dict["skip_limbo_chunks"] = recent_ideas_obj.skip_limbo_chunks
+
+            if idea_sim_dict:
+                filter_dict["idea_similarity"] = idea_sim_dict
+            if idea_sim_dict:
+                filter_dict["idea_similarity"] = idea_sim_dict
+
+            if filter_dict:
+                data["filter"] = filter_dict
         return data
 
     @property
@@ -963,6 +1142,71 @@ class Settings(BaseSettings):
         default=True,
         description="Automatically bypass References, Bibliography, and Acknowledgments sections in scientific white papers.",
     )
+    # Fine-grained chunk filter conveyor configuration
+    filter: FilterConfig = Field(
+        default_factory=FilterConfig,
+        description="Stateless chunk filter conveyor configuration.",
+    )
+    # Flat backward compatibility switches (synchronized with self.filter)
+    filter_reference_sections: bool = Field(
+        default=True,
+        description="Filter out References and Bibliography sections in scientific papers.",
+    )
+    filter_bibliographic: bool = Field(
+        default=True,
+        description="Filter out citation lists, DOIs, arXiv headers, and reference slices.",
+    )
+    filter_technical_boilerplate: bool = Field(
+        default=True,
+        description="Filter out code headers, licenses, and web scrape noise.",
+    )
+    filter_dataset_stimulus: bool = Field(
+        default=True,
+        description="Filter out questionnaire items and benchmark token noise.",
+    )
+    filter_diagram_ocr: bool = Field(
+        default=True,
+        description="Filter out diagram OCR fragments and visual table scraps.",
+    )
+    filter_detect_formulas: bool = Field(
+        default=True,
+        description="Detect mathematical formulas in chunks and set has_formula flag.",
+    )
+    filter_retain_formulas: bool = Field(
+        default=True,
+        description="Immediately retain chunks containing mathematical formulas.",
+    )
+
+    def get_chunk_filter_conveyor(
+        self,
+        skip_references: Optional[bool] = None,
+        idea_index: Optional[Any] = None,
+        include_chunk_similarity: bool = False,
+        include_idea_similarity: bool = False,
+    ) -> Any:
+        from bookeeper.processing.filters import ChunkFilterConveyor, build_chunk_filter_conveyor
+        if not self.filter.enabled:
+            return ChunkFilterConveyor([])
+        should_skip_refs = self.filter.skip_references_sections if skip_references is None else skip_references
+        return build_chunk_filter_conveyor(
+            enable_formula_detection=self.filter.detect_formulas,
+            retain_on_formula=self.filter.retain_formulas,
+            skip_reference_sections=should_skip_refs and self.filter.reference_sections,
+            skip_bibliographic=self.filter.bibliographic,
+            skip_technical_boilerplate=self.filter.technical_boilerplate,
+            skip_dataset_stimulus=self.filter.dataset_stimulus,
+            skip_diagram_ocr=self.filter.diagram_ocr,
+            enable_chunk_similarity=include_chunk_similarity and self.filter.chunk_similarity.enabled,
+            chunk_similarity_threshold=self.filter.chunk_similarity.threshold,
+            chunk_window_size=self.filter.chunk_similarity.window_size,
+            chunk_min_section_chunks=self.filter.chunk_similarity.min_section_chunks,
+            enable_idea_similarity=include_idea_similarity and self.filter.idea_similarity.enabled,
+            idea_index=idea_index,
+            unassigned_threshold=self.filter.idea_similarity.unassigned_threshold,
+            high_confidence_threshold=self.filter.idea_similarity.high_confidence_threshold,
+            skip_limbo_chunks=self.filter.idea_similarity.skip_limbo_chunks,
+            max_batch_chunk_size=self.filter.idea_similarity.max_batch_chunk_size,
+        )
     # Legacy alias fields for backward compatibility with existing configs
     enable_mmr: Optional[bool] = Field(
         default=None,
@@ -1137,6 +1381,58 @@ class Settings(BaseSettings):
             self.verifiers = [default_v]
             self.verification.verifiers = [default_v]
 
+        # 3. Keep flat filter attributes synchronized with self.filter
+        if not self.filter.enabled:
+            # Master switch is disabled: bypass all chunk filters (100% chunks kept)
+            self.skip_references_sections = False
+            self.filter_detect_formulas = False
+            self.filter_retain_formulas = False
+            self.filter_reference_sections = False
+            self.filter_bibliographic = False
+            self.filter_technical_boilerplate = False
+            self.filter_dataset_stimulus = False
+            self.filter_diagram_ocr = False
+            self.enable_hierarchical_cover = False
+            self.skip_limbo_chunks = False
+            self.filter.chunk_similarity.enabled = False
+            self.filter.idea_similarity.enabled = False
+            self.filter.idea_similarity.skip_limbo_chunks = False
+            if hasattr(self, "recent_ideas") and self.recent_ideas is not None:
+                self.recent_ideas.enabled = False
+                self.recent_ideas.skip_limbo_chunks = False
+        else:
+            self.skip_references_sections = self.filter.skip_references_sections
+            self.filter_detect_formulas = self.filter.detect_formulas
+            self.filter_retain_formulas = self.filter.retain_formulas
+            self.filter_reference_sections = self.filter.reference_sections
+            self.filter_bibliographic = self.filter.bibliographic
+            self.filter_technical_boilerplate = self.filter.technical_boilerplate
+            self.filter_dataset_stimulus = self.filter.dataset_stimulus
+            self.filter_diagram_ocr = self.filter.diagram_ocr
+
+            # Synchronize chunk_similarity
+            self.enable_hierarchical_cover = self.filter.chunk_similarity.enabled
+            self.cover_similarity_threshold = self.filter.chunk_similarity.threshold
+            self.cover_window_size = self.filter.chunk_similarity.window_size
+            self.cover_min_section_chunks = self.filter.chunk_similarity.min_section_chunks
+
+            # Synchronize idea_similarity
+            self.similarity_unassigned_threshold = self.filter.idea_similarity.unassigned_threshold
+            self.similarity_high_confidence_threshold = self.filter.idea_similarity.high_confidence_threshold
+            self.skip_limbo_chunks = self.filter.idea_similarity.skip_limbo_chunks
+            self.max_batch_chunk_size = self.filter.idea_similarity.max_batch_chunk_size
+
+            if hasattr(self, "recent_ideas") and self.recent_ideas is not None:
+                self.recent_ideas.enabled = self.filter.idea_similarity.enabled
+                self.recent_ideas.similarity_unassigned_threshold = self.filter.idea_similarity.unassigned_threshold
+                self.recent_ideas.similarity_high_confidence_threshold = self.filter.idea_similarity.high_confidence_threshold
+                self.recent_ideas.skip_limbo_chunks = self.filter.idea_similarity.skip_limbo_chunks
+                self.recent_ideas.max_batch_chunk_size = self.filter.idea_similarity.max_batch_chunk_size
+
+        # batch_books is independent of any filter or recent_ideas switch
+        if hasattr(self, "recent_ideas") and self.recent_ideas is not None:
+            self.recent_ideas.batch_books = self.batch_books
+
         return self
 
     @property
@@ -1208,6 +1504,10 @@ class Settings(BaseSettings):
         for key, val in data.items():
             if key == "neo4j" and isinstance(val, dict):
                 flat_data["neo4j"] = val
+            elif key in ("filter", "filters") and isinstance(val, dict):
+                flat_data["filter"] = val
+            elif key == "recent_ideas" and isinstance(val, dict):
+                flat_data["recent_ideas"] = val
             elif key == "verification" and isinstance(val, dict):
                 flat_data["verification"] = val
             elif key in ("dual_pass", "idea_postprocessor") and isinstance(val, dict):

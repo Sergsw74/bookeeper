@@ -968,6 +968,66 @@ def test_cli_verify_kg_mode_low_p10_prompt_with_limit(mock_stores_with_embedding
     assert rep_data.get("low_p10_prompt_chunks_count") == 2
 
 
+def test_generate_low_p10_prompt_offset(mock_stores_with_embeddings):
+    """Verifies that low-p10 prompt generation skips offset chunks and paginates through the tail."""
+    store_a, _ = mock_stores_with_embeddings
+
+    # First slice: offset=0, max_chunks=2
+    prompt_0, meta_0 = generate_low_p10_verification_prompt(
+        store=store_a,
+        max_chunks=2,
+        offset=0,
+    )
+
+    # Second slice: offset=2, max_chunks=2
+    prompt_2, meta_2 = generate_low_p10_verification_prompt(
+        store=store_a,
+        max_chunks=2,
+        offset=2,
+    )
+
+    assert meta_0["chunks_count"] == 2
+    assert meta_0["offset"] == 0
+    assert meta_2["chunks_count"] == 2
+    assert meta_2["offset"] == 2
+    assert "Tail Chunk Offset: 2" in prompt_2
+    assert "#3 (Slice #1 of 2)" in prompt_2
+
+    # Chunks in slice 2 must differ from slice 0
+    assert prompt_0 != prompt_2
+
+
+def test_cli_verify_kg_mode_low_p10_offset(mock_stores_with_embeddings, tmp_path):
+    """Tests CLI flag --low-p10-offset pagination."""
+    store_a, _ = mock_stores_with_embeddings
+    kg_path = tmp_path / "knowledge_graph.json"
+    store_a.save(kg_path)
+
+    prompt_dest = tmp_path / "custom_p10_offset.txt"
+    report_dest = tmp_path / "kg_report_offset.json"
+
+    res = runner.invoke(app, [
+        "verify",
+        "--graph-file", str(kg_path),
+        "--mode", "kg",
+        "--low-p10-prompt",
+        "--low-p10-limit", "2",
+        "--low-p10-offset", "2",
+        "--low-p10-output", str(prompt_dest),
+        "--output", str(report_dest),
+    ])
+
+    assert res.exit_code == 0, f"Error: {res.stdout}"
+    assert prompt_dest.is_file()
+
+    with open(prompt_dest, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    assert "Tail Chunk Offset: 2" in content
+    assert "#3 (Slice #1 of 2)" in content
+
+
+
 
 
 

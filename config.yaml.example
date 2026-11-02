@@ -34,22 +34,10 @@ max_retries: 1           # Retries for an attempt on an Ollama server before fai
 max_chunk_attempts: 6    # Maximum attempts across pool for a stalled chunk before marking failed (default: 6)
 max_context_size: 5120   # Maximum combined chunk context size in bytes (default: 5KB) for simultaneous extraction
 max_chunk_batch: 3       # Top limit on number of chunks combined per extraction task (default: 3)
-# Chronological Ingestion & 3-Tier Semantic Chunk Routing Options
-# Top-level shorthand (also configurable under 'recent_ideas:' block):
+# Chronological Ingestion Settings
 batch_books: 10          # Number of books grouped per chronological ingestion batch (default: 10)
-similarity_unassigned_threshold: 0.65       # Chunks below this similarity (<0.65) treated as brand new ideas (Tier 1)
-similarity_high_confidence_threshold: 0.90  # Chunks above this similarity (>=0.90) directly assigned to idea, skipping LLM (Tier 2)
-skip_limbo_chunks: false                    # Skip limbo chunks (0.65 <= sim < 0.90) completely from LLM processing (Tier 3)
-max_batch_chunk_size: null                  # If a limbo chunk is this size (chars) or larger, recover it from limbo into processing queue
-
-# Alternatively, configure as structured section:
-# recent_ideas:
-#   enabled: true
-#   batch_books: 10
-#   similarity_unassigned_threshold: 0.65
-#   similarity_high_confidence_threshold: 0.90
-#   skip_limbo_chunks: false
-#   max_batch_chunk_size: 500               # Recover limbo chunks >= 500 chars to unprocessed LLM queue
+# (Note: Idea similarity filtering is configured under the 'filter.idea_similarity' block below;
+# legacy top-level keys like similarity_unassigned_threshold are still supported for backwards compatibility)
 
 # Dedicated local or remote Embeddings endpoint (Recommended for maximum performance)
 # Offloading embeddings to your local machine (e.g. Apple Silicon Mac on http://localhost:11434)
@@ -197,6 +185,11 @@ verifiers:
     low_p10_prompt: false             # Set to true to generate ~1M prompt for frontier models auditing bottom p10 blind spots
     low_p10_output: null              # Optional destination path (default: output_dir/low_p10_verification_prompt.txt)
     low_p10_max_chunks: 500           # Maximum number of tail chunks to include in verification prompt (default: 500)
+    low_p10_offset: 0                 # Offset into tail chunks to skip before selecting chunks (e.g. 500 to audit next slice)
+    low_p10_filter_boilerplate: true  # Filter out bibliography references, author lists, and technical boilerplate (default: true)
+    hybrid_math: true                 # Block-normalized composite vectors (text + formulas) for KG verification (default: true)
+    formula_alpha: 0.35               # Formula subspace weight alpha in [0, 1] (default: 0.35)
+    formula_dim: 128                  # Dimensionality m of formula feature vector (default: 128)
 
 # Legacy single-verifier configuration (retained for backward compatibility;
 # synchronized with the default verifier in verifiers list above).
@@ -212,17 +205,48 @@ verification:
   low_p10_prompt: false             # Generate ~1M verification prompt for frontier models evaluating lowest-p10 tail chunks
   low_p10_output: null              # Optional destination path for low-p10 verification prompt
   low_p10_max_chunks: 500           # Maximum number of tail chunks to include in verification prompt (default: 500)
+  low_p10_offset: 0                 # Offset into tail chunks to skip before selecting chunks (e.g. 500 to audit next slice)
+  low_p10_filter_boilerplate: true  # Filter out bibliography references, author lists, and technical boilerplate (default: true)
+  hybrid_math: true                 # Block-normalized composite vectors (text + formulas) for KG verification (default: true)
+  formula_alpha: 0.35               # Formula subspace weight alpha in [0, 1] (default: 0.35)
+  formula_dim: 128                  # Dimensionality m of formula feature vector (default: 128)
 
 # ==============================================================================
-# Section-Aware Hierarchical Semantic Cover Settings
+# Chunk Filter Pipeline Configuration
 # ==============================================================================
-# Prunes redundant narrative elaborations and repetitive experimental tables within
-# the same section/chapter, while preserving all novel conceptual contributions.
-enable_hierarchical_cover: true
-cover_similarity_threshold: 0.92        # Cosine similarity threshold (>=) within section to mark chunk redundant/covered
-cover_window_size: 3                    # Number of recent section chunks to compare against (prevents distant paragraph absorption)
-cover_min_section_chunks: 2             # Sections with fewer chunks are always kept (anchor preservation)
-skip_references_sections: true          # Automatically bypasses References, Bibliography, and Boilerplate in scientific white papers
+# Unified filter pipeline executed sequentially on chunks before LLM extraction.
+# Hierarchy & Execution Priority:
+#   1. Math Formulas (Highest Priority): Formulas are detected and shielded; math chunks are ALWAYS retained.
+#   2. Boilerplate & Structure: Rejects bibliographies, code headers, and layout debris (unless containing math).
+#   3. Idea Similarity (Middle Priority): Semantic routing against graph ideas (unassigned, limbo, high-confidence).
+#   4. Chunk Similarity (Least Priority): Section-aware redundancy cover; NEVER prunes math or high-priority chunks.
+filter:
+  enabled: true                       # Master switch: if false, bypasses all filters (100% chunks kept)
+
+  # 1. Content & Structure Conveyor Filters (Priority 1: Math retention shield, Priority 2: Non-conceptual boilerplate)
+  detect_formulas: true               # Priority 1: Detects formulas/equations, tags chunk.has_formula, and shields math
+  retain_formulas: true               # Priority 1: Immediately retains chunks with formulas (FilterDecision.RETAIN), halting further filtering
+  reference_sections: true            # Priority 2: Drops References, Bibliography, and Acknowledgments sections
+  bibliographic: true                 # Priority 2: Drops citation dumps, DOIs, arXiv headers, and short reference slices
+  technical_boilerplate: true         # Priority 2: Drops C/C++ compilation headers, license notices, and web scrape noise
+  dataset_stimulus: true              # Priority 2: Drops survey questions, Likert questionnaires, and benchmark tokenizer noise
+  diagram_ocr: true                   # Priority 2: Drops visual table/diagram OCR layout fragments (skips if has_formula=true)
+  skip_references_sections: true      # Automatically bypass References, Bibliography, and Boilerplate in scientific white papers
+
+  # 2. Idea Similarity Filter (Priority 3 - Middle Priority: Semantic routing against existing Knowledge Graph ideas)
+  idea_similarity:
+    enabled: true                     # Enable filter by idea similarity
+    unassigned_threshold: 0.72        # Similarity (<0.72) treated as brand new ideas (continues to LLM)
+    high_confidence_threshold: 0.87   # Similarity (>=0.87) directly assigned to idea (retained, skips LLM)
+    skip_limbo_chunks: true           # Skip limbo chunks between unassigned and high confidence from LLM processing
+    max_batch_chunk_size: 1024        # Chunks >= this size (chars) recover from limbo into processing queue
+
+  # 3. Chunk Similarity Filter (Priority 4 - Least Priority: Drops repetitive / redundant narrative chunks within section)
+  chunk_similarity:
+    enabled: true                     # Enable drop by chunk similarity (Least priority: formulas are never dropped)
+    threshold: 0.95                   # Cosine similarity threshold (>=) within section to drop chunk as redundant (Optimal: 0.95, Conservative: 0.96)
+    window_size: 3                    # Window of recent section chunks to compare against
+    min_section_chunks: 2             # Minimum chunks in a section before similarity pruning applies
 
 # ==============================================================================
 # Token Usage & Financial Cost Estimation Settings

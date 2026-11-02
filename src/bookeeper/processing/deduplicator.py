@@ -907,6 +907,24 @@ class EntityDeduplicator:
 
         # 1. Exact or case-insensitive string match
         if norm1 == norm2:
+            # Granularity guard: Verify whether concepts represent distinct mathematical formulas or categories
+            if isinstance(c1, Concept) and isinstance(c2, Concept):
+                # Guard A: If both concepts have formulas or are mathematical formulations, ensure formulas match
+                c1_is_formula = getattr(c1, "has_formula", False) or getattr(c1, "category", "") in ("Mathematical Formulation", "Formula")
+                c2_is_formula = getattr(c2, "has_formula", False) or getattr(c2, "category", "") in ("Mathematical Formulation", "Formula")
+                if c1_is_formula and c2_is_formula:
+                    q1 = getattr(c1, "supporting_quote", "") or ""
+                    q2 = getattr(c2, "supporting_quote", "") or ""
+                    if q1 and q2 and q1.strip() != q2.strip() and not (q1 in q2 or q2 in q1):
+                        return False, 0.0, "distinct_formula_guard", None, "Concepts share a label but represent distinct mathematical formulas"
+
+                # Guard B: Distinguish formal mathematical formulations from empirical findings
+                cat1 = getattr(c1, "category", "") or ""
+                cat2 = getattr(c2, "category", "") or ""
+                dist_cats = {"Mathematical Formulation", "Formula", "Empirical Finding"}
+                if cat1 in dist_cats and cat2 in dist_cats and cat1 != cat2:
+                    return False, 0.0, "distinct_category_guard", None, f"Concepts share a label but represent distinct {cat1} vs {cat2}"
+
             return True, 1.0, "exact", name1, "Exact normalized name match"
 
         # 2. Embedding-based semantic cosine similarity

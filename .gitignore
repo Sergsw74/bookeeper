@@ -68,6 +68,7 @@ config.yaml
 config-*.yaml
 data/
 output/
+reports/
 ab_test_runs/
 obsidian_vault/
 graph_exports/

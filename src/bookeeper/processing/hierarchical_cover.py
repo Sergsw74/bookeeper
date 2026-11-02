@@ -20,25 +20,41 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
+from bookeeper.processing.filters import (
+    FilterDecision,
+    ChunkFilter,
+    BaseChunkFilter,
+    ChunkFilterConveyor,
+    FormulaDetectionFilter,
+    ReferenceSectionFilter,
+    BibliographicFilter,
+    TechnicalBoilerplateFilter,
+    DatasetStimulusFilter,
+    DiagramOCRFilter,
+    EmptyChunkFilter,
+    build_chunk_filter_conveyor,
+    get_default_filter_conveyor,
+    has_mathematical_formula,
+    get_chunk_attr,
+    set_chunk_attr,
+    extract_chunk_text_and_titles,
+    REFERENCE_SECTION_TITLE_REGEX,
+    CITATION_BRACKET_REGEX,
+    CITATION_AUTHOR_YEAR_REGEX,
+    DOI_REGEX,
+    ARXIV_ID_REGEX,
+    URL_COUNT_REGEX,
+    VENUE_REGEX,
+    SHORT_REF_KEYWORD_REGEX,
+    BIB_ENTRY_LINE_REGEX,
+    CODE_HEADER_BOILERPLATE_REGEX,
+    LICENSE_BOILERPLATE_REGEX,
+    WEB_SCRAPE_NOISE_REGEX,
+    SURVEY_QUESTION_REGEX,
+    TOKENIZER_NOISE_REGEX,
+)
+
 logger = logging.getLogger(__name__)
-
-# Patterns identifying bibliography, citation lists, and non-conceptual boilerplate in papers
-REFERENCE_SECTION_TITLE_REGEX = re.compile(
-    r"(?:^|\b)(?:"
-    r"references|bibliography|works\s+cited|literature\s+cited|"
-    r"author\s+contributions?|acknowledgements?|acknowledgments?|"
-    r"funding|competing\s+interests?|conflict\s+of\s+interests?|"
-    r"declarations?|data\s+availability|code\s+availability|"
-    r"broader\s+impacts?|checklist"
-    r")(?:\b|$)",
-    re.IGNORECASE,
-)
-
-# Citation density: numbered brackets like [1], [2], or author-year patterns like (Vaswani et al., 2017)
-CITATION_BRACKET_REGEX = re.compile(r"\[\d{1,3}\]")
-CITATION_AUTHOR_YEAR_REGEX = re.compile(
-    r"\b(?:[A-Z][a-zA-Z]+(?:\s+et\s+al\.?)?,?\s*(?:19|20)\d{2}[a-z]?)\b"
-)
 
 
 def compute_cosine_similarity(vec1: Sequence[float], vec2: Sequence[float]) -> float:
@@ -53,45 +69,42 @@ def compute_cosine_similarity(vec1: Sequence[float], vec2: Sequence[float]) -> f
 
 
 _cosine_sim = compute_cosine_similarity
+_extract_chunk_fields = extract_chunk_text_and_titles
 
 
-def is_reference_or_boilerplate_chunk(chunk: Any) -> bool:
+def is_bibliographic_chunk(chunk: Any) -> bool:
+    """Detect whether a chunk is a bibliography, references, or citation block."""
+    return BibliographicFilter().verify(chunk) == FilterDecision.SKIP or ReferenceSectionFilter().verify(chunk) == FilterDecision.SKIP
+
+
+def is_diagram_or_ocr_layout_dump(chunk: Any) -> bool:
     """
-    Detect whether a chunk belongs to a bibliography, references, or boilerplate section
-    in scientific white papers and technical preprints.
+    Detect whether a chunk is a diagram OCR dump, game board list, or visual table layout scrap.
+    Such artifacts typically consist of many very short lines (average length <= 25 chars),
+    repeated UI/diagram tokens, or high density of graphical layout symbols.
     """
-    sec_title = str(getattr(chunk, "section_title", "") or "").strip()
-    ch_title = str(getattr(chunk, "chapter_title", "") or "").strip()
-    breadcrumb = str(getattr(chunk, "breadcrumb", "") or "").strip()
+    return DiagramOCRFilter().verify(chunk) == FilterDecision.SKIP
 
-    # 1. Section / Chapter header match
-    for title_cand in (sec_title, ch_title, breadcrumb):
-        if title_cand and REFERENCE_SECTION_TITLE_REGEX.search(title_cand):
-            return True
 
-    # 2. Text-level citation density check
-    text = str(getattr(chunk, "text", "") or "").strip()
-    if not text:
-        return True
+def is_technical_boilerplate_or_code_dump(chunk: Any) -> bool:
+    """Detect whether a chunk is technical boilerplate (C/C++ headers, license notices, scrape noise)."""
+    return TechnicalBoilerplateFilter().verify(chunk) == FilterDecision.SKIP
 
-    # Count citation indicators
-    bracket_citations = len(CITATION_BRACKET_REGEX.findall(text))
-    author_year_citations = len(CITATION_AUTHOR_YEAR_REGEX.findall(text))
 
-    # If chunk has multiple bracket citations ([1], [2], [3], [4]...) and few other sentences
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    if bracket_citations >= 3 and len(lines) <= bracket_citations + 2:
-        return True
+def is_dataset_stimulus_noise(chunk: Any) -> bool:
+    """Detect raw evaluation dataset questionnaire options, tokenizer noise, or repetitive stimulus prompts."""
+    return DatasetStimulusFilter().verify(chunk) == FilterDecision.SKIP
 
-    if bracket_citations >= 5 or (bracket_citations >= 3 and author_year_citations >= 3):
-        return True
 
-    # Check for leading "References" / "Bibliography" header in text
-    first_line = lines[0].lower() if lines else ""
-    if REFERENCE_SECTION_TITLE_REGEX.match(first_line):
-        return True
+def is_non_conceptual_boilerplate(chunk: Any, conveyor: Optional[ChunkFilterConveyor] = None) -> bool:
+    """Master filter checking if a chunk is non-conceptual boilerplate via ChunkFilterConveyor."""
+    conv = conveyor or get_default_filter_conveyor()
+    return conv.should_skip(chunk)
 
-    return False
+
+def is_reference_or_boilerplate_chunk(chunk: Any, conveyor: Optional[ChunkFilterConveyor] = None) -> bool:
+    """Backward-compatible alias for non-conceptual boilerplate detection via ChunkFilterConveyor."""
+    return is_non_conceptual_boilerplate(chunk, conveyor=conveyor)
 
 
 @dataclass
@@ -112,6 +125,8 @@ def hierarchical_semantic_cover(
     min_section_chunks: int = 2,
     sliding_window_size: int = 3,
     on_progress: Optional[Callable[[int, int], None]] = None,
+    filter_conveyor: Optional[ChunkFilterConveyor] = None,
+    enable_chunk_similarity: bool = True,
 ) -> Tuple[List[Any], List[Any], List[CoverDecision]]:
     """
     Partition candidate chunks into:
@@ -131,6 +146,7 @@ def hierarchical_semantic_cover(
         min_section_chunks: Minimum chunks in a section before redundancy pruning applies.
         sliding_window_size: Maximum recent section anchors to compare against (default: 3).
         on_progress: Optional callback progress(completed_count, total_count).
+        filter_conveyor: Optional custom ChunkFilterConveyor for chunk verification.
 
     Returns:
         Tuple of (selected_chunks, skipped_chunks, decisions_list).
@@ -142,6 +158,22 @@ def hierarchical_semantic_cover(
         single = chunks[0]
         dec = CoverDecision(chunk=single, selected=True, status="selected_anchor", section_name="")
         return [single], [], [dec]
+
+    if filter_conveyor is not None:
+        effective_conveyor = filter_conveyor
+    elif skip_references:
+        effective_conveyor = get_default_filter_conveyor()
+    else:
+        effective_conveyor = ChunkFilterConveyor([])
+
+    if not skip_references and not enable_chunk_similarity and len(effective_conveyor.filters) == 0:
+        # Filtering is completely bypassed: retain 100% of chunks
+        all_selected = list(chunks)
+        all_decisions = [
+            CoverDecision(chunk=c, selected=True, status="selected_anchor", section_name="")
+            for c in chunks
+        ]
+        return all_selected, [], all_decisions
 
     selected_chunks: List[Any] = []
     skipped_chunks: List[Any] = []
@@ -159,6 +191,7 @@ def hierarchical_semantic_cover(
 
     processed_count = 0
     total_count = len(chunks)
+    in_trailing_references_by_chapter: Dict[int, bool] = {}
 
     # 2. Process each section hierarchically
     for (ch_idx, sec_title_lower), sec_chunks in sections_map.items():
@@ -167,7 +200,16 @@ def hierarchical_semantic_cover(
         # Check if the entire section is references/bibliography
         is_ref_section = skip_references and bool(REFERENCE_SECTION_TITLE_REGEX.search(sec_display))
 
+        # Check trailing reference continuation in chapter
+        if in_trailing_references_by_chapter.get(ch_idx, False):
+            is_appendix = bool(re.search(r"(?:^|\b)(?:appendix|supplementary|annex)\b", sec_display, re.I))
+            if is_appendix:
+                in_trailing_references_by_chapter[ch_idx] = False
+            elif skip_references:
+                is_ref_section = True
+
         if is_ref_section:
+            in_trailing_references_by_chapter[ch_idx] = True
             for chk in sec_chunks:
                 skipped_chunks.append(chk)
                 dec = CoverDecision(
@@ -185,7 +227,7 @@ def hierarchical_semantic_cover(
         # If section has fewer chunks than min_section_chunks, keep all non-reference chunks
         if len(sec_chunks) < min_section_chunks:
             for chk in sec_chunks:
-                if skip_references and is_reference_or_boilerplate_chunk(chk):
+                if effective_conveyor.should_skip(chk):
                     skipped_chunks.append(chk)
                     dec = CoverDecision(
                         chunk=chk,
@@ -212,13 +254,35 @@ def hierarchical_semantic_cover(
         sec_selected_vectors: List[np.ndarray] = []
 
         for chk in sec_chunks:
-            # Check individual chunk for bibliography/boilerplate
-            if skip_references and is_reference_or_boilerplate_chunk(chk):
+            # Check individual chunk for bibliography/boilerplate via conveyor
+            if effective_conveyor.should_skip(chk):
                 skipped_chunks.append(chk)
                 dec = CoverDecision(
                     chunk=chk,
                     selected=False,
                     status="skipped_reference",
+                    section_name=sec_display,
+                )
+                decisions.append(dec)
+                processed_count += 1
+                if on_progress:
+                    on_progress(processed_count, total_count)
+                continue
+
+            # If chunk is verified to contain mathematical formulas, shield it from redundancy pruning
+            if get_chunk_attr(chk, "has_formula", False):
+                selected_chunks.append(chk)
+                sec_selected_chunks.append(chk)
+                raw_emb = getattr(chk, "embedding", None)
+                if raw_emb is not None and len(raw_emb) > 1:
+                    arr = np.array(raw_emb, dtype=np.float32)
+                    norm = float(np.linalg.norm(arr))
+                    v_unit = (arr / norm) if norm > 1e-12 else arr
+                    sec_selected_vectors.append(v_unit)
+                dec = CoverDecision(
+                    chunk=chk,
+                    selected=True,
+                    status="selected_distinct" if sec_selected_vectors else "selected_anchor",
                     section_name=sec_display,
                 )
                 decisions.append(dec)
@@ -282,7 +346,10 @@ def hierarchical_semantic_cover(
             # Length Guard: A short snippet/header (<300 chars) cannot cover a substantive conceptual chunk (>=500 chars)
             is_substantive_expansion = chk_text_len >= 500 and best_text_len < 300
 
-            if max_sim >= similarity_threshold and not is_substantive_expansion:
+            # Math safeguard: chunks containing equations must not be dropped as redundant elaborations
+            chk_has_math = get_chunk_attr(chk, "has_formula", False) or has_mathematical_formula(str(getattr(chk, "text", "") or ""))
+
+            if enable_chunk_similarity and max_sim >= similarity_threshold and not is_substantive_expansion and not chk_has_math:
                 # Chunk is redundant elaboration covered by best_match_chk
                 skipped_chunks.append(chk)
                 dec = CoverDecision(

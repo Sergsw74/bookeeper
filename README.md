@@ -15,6 +15,7 @@ The documentation is split into specialized subchapters stored in the [`docs/`](
 | 🔄 **[Recommended Workflow](docs/workflow.md)** | **Start here**: Calibration via small A/B tests, building knowledge graph, export, and optional post-processing. |
 | 🚀 **[Getting Started](docs/get-started.md)** | Prerequisites, installation (`uv`/`pip`), configuration walkthrough, and basic commands. |
 | 🏗️ **[Building the Knowledge Graph](docs/building-graph.md)** | Graph extraction pipeline, chronological ingestion, 3-tier semantic routing, offline rebuilds, pruning, incremental Neo4j sync, and index suspension. |
+| 🧹 **[Chunk Filtering & Semantic Pruning](docs/filters.md)** | 4-tier conveyor filtering (math shield, regex boilerplate, semantic routing, hierarchical semantic cover), benchmark trade-offs, and optimal settings ($\tau = 0.95$). |
 | 🌐 **[Interactive Web UI & Search](docs/ui.md)** | **Idea Search & Explorer**: Interactive Cytoscape Neo4j graph, dedicated **💡 Ideas Page** (exact, embedded vector search, modernity range filter), Obsidian note panel, and embedded LightRAG WebUI. |
 | 🔍 **[Decoupled Hybrid RAG](docs/rag.md)** | LightRAG vector/graph indexing from cached chunks and multi-mode querying (`hybrid`, `local`, `global`). |
 | 🔄 **[Two-Pass Idea Post-Processing](docs/post-processing.md)** | Concept clustering ($\ge 0.92$), alias resolution, concise macro-definition synthesis, and state checkpointing. |

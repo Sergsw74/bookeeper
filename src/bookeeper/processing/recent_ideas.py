@@ -743,6 +743,15 @@ class RecentIdeaChunkRouter:
         return None
 
     def should_recover_from_limbo(self, chunk: Any) -> bool:
+        from bookeeper.processing.filters import has_mathematical_formula, get_chunk_attr, set_chunk_attr
+        # Math formulas have absolute highest priority - always recover from limbo to extract equations!
+        if get_chunk_attr(chunk, "has_formula", False):
+            return True
+        text = getattr(chunk, "text", "") or (chunk.get("text", "") if isinstance(chunk, dict) else "")
+        if text and has_mathematical_formula(text):
+            set_chunk_attr(chunk, "has_formula", True)
+            return True
+
         th = self.recovery_threshold
         if th is None or th <= 0:
             return False

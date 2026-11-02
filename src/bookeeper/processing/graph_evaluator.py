@@ -32,28 +32,95 @@ def compute_max_cosine_sim_batched(
     U: np.ndarray,
     G: np.ndarray,
     max_batch_mem_bytes: int = 64 * 1024 * 1024,
+    formula_dim: int = 0,
+    alpha: float = 0.35,
 ) -> np.ndarray:
     """
     Computes max cosine similarity across G for each vector in U in memory-safe batches.
     Caps intermediate projection matrices strictly to max_batch_mem_bytes (default 64MB).
+
+    If formula_dim > 0 (or composite math features detected), performs unpenalized adaptive similarity:
+    - Pure text cosine similarity is evaluated on dims [0 : D - formula_dim].
+    - Math similarity is evaluated on dims [D - formula_dim : D].
+    - For any chunk/concept pair where either lacks a formula, text similarity is unpenalized.
+    - When both have formulas, similarity is max(text_sim, (1 - alpha) * text_sim + alpha * math_sim).
     """
     if len(U) == 0 or len(G) == 0:
         return np.zeros(len(U), dtype=np.float32)
 
     n_u = len(U)
     n_g = len(G)
-    # Estimate batch size so (batch_size * n_g * 4 bytes) <= max_batch_mem_bytes
-    item_bytes = max(1, n_g * 4)  # float32 = 4 bytes
-    batch_size = max(50, min(5000, max_batch_mem_bytes // item_bytes))
+    dim = U.shape[1]
 
-    # Pre-cast to float32 contiguous array
-    G_T = np.ascontiguousarray(G.T, dtype=np.float32)
+    # Auto-detect standard formula composite embedding dimension if not explicitly passed
+    eff_formula_dim = int(formula_dim)
+    if eff_formula_dim <= 0 and dim in (896, 1152, 1664, 3200):
+        eff_formula_dim = 128
+
+    is_hybrid = eff_formula_dim > 0 and dim > eff_formula_dim
+
+    if not is_hybrid:
+        item_bytes = max(1, n_g * 4)  # float32 = 4 bytes
+        batch_size = max(50, min(5000, max_batch_mem_bytes // item_bytes))
+
+        # Pre-cast to float32 contiguous array
+        G_T = np.ascontiguousarray(G.T, dtype=np.float32)
+        results = np.empty(n_u, dtype=np.float32)
+
+        for i in range(0, n_u, batch_size):
+            u_batch = np.ascontiguousarray(U[i : i + batch_size], dtype=np.float32)
+            sim_batch = u_batch @ G_T
+            results[i : i + batch_size] = np.max(sim_batch, axis=1)
+
+        return results
+
+    # Hybrid adaptive computation
+    d = dim - eff_formula_dim
+    eff_alpha = float(min(1.0, max(0.0, alpha)))
+
+    # 1. Normalize text blocks to unit length
+    U_text = np.ascontiguousarray(U[:, :d], dtype=np.float32)
+    norm_u_text = np.linalg.norm(U_text, axis=1, keepdims=True)
+    U_text_hat = np.divide(U_text, norm_u_text, out=np.zeros_like(U_text), where=norm_u_text > 1e-12)
+
+    G_text = np.ascontiguousarray(G[:, :d], dtype=np.float32)
+    norm_g_text = np.linalg.norm(G_text, axis=1, keepdims=True)
+    G_text_hat = np.divide(G_text, norm_g_text, out=np.zeros_like(G_text), where=norm_g_text > 1e-12)
+    G_text_T = np.ascontiguousarray(G_text_hat.T, dtype=np.float32)
+
+    # 2. Extract and normalize math blocks
+    U_math = np.ascontiguousarray(U[:, d:], dtype=np.float32)
+    norm_u_math = np.linalg.norm(U_math, axis=1, keepdims=True)
+    U_math_hat = np.divide(U_math, norm_u_math, out=np.zeros_like(U_math), where=norm_u_math > 1e-6)
+    has_u_math = (norm_u_math > 1e-6)  # (N, 1) bool
+
+    G_math = np.ascontiguousarray(G[:, d:], dtype=np.float32)
+    norm_g_math = np.linalg.norm(G_math, axis=1, keepdims=True)
+    G_math_hat = np.divide(G_math, norm_g_math, out=np.zeros_like(G_math), where=norm_g_math > 1e-6)
+    G_math_T = np.ascontiguousarray(G_math_hat.T, dtype=np.float32)
+    has_g_math = (norm_g_math.T > 1e-6)  # (1, M) bool
+
+    has_any_g_math = bool(np.any(has_g_math))
+
+    item_bytes = max(1, n_g * 4)
+    batch_size = max(50, min(5000, max_batch_mem_bytes // item_bytes))
     results = np.empty(n_u, dtype=np.float32)
 
     for i in range(0, n_u, batch_size):
-        u_batch = np.ascontiguousarray(U[i : i + batch_size], dtype=np.float32)
-        sim_batch = u_batch @ G_T
-        results[i : i + batch_size] = np.max(sim_batch, axis=1)
+        u_t_batch = U_text_hat[i : i + batch_size]
+        t_sim = u_t_batch @ G_text_T
+
+        u_m_flags = has_u_math[i : i + batch_size]
+        if has_any_g_math and np.any(u_m_flags):
+            u_m_batch = U_math_hat[i : i + batch_size]
+            m_sim = u_m_batch @ G_math_T
+            both_m = u_m_flags & has_g_math
+            h_sim = np.where(both_m, (1.0 - eff_alpha) * t_sim + eff_alpha * m_sim, t_sim)
+            eff_sim = np.maximum(t_sim, h_sim)
+        else:
+            eff_sim = t_sim
+
+        results[i : i + batch_size] = np.max(eff_sim, axis=1)
 
     return results
 
@@ -138,6 +205,7 @@ class GraphSpaceMetrics(BaseModel):
     low_p10_prompt_path: Optional[str] = Field(None, description="Path to generated low-p10 verification prompt if requested.")
     low_p10_prompt_chunks_count: Optional[int] = Field(None, description="Number of low-p10 chunks included in verification prompt.")
     low_p10_prompt_chars_count: Optional[int] = Field(None, description="Character count of generated low-p10 verification prompt.")
+    low_p10_prompt_offset: Optional[int] = Field(None, description="Offset into lowest-proximity chunks for verification prompt.")
 
 
 class GraphSpaceComparisonReport(BaseModel):
@@ -191,6 +259,7 @@ class GraphSpaceComparisonReport(BaseModel):
     low_p10_prompt_path: Optional[str] = Field(None, description="Path to generated low-p10 verification prompt if requested.")
     low_p10_prompt_chunks_count: Optional[int] = Field(None, description="Number of low-p10 chunks included in verification prompt.")
     low_p10_prompt_chars_count: Optional[int] = Field(None, description="Character count of generated low-p10 verification prompt.")
+    low_p10_prompt_offset: Optional[int] = Field(None, description="Offset into lowest-proximity chunks for verification prompt.")
 
 
 # ==============================================================================
@@ -292,6 +361,8 @@ def evaluate_graph_space(
     batch_size: int = 5000,
     parent_chunk_mask: Optional[np.ndarray] = None,  # (N,) bool array indicating parent chunks
     chunk_weights: Optional[np.ndarray] = None,      # (N,) float array of chunk sizes (chars)
+    formula_dim: int = 0,
+    formula_alpha: float = 0.35,
 ) -> Dict[str, Any]:
     """
     Evaluates how effectively Graph G covers and disperses across the 
@@ -353,7 +424,13 @@ def evaluate_graph_space(
     tot_w = float(np.sum(W))
 
     # 2. Pairwise Cosine Projection (memory-bounded in float32 batches)
-    max_sims = compute_max_cosine_sim_batched(U, G, max_batch_mem_bytes=64 * 1024 * 1024)
+    max_sims = compute_max_cosine_sim_batched(
+        U,
+        G,
+        max_batch_mem_bytes=64 * 1024 * 1024,
+        formula_dim=formula_dim,
+        alpha=formula_alpha,
+    )
 
     # 3. Size-Weighted Distributional Metrics (Chamfer, Variance, Percentiles)
     chamfer_mean = float(np.sum(W * max_sims) / tot_w) if tot_w > 0 else 0.0
@@ -472,6 +549,8 @@ def calculate_postprocessing_drift(
     post_embeddings: np.ndarray,
     raw_weights: Optional[Sequence[Union[int, float]]] = None,
     tau_loss: float = 0.70,
+    formula_dim: int = 0,
+    formula_alpha: float = 0.35,
 ) -> Dict[str, Any]:
     """
     Measures idea drift between RAW (from book state files) and POST (after post-processing)
@@ -516,10 +595,20 @@ def calculate_postprocessing_drift(
 
     # Cross-similarity nearest neighbor in chunks to respect memory limits
     # 1. Forward: best match in P for each raw idea in R
-    max_sim_r_to_p = compute_max_cosine_sim_batched(R, P)
+    max_sim_r_to_p = compute_max_cosine_sim_batched(
+        R,
+        P,
+        formula_dim=formula_dim,
+        alpha=formula_alpha,
+    )
 
     # 2. Backward: best match in R for each post idea in P
-    max_sim_p_to_r = compute_max_cosine_sim_batched(P, R)
+    max_sim_p_to_r = compute_max_cosine_sim_batched(
+        P,
+        R,
+        formula_dim=formula_dim,
+        alpha=formula_alpha,
+    )
 
     forward_retention = float(np.mean(max_sim_r_to_p))
     backward_fidelity = float(np.mean(max_sim_p_to_r))
@@ -588,6 +677,8 @@ def compare_graph_spaces(
     universe_embeddings_b: Optional[np.ndarray] = None,
     chunk_weights: Optional[np.ndarray] = None,
     chunk_weights_b: Optional[np.ndarray] = None,
+    formula_dim: int = 0,
+    formula_alpha: float = 0.35,
 ) -> GraphSpaceComparisonReport:
     """
     Evaluates and compares Baseline (G1) vs Candidate (G2) against their respective chunk Universes
@@ -602,6 +693,8 @@ def compare_graph_spaces(
         tau=tau,
         parent_chunk_mask=parent_mask_a,
         chunk_weights=chunk_weights,
+        formula_dim=formula_dim,
+        formula_alpha=formula_alpha,
     )
     raw_m2 = evaluate_graph_space(
         u_b,
@@ -609,6 +702,8 @@ def compare_graph_spaces(
         tau=tau,
         parent_chunk_mask=parent_mask_b,
         chunk_weights=w_b,
+        formula_dim=formula_dim,
+        formula_alpha=formula_alpha,
     )
 
     m1 = GraphSpaceMetrics(**raw_m1)
@@ -802,12 +897,20 @@ def get_parent_chunk_ids(store: ConceptGraphStore) -> Set[str]:
     return parent_cids
 
 
-def extract_concept_embeddings(store: ConceptGraphStore) -> Tuple[List[str], np.ndarray]:
+def extract_concept_embeddings(
+    store: ConceptGraphStore,
+    hybrid_math: bool = False,
+    alpha: float = 0.35,
+    formula_dim: int = 128,
+) -> Tuple[List[str], np.ndarray]:
     """
     Extracts all Idea/Concept node IDs and their stored vector embeddings.
+    If hybrid_math is True, constructs block-normalized composite unit vectors (text + formulas).
     Transparently supports both legacy float arrays and compact Base64 binary vectors.
     """
     from bookeeper.graph.embedding_codec import get_node_embedding
+    from bookeeper.processing.formula_embedding import build_composite_embedding, build_formula_feature_vector
+    from bookeeper.processing.filters import has_mathematical_formula
 
     names: List[str] = []
     vec_arrays: List[np.ndarray] = []
@@ -815,13 +918,44 @@ def extract_concept_embeddings(store: ConceptGraphStore) -> Tuple[List[str], np.
     node_source = store.iter_all_nodes(data=True) if hasattr(store, "iter_all_nodes") else store.graph.nodes(data=True)
     for node_id, attrs in node_source:
         ntype = attrs.get("type", "")
-        is_idea = bool(attrs.get("is_idea") or attrs.get("tag") == "idea" or ntype in ("Concept", "Idea"))
+        is_idea = bool(attrs.get("is_idea") or attrs.get("tag") in ("idea", "formula") or ntype in ("Concept", "Idea", "Formula") or attrs.get("is_formula"))
         if is_idea:
             emb = get_node_embedding(attrs, return_numpy=True)
             if emb is not None and len(emb) > 1:
-                clean_name = attrs.get("name") or str(node_id).replace("concept:", "")
+                clean_name = attrs.get("name") or str(node_id).replace("concept:", "").replace("formula:", "")
                 names.append(str(clean_name))
-                vec_arrays.append(emb)
+
+                if hybrid_math:
+                    has_f = bool(attrs.get("has_formula", False) or attrs.get("is_formula", False) or attrs.get("category") in ("Formula", "Mathematical Formulation") or ntype == "Formula")
+                    math_sources = []
+                    for k in ("name", "brief_description", "detailed_explanation", "summary", "supporting_quote", "raw_latex", "label"):
+                        val = attrs.get(k)
+                        if val:
+                            math_sources.append(str(val))
+
+                    # Check for connected formula nodes in graph
+                    if hasattr(store, "graph") and store.graph.has_node(node_id):
+                        for _, tgt, edata in store.graph.out_edges(node_id, data=True):
+                            if edata.get("relation") == "HAS_FORMULA" and store.graph.has_node(tgt):
+                                math_sources.append(str(store.graph.nodes[tgt].get("raw_latex", "")))
+
+                    m_text = " ".join(math_sources)
+                    if has_f or has_mathematical_formula(m_text):
+                        m_vec = build_formula_feature_vector(m_text, m=formula_dim)
+                        has_f = True
+                    else:
+                        m_vec = None
+
+                    comp_vec = build_composite_embedding(
+                        text_vec=emb,
+                        math_vec=m_vec,
+                        has_formula=has_f,
+                        alpha=alpha,
+                        m=formula_dim,
+                    )
+                    vec_arrays.append(comp_vec)
+                else:
+                    vec_arrays.append(emb)
 
     if not vec_arrays:
         return names, np.empty((0, 0), dtype=np.float32)
@@ -832,13 +966,19 @@ def extract_concept_embeddings(store: ConceptGraphStore) -> Tuple[List[str], np.
 def extract_chunk_embeddings_and_weights(
     store: ConceptGraphStore,
     chunks_dir: Optional[Union[Path, str]] = None,
+    hybrid_math: bool = False,
+    alpha: float = 0.35,
+    formula_dim: int = 128,
 ) -> Tuple[List[str], np.ndarray, np.ndarray]:
     """
     Extracts all Chunk node IDs, their stored vector embeddings, and chunk character weights.
+    If hybrid_math is True, constructs block-normalized composite unit vectors (text + formulas).
     Seamlessly streams chunk nodes across Spine and Shards (or falls back to persistent chunks_dir
     when chunks are not embedded in graph nodes).
     """
     from bookeeper.graph.embedding_codec import get_node_embedding
+    from bookeeper.processing.formula_embedding import build_composite_embedding, build_formula_feature_vector
+    from bookeeper.processing.filters import has_mathematical_formula
 
     chunk_ids: List[str] = []
     vec_arrays: List[np.ndarray] = []
@@ -851,13 +991,40 @@ def extract_chunk_embeddings_and_weights(
             if emb is not None and len(emb) > 1:
                 cid = attrs.get("chunk_id") or str(node_id).replace("chunk:", "")
                 chunk_ids.append(str(cid))
-                vec_arrays.append(emb)
                 c_len = attrs.get("char_count")
+                txt = attrs.get("text") or ""
                 if c_len is not None and int(c_len) > 0:
                     weights.append(float(c_len))
                 else:
-                    txt = attrs.get("text") or ""
                     weights.append(float(len(txt)) if len(txt) > 0 else 1.0)
+
+                if hybrid_math:
+                    has_f = bool(attrs.get("has_formula", False))
+                    math_sources = []
+                    if hasattr(store, "get_chunk_formulas"):
+                        f_list = store.get_chunk_formulas(cid)
+                        for f_item in f_list:
+                            math_sources.append(str(f_item.get("raw_latex", "")))
+                    if txt:
+                        math_sources.append(txt)
+
+                    m_text = " ".join(math_sources)
+                    if has_f or has_mathematical_formula(m_text):
+                        m_vec = build_formula_feature_vector(m_text, m=formula_dim)
+                        has_f = True
+                    else:
+                        m_vec = None
+
+                    comp_vec = build_composite_embedding(
+                        text_vec=emb,
+                        math_vec=m_vec,
+                        has_formula=has_f,
+                        alpha=alpha,
+                        m=formula_dim,
+                    )
+                    vec_arrays.append(comp_vec)
+                else:
+                    vec_arrays.append(emb)
 
     # Fallback to persistent chunks storage if graph has no loaded chunks
     if not vec_arrays and chunks_dir is not None:
@@ -872,13 +1039,26 @@ def extract_chunk_embeddings_and_weights(
                         if emb is not None and len(emb) > 1:
                             cid = citem.get("chunk_id") or f"chunk_{len(chunk_ids)}"
                             chunk_ids.append(str(cid))
-                            vec_arrays.append(emb)
                             c_len = citem.get("char_count")
+                            txt = citem.get("text") or ""
                             if c_len is not None and int(c_len) > 0:
                                 weights.append(float(c_len))
                             else:
-                                txt = citem.get("text") or ""
                                 weights.append(float(len(txt)) if len(txt) > 0 else 1.0)
+
+                            if hybrid_math:
+                                has_f = bool(citem.get("has_formula", False) or has_mathematical_formula(txt))
+                                m_vec = build_formula_feature_vector(txt, m=formula_dim) if has_f else None
+                                comp_vec = build_composite_embedding(
+                                    text_vec=emb,
+                                    math_vec=m_vec,
+                                    has_formula=has_f,
+                                    alpha=alpha,
+                                    m=formula_dim,
+                                )
+                                vec_arrays.append(comp_vec)
+                            else:
+                                vec_arrays.append(emb)
                 except Exception as e:
                     logger.debug(f"Could not load chunks from {cfile}: {e}")
 
@@ -891,11 +1071,20 @@ def extract_chunk_embeddings_and_weights(
 def extract_chunk_embeddings(
     store: ConceptGraphStore,
     chunks_dir: Optional[Union[Path, str]] = None,
+    hybrid_math: bool = False,
+    alpha: float = 0.35,
+    formula_dim: int = 128,
 ) -> Tuple[List[str], np.ndarray]:
     """
     Extracts all Chunk node IDs and their stored vector embeddings.
     """
-    cids, mat, _ = extract_chunk_embeddings_and_weights(store, chunks_dir=chunks_dir)
+    cids, mat, _ = extract_chunk_embeddings_and_weights(
+        store,
+        chunks_dir=chunks_dir,
+        hybrid_math=hybrid_math,
+        alpha=alpha,
+        formula_dim=formula_dim,
+    )
     return cids, mat
 
 
@@ -960,12 +1149,17 @@ def generate_low_p10_verification_prompt(
     output_path: Optional[Union[Path, str]] = None,
     target_prompt_chars: int = 1_000_000,
     max_chunks: int = 500,
+    offset: int = 0,
+    filter_boilerplate: bool = True,
     u_ids: Optional[List[str]] = None,
     u_mat: Optional[np.ndarray] = None,
     g_mat: Optional[np.ndarray] = None,
     u_weights: Optional[np.ndarray] = None,
     tau: float = 0.75,
     strict_p10: bool = False,
+    hybrid_math: bool = True,
+    formula_alpha: float = 0.35,
+    formula_dim: int = 128,
 ) -> Tuple[str, Dict[str, Any]]:
     """
     Generates a ~1M verification benchmark prompt for high-capability frontier models
@@ -978,6 +1172,11 @@ def generate_low_p10_verification_prompt(
     Parameters:
         target_prompt_chars: Target character budget for entire prompt (default: 1,000,000 chars / ~250k tokens).
         max_chunks: Maximum number of worst-proximity chunks to include in prompt (default: 500).
+        offset: Number of lowest-proximity eligible chunks to skip before collecting (default: 0).
+        filter_boilerplate: Skip bibliographic references, code headers, and diagram OCR dumps (default: True).
+        hybrid_math: Whether to use block-normalized composite vectors for formula-aware proximity.
+        formula_alpha: Subspace weight alpha for formula feature vector (default: 0.35).
+        formula_dim: Dimension m of formula feature sub-vector (default: 128).
 
     Expected output format in prompt:
     1. Percentage of chunks with ideas out of provided examples.
@@ -985,17 +1184,33 @@ def generate_low_p10_verification_prompt(
     3. Itemized breakdown of missed ideas per chunk.
     """
     if g_mat is None:
-        _, g_mat = extract_concept_embeddings(store)
+        _, g_mat = extract_concept_embeddings(
+            store,
+            hybrid_math=hybrid_math,
+            alpha=formula_alpha,
+            formula_dim=formula_dim,
+        )
     if u_mat is None or u_ids is None or u_weights is None:
         u_target = universe_store if universe_store is not None else store
-        u_ids, u_mat, u_weights = extract_chunk_embeddings_and_weights(u_target, chunks_dir=chunks_dir)
+        u_ids, u_mat, u_weights = extract_chunk_embeddings_and_weights(
+            u_target,
+            chunks_dir=chunks_dir,
+            hybrid_math=hybrid_math,
+            alpha=formula_alpha,
+            formula_dim=formula_dim,
+        )
 
     if len(u_mat) == 0 or len(g_mat) == 0:
         logger.warning("Cannot generate low-p10 prompt: empty chunk or idea embeddings.")
-        return "", {"file": None, "chunks_count": 0, "chars_count": 0}
+        return "", {"file": None, "chunks_count": 0, "chars_count": 0, "offset": offset}
 
     # 1. Cosine similarity of each chunk to nearest graph idea
-    sims = compute_max_cosine_sim_batched(u_mat, g_mat)
+    sims = compute_max_cosine_sim_batched(
+        u_mat,
+        g_mat,
+        formula_dim=formula_dim if hybrid_math else 0,
+        alpha=formula_alpha,
+    )
     p10 = compute_weighted_percentile(sims, u_weights, 10.0)
 
     # 2. Sort chunks ascending by proximity (worst Hausdorff / most isolated chunks first)
@@ -1018,6 +1233,8 @@ def generate_low_p10_verification_prompt(
     rendered_chunks: List[str] = []
     selected_indices: List[int] = []
     total_chunk_chars = 0
+    skipped_offset = 0
+    seen_normalized_texts = set()
 
     # Leave ~3,500 chars for header and instruction framing
     available_chars_for_chunks = max(1000, target_prompt_chars - 3500)
@@ -1030,6 +1247,20 @@ def generate_low_p10_verification_prompt(
         meta = meta_map.get(cid, {})
         txt = meta.get("text", "").strip()
         if not txt:
+            continue
+
+        if filter_boilerplate:
+            from bookeeper.processing.hierarchical_cover import is_non_conceptual_boilerplate
+            if is_non_conceptual_boilerplate(meta):
+                continue
+            # Deduplicate repeated identical OCR/figure blocks (e.g. AAArena across 36 chunks)
+            norm_txt = " ".join(txt.split())
+            if norm_txt in seen_normalized_texts:
+                continue
+            seen_normalized_texts.add(norm_txt)
+
+        if skipped_offset < offset:
+            skipped_offset += 1
             continue
 
         b_title = meta.get("book_title") or "Unknown Work"
@@ -1056,7 +1287,10 @@ def generate_low_p10_verification_prompt(
     num_chunks = len(selected_indices)
     final_blocks = []
     for i, blk in enumerate(rendered_chunks, start=1):
-        final_blocks.append(blk.replace("[CHUNK_INDEX_PLACEHOLDER]", f"#{i} of {num_chunks}"))
+        if offset > 0:
+            final_blocks.append(blk.replace("[CHUNK_INDEX_PLACEHOLDER]", f"#{offset + i} (Slice #{i} of {num_chunks})"))
+        else:
+            final_blocks.append(blk.replace("[CHUNK_INDEX_PLACEHOLDER]", f"#{i} of {num_chunks}"))
     chunks_content = "\n".join(final_blocks)
 
     min_sim = float(sims[selected_indices[0]]) if selected_indices else 0.0
@@ -1069,10 +1303,11 @@ def generate_low_p10_verification_prompt(
         f"You are an expert scientific and conceptual auditor evaluating an automated Knowledge Graph extraction pipeline.\n"
         f"The {num_chunks:,} literature text chunks provided below represent the hardest, lowest-proximity passages\n"
         f"relative to our extracted Knowledge Graph concepts (sorted strictly in ascending order from the most isolated\n"
-        f"blind spot chunks upward).\n\n"
+        f"blind spot chunks upward, with offset = {offset:,}).\n\n"
         f"### Benchmark Scope:\n"
         f"- Total Chunks Provided: {num_chunks:,}\n"
-        f"- Total Prompt Size: ~{len(chunks_content):,} characters\n"
+        f"- Tail Chunk Offset: {offset:,} (Auditing chunks #{offset + 1:,} to #{offset + num_chunks:,})\n"
+        f"- Total Prompt Size: ~{len(chunks_content) + 3000:,} characters\n"
         f"- Cosine Proximity Range: {min_sim:.4f} to {max_sim:.4f} (Literature coverage radius τ = {tau:.2f})\n"
         f"- Knowledge Graph P10 Cutoff: {p10:.4f} ({p10_in_selected:,} chunks in bottom decile)\n\n"
         f"## 2. EVALUATION TASK\n"
@@ -1127,6 +1362,7 @@ def generate_low_p10_verification_prompt(
     meta_dict = {
         "file": str(out_file) if out_file else None,
         "chunks_count": num_chunks,
+        "offset": offset,
         "chars_count": len(prompt),
         "min_similarity": round(min_sim, 4),
         "max_similarity": round(max_sim, 4),
@@ -1208,6 +1444,11 @@ def run_graph_space_evaluation(
     low_p10_prompt_output: Optional[Union[Path, str]] = None,
     low_p10_target_chars: int = 1_000_000,
     low_p10_max_chunks: int = 500,
+    low_p10_offset: int = 0,
+    low_p10_filter_boilerplate: bool = True,
+    hybrid_math: bool = True,
+    formula_alpha: float = 0.35,
+    formula_dim: int = 128,
 ) -> GraphSpaceMetrics:
     """
     Executes a single Graph Space evaluation on a Knowledge Graph.
@@ -1215,12 +1456,23 @@ def run_graph_space_evaluation(
     If generate_low_p10_prompt is True, generates a ~1M context verification benchmark prompt for frontier models.
     """
     ensure_graph_embeddings(store, embeddings=embeddings, chunks_dir=chunks_dir, console=console)
-    _, g_mat = extract_concept_embeddings(store)
+    _, g_mat = extract_concept_embeddings(
+        store,
+        hybrid_math=hybrid_math,
+        alpha=formula_alpha,
+        formula_dim=formula_dim,
+    )
 
     u_target = universe_store if universe_store is not None else store
     if universe_store is not None:
         ensure_graph_embeddings(universe_store, embeddings=embeddings, chunks_dir=chunks_dir, console=console)
-    u_ids, u_mat, u_weights = extract_chunk_embeddings_and_weights(u_target, chunks_dir=chunks_dir)
+    u_ids, u_mat, u_weights = extract_chunk_embeddings_and_weights(
+        u_target,
+        chunks_dir=chunks_dir,
+        hybrid_math=hybrid_math,
+        alpha=formula_alpha,
+        formula_dim=formula_dim,
+    )
 
     if len(u_mat) == 0:
         raise ValueError("Universe chunk embeddings are missing. Provide a graph with stored chunks or configure chunks_dir.")
@@ -1236,6 +1488,8 @@ def run_graph_space_evaluation(
         tau=tau,
         parent_chunk_mask=parent_mask,
         chunk_weights=u_weights,
+        formula_dim=formula_dim if hybrid_math else 0,
+        formula_alpha=formula_alpha,
     )
 
     # Generate low-p10 prompt if requested
@@ -1247,15 +1501,21 @@ def run_graph_space_evaluation(
             output_path=low_p10_prompt_output,
             target_prompt_chars=low_p10_target_chars,
             max_chunks=low_p10_max_chunks,
+            offset=low_p10_offset,
+            filter_boilerplate=low_p10_filter_boilerplate,
             u_ids=u_ids,
             u_mat=u_mat,
             g_mat=g_mat,
             u_weights=u_weights,
             tau=tau,
+            hybrid_math=hybrid_math,
+            formula_alpha=formula_alpha,
+            formula_dim=formula_dim,
         )
         raw["low_p10_prompt_path"] = p_meta.get("file")
         raw["low_p10_prompt_chunks_count"] = p_meta.get("chunks_count")
         raw["low_p10_prompt_chars_count"] = p_meta.get("chars_count")
+        raw["low_p10_prompt_offset"] = p_meta.get("offset", 0)
 
     # Calculate post-processing idea drift if state cache directory is available
     post_drift: Optional[PostProcessingDriftMetrics] = None
@@ -1296,6 +1556,11 @@ def run_graph_space_comparison(
     low_p10_prompt_output: Optional[Union[Path, str]] = None,
     low_p10_target_chars: int = 1_000_000,
     low_p10_max_chunks: int = 500,
+    low_p10_offset: int = 0,
+    low_p10_filter_boilerplate: bool = True,
+    hybrid_math: bool = True,
+    formula_alpha: float = 0.35,
+    formula_dim: int = 128,
 ) -> GraphSpaceComparisonReport:
     """
     Runs end-to-end Graph Space Comparison between Store A and Store B over their combined Universe.
@@ -1304,11 +1569,33 @@ def run_graph_space_comparison(
     ensure_graph_embeddings(store_a, embeddings=embeddings, chunks_dir=chunks_dir, console=console)
     ensure_graph_embeddings(store_b, embeddings=embeddings, chunks_dir=chunks_dir, console=console)
 
-    _, g1_mat = extract_concept_embeddings(store_a)
-    _, g2_mat = extract_concept_embeddings(store_b)
+    _, g1_mat = extract_concept_embeddings(
+        store_a,
+        hybrid_math=hybrid_math,
+        alpha=formula_alpha,
+        formula_dim=formula_dim,
+    )
+    _, g2_mat = extract_concept_embeddings(
+        store_b,
+        hybrid_math=hybrid_math,
+        alpha=formula_alpha,
+        formula_dim=formula_dim,
+    )
 
-    cids_a, u1_mat, w_a = extract_chunk_embeddings_and_weights(store_a, chunks_dir=chunks_dir)
-    cids_b, u2_mat, w_b = extract_chunk_embeddings_and_weights(store_b, chunks_dir=chunks_dir)
+    cids_a, u1_mat, w_a = extract_chunk_embeddings_and_weights(
+        store_a,
+        chunks_dir=chunks_dir,
+        hybrid_math=hybrid_math,
+        alpha=formula_alpha,
+        formula_dim=formula_dim,
+    )
+    cids_b, u2_mat, w_b = extract_chunk_embeddings_and_weights(
+        store_b,
+        chunks_dir=chunks_dir,
+        hybrid_math=hybrid_math,
+        alpha=formula_alpha,
+        formula_dim=formula_dim,
+    )
 
     if len(u1_mat) == 0 and len(u2_mat) > 0:
         u1_mat = u2_mat
@@ -1344,6 +1631,8 @@ def run_graph_space_comparison(
         universe_embeddings_b=u2_mat,
         chunk_weights=w_a,
         chunk_weights_b=w_b,
+        formula_dim=formula_dim if hybrid_math else 0,
+        formula_alpha=formula_alpha,
     )
 
     # Optional drift evaluation for A and B
@@ -1388,6 +1677,8 @@ def run_graph_space_comparison(
             output_path=low_p10_prompt_output,
             target_prompt_chars=low_p10_target_chars,
             max_chunks=low_p10_max_chunks,
+            offset=low_p10_offset,
+            filter_boilerplate=low_p10_filter_boilerplate,
             u_ids=cids_b,
             u_mat=u2_mat,
             g_mat=g2_mat,
@@ -1397,6 +1688,7 @@ def run_graph_space_comparison(
         report.low_p10_prompt_path = p_meta.get("file")
         report.low_p10_prompt_chunks_count = p_meta.get("chunks_count")
         report.low_p10_prompt_chars_count = p_meta.get("chars_count")
+        report.low_p10_prompt_offset = p_meta.get("offset", 0)
 
     return report
 
@@ -1497,6 +1789,9 @@ def run_postprocessing_drift_evaluation(
     tau_loss: float = 0.70,
     embeddings: Optional[Any] = None,
     console: Optional[Any] = None,
+    hybrid_math: bool = True,
+    formula_alpha: float = 0.35,
+    formula_dim: int = 128,
 ) -> PostProcessingDriftMetrics:
     """
     Measures idea drift and semantic alignment between RAW idea space (from book states)
@@ -1509,6 +1804,9 @@ def run_postprocessing_drift_evaluation(
         tau_loss: Cosine similarity cutoff below which a raw idea is considered dropped.
         embeddings: Optional FailoverOllamaEmbeddings provider to compute any missing embeddings.
         console: Optional Rich Console for progress logging.
+        hybrid_math: Whether to use block-normalized composite vectors for formula-aware proximity.
+        formula_alpha: Subspace weight alpha for formula feature vector (default: 0.35).
+        formula_dim: Dimension m of formula feature sub-vector (default: 128).
 
     Returns:
         PostProcessingDriftMetrics object.
@@ -1525,28 +1823,33 @@ def run_postprocessing_drift_evaluation(
 
     # 1. Extract or backfill POST KG ideas
     ensure_graph_embeddings(store, embeddings=embeddings, console=console)
-    _, p_mat = extract_concept_embeddings(store)
+    _, p_mat = extract_concept_embeddings(
+        store,
+        hybrid_math=hybrid_math,
+        alpha=formula_alpha,
+        formula_dim=formula_dim,
+    )
     if len(p_mat) == 0:
         raise ValueError("Knowledge graph contains 0 concept nodes with vector embeddings.")
 
     # Filter post ideas if book_id is specified
     if book_id is not None:
         target_bid = int(book_id) if str(book_id).isdigit() else book_id
-        filtered_p_vecs = []
-        for n_id, attrs in store.graph.nodes(data=True):
+        filtered_indices = []
+        node_source = store.iter_all_nodes(data=True) if hasattr(store, "iter_all_nodes") else store.graph.nodes(data=True)
+        idx_counter = 0
+        for node_id, attrs in node_source:
             ntype = attrs.get("type", "")
             is_idea = bool(attrs.get("is_idea") or attrs.get("tag") == "idea" or ntype in ("Concept", "Idea"))
             if is_idea:
                 emb = get_node_embedding(attrs, return_numpy=True)
                 if emb is not None and len(emb) > 1:
-                    # Check associated chunks or book_ids
                     b_ids = attrs.get("book_ids") or []
-                    if isinstance(b_ids, (list, set)) and target_bid in b_ids:
-                        filtered_p_vecs.append(emb)
-                    elif attrs.get("book_id") == target_bid:
-                        filtered_p_vecs.append(emb)
-        if filtered_p_vecs:
-            p_mat = np.vstack(filtered_p_vecs)
+                    if (isinstance(b_ids, (list, set)) and target_bid in b_ids) or attrs.get("book_id") == target_bid:
+                        filtered_indices.append(idx_counter)
+                    idx_counter += 1
+        if filtered_indices:
+            p_mat = p_mat[filtered_indices]
 
     # 2. Collect or compute RAW concept embeddings
     raw_texts = []
@@ -1594,11 +1897,12 @@ def run_postprocessing_drift_evaluation(
     if unembedded_texts:
         if embeddings is None:
             # If no embeddings client, but some matched: retain only matched
-            valid_pairs = [(v, raw_weights[i]) for i, v in enumerate(raw_vecs) if v is not None]
+            valid_pairs = [(v, raw_weights[i], raw_concepts[i]) for i, v in enumerate(raw_vecs) if v is not None]
             if not valid_pairs:
                 raise ValueError("Embeddings client is required to compute embeddings for raw concepts.")
             r_mat = np.vstack([p[0] for p in valid_pairs])
             eff_weights = [p[1] for p in valid_pairs]
+            eff_raw_concepts = [p[2] for p in valid_pairs]
         else:
             if console:
                 console.print(f"[bold cyan]Computing embeddings for {len(unembedded_texts):,} raw extracted ideas...[/bold cyan]")
@@ -1607,15 +1911,34 @@ def run_postprocessing_drift_evaluation(
                 raw_vecs[orig_idx] = np.asarray(computed[idx_in_sub], dtype=np.float32)
             r_mat = np.vstack(raw_vecs)
             eff_weights = raw_weights
+            eff_raw_concepts = raw_concepts
     else:
         r_mat = np.vstack(raw_vecs)
         eff_weights = raw_weights
+        eff_raw_concepts = raw_concepts
+
+    if hybrid_math:
+        from bookeeper.processing.formula_embedding import build_composite_embeddings_matrix
+        has_f_raw = np.array([bool(c.get("has_formula", False)) for c in eff_raw_concepts], dtype=bool)
+        r_sources = []
+        for c in eff_raw_concepts:
+            srcs = [str(c.get(k) or "") for k in ("name", "brief_description", "detailed_explanation", "supporting_quote") if c.get(k)]
+            r_sources.append(" ".join(srcs))
+        r_mat = build_composite_embeddings_matrix(
+            text_matrix=r_mat,
+            has_formula_mask=has_f_raw,
+            text_sources=r_sources,
+            alpha=formula_alpha,
+            m=formula_dim,
+        )
 
     metrics_dict = calculate_postprocessing_drift(
         raw_embeddings=r_mat,
         post_embeddings=p_mat,
         raw_weights=eff_weights,
         tau_loss=tau_loss,
+        formula_dim=formula_dim if hybrid_math else 0,
+        formula_alpha=formula_alpha,
     )
     return PostProcessingDriftMetrics(**metrics_dict)
 

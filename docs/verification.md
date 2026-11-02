@@ -249,22 +249,58 @@ bookeeper verify --mode kg --low-p10-prompt
 
 # Specify custom prompt output file and custom chunk limit (e.g. 250 chunks):
 bookeeper verify --mode kg --low-p10-prompt --low-p10-limit 250 --low-p10-output ./output/p10_eval_prompt.txt
+
+# Audit subsequent slices of the low-proximity tail using offset pagination (e.g. skip first 500 chunks):
+bookeeper verify --mode kg --low-p10-prompt --low-p10-limit 500 --low-p10-offset 500
 ```
 
 **Key Features:**
 1. **Targeted Tail Sampling**: Extracts the lowest 10% proximity chunks ranked strictly by cosine similarity against all Knowledge Graph concept nodes.
 2. **Sequential Token Budget & Chunk Count Packing**: Progressively packs chunks up to a ~1,000,000 character ceiling (~250,000 tokens) and bounded by chunk count limit (`--low-p10-limit`, default: 500 chunks), preserving complete chunk texts without truncation.
-3. **Structured Chunk Delimiters**: Formats each chunk with clear bounding banners:
+3. **Tail Offset Pagination (`--low-p10-offset`)**: Enables auditing successive slices of the tail distribution (e.g. chunks 0–500, 500–1000, 1000–1500) to audit progressively higher proximity tiers without re-evaluating already audited passages.
+4. **Automatic Boilerplate, Diagram & Bibliography Filtering**: In technical white papers, bibliography lists (DOIs, ArXiv IDs, venue headers), C code headers, license notices, and diagram OCR layout dumps naturally yield low cosine proximity to concepts. Bookkeeper automatically purges non-conceptual boilerplate and deduplicates repeated layout blocks (`--filter-boilerplate`, enabled by default) so the prompt contains genuine literature text.
+5. **Structured Chunk Delimiters**: Formats each chunk with clear bounding banners:
    ```text
    ================================================================================
-   CHUNK 1/1379 [ID: book_1_chunk_42] | Proximity: 0.5421 | Length: 842 chars
+   CHUNK 1/500 [ID: book_1_chunk_42] | Proximity: 0.5421 | Length: 842 chars
    ================================================================================
    <raw chunk content>
    ```
-4. **Frontier Model Evaluation Template**: Instructs the frontier model to return a structured evaluation report:
+5. **Frontier Model Evaluation Template**: Instructs the frontier model to return a structured evaluation report:
    - **Percentage of Chunks with Specific Ideas**: Ratio of chunks containing real, substantive ideas vs boilerplate/generic text.
    - **Total Missed Ideas Count**: Number of distinct technical concepts that should have been captured.
    - **Itemized Missed Idea Breakdown**: Chunk ID, concept name, brief definition, and supporting quote.
+
+#### Hybrid Text & Math Verification (Block-Normalized Composite Vector, `--hybrid-math`)
+
+Scientific papers, machine learning white papers, and quantitative texts contain mathematical equations and LaTeX notations that dense prose embeddings alone struggle to align. To ensure mathematical ideas and equations are evaluated fairly alongside prose without penalizing concepts, Bookkeeper implements **Option A: Block-Normalized Composite Vectors** with pure standard cosine similarity ($\cos(\mathbf{u}, \mathbf{v}) = \frac{\mathbf{u} \cdot \mathbf{v}}{\|\mathbf{u}\| \|\mathbf{v}\|}$).
+
+```bash
+# Enable hybrid math verification (default: true, alpha: 0.35):
+bookeeper verify --mode kg --hybrid-math --alpha 0.35
+
+# Disable hybrid math and evaluate pure text prose embeddings only:
+bookeeper verify --mode kg --no-hybrid-math
+```
+
+##### 1. Subspace Architecture ($\mathbf{v}_{\text{math}} \in \mathbb{R}^m$, $m = 128$)
+The formula feature vector decomposes into three deterministic subspaces:
+1. **Structural Operators (Dims 0..31)**: 32 canonical LaTeX primitives (`=`, `\sum`, `\int`, `\prod`, `\frac`, `\nabla`, `\mathbb{E}`, `\mathcal{L}`, `\arg\max`, `\log`, `\exp`, `\sim`, `\in`, `^T`, etc.) weighted by Inverse Document Frequency (IDF) so structural discriminators like `\mathbb{E}` or `\nabla` exert higher leverage than ubiquitous symbols like `=`.
+2. **AST Bigram Transitions (Dims 32..63)**: 2-gram structural transitions (e.g. `\sum \to \log`, `\mathbb{E} \to \nabla`) hashed into 32 deterministic CRC32 buckets, preserving topological operator ordering and distinguishing $\log \sum \exp$ from $\sum \log \exp$.
+3. **Identifiers & Greek Variables (Dims 64..127)**: Greek letters and domain symbols (`\theta`, `\phi`, `\pi`, `\gamma`, `\lambda`, `Q`, `V`, `W`, etc.) hashed into 64 deterministic buckets.
+4. **Bilingual Mapping**: English mathematical keywords (*"expectation"*, *"gradient"*, *"loss"*, *"summation"*, *"kl divergence"*, *"bellman"*, etc.) are mapped to the exact same vector indices as their LaTeX counterparts (`\mathbb{E}`, `\nabla`, `\mathcal{L}`, `\sum`, `KL`, etc.), allowing extracted concept descriptions written in natural language to match raw LaTeX formulas directly.
+
+##### 2. Block Normalization & Cosine Equivalence
+For any text or idea with `has_formula = True`, the composite embedding $\mathbf{z} \in \mathbb{R}^{d + m}$ is constructed as:
+$$\mathbf{z} = \begin{bmatrix} \sqrt{1 - \alpha} \cdot \hat{\mathbf{v}}_{\text{text}} \\ \sqrt{\alpha} \cdot \hat{\mathbf{v}}_{\text{math}} \end{bmatrix}$$
+where $\hat{\mathbf{v}}_{\text{text}}$ and $\hat{\mathbf{v}}_{\text{math}}$ are individually L2-normalized. Because $\|\hat{\mathbf{v}}_{\text{text}}\|_2 = 1.0$ and $\|\hat{\mathbf{v}}_{\text{math}}\|_2 = 1.0$:
+$$\|\mathbf{z}\|_2 = \sqrt{(1 - \alpha)\|\hat{\mathbf{v}}_{\text{text}}\|_2^2 + \alpha\|\hat{\mathbf{v}}_{\text{math}}\|_2^2} = \sqrt{(1 - \alpha) + \alpha} = 1.0$$
+
+The standard cosine similarity between two composite vectors $\mathbf{z}_1$ and $\mathbf{z}_2$ is mathematically identical to a weighted convex combination of text and formula similarities:
+$$\mathbf{z}_1 \cdot \mathbf{z}_2 = (1 - \alpha)(\hat{\mathbf{v}}_{\text{text}, 1} \cdot \hat{\mathbf{v}}_{\text{text}, 2}) + \alpha(\hat{\mathbf{v}}_{\text{math}, 1} \cdot \hat{\mathbf{v}}_{\text{math}, 2})$$
+
+##### 3. Graceful Degradation
+When `has_formula = False`, $\alpha$ is dynamically set to $0.0$, producing $\mathbf{z} = \begin{bmatrix} \hat{\mathbf{v}}_{\text{text}} \\ \mathbf{0}_m \end{bmatrix}$. The vector norm remains strictly $1.0$, and the inner product reduces 100% to prose cosine similarity with zero changes to the underlying vector index or scoring loops.
 
 ---
 
@@ -391,6 +427,12 @@ Options:
   --low-p10-prompt                Generate ~1M context verification audit prompt for tail p10 chunks.
   --low-p10-output PATH           Custom output path for low-p10 prompt (default: output/low_p10_verification_prompt.txt).
   --low-p10-limit INTEGER         Maximum number of worst-proximity chunks to include in low-p10 prompt (default: 500).
+  --low-p10-offset INTEGER        Offset into lowest-proximity chunks to skip before selecting chunks (default: 0).
+  --filter-boilerplate / --no-filter-boilerplate
+                                  Filter out bibliography references, author lists, and technical boilerplate (default: True).
+  --hybrid-math / --no-hybrid-math
+                                  Use hybrid block-normalized composite vectors (text + formulas) for KG verification (default: True).
+  --alpha FLOAT                   Subspace weight alpha for formula feature vector in hybrid KG verification (default: 0.35).
 ```
 
 ---

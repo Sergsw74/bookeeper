@@ -408,6 +408,81 @@ class BookProcessingState:
                 self.save()
         return recovered
 
+    def recover_all_skipped_chunks(self, chunks: Sequence[Any]) -> List[str]:
+        """
+        Recover ALL chunks previously marked as skipped (any skipped_*),
+        unmarking them from processed_chunks so they are returned to the unprocessed queue
+        when filtering is disabled (filter.enabled=false, 100% chunks kept).
+        Returns list of recovered chunk IDs.
+        """
+        recovered = []
+        with self._lock:
+            processed = self.data.get("processed_chunks", {})
+            for chk in chunks:
+                cid = getattr(chk, "chunk_id", None) or (chk.get("chunk_id") if isinstance(chk, dict) else None)
+                if not cid or cid not in processed:
+                    continue
+                rec = processed[cid]
+                srv = rec.get("server_used", "")
+                if str(srv).startswith("skipped_"):
+                    del processed[cid]
+                    recovered.append(cid)
+            if recovered:
+                self.save()
+        return recovered
+
+    def recover_skipped_chunk_sim_chunks(self, chunks: Sequence[Any]) -> List[str]:
+        """
+        Recover chunks previously marked as skipped by chunk similarity (skipped_chunk_sim, skipped_cover, skipped_mmr),
+        unmarking them from processed_chunks when chunk_similarity.enabled=false.
+        Returns list of recovered chunk IDs.
+        """
+        recovered = []
+        with self._lock:
+            processed = self.data.get("processed_chunks", {})
+            for chk in chunks:
+                cid = getattr(chk, "chunk_id", None) or (chk.get("chunk_id") if isinstance(chk, dict) else None)
+                if not cid or cid not in processed:
+                    continue
+                rec = processed[cid]
+                srv = rec.get("server_used", "")
+                if srv in ("skipped_chunk_sim", "skipped_cover", "skipped_mmr"):
+                    del processed[cid]
+                    recovered.append(cid)
+            if recovered:
+                self.save()
+        return recovered
+
+    def recover_skipped_formula_chunks(self, chunks: Sequence[Any]) -> List[str]:
+        """
+        Recover chunks previously marked as skipped_cover, skipped_mmr, or skipped_limbo
+        that contain mathematical formulas, unmarking them from processed_chunks so they
+        are re-evaluated by the formula-retaining filter conveyor and LLM extractor.
+        Returns list of recovered chunk IDs.
+        """
+        from bookeeper.processing.filters import has_mathematical_formula, get_chunk_attr
+
+        recovered = []
+        with self._lock:
+            processed = self.data.get("processed_chunks", {})
+            for chk in chunks:
+                cid = getattr(chk, "chunk_id", None) or (chk.get("chunk_id") if isinstance(chk, dict) else None)
+                if not cid or cid not in processed:
+                    continue
+                rec = processed[cid]
+                srv = rec.get("server_used", "")
+                if srv in ("skipped_cover", "skipped_mmr", "skipped_limbo"):
+                    text = getattr(chk, "text", "") or (chk.get("text", "") if isinstance(chk, dict) else "")
+                    has_f = get_chunk_attr(chk, "has_formula", None)
+                    if has_f is None:
+                        has_f = has_mathematical_formula(text)
+                    if has_f:
+                        del processed[cid]
+                        recovered.append(cid)
+            if recovered:
+                self.save()
+        return recovered
+
     def is_chunk_failed(self, chunk_id: str) -> bool:
         with self._lock:
             return chunk_id in self.data.get("failed_chunks", {})
@@ -468,7 +543,7 @@ class BookProcessingState:
             return sum(
                 1
                 for rec in processed.values()
-                if rec.get("server_used") == "skipped_limbo" or rec.get("status") == "skipped_limbo"
+                if str(rec.get("server_used", "")).startswith("skipped_") or str(rec.get("status", "")).startswith("skipped_")
             )
 
     @contextmanager
@@ -487,6 +562,7 @@ class BookProcessingState:
         duration: float,
         server_used: str,
         auto_save: bool = True,
+        cached_extraction: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Mark a chunk as successfully extracted and persist."""
         with self._lock:
@@ -495,13 +571,23 @@ class BookProcessingState:
 
             if server_used == "semantic_fastpath":
                 chunk_status = "assigned"
-            elif server_used in ("skipped_limbo", "skipped_cover", "skipped_mmr"):
+            elif str(server_used).startswith("skipped_"):
                 chunk_status = server_used
             else:
                 chunk_status = "extracted"
 
             processed = self.data.setdefault("processed_chunks", {})
-            processed[chunk_id] = {
+            existing_rec = processed.get(chunk_id, {})
+            existing_ext = (
+                cached_extraction
+                or existing_rec.get("cached_extraction")
+                or (existing_rec.get("extraction") if (
+                    isinstance(existing_rec.get("extraction"), dict)
+                    and (existing_rec.get("extraction", {}).get("concepts") or existing_rec.get("extraction", {}).get("extracted_ideas"))
+                ) else None)
+            )
+
+            rec_data: Dict[str, Any] = {
                 "chunk_id": chunk_id,
                 "chunk_idx": chunk_idx,
                 "section_title": section_title,
@@ -511,10 +597,28 @@ class BookProcessingState:
                 "extraction": extraction_dict,
                 "completed_at": time.time(),
             }
+            if existing_ext:
+                rec_data["cached_extraction"] = existing_ext
+
+            processed[chunk_id] = rec_data
             self.data["assigned_chunks_count"] = self.assigned_chunks_count
             self.data["skipped_chunks_count"] = self.skipped_chunks_count
             if auto_save:
                 self.save()
+
+    def get_cached_substantive_extraction(self, chunk_id: str) -> Optional[Dict[str, Any]]:
+        """Return non-empty cached extraction dictionary if available (even if currently marked skipped)."""
+        with self._lock:
+            rec = self.data.get("processed_chunks", {}).get(chunk_id)
+            if not rec:
+                return None
+            ext = rec.get("extraction")
+            if isinstance(ext, dict) and (ext.get("concepts") or ext.get("extracted_ideas")):
+                return ext
+            cached_ext = rec.get("cached_extraction")
+            if isinstance(cached_ext, dict) and (cached_ext.get("concepts") or cached_ext.get("extracted_ideas")):
+                return cached_ext
+            return None
 
     def mark_chunks_processed_batch(
         self,
@@ -536,12 +640,22 @@ class BookProcessingState:
                 srv = rec.get("server_used", "extracted")
                 if srv == "semantic_fastpath":
                     status = "assigned"
-                elif srv in ("skipped_limbo", "skipped_cover", "skipped_mmr"):
+                elif str(srv).startswith("skipped_"):
                     status = srv
                 else:
                     status = "extracted"
 
-                processed[cid] = {
+                existing_rec = processed.get(cid, {})
+                existing_ext = (
+                    rec.get("cached_extraction")
+                    or existing_rec.get("cached_extraction")
+                    or (existing_rec.get("extraction") if (
+                        isinstance(existing_rec.get("extraction"), dict)
+                        and (existing_rec.get("extraction", {}).get("concepts") or existing_rec.get("extraction", {}).get("extracted_ideas"))
+                    ) else None)
+                )
+
+                chunk_entry: Dict[str, Any] = {
                     "chunk_id": cid,
                     "chunk_idx": rec.get("chunk_idx", 0),
                     "section_title": rec.get("section_title", ""),
@@ -551,6 +665,10 @@ class BookProcessingState:
                     "extraction": rec.get("extraction_dict", {"concepts": []}),
                     "completed_at": now,
                 }
+                if existing_ext:
+                    chunk_entry["cached_extraction"] = existing_ext
+
+                processed[cid] = chunk_entry
             self.data["assigned_chunks_count"] = self.assigned_chunks_count
             self.data["skipped_chunks_count"] = self.skipped_chunks_count
             if auto_save:

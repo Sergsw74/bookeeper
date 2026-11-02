@@ -41,6 +41,7 @@ class HierarchicalChunk(BaseModel):
     prev_chunk_id: Optional[str] = None
     next_chunk_id: Optional[str] = None
     embedding: Optional[List[float]] = None
+    has_formula: bool = False
 
     def model_post_init(self, __context) -> None:
         from bookeeper.calibre.parser import BookParser
@@ -64,6 +65,10 @@ class HierarchicalChunk(BaseModel):
             self.word_count = len(self.text.split())
         if not self.chapter_title and self.section_title:
             self.chapter_title = self.section_title
+
+        if self.text and not self.has_formula:
+            from bookeeper.processing.filters import has_mathematical_formula
+            self.has_formula = has_mathematical_formula(self.text)
         if not self.subtitle and self.section_title:
             self.subtitle = self.section_title
 
@@ -209,8 +214,23 @@ class HierarchicalChunker:
             if not raw_chunks_with_emb:
                 raw_chunks_with_emb = [(ct, None) for ct in self._smart_split(sub_text, self.max_chunk_chars)]
 
+            # Cohesive merge pass: ensure chunks < min_chunk_chars (such as standalone formulas)
+            # are merged with their preceding introductory prose instead of being dropped or isolated.
+            cohesive_chunks: List[Tuple[str, Optional[List[float]]]] = []
             for chunk_text, chunk_emb in raw_chunks_with_emb:
-                if len(chunk_text) < self.min_chunk_chars and raw_chunks_with_emb and len(raw_chunks_with_emb) > 1:
+                txt = chunk_text.strip()
+                if not txt:
+                    continue
+                if len(txt) < self.min_chunk_chars and cohesive_chunks:
+                    prev_txt, prev_emb = cohesive_chunks[-1]
+                    merged_txt = f"{prev_txt}\n\n{txt}"
+                    if len(merged_txt) <= int(self.max_chunk_chars * 1.5):
+                        cohesive_chunks[-1] = (merged_txt, None)
+                        continue
+                cohesive_chunks.append((txt, chunk_emb))
+
+            for chunk_text, chunk_emb in cohesive_chunks:
+                if len(chunk_text) < self.min_chunk_chars and len(cohesive_chunks) > 1:
                     continue
 
                 h = hashlib.sha256(chunk_text.encode("utf-8", "replace")).hexdigest()[:8]

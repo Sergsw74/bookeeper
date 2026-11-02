@@ -104,6 +104,18 @@ Comprehensive empirical evaluation on an 18,233-chunk scientific document corpus
 | **Vendi Diversity Score** | 8.89 | 8.90 | 8.90 | **8.92** | **8.93** | **8.92** |
 | **Skipped Retention ($R_{\text{skipped}}$)** | 26.61% | 26.98% | 27.03% | **27.06%** | 23.88% | 15.65% |
 
+> [!IMPORTANT]
+> ### ⚠️ Nominal Pruning Stat vs. Real Skip Rate in Production
+> The **Total Skipped / Pruned Chunks %** reported above (e.g. **35.17%** at $\tau = 0.95$ and **27.38%** at $\tau = 0.96$) reflects the **gross theoretical candidate pruning rate** across an entire document corpus.
+> 
+> In **actual live book ingestion**, the **real skip rate is approximately `gross prune rate - (12% to 13%)`**:
+> - At **$\tau = 0.95$**: Real skipped rate during live extraction is **~22% – 23%** (rather than 35%).
+> - At **$\tau = 0.96$**: Real skipped rate during live extraction is **~14% – 15%** (rather than 27%).
+> - On math-heavy or formula-dense books, real skipped chunks may drop to **~11% – 13%** because:
+>   1. **Priority 1 Math Shield**: Any chunk containing equations, LaTeX, or Unicode symbols immediately halts the conveyor with `RETAIN`. Math is never pruned regardless of semantic similarity.
+>   2. **Section Anchor Guarantees**: The opening chunk of every chapter and section is unconditionally preserved as a conceptual anchor.
+>   3. **Substantive Expansion Guard**: Substantive conceptual expansions ($\ge 500$ chars) cannot be pruned by short preceding headers ($< 300$ chars).
+
 ### Key Benchmark Insights
 
 ```

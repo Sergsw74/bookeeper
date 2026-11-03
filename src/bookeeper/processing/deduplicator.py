@@ -78,6 +78,9 @@ class EntityDeduplicator:
         # Native C++ HNSW usearch index for logarithmic vector similarity search
         self._usearch_index: Optional[Any] = None
         self._cached_canon_order: List[str] = []
+        self._canon_to_index: Dict[str, int] = {}
+        # High-performance concept text -> normalized unit embedding vector cache
+        self._embed_cache: Dict[str, np.ndarray] = {}
 
     def _register_in_cache(
         self,
@@ -101,15 +104,18 @@ class EntityDeduplicator:
 
                 self._usearch_index = Index(ndim=int(unit_v.shape[0]), metric="cos")
 
-            if canon_name in self._cached_canon_order:
-                idx = self._cached_canon_order.index(canon_name)
-                if idx in self._usearch_index:
+            if canon_name in self._canon_to_index:
+                idx = self._canon_to_index[canon_name]
+                if self._usearch_index is not None and idx in self._usearch_index:
                     self._usearch_index.remove(idx)
-                self._usearch_index.add(idx, unit_v)
+                if self._usearch_index is not None:
+                    self._usearch_index.add(idx, unit_v)
             else:
                 idx = len(self._cached_canon_order)
+                self._canon_to_index[canon_name] = idx
                 self._cached_canon_order.append(canon_name)
-                self._usearch_index.add(idx, unit_v)
+                if self._usearch_index is not None:
+                    self._usearch_index.add(idx, unit_v)
 
     @classmethod
     def from_settings(
@@ -180,14 +186,17 @@ class EntityDeduplicator:
             detailed = attrs.get("detailed_explanation") or ""
             cat = attrs.get("category") or "Idea"
             weight = int(attrs.get("weight") or 5)
-            existing_emb = attrs.get("embedding")
+            from bookeeper.graph.embedding_codec import get_node_embedding
+
+            existing_emb = get_node_embedding(attrs)
             vec_arr: Optional[np.ndarray] = None
             emb_list: Optional[List[float]] = None
-            if isinstance(existing_emb, (list, np.ndarray)) and len(existing_emb) > 1:
+            if existing_emb is not None and isinstance(existing_emb, (list, np.ndarray)) and len(existing_emb) > 1:
                 arr = np.array(existing_emb, dtype=np.float32)
                 norm = float(np.linalg.norm(arr))
                 vec_arr = (arr / norm) if norm > 0.0 else arr
                 emb_list = vec_arr.tolist()
+                self._embed_cache[clean_name] = vec_arr
 
             concept_obj = Concept(
                 name=clean_name,
@@ -199,6 +208,9 @@ class EntityDeduplicator:
             )
             if emb_list is not None:
                 concept_obj.embedding = emb_list
+                embed_text = format_idea_for_embedding(clean_name, brief, detailed, brief or detailed)
+                if embed_text:
+                    self._embed_cache[embed_text] = vec_arr
             self._register_in_cache(clean_name, vec_arr, concept_obj)
             seeded += 1
         return seeded
@@ -385,6 +397,20 @@ class EntityDeduplicator:
                 unit = (arr / norm) if norm > 0.0 else arr
                 c.embedding = unit.tolist()
                 missing_text_to_vec[embed_text] = unit
+                self._embed_cache[embed_text] = unit
+                self._embed_cache[raw_name] = unit
+                continue
+
+            if embed_text in self._embed_cache:
+                vec = self._embed_cache[embed_text]
+                c.embedding = vec.tolist()
+                missing_text_to_vec[embed_text] = vec
+                continue
+
+            if raw_name in self._embed_cache:
+                vec = self._embed_cache[raw_name]
+                c.embedding = vec.tolist()
+                missing_text_to_vec[embed_text] = vec
                 continue
 
             canon_hit = self._norm_to_canon.get(norm_name) or (raw_name if raw_name in self._cache else None)
@@ -393,6 +419,8 @@ class EntityDeduplicator:
                 if vec is not None:
                     c.embedding = vec.tolist()
                     missing_text_to_vec[embed_text] = vec
+                    self._embed_cache[embed_text] = vec
+                    self._embed_cache[raw_name] = vec
                     continue
 
             if embed_text not in seen_missing:
@@ -433,6 +461,7 @@ class EntityDeduplicator:
                             norm = float(np.linalg.norm(arr))
                             unit = (arr / norm) if norm > 0.0 else arr
                             missing_text_to_vec[txt] = unit
+                            self._embed_cache[txt] = unit
                     pooled_ok = True
                 except Exception as e:
                     logger.debug(f"Pooled batch concept embedding fallback to sub-batches: {e}")
@@ -455,6 +484,7 @@ class EntityDeduplicator:
                                 norm = float(np.linalg.norm(arr))
                                 unit = (arr / norm) if norm > 0.0 else arr
                                 missing_text_to_vec[txt] = unit
+                                self._embed_cache[txt] = unit
                     except Exception as e:
                         logger.debug(f"Batch concept embedding failed on sub-batch {b_idx}: {e}")
                     _on_batch_done(len(sub))
@@ -571,7 +601,11 @@ class EntityDeduplicator:
                 ):
                     pair_key = (self._normalize_name(best_match.name), norm_name)
                     if pair_key not in self._disambiguation_cache and pair_key not in pending_disambiguations:
-                        pending_disambiguations[pair_key] = (best_match, concept, best_sim)
+                        lex_dec = self._try_lexical_disambiguation(best_match, concept, best_sim)
+                        if lex_dec is not None:
+                            self._disambiguation_cache[pair_key] = lex_dec
+                        else:
+                            pending_disambiguations[pair_key] = (best_match, concept, best_sim)
 
             if pending_disambiguations:
                 total_disambig = len(pending_disambiguations)
@@ -617,12 +651,6 @@ class EntityDeduplicator:
             canon_hit = self._norm_to_canon.get(norm_name)
             if canon_hit and canon_hit in self._cache:
                 _, exact_hit = self._cache[canon_hit]
-            else:
-                for canon_name, (_, existing) in self._cache.items():
-                    if self._normalize_name(canon_name) == norm_name:
-                        self._norm_to_canon[norm_name] = canon_name
-                        exact_hit = existing
-                        break
             if exact_hit is not None:
                 self._merge_into(exact_hit, concept)
                 if exact_hit.embedding is None and concept.embedding:
@@ -713,7 +741,8 @@ class EntityDeduplicator:
                     pair_key = (self._normalize_name(best_match.name), norm_name)
                     decision = self._disambiguation_cache.get(pair_key)
                     if decision is None:
-                        decision = self._ask_llm_disambiguation(best_match, concept, best_sim)
+                        lex_dec = self._try_lexical_disambiguation(best_match, concept, best_sim)
+                        decision = lex_dec if lex_dec is not None else self._ask_llm_disambiguation(best_match, concept, best_sim)
                         self._disambiguation_cache[pair_key] = decision
                     if decision.is_same_concept:
                         self._merge_with_llm_decision(best_match, concept, decision, best_canon_name)
@@ -733,6 +762,120 @@ class EntityDeduplicator:
             resolved_list.append(concept)
 
         return resolved_list
+
+    @staticmethod
+    def _try_lexical_disambiguation(
+        canonical: Concept,
+        incoming: Concept,
+        similarity: float,
+    ) -> Optional[ConceptDeduplicationDecision]:
+        """
+        Fast, deterministic heuristic check to resolve obvious duplicates or obvious distincts
+        without an expensive LLM call.
+        """
+        c_name = canonical.name.strip()
+        i_name = incoming.name.strip()
+        c_lower = c_name.lower()
+        i_lower = i_name.lower()
+
+        if c_lower == i_lower:
+            return ConceptDeduplicationDecision(
+                is_same_concept=True,
+                canonical_name=canonical.name,
+                brief_description=canonical.brief_description or incoming.brief_description,
+                detailed_explanation=canonical.detailed_explanation or incoming.detailed_explanation,
+                reasoning="Exact case-insensitive name match.",
+            )
+
+        # Stop words to filter out for core semantic token set comparison
+        stop_words = {"the", "a", "an", "and", "or", "of", "in", "to", "for", "with", "on", "at", "by", "from", "as", "is", "are"}
+        c_tokens = set(re.findall(r"\b[a-zA-Z0-9]+\b", c_lower)) - stop_words
+        i_tokens = set(re.findall(r"\b[a-zA-Z0-9]+\b", i_lower)) - stop_words
+
+        def _stem(t: str) -> str:
+            if len(t) > 4 and t.endswith("ing"):
+                return t[:-3]
+            if len(t) > 3 and t.endswith("es"):
+                return t[:-2]
+            if len(t) > 3 and t.endswith("s"):
+                return t[:-1]
+            return t
+
+        c_stems = {_stem(t) for t in c_tokens}
+        i_stems = {_stem(t) for t in i_tokens}
+
+        # If identical core tokens (e.g. "Failure Attribution" vs "Attribution of Failure")
+        if c_tokens and (c_tokens == i_tokens or c_stems == i_stems):
+            return ConceptDeduplicationDecision(
+                is_same_concept=True,
+                canonical_name=canonical.name,
+                brief_description=canonical.brief_description or incoming.brief_description,
+                detailed_explanation=canonical.detailed_explanation or incoming.detailed_explanation,
+                reasoning="Identical core semantic token set.",
+            )
+
+        # Simple plural / singular equivalence (e.g. "Attack Vector" vs "Attack Vectors")
+        if (c_lower + "s" == i_lower) or (i_lower + "s" == c_lower) or (c_lower + "es" == i_lower) or (i_lower + "es" == c_lower):
+            canon_pick = canonical.name if len(canonical.name) <= len(incoming.name) else incoming.name
+            return ConceptDeduplicationDecision(
+                is_same_concept=True,
+                canonical_name=canon_pick,
+                brief_description=canonical.brief_description or incoming.brief_description,
+                detailed_explanation=canonical.detailed_explanation or incoming.detailed_explanation,
+                reasoning="Singular/plural morphological variant.",
+            )
+
+        # Antonym / opposing direction guard -> definitely NOT the same concept
+        opposing_pairs = {
+            ("attack", "defense"),
+            ("attacker", "defender"),
+            ("offensive", "defensive"),
+            ("retreat", "advance"),
+            ("centralized", "decentralized"),
+            ("static", "dynamic"),
+            ("positive", "negative"),
+            ("synchronous", "asynchronous"),
+            ("supervised", "unsupervised"),
+            ("deterministic", "stochastic"),
+            ("symmetric", "asymmetric"),
+            ("linear", "nonlinear"),
+            ("discrete", "continuous"),
+            ("inbound", "outbound"),
+            ("ingress", "egress"),
+        }
+        for w1, w2 in opposing_pairs:
+            if (w1 in c_tokens and w2 in i_tokens) or (w2 in c_tokens and w1 in i_tokens):
+                return ConceptDeduplicationDecision(
+                    is_same_concept=False,
+                    reasoning=f"Opposing concept semantics: '{w1}' vs '{w2}'.",
+                )
+
+        # High similarity (>= 0.93) with very high token Jaccard overlap (>= 0.70)
+        # e.g. "Failure Attribution Model" and "Failure Attribution Modeling"
+        if c_stems and i_stems:
+            intersection = len(c_stems & i_stems)
+            union = len(c_stems | i_stems)
+            jaccard = intersection / union if union > 0 else 0.0
+            if similarity >= 0.93 and jaccard >= 0.70:
+                canon_pick = canonical.name if len(canonical.name) >= len(incoming.name) else incoming.name
+                brief_pick = canonical.brief_description if len(canonical.brief_description or "") >= len(incoming.brief_description or "") else incoming.brief_description
+                detailed_pick = canonical.detailed_explanation if len(canonical.detailed_explanation or "") >= len(incoming.detailed_explanation or "") else incoming.detailed_explanation
+                return ConceptDeduplicationDecision(
+                    is_same_concept=True,
+                    canonical_name=canon_pick,
+                    brief_description=brief_pick,
+                    detailed_explanation=detailed_pick,
+                    reasoning=f"High cosine similarity ({similarity:.2f}) and high token overlap ({jaccard:.2f}).",
+                )
+
+            # Very low Jaccard (< 0.20) with borderline similarity (< 0.83) -> distinct concepts
+            if similarity < 0.83 and jaccard < 0.20:
+                return ConceptDeduplicationDecision(
+                    is_same_concept=False,
+                    reasoning=f"Borderline similarity ({similarity:.2f}) with distinct vocabulary ({jaccard:.2f} token overlap).",
+                )
+
+        return None
 
     def _ask_llm_disambiguation(
         self,

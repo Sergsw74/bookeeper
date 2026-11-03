@@ -191,6 +191,8 @@ class GraphSpaceMetrics(BaseModel):
     # Skipping Leverage Metrics
     parent_chunks_count: Optional[int] = Field(None, description="Number of chunks from which ideas were extracted.")
     skipped_chunks_count: Optional[int] = Field(None, description="Number of chunks bypassed/skipped by heuristic.")
+    retained_chunks_count: Optional[int] = Field(None, description="Number of chunks protected/retained (formulas, math shield, high confidence).")
+    continued_chunks_count: Optional[int] = Field(None, description="Number of chunks continued through all filters for extraction.")
     parent_chunk_ratio_pct: Optional[float] = Field(None, description="Extraction ratio rho_parent = W_parent / W_total (size-weighted percentage).")
     skipped_retention_pct: Optional[float] = Field(None, description="Skipped text retention rate R_skipped within tau radius (size-weighted).")
     generalization_surplus_pct: Optional[float] = Field(None, description="Generalization surplus Delta_cov = Cov_tau - rho_parent (size-weighted).")
@@ -871,12 +873,29 @@ def compare_graph_spaces(
 # ==============================================================================
 
 
+def get_chunk_filter_states(store: ConceptGraphStore) -> Dict[str, str]:
+    """
+    Extracts chunk_id -> filter_state ('skip', 'retain', 'continue') from Chunk nodes in store.
+    """
+    states: Dict[str, str] = {}
+    for nid, attrs in store.graph.nodes(data=True):
+        if attrs.get("type") == "Chunk" or str(nid).startswith("chunk:"):
+            cid = attrs.get("chunk_id") or str(nid).replace("chunk:", "")
+            fs = attrs.get("filter_state")
+            if fs:
+                states[str(cid)] = str(fs).lower()
+    return states
+
+
 def get_parent_chunk_ids(store: ConceptGraphStore) -> Set[str]:
     """
-    Returns the set of chunk IDs that directly support at least one Idea/Concept node in store.
-    Identifies chunks connected via SUPPORTED_BY or SUPPORTS_IDEA relations,
-    or flagged with is_parent/ideas metadata.
+    Returns the set of chunk IDs that directly support at least one Idea/Concept node in store,
+    or were retained/continued according to explicit filter_state metadata.
     """
+    filter_states = get_chunk_filter_states(store)
+    if any(fs == "skip" for fs in filter_states.values()):
+        return {cid for cid, fs in filter_states.items() if fs in ("retain", "continue")}
+
     parent_cids: Set[str] = set()
     for u, v, data in store.graph.edges(data=True):
         rel = data.get("relation")
@@ -1492,6 +1511,13 @@ def run_graph_space_evaluation(
         formula_alpha=formula_alpha,
     )
 
+    filter_states = get_chunk_filter_states(store)
+    if filter_states:
+        retained_cnt = sum(1 for fs in filter_states.values() if fs == "retain")
+        continued_cnt = sum(1 for fs in filter_states.values() if fs == "continue")
+        raw["retained_chunks_count"] = retained_cnt
+        raw["continued_chunks_count"] = continued_cnt
+
     # Generate low-p10 prompt if requested
     if generate_low_p10_prompt:
         _, p_meta = generate_low_p10_verification_prompt(
@@ -1696,6 +1722,7 @@ def run_graph_space_comparison(
 def load_raw_ideas_from_states(
     states_dir: Union[Path, str],
     book_id: Optional[Union[int, str]] = None,
+    skipped_chunk_ids: Optional[Set[str]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[int]]:
     """
     Load raw extracted ideas/concepts and their evidence quote weights from per-book state files.
@@ -1703,6 +1730,7 @@ def load_raw_ideas_from_states(
     Parameters:
         states_dir: Directory containing book_*_state.json files or its parent.
         book_id: Optional single book ID filter.
+        skipped_chunk_ids: Optional set of chunk IDs marked with filter_state='skip' to exclude.
 
     Returns:
         Tuple of (raw_concepts_list, quote_char_weights).
@@ -1742,7 +1770,11 @@ def load_raw_ideas_from_states(
         for cid, prec in processed_chunks.items():
             if not isinstance(prec, dict):
                 continue
+            if skipped_chunk_ids and str(cid) in skipped_chunk_ids:
+                continue
             ext = prec.get("extraction")
+            if (not ext or not isinstance(ext, dict) or not ext.get("concepts")) and prec.get("cached_extraction"):
+                ext = prec.get("cached_extraction")
             if not ext or not isinstance(ext, dict):
                 continue
 
@@ -1796,24 +1828,18 @@ def run_postprocessing_drift_evaluation(
     """
     Measures idea drift and semantic alignment between RAW idea space (from book states)
     and post-processed Knowledge Graph idea vectors.
-
-    Parameters:
-        store: Post-processed ConceptGraphStore containing final Concept nodes.
-        states_dir: Directory containing book_*_state.json files.
-        book_id: Optional specific book ID to evaluate.
-        tau_loss: Cosine similarity cutoff below which a raw idea is considered dropped.
-        embeddings: Optional FailoverOllamaEmbeddings provider to compute any missing embeddings.
-        console: Optional Rich Console for progress logging.
-        hybrid_math: Whether to use block-normalized composite vectors for formula-aware proximity.
-        formula_alpha: Subspace weight alpha for formula feature vector (default: 0.35).
-        formula_dim: Dimension m of formula feature sub-vector (default: 128).
-
-    Returns:
-        PostProcessingDriftMetrics object.
     """
     from bookeeper.processing.ollama_pool import format_idea_for_embedding
 
-    raw_concepts, raw_weights = load_raw_ideas_from_states(states_dir, book_id=book_id)
+    skipped_cids: Set[str] = set()
+    for nid, attrs in store.graph.nodes(data=True):
+        if (attrs.get("type") == "Chunk" or str(nid).startswith("chunk:")) and attrs.get("filter_state") == "skip":
+            cid = attrs.get("chunk_id") or str(nid).replace("chunk:", "")
+            skipped_cids.add(str(cid))
+
+    raw_concepts, raw_weights = load_raw_ideas_from_states(
+        states_dir, book_id=book_id, skipped_chunk_ids=skipped_cids
+    )
     if not raw_concepts:
         raise ValueError(
             f"No raw concepts found in state files at '{states_dir}'"
@@ -2178,6 +2204,10 @@ def format_graph_space_table(metrics: GraphSpaceMetrics, title: str = "Knowledge
         tbl.add_section()
         if metrics.parent_chunks_count is not None:
             tbl.add_row("Parent Chunks Count (Np)", f"{metrics.parent_chunks_count:,}", "Chunks from which ideas were extracted")
+            if metrics.retained_chunks_count is not None:
+                tbl.add_row("  ├─ Retained Chunks (Math / Shield)", f"{metrics.retained_chunks_count:,}", "Chunks shielded from pruning (formulas, math shield)")
+            if metrics.continued_chunks_count is not None:
+                tbl.add_row("  └─ Continued Chunks (LLM Extracted)", f"{metrics.continued_chunks_count:,}", "Chunks passed through conveyor for concept extraction")
         if metrics.skipped_chunks_count is not None:
             tbl.add_row("Skipped Chunks Count (Ns)", f"{metrics.skipped_chunks_count:,}", "Chunks bypassed by skipping heuristic")
         tbl.add_row("Extraction Ratio (ρ_parent)", f"{metrics.parent_chunk_ratio_pct:.2f}%", "Fraction of corpus compute spent on (Np / N)")

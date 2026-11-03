@@ -1059,6 +1059,9 @@ class SemanticRoutingEngine:
         quote = text[:200] if text else ""
         summary = rc.matched_idea_summary or ""
 
+        # Ensure chunk node is recorded with filter_state="retain"
+        self.store.add_chunk(h_chk, filter_state="retain")
+
         # 1. Direct idea support link
         self.store.add_idea_support_link(
             concept_name=h_idea,

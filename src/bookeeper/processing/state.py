@@ -318,6 +318,27 @@ class BookProcessingState:
                             self.data["book_title"] = self.book_title
                         if self.data.get("book_title"):
                             self.data["book_title"] = BookParser.repair_mojibake(self.data["book_title"])
+
+                        # Normalize legacy skipped_* and cached_extraction entries back to clean extractions
+                        # so that filter_state is never stored in state files.
+                        processed = self.data.get("processed_chunks")
+                        if isinstance(processed, dict):
+                            for cid, rec in processed.items():
+                                if not isinstance(rec, dict):
+                                    continue
+                                cached = rec.pop("cached_extraction", None)
+                                srv = str(rec.get("server_used", ""))
+                                if cached and isinstance(cached, dict):
+                                    rec["extraction"] = cached
+                                    if srv.startswith("skipped_"):
+                                        rec["server_used"] = "cached"
+                                        rec["status"] = "extracted"
+                                elif srv.startswith("skipped_") and (not rec.get("extraction") or not rec.get("extraction", {}).get("concepts")):
+                                    # If marked skipped without cached extraction, keep extraction as is
+                                    rec["server_used"] = "cached"
+                                    rec["status"] = "extracted"
+                                rec.pop("filter_state", None)
+                        self.data.pop("skipped_chunks_count", None)
             except Exception as e:
                 logger.warning(f"Could not load book state from {self.file_path} ({e}); starting fresh.")
 

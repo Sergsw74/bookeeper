@@ -305,8 +305,8 @@ class ConceptGraphStore:
         self.mark_node_dirty(node_id)
         return node_id
 
-    def add_chunk(self, chunk: Any) -> str:
-        """Add a Chunk node (preserving its embedding) and connect (:Section) -[:HAS_CHUNK]-> (:Chunk)."""
+    def add_chunk(self, chunk: Any, filter_state: Optional[str] = None) -> str:
+        """Add a Chunk node (preserving its embedding and filter_state) and connect (:Section) -[:HAS_CHUNK]-> (:Chunk)."""
         def _get(key: str, default: Any = None) -> Any:
             if isinstance(chunk, dict):
                 return chunk.get(key, default)
@@ -330,11 +330,23 @@ class ConceptGraphStore:
         prev_chunk_id = _get("prev_chunk_id", None)
         next_chunk_id = _get("next_chunk_id", None)
         emb = _get("embedding", None)
-        existing_emb = (
-            self.graph.nodes[chunk_node_id].get("embedding")
-            if self.graph.has_node(chunk_node_id)
-            else None
-        )
+        existing_node = self.graph.nodes[chunk_node_id] if self.graph.has_node(chunk_node_id) else None
+        existing_emb = existing_node.get("embedding") if existing_node else None
+
+        raw_fstate = filter_state or _get("filter_state", None)
+        if isinstance(raw_fstate, str) and raw_fstate.strip().lower() in ("skip", "retain", "continue"):
+            eff_filter_state = raw_fstate.strip().lower()
+        elif existing_node and existing_node.get("filter_state") in ("skip", "retain", "continue"):
+            eff_filter_state = existing_node["filter_state"]
+        elif (
+            self.is_sharded
+            and self.active_shard_graph is not None
+            and self.active_shard_graph.has_node(chunk_node_id)
+            and self.active_shard_graph.nodes[chunk_node_id].get("filter_state") in ("skip", "retain", "continue")
+        ):
+            eff_filter_state = self.active_shard_graph.nodes[chunk_node_id]["filter_state"]
+        else:
+            eff_filter_state = None
 
         chunk_attrs: Dict[str, Any] = {
             "type": "Chunk",
@@ -355,6 +367,8 @@ class ConceptGraphStore:
             "next_chunk_id": next_chunk_id,
             "has_formula": bool(_get("has_formula", False)),
         }
+        if eff_filter_state is not None:
+            chunk_attrs["filter_state"] = eff_filter_state
         if emb and len(emb) > 1:
             chunk_attrs["embedding"] = [round(float(x), 6) for x in emb]
         elif existing_emb and len(existing_emb) > 1:
@@ -1191,15 +1205,9 @@ class ConceptGraphStore:
                     compress_node_embedding(attrs, dtype=embedding_dtype, in_place=True)
 
         data = json_graph.node_link_data(self.graph)
-        use_compact = self.graph.number_of_nodes() > 100 or any(
-            "embedding" in attrs or "embedding_b64" in attrs
-            for _, attrs in self.graph.nodes(data=True)
-        )
-        with open(path, "w", encoding="utf-8") as f:
-            if use_compact:
-                json.dump(data, f, separators=(",", ":"))
-            else:
-                json.dump(data, f, indent=2)
+        from bookeeper.graph.sharding import json_dump_file
+
+        json_dump_file(data, path)
 
         logger.info(f"Saved graph with {len(self.graph)} nodes to {path}")
         return path
@@ -1315,8 +1323,9 @@ class ConceptGraphStore:
             raise FileNotFoundError(f"Knowledge graph file not found at {path}")
 
         self.is_sharded = False
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        from bookeeper.graph.sharding import json_load_file
+
+        data = json_load_file(path)
 
         # Backwards compatibility: NetworkX 2.x serialized 'edges' as 'links'
         if "links" in data and "edges" not in data:

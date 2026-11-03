@@ -47,7 +47,7 @@ from bookeeper.calibre import (
     Section,
     get_book_client,
 )
-from bookeeper.config import Settings, get_settings
+from bookeeper.config import Settings, get_active_config_diff, get_settings, set_active_config_diff
 from bookeeper.graph.exporters import GraphMLExporter, Neo4jExporter, ObsidianExporter
 from bookeeper.graph.sharding import GraphMigrator, ShardedGraphStore
 from bookeeper.graph.store import ConceptGraphStore
@@ -142,6 +142,21 @@ app = typer.Typer(
 console = Console()
 logger = logging.getLogger(__name__)
 logging.getLogger("pypdf").setLevel(logging.ERROR)
+
+
+@app.callback()
+def _main_callback(
+    config_diff: Optional[str] = typer.Option(
+        None,
+        "--config-diff",
+        envvar=["BOOKEEPER_CONFIG_DIFF"],
+        help="Path to YAML config overlay applied on top of base config.yaml with override values.",
+    ),
+) -> None:
+    """Global CLI callback supporting --config-diff before subcommands."""
+    resolved_diff = _resolve_opt(config_diff)
+    if resolved_diff:
+        set_active_config_diff(str(resolved_diff))
 
 
 
@@ -540,9 +555,13 @@ def _get_effective_settings(
     skip_limbo_chunks: Optional[bool] = None,
     max_batch_chunk_size: Optional[int] = None,
     state_cache_dir: Optional[str] = None,
+    config_diff: Optional[str] = None,
 ) -> Settings:
     """Retrieve settings and merge explicit CLI arguments with highest precedence."""
     config_path = _resolve_opt(config_path)
+    config_diff = _resolve_opt(config_diff)
+    if config_diff:
+        set_active_config_diff(str(config_diff))
     calibre_path = _resolve_opt(calibre_path)
     ollama_url = _resolve_opt(ollama_url)
     model = _resolve_opt(model)
@@ -563,7 +582,7 @@ def _get_effective_settings(
     max_batch_chunk_size = _resolve_opt(max_batch_chunk_size)
     state_cache_dir = _resolve_opt(state_cache_dir)
 
-    cfg = get_settings(config_path)
+    cfg = get_settings(config_path, config_diff=config_diff)
     overrides = {}
     if state_cache_dir:
         overrides["state_cache_dir"] = str(state_cache_dir)
@@ -756,6 +775,9 @@ def config(
     config_path: Optional[str] = typer.Option(
         None, "--config", "-c", help="Path to custom config.yaml file."
     ),
+    config_diff: Optional[str] = typer.Option(
+        None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."
+    ),
     calibre_path: Optional[str] = typer.Option(
         None, "--calibre-path", help="Override Calibre library path or SMB share mount."
     ),
@@ -773,7 +795,15 @@ def config(
     ),
 ):
     """Display the active bookeeper configuration settings."""
-    cfg = _get_effective_settings(config_path, calibre_path, ollama_url, model, embedding_model, embedding_url)
+    cfg = _get_effective_settings(
+        config_path,
+        calibre_path,
+        ollama_url,
+        model,
+        embedding_model=embedding_model,
+        embedding_url=embedding_url,
+        config_diff=config_diff,
+    )
     servers_desc = []
     for s in cfg.resolved_ollama_servers:
         name_tag = f" ({s.name})" if s.name else ""
@@ -827,12 +857,15 @@ def list_books(
     config_path: Optional[str] = typer.Option(
         None, "--config", "-c", help="Path to config.yaml file."
     ),
+    config_diff: Optional[str] = typer.Option(
+        None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."
+    ),
 ):
     """
     List and search books in the configured Calibre library, download folder, or mounted SMB share.
     Useful for testing database connectivity and discovering book IDs.
     """
-    cfg = _get_effective_settings(config_path, calibre_path=calibre_path, books_dir=books_dir)
+    cfg = _get_effective_settings(config_path, calibre_path=calibre_path, books_dir=books_dir, config_diff=config_diff)
     client = get_book_client(cfg, calibre_path=calibre_path, books_dir=books_dir)
     source_display = getattr(client, "display_name", f"Calibre Library: {cfg.calibre_library_path}")
 
@@ -945,6 +978,9 @@ def clean_metadata(
     config_path: Optional[str] = typer.Option(
         None, "--config", "-c", help="Path to config.yaml file."
     ),
+    config_diff: Optional[str] = typer.Option(
+        None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."
+    ),
     skip_warmup: bool = typer.Option(
         False, "--skip-warmup", help="Skip Ollama warmup and GPU acceleration check."
     ),
@@ -981,6 +1017,7 @@ def clean_metadata(
         request_timeout=request_timeout,
         max_retries=retries,
         books_dir=books_dir,
+        config_diff=config_diff,
     )
     effective_stage_db = cfg.stage_metadata_db if stage_db is None else stage_db
     effective_backup_db = cfg.backup_metadata_db if backup_db is None else backup_db
@@ -1587,6 +1624,9 @@ def build_graph(
     config_path: Optional[str] = typer.Option(
         None, "--config", "-c", help="Path to config.yaml file."
     ),
+    config_diff: Optional[str] = typer.Option(
+        None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."
+    ),
     skip_warmup: bool = typer.Option(
         False, "--skip-warmup", help="Skip Ollama warmup and GPU acceleration check."
     ),
@@ -1798,6 +1838,7 @@ def build_graph(
         skip_limbo_chunks=skip_limbo_chunks,
         max_batch_chunk_size=max_batch_chunk_size,
         state_cache_dir=state_cache_dir,
+        config_diff=config_diff,
     )
     output_dir = cfg.resolved_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2406,6 +2447,9 @@ def build_graph(
     completed_in_session = 0
     session_assigned_chunks = 0
     session_skipped_chunks = 0
+    session_math_chunks = 0
+    session_total_candidate_chunks = 0
+    session_filter_stats: Dict[str, int] = {}
     interrupted = False
     pipeline_start_time = time.perf_counter()
 
@@ -2651,6 +2695,8 @@ def build_graph(
                     extracted_results: List[Dict[str, Any]] = []
                     book_assigned_chunks = 0
                     book_skipped_chunks = 0
+                    book_math_chunks = 0
+                    book_filter_stats: Dict[str, int] = {}
                     book_llm_durations: List[float] = []
 
                     def _update_progress_description():
@@ -2660,8 +2706,10 @@ def build_graph(
                             num_extracted = len(extracted_results)
                             cur_book_assigned = book_assigned_chunks
                             cur_book_skipped = book_skipped_chunks
+                            cur_book_math = book_math_chunks
                             cur_session_assigned = session_assigned_chunks
                             cur_session_skipped = session_skipped_chunks
+                            cur_session_math = session_math_chunks
                             # Prefer current book's measured LLM durations; fallback to session durations
                             cur_durations = list(book_llm_durations) if len(book_llm_durations) >= 2 else list(durations)
 
@@ -2677,7 +2725,8 @@ def build_graph(
                             f"[bold cyan]Current Book #{bid}[/bold cyan] ('{btitle[:18]}') | "
                             f"Active: [bold cyan]{cur_active}[/bold cyan] tasks | "
                             f"Assigned: [bold green]{cur_book_assigned}[/bold green] | "
-                            f"Skipped: [bold yellow]{cur_book_skipped}[/bold yellow]"
+                            f"Skipped: [bold yellow]{cur_book_skipped}[/bold yellow] | "
+                            f"Math: [bold cyan]{cur_book_math}[/bold cyan]"
                         )
                         if durations:
                             desc1 += (
@@ -2703,6 +2752,7 @@ def build_graph(
                             f"avg book: [bold yellow]{avg_book_fmt}[/bold yellow] | "
                             f"Assigned: [bold green]{cur_session_assigned}[/bold green] | "
                             f"Skipped: [bold yellow]{cur_session_skipped}[/bold yellow] | "
+                            f"Math: [bold cyan]{cur_session_math}[/bold cyan] | "
                             f"LLM: [bold green]{cfg.llm_model}[/bold green] | "
                             f"Embeddings: [bold cyan]{cfg.embedding_model}[/bold cyan]"
                         )
@@ -2733,10 +2783,11 @@ def build_graph(
                     effective_skip_refs = (
                         cfg.skip_references_sections if skip_references is None else skip_references
                     )
+                    is_chunk_sim_enabled = bool(effective_enable_cover and cfg.filter.chunk_similarity.enabled)
 
-                    # 1. Ensure all candidate chunks have embeddings
-                    missing_embs = [c for c in chunks if not getattr(c, "embedding", None)]
-                    if missing_embs and embeddings is not None:
+                    # 1. Ensure all candidate chunks have embeddings (only required when chunk_similarity is enabled)
+                    missing_embs = [c for c in chunks if not getattr(c, "embedding", None)] if is_chunk_sim_enabled else []
+                    if is_chunk_sim_enabled and missing_embs and embeddings is not None:
                         emb_task = None
                         try:
                             emb_task = progress.add_task(
@@ -2816,14 +2867,36 @@ def build_graph(
                             min_section_chunks=cfg.cover_min_section_chunks,
                             sliding_window_size=effective_cover_win,
                             filter_conveyor=filter_conveyor,
-                            enable_chunk_similarity=bool(effective_enable_cover and cfg.filter.chunk_similarity.enabled),
+                            enable_chunk_similarity=is_chunk_sim_enabled,
                         )
                     else:
                         cover_selected = list(candidate_chunks)
                         cover_skipped = []
                         cover_decisions = []
 
-                    # 2. Record skipped redundant / reference chunks into graph and state (preserving any cached extractions)
+                    # Tally per-category filter counts and formula shield counts for this book and session
+                    for dec_item in cover_decisions:
+                        fcat = getattr(dec_item, "filter_category", "") or ""
+                        if not dec_item.selected:
+                            cat_key = fcat if fcat and fcat != "passed" else ("chunk_sim" if dec_item.status == "skipped_redundant" else "ref_sections")
+                            book_filter_stats[cat_key] = book_filter_stats.get(cat_key, 0) + 1
+                            with stats_lock:
+                                session_filter_stats[cat_key] = session_filter_stats.get(cat_key, 0) + 1
+                        elif fcat == "formulas" or getattr(dec_item.chunk, "has_formula", False):
+                            book_filter_stats["formulas"] = book_filter_stats.get("formulas", 0) + 1
+                            with stats_lock:
+                                book_math_chunks += 1
+                                session_math_chunks += 1
+                                session_filter_stats["formulas"] = session_filter_stats.get("formulas", 0) + 1
+
+                    with stats_lock:
+                        session_total_candidate_chunks += len(candidate_chunks)
+
+                    chunk_filter_states: Dict[str, str] = {
+                        dec_item.chunk.chunk_id: dec_item.filter_state for dec_item in cover_decisions
+                    }
+
+                    # 2. Record skipped redundant / reference chunks into graph (storing filter_state in KG only, preserving state files)
                     for s_chk in cover_skipped:
                         sec_node_id = store.add_section(
                             book_id=bid,
@@ -2831,18 +2904,7 @@ def build_graph(
                             title=s_chk.section_title,
                             text=s_chk.text,
                         )
-                        store.add_chunk(s_chk)
-                        existing_substantive = book_state.get_cached_substantive_extraction(s_chk.chunk_id)
-                        book_state.mark_chunk_processed(
-                            chunk_id=s_chk.chunk_id,
-                            chunk_idx=s_chk.chunk_idx,
-                            section_title=s_chk.section_title,
-                            extraction_dict={"concepts": [], "extracted_ideas": []},
-                            duration=0.0,
-                            server_used="skipped_cover",
-                            auto_save=False,
-                            cached_extraction=existing_substantive,
-                        )
+                        store.add_chunk(s_chk, filter_state=chunk_filter_states.get(s_chk.chunk_id, "skip"))
                         with stats_lock:
                             book_skipped_chunks += 1
                             session_skipped_chunks += 1
@@ -2855,11 +2917,9 @@ def build_graph(
                             })
                         progress.advance(book_task, advance=1)
 
-                    if cover_skipped:
-                        book_state.save()
-
                     # 3. Restore cover-selected chunks that were already processed in state (cache hit)
                     restored_from_state = 0
+                    restored_skipped_dirty = False
                     unprocessed_fresh: List[HierarchicalChunk] = []
                     unprocessed_retries: List[Tuple[HierarchicalChunk, int]] = []
 
@@ -2903,6 +2963,7 @@ def build_graph(
                                     server_used=actual_srv,
                                     auto_save=False,
                                 )
+                                restored_skipped_dirty = True
                             restored_from_state += 1
                             progress.advance(book_task, advance=1)
                         else:
@@ -2911,6 +2972,9 @@ def build_graph(
                                 unprocessed_fresh.append(chk)
                             else:
                                 unprocessed_retries.append((chk, init_attempt))
+
+                    if restored_skipped_dirty:
+                        book_state.save()
 
                     # 4. Restore failed poison chunks
                     restored_failed = 0
@@ -2928,14 +2992,28 @@ def build_graph(
                         restored_failed += 1
                         progress.advance(book_task, advance=1)
 
-                    if cover_skipped:
+                    if cover_skipped or book_filter_stats:
+                        from bookeeper.processing.filters import format_filter_stats
                         with display_lock:
                             cover_pct = (len(cover_skipped) / len(candidate_chunks)) * 100.0 if candidate_chunks else 0.0
+                            if is_chunk_sim_enabled:
+                                header_label = f"[bold cyan]🎯 Hierarchical Semantic Cover (τ={effective_cover_thresh:.2f}):[/bold cyan]"
+                                skip_label = "redundant/boilerplate chunks"
+                            else:
+                                header_label = "[bold cyan]🧹 Chunk Filter Conveyor (chunk_similarity=off):[/bold cyan]"
+                                skip_label = "boilerplate/reference chunks"
                             console.print(
-                                f"  [bold cyan]🎯 Hierarchical Semantic Cover (τ={effective_cover_thresh:.2f}):[/bold cyan] "
+                                f"  {header_label} "
                                 f"Selected [bold green]{len(cover_selected)}[/bold green] chunks ({restored_from_state} restored from cache, {len(unprocessed_fresh)} fresh for LLM), "
-                                f"skipped [bold yellow]{len(cover_skipped)}[/bold yellow] redundant/reference chunks "
+                                f"skipped [bold yellow]{len(cover_skipped)}[/bold yellow] {skip_label} "
                                 f"([bold yellow]{cover_pct:.1f}% skipped[/bold yellow])."
+                            )
+                            book_stats_str = format_filter_stats(book_filter_stats)
+                            tot_stats_str = format_filter_stats(session_filter_stats)
+                            tot_skip_pct = (session_skipped_chunks / session_total_candidate_chunks * 100.0) if session_total_candidate_chunks else 0.0
+                            console.print(
+                                f"  [dim cyan]Filter stats (Book #{bid}):[/dim cyan] {book_stats_str} "
+                                f"[dim]| Total ({book_idx} books, {session_skipped_chunks}/{session_total_candidate_chunks} skipped, {tot_skip_pct:.1f}%):[/dim] {tot_stats_str}"
                             )
 
                     if restored_from_state > 0 or restored_failed > 0:
@@ -3010,7 +3088,8 @@ def build_graph(
                                             title=h_chk.section_title,
                                             text=h_chk.text,
                                         )
-                                        store.add_chunk(h_chk)
+                                        chunk_filter_states[h_chk.chunk_id] = "retain"
+                                        store.add_chunk(h_chk, filter_state="retain")
                                         store.add_section_concept_link(
                                             section_node_id=sec_node_id,
                                             concept_name=h_idea,
@@ -3058,16 +3137,8 @@ def build_graph(
                                             title=l_chk.section_title,
                                             text=l_chk.text,
                                         )
-                                        store.add_chunk(l_chk)
-                                        book_state.mark_chunk_processed(
-                                            chunk_id=l_chk.chunk_id,
-                                            chunk_idx=l_chk.chunk_idx,
-                                            section_title=l_chk.section_title,
-                                            extraction_dict={"concepts": [], "extracted_ideas": []},
-                                            duration=0.0,
-                                            server_used="skipped_limbo",
-                                            auto_save=False,
-                                        )
+                                        chunk_filter_states[l_chk.chunk_id] = "skip"
+                                        store.add_chunk(l_chk, filter_state="skip")
                                         with stats_lock:
                                             book_skipped_chunks += 1
                                             session_skipped_chunks += 1
@@ -3084,8 +3155,6 @@ def build_graph(
                                                 f"  [dim yellow]⏭ [{l_chk.section_title[:24]} p{l_chk.chunk_idx}][/dim yellow] "
                                                 f"Limbo chunk ({rc.similarity:.2f}) skipped (--skip-limbo-chunks enabled)."
                                             )
-                                    if routing.limbo:
-                                        book_state.save()
                                 else:
                                     for rc in routing.limbo:
                                         if rc.matched_idea:
@@ -3579,7 +3648,7 @@ def build_graph(
                                 title=b_chk.section_title,
                                 text=b_chk.text,
                             )
-                            store.add_chunk(b_chk)
+                            store.add_chunk(b_chk, filter_state=chunk_filter_states.get(b_chk.chunk_id))
 
                     resolved_concept_iter = iter(resolved_book_concepts)
                     upserted_ideas_for_neo4j: Dict[str, Dict[str, Any]] = {}
@@ -3595,7 +3664,7 @@ def build_graph(
                             title=chk.section_title,
                             text=chk.text,
                         )
-                        store.add_chunk(chk)
+                        store.add_chunk(chk, filter_state=chunk_filter_states.get(chk.chunk_id))
 
                         for concept in extraction.concepts:
                             canonical_concept = next(resolved_concept_iter, None) or deduplicator.resolve_concept(concept)
@@ -4128,12 +4197,14 @@ def build_graph(
 @app.command("status")
 def show_status(
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."),
     state_file: Optional[str] = typer.Option(None, "--state-file", help="Custom path for progress checkpoint JSON file."),
 ):
     """Display progress and checkpoint summary for batch operations."""
     config_path = _resolve_opt(config_path)
+    config_diff = _resolve_opt(config_diff)
     state_file = _resolve_opt(state_file)
-    cfg = get_settings(config_path)
+    cfg = get_settings(config_path, config_diff=config_diff)
     tracker_path = Path(state_file) if state_file else cfg.resolved_state_file
     tracker = ProgressTracker(tracker_path)
     clean_summary = tracker.summary("clean_metadata")
@@ -4247,10 +4318,11 @@ def show_status(
 
 @app.command()
 def stats(
-    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml.")
+    config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."),
 ):
     """Display metrics for the current Knowledge Graph."""
-    cfg = get_settings(config_path)
+    cfg = get_settings(_resolve_opt(config_path), config_diff=_resolve_opt(config_diff))
     store = ConceptGraphStore()
     output_dir = cfg.resolved_output_dir
     graph_file = output_dir / "knowledge_graph.json"
@@ -4294,6 +4366,7 @@ def query_command(
     embedding_model: Optional[str] = typer.Option(None, "--embedding-model", help="Embedding model name."),
     embedding_url: Optional[str] = typer.Option(None, "--embedding-url", help="Ollama server URL dedicated for embeddings."),
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."),
 ):
     """
     Query the ingested library using the LightRAG dual-level graph retrieval engine.
@@ -4305,6 +4378,7 @@ def query_command(
         model=model,
         embedding_model=embedding_model,
         embedding_url=embedding_url,
+        config_diff=config_diff,
     )
     target_dir = Path(lightrag_dir).expanduser().resolve() if lightrag_dir else cfg.resolved_lightrag_dir
     effective_mode = (mode or cfg.lightrag_mode).lower().strip()
@@ -4339,6 +4413,7 @@ def query_command(
 @app.command("export-obsidian")
 def export_obsidian_command(
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."),
     graph_file: Optional[str] = typer.Option(
         None, "--graph-file", help="Path to knowledge_graph.json (default: output_dir/knowledge_graph.json)."
     ),
@@ -4356,7 +4431,7 @@ def export_obsidian_command(
     Generates notes with Wikilinks, concept significance weights, and an index.
     Exports strictly based on existing knowledge_graph.json without processing books.
     """
-    cfg = get_settings(config_path)
+    cfg = get_settings(_resolve_opt(config_path), config_diff=_resolve_opt(config_diff))
     target_graph_file = Path(graph_file).expanduser().resolve() if graph_file else cfg.resolved_output_dir / "knowledge_graph.json"
     sharded_spine = (target_graph_file.parent if target_graph_file.suffix == ".json" else target_graph_file) / "knowledge_graph_spine.json"
     sharded_manifest = (target_graph_file.parent if target_graph_file.suffix == ".json" else target_graph_file) / "shards_manifest.json"
@@ -4389,6 +4464,7 @@ def export_obsidian_command(
 @app.command("export")
 def export_command(
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."),
     graph_file: Optional[str] = typer.Option(
         None, "--graph-file", help="Path to knowledge_graph.json (default: output_dir/knowledge_graph.json)."
     ),
@@ -4421,7 +4497,7 @@ def export_command(
     Export current Knowledge Graph to external destinations (Obsidian, Neo4j, and optional GraphML)
     based strictly on existing knowledge_graph.json without continuing book processing.
     """
-    cfg = get_settings(config_path)
+    cfg = get_settings(_resolve_opt(config_path), config_diff=_resolve_opt(config_diff))
     target_graph_file = Path(graph_file).expanduser().resolve() if graph_file else cfg.resolved_output_dir / "knowledge_graph.json"
     sharded_spine = (target_graph_file.parent if target_graph_file.suffix == ".json" else target_graph_file) / "knowledge_graph_spine.json"
     sharded_manifest = (target_graph_file.parent if target_graph_file.suffix == ".json" else target_graph_file) / "shards_manifest.json"
@@ -4503,6 +4579,7 @@ def export_command(
 @app.command("export-neo4j")
 def export_neo4j_command(
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."),
     graph_file: Optional[str] = typer.Option(
         None, "--graph-file", help="Path to knowledge_graph.json (default: output_dir/knowledge_graph.json)."
     ),
@@ -4528,7 +4605,7 @@ def export_neo4j_command(
     and updating existing ones with latest attributes) based on current knowledge_graph.json data.
     Supports clean start to wipe the database before exporting.
     """
-    cfg = get_settings(config_path)
+    cfg = get_settings(_resolve_opt(config_path), config_diff=_resolve_opt(config_diff))
 
     # Resolve overrides
     target_uri = uri or cfg.neo4j.uri
@@ -4661,11 +4738,12 @@ def export_graphml_command(
         None, "--graph-file", "-g", help="Source knowledge_graph.json path."
     ),
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."),
 ):
     """
     Export current Knowledge Graph to GraphML XML format on-demand for Gephi, Cytoscape, or yEd.
     """
-    cfg = get_settings(config_path)
+    cfg = get_settings(_resolve_opt(config_path), config_diff=_resolve_opt(config_diff))
     target_graph = Path(graph_file).expanduser().resolve() if graph_file else cfg.resolved_output_dir / "knowledge_graph.json"
     if not target_graph.is_file():
         console.print(f"[bold red]Knowledge graph file not found at {target_graph}[/bold red]")
@@ -4711,6 +4789,7 @@ def shard_graph_command(
         True, "--backup/--no-backup", help="Preserve safety copy (knowledge_graph.json.bak) before migration (default: True)."
     ),
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."),
 ):
     """
     Migrate a monolithic knowledge graph into a high-performance Spine + Sharded graph.
@@ -4719,7 +4798,7 @@ def shard_graph_command(
     - Preserves lightweight semantic spine (Books, Sections, Ideas, Clusters) for fast in-memory indexing.
     - Zero compute cost: runs 100% offline without invoking LLMs or embedding models.
     """
-    cfg = get_settings(config_path)
+    cfg = get_settings(_resolve_opt(config_path), config_diff=_resolve_opt(config_diff))
     target_graph = (
         Path(graph_file).expanduser().resolve()
         if graph_file
@@ -4826,12 +4905,13 @@ def inspect_shards_command(
         None, "--dir", "-d", help="Directory containing shards_manifest.json (default: config output_dir)."
     ),
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."),
 ):
     """
     Inspect the Spine and Shards structure of a partitioned Knowledge Graph.
     Displays detailed breakdown of shard files, node/edge counts, file sizes, and memory usage.
     """
-    cfg = get_settings(config_path)
+    cfg = get_settings(_resolve_opt(config_path), config_diff=_resolve_opt(config_diff))
     target_dir = Path(directory).expanduser().resolve() if directory else cfg.resolved_output_dir
     manifest_path = target_dir / "shards_manifest.json"
 
@@ -4891,12 +4971,13 @@ def unshard_graph_command(
         False, "--decompress-embeddings", help="Decompress Base64 binary embeddings back to raw JSON float lists."
     ),
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."),
 ):
     """
     Reconstruct a single monolithic knowledge_graph.json from the Spine and Shards.
     Useful for external tooling or backup archives.
     """
-    cfg = get_settings(config_path)
+    cfg = get_settings(_resolve_opt(config_path), config_diff=_resolve_opt(config_diff))
     target_dir = Path(directory).expanduser().resolve() if directory else cfg.resolved_output_dir
     manifest_path = target_dir / "shards_manifest.json"
 
@@ -4942,12 +5023,15 @@ def build_rag(
     config_path: Optional[str] = typer.Option(
         None, "--config", "-c", help="Path to config.yaml file."
     ),
+    config_diff: Optional[str] = typer.Option(
+        None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."
+    ),
 ):
     """
     Index locally cached chunks from disk into LightRAG database.
     Allows decoupling fast concept graph extraction from heavy LightRAG vector/graph indexing.
     """
-    cfg = _get_effective_settings(config_path, embedding_url=embedding_url)
+    cfg = _get_effective_settings(config_path, embedding_url=embedding_url, config_diff=config_diff)
     resolved_chunks_path = Path(chunks_dir).expanduser().resolve() if chunks_dir else cfg.resolved_chunks_dir
     chunk_store = ChunkStore(resolved_chunks_path)
 
@@ -5140,6 +5224,7 @@ def _execute_single_verification(
     low_p10_output: Optional[str] = None,
     low_p10_target_chars: int = 1_000_000,
     low_p10_max_chunks: Optional[int] = None,
+    low_p10_offset: int = 0,
     cfg: Optional[Settings] = None,
 ) -> Optional[Dict[str, Any]]:
     """
@@ -6082,6 +6167,11 @@ def _execute_single_verification(
             if low_p10_max_chunks is not None
             else getattr(cfg.verification, "low_p10_max_chunks", 500)
         )
+        effective_low_p10_offset = int(
+            low_p10_offset
+            if low_p10_offset is not None
+            else getattr(cfg.verification, "low_p10_offset", 0)
+        )
         temp_backup_targets: List[ResolvedBackupTarget] = []
 
         try:
@@ -6226,6 +6316,7 @@ def _execute_single_verification(
                         low_p10_prompt_output=effective_low_p10_output,
                         low_p10_target_chars=low_p10_target_chars,
                         low_p10_max_chunks=effective_low_p10_max_chunks,
+                        low_p10_offset=effective_low_p10_offset,
                     )
                 console.print(format_graph_comparison_table(kg_report))
                 report_dict = kg_report.model_dump()
@@ -6245,6 +6336,7 @@ def _execute_single_verification(
                         low_p10_prompt_output=effective_low_p10_output,
                         low_p10_target_chars=low_p10_target_chars,
                         low_p10_max_chunks=effective_low_p10_max_chunks,
+                        low_p10_offset=effective_low_p10_offset,
                     )
                 console.print(format_graph_space_table(metrics))
                 if metrics.postprocessing_drift:
@@ -6631,6 +6723,7 @@ def _write_combined_multi_verification_report(
 @app.command("verify")
 def verify_command(
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."),
     graph_file: Optional[str] = typer.Option(
         None, "--graph-file", help="Path to knowledge_graph.json (default: output_dir/knowledge_graph.json)."
     ),
@@ -6736,6 +6829,11 @@ def verify_command(
         "--low-p10-max-chunks",
         help="Maximum number of worst-proximity chunks to include in low-p10 verification prompt (default: 500).",
     ),
+    low_p10_offset: int = typer.Option(
+        0,
+        "--low-p10-offset",
+        help="Number of worst-proximity chunks to skip before assembling verification prompt (default: 0).",
+    ),
 ):
     """
     Verify Knowledge Graph factual integrity, chunking correctness, or chunk Oracle alignment.
@@ -6769,6 +6867,7 @@ def verify_command(
         config_path=config_path,
         embedding_model=embedding_model,
         embedding_url=embedding_url,
+        config_diff=config_diff,
     )
 
     enabled_verifiers = [v for v in cfg.verifiers if v.enabled]
@@ -6856,6 +6955,7 @@ def verify_command(
                 low_p10_prompt=getattr(v, "low_p10_prompt", low_p10_prompt) if getattr(v, "low_p10_prompt", None) is not None else low_p10_prompt,
                 low_p10_output=getattr(v, "low_p10_output", low_p10_output) if getattr(v, "low_p10_output", None) is not None else low_p10_output,
                 low_p10_max_chunks=getattr(v, "low_p10_max_chunks", low_p10_limit) if getattr(v, "low_p10_max_chunks", None) is not None else low_p10_limit,
+                low_p10_offset=getattr(v, "low_p10_offset", low_p10_offset) if getattr(v, "low_p10_offset", None) is not None else low_p10_offset,
             )
             reports.append((v_mode, v_report, rep))
 
@@ -6899,6 +6999,8 @@ def verify_command(
             low_p10_output = first_v.low_p10_output
         if low_p10_limit is None and getattr(first_v, "low_p10_max_chunks", None) is not None:
             low_p10_limit = first_v.low_p10_max_chunks
+        if (low_p10_offset == 0 or low_p10_offset is None) and getattr(first_v, "low_p10_offset", None) is not None:
+            low_p10_offset = first_v.low_p10_offset
 
     return _execute_single_verification(
         cfg=cfg,
@@ -6931,12 +7033,14 @@ def verify_command(
         low_p10_prompt=low_p10_prompt,
         low_p10_output=low_p10_output,
         low_p10_max_chunks=low_p10_limit,
+        low_p10_offset=low_p10_offset,
     )
 
 
 @app.command("verifiers")
 def verifiers_command(
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."),
     graph_file: Optional[str] = typer.Option(
         None, "--graph-file", help="Path to knowledge_graph.json (default: output_dir/knowledge_graph.json)."
     ),
@@ -7005,6 +7109,7 @@ def verifiers_command(
     """Execute configured verifiers (multi-verification by default when multiple verifiers configured)."""
     return verify_command(
         config_path=config_path,
+        config_diff=config_diff,
         graph_file=graph_file,
         percent=percent,
         mode=mode,
@@ -7071,6 +7176,11 @@ def ab_compare_command(
         "-c",
         help="Path to config.yaml file.",
     ),
+    config_diff: Optional[str] = typer.Option(
+        None,
+        "--config-diff",
+        help="Path to YAML config overlay applied on top of base config.yaml.",
+    ),
     output_report: Optional[str] = typer.Option(
         None,
         "--output",
@@ -7100,7 +7210,7 @@ def ab_compare_command(
     without re-indexing through LLMs. Unpacks backup archives (.zip, .7z) into isolated temporary
     folders, evaluates topological and idea differences, and executes comparative cross-check audits.
     """
-    cfg = get_settings(config_path)
+    cfg = get_settings(_resolve_opt(config_path), config_diff=_resolve_opt(config_diff))
     output_dir = cfg.resolved_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -7408,6 +7518,7 @@ def ab_compare_command(
 def remove_book_cmd(
     book_id: int = typer.Argument(..., help="Calibre ID of the book to remove from knowledge graph."),
     config: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."),
     export_obsidian: Optional[str] = typer.Option(
         None,
         "--export-obsidian",
@@ -7424,7 +7535,7 @@ def remove_book_cmd(
     Purges the book node, its sections, chunks, and any orphan concepts that only belonged to this book.
     Also clears its completed state from the progress checkpoint so it can be re-indexed cleanly.
     """
-    cfg = get_settings(config)
+    cfg = get_settings(_resolve_opt(config), config_diff=_resolve_opt(config_diff))
     output_dir = cfg.resolved_output_dir
     graph_file = output_dir / "knowledge_graph.json"
     tracker = ProgressTracker(cfg.resolved_state_file)
@@ -7468,6 +7579,9 @@ def postprocess_ideas_command(
     config_path: Optional[str] = typer.Option(
         None, "--config", "-c", help="Path to config.yaml file."
     ),
+    config_diff: Optional[str] = typer.Option(
+        None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."
+    ),
     model: Optional[str] = typer.Option(
         None, "--model", "-m", help="Dedicated LLM model for idea consolidation (default: from config.yaml dual_pass.model or llm_model)."
     ),
@@ -7509,7 +7623,7 @@ def postprocess_ideas_command(
     4. Graph overwrite with unified brief_description, detailed_explanation, :MENTIONED_IN, and :RELATES_TO edges.
     Supports persistent state checkpoints (every 100 ideas) and auto-continue.
     """
-    cfg = get_settings(config_path)
+    cfg = get_settings(_resolve_opt(config_path), config_diff=_resolve_opt(config_diff))
     output_dir = cfg.resolved_output_dir
     target_graph = Path(graph_file).expanduser().resolve() if graph_file else output_dir / "knowledge_graph.json"
 
@@ -7600,6 +7714,9 @@ def test_run_command(
     config_path: Optional[str] = typer.Option(
         None, "--config", "-c", help="Path to config.yaml file."
     ),
+    config_diff: Optional[str] = typer.Option(
+        None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."
+    ),
     calibre_path: Optional[str] = typer.Option(
         None, "--calibre-path", help="Calibre library path or SMB mount."
     ),
@@ -7649,7 +7766,7 @@ def test_run_command(
         console.print("[bold red]book-cnt must be at least 1[/bold red]")
         raise typer.Exit(1)
 
-    eff_cfg = _get_effective_settings(config_path, calibre_path, model=model, books_dir=books_dir)
+    eff_cfg = _get_effective_settings(config_path, calibre_path, model=model, books_dir=books_dir, config_diff=config_diff)
     enabled_verifiers = [v for v in eff_cfg.verifiers if v.enabled]
     is_multi_verif = (mode is None and len(enabled_verifiers) > 1)
 
@@ -7682,6 +7799,7 @@ def test_run_command(
             calibre_path=calibre_path,
             books_dir=books_dir,
             config_path=config_path,
+            config_diff=config_diff,
             from_scratch=True,
             enable_lightrag=False,
             clean_export=True,
@@ -7722,6 +7840,7 @@ def test_run_command(
     try:
         verify_command(
             config_path=config_path,
+            config_diff=config_diff,
             percent=percent,
             mode=mode,
             model=verifier_model,
@@ -7740,6 +7859,9 @@ def test_run_command(
 def rebuild_graph_command(
     config_path: Optional[str] = typer.Option(
         None, "--config", "-c", help="Path to config.yaml configuration file."
+    ),
+    config_diff: Optional[str] = typer.Option(
+        None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."
     ),
     calibre_path: Optional[str] = typer.Option(
         None, "--calibre-path", help="Calibre library root path or SMB mount."
@@ -7796,6 +7918,7 @@ def rebuild_graph_command(
     Wipes existing graph content before rebuild to ensure a clean, authoritative state.
     """
     config_path = _resolve_opt(config_path)
+    config_diff = _resolve_opt(config_diff)
     calibre_path = _resolve_opt(calibre_path)
     states_dir = _resolve_opt(states_dir)
     chunks_dir = _resolve_opt(chunks_dir)
@@ -7810,7 +7933,7 @@ def rebuild_graph_command(
     state_cache_dir = _resolve_opt(state_cache_dir)
     export_graphml = _resolve_opt(export_graphml, False)
 
-    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir)
+    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir, config_diff=config_diff)
     output_dir = cfg.resolved_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     graph_file = output_dir / "knowledge_graph.json"
@@ -7960,6 +8083,16 @@ def rebuild_graph_command(
                 chunks = chunk_store.load_chunks(bid) if chunk_store.has_chunks(bid) else []
                 chunks_map = {c.chunk_id: c for c in chunks}
 
+                rebuild_filter_states: Dict[str, str] = {}
+                if chunks:
+                    try:
+                        from bookeeper.processing.hierarchical_cover import hierarchical_semantic_cover
+                        _, _, cover_decisions = hierarchical_semantic_cover(chunks, settings=cfg)
+                        for dec in cover_decisions:
+                            rebuild_filter_states[dec.chunk.chunk_id] = dec.filter_state
+                    except Exception as e:
+                        logger.debug(f"Could not compute cover for rebuild Book #{bid}: {e}")
+
                 processed = s_data.get("processed_chunks", {})
                 extracted_items = [v for v in processed.values() if v.get("status") == "extracted"]
                 extracted_items.sort(key=lambda x: x.get("chunk_idx", 0))
@@ -7977,10 +8110,12 @@ def rebuild_graph_command(
                             title=b_chk.section_title,
                             text=b_chk.text,
                         )
-                        store.add_chunk(b_chk)
+                        store.add_chunk(b_chk, filter_state=rebuild_filter_states.get(b_chk.chunk_id))
 
                 for res in extracted_items:
                     chk_id = res["chunk_id"]
+                    if rebuild_filter_states.get(chk_id) == "skip":
+                        continue
                     chk = chunks_map.get(chk_id)
                     if not chk:
                         chk = HierarchicalChunk(
@@ -7999,7 +8134,7 @@ def rebuild_graph_command(
                         title=chk.section_title,
                         text=chk.text,
                     )
-                    store.add_chunk(chk)
+                    store.add_chunk(chk, filter_state=rebuild_filter_states.get(chk.chunk_id, "continue"))
 
                     extraction = res.get("extraction", {})
                     for c_dict in extraction.get("concepts", []):
@@ -8175,6 +8310,11 @@ def backup_command(
         "-c",
         help="Path to config.yaml.",
     ),
+    config_diff: Optional[Path] = typer.Option(
+        None,
+        "--config-diff",
+        help="Path to YAML config overlay applied on top of base config.yaml.",
+    ),
     calibre_path: Optional[Path] = typer.Option(
         None,
         "--calibre-path",
@@ -8214,6 +8354,7 @@ def backup_command(
     all_books = _resolve_opt(all_books, False)
     output_dir = _resolve_opt(output_dir)
     config_path = _resolve_opt(config_path)
+    config_diff = _resolve_opt(config_diff)
     calibre_path = _resolve_opt(calibre_path)
     no_chunks = _resolve_opt(no_chunks, False)
     no_obsidian = _resolve_opt(no_obsidian, False)
@@ -8222,7 +8363,7 @@ def backup_command(
 
     target_dest = destination or output
 
-    cfg = _get_effective_settings(config_path, calibre_path)
+    cfg = _get_effective_settings(config_path, calibre_path, config_diff=config_diff)
     source_dir = Path(output_dir).expanduser().resolve() if output_dir else cfg.resolved_output_dir
 
     if not source_dir.is_dir():
@@ -8359,6 +8500,11 @@ def restore_command(
         "-c",
         help="Path to config.yaml.",
     ),
+    config_diff: Optional[Path] = typer.Option(
+        None,
+        "--config-diff",
+        help="Path to partial YAML config overlay applied on top of base config.yaml.",
+    ),
     calibre_path: Optional[Path] = typer.Option(
         None,
         "--calibre-path",
@@ -8384,6 +8530,7 @@ def restore_command(
     output_dir = _resolve_opt(output_dir)
     books_dir = _resolve_opt(books_dir)
     config_path = _resolve_opt(config_path)
+    config_diff = _resolve_opt(config_diff)
     calibre_path = _resolve_opt(calibre_path)
     clean = _resolve_opt(clean, False)
     dry_run = _resolve_opt(dry_run, False)
@@ -8399,7 +8546,7 @@ def restore_command(
         console.print(f"[bold red]Backup archive not found:[/bold red] {archive_file}")
         raise typer.Exit(1)
 
-    cfg = _get_effective_settings(config_path, calibre_path)
+    cfg = _get_effective_settings(config_path, calibre_path, config_diff=config_diff)
     target_dir = Path(output_dir).expanduser().resolve() if output_dir else cfg.resolved_output_dir
     explicit_books_dir = Path(books_dir).expanduser().resolve() if books_dir else None
 
@@ -8545,6 +8692,11 @@ def sync_command(
         "-c",
         help="Path to config.yaml configuration file.",
     ),
+    config_diff: Optional[Path] = typer.Option(
+        None,
+        "--config-diff",
+        help="Path to partial YAML config overlay applied on top of base config.yaml.",
+    ),
     books_dir: Optional[Path] = typer.Option(
         None,
         "--books-dir",
@@ -8588,13 +8740,14 @@ def sync_command(
     server = _resolve_opt(server)
     clean = _resolve_opt(clean, False)
     config_path = _resolve_opt(config_path)
+    config_diff = _resolve_opt(config_diff)
     books_dir = _resolve_opt(books_dir)
     output_dir = _resolve_opt(output_dir)
     calibre_path = _resolve_opt(calibre_path)
     format_type = _resolve_opt(format_type, "zip")
     timeout = _resolve_opt(timeout, 600)
 
-    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir)
+    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir, config_diff=config_diff)
 
     # Normalize remote server URL
     target_server = server.strip()
@@ -8782,6 +8935,7 @@ def ui_command(
     host: str = typer.Option("127.0.0.1", "--host", "-h", envvar=["BOOKEEPER_HOST", "HOST"], help="Host interface to bind the web server (default: 127.0.0.1)."),
     port: int = typer.Option(8000, "--port", "-p", envvar=["BOOKEEPER_PORT", "PORT"], help="HTTP port to listen on (default: 8000)."),
     config_path: Optional[str] = typer.Option(None, "--config", "-c", envvar=["BOOKEEPER_CONFIG"], help="Path to config.yaml configuration file."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", envvar=["BOOKEEPER_CONFIG_DIFF"], help="Path to partial YAML config overlay applied on top of base config.yaml."),
 ):
     """
     Launch the interactive Bookeeper Idea-Based Search Engine Web UI and REST API.
@@ -8792,7 +8946,7 @@ def ui_command(
     from bookeeper.ui.backend import SearchEngineBackend
     from bookeeper.ui.server import run_server
 
-    cfg = _get_effective_settings(config_path)
+    cfg = _get_effective_settings(config_path, config_diff=config_diff)
     backend = SearchEngineBackend(config=cfg, neo4j_config=cfg.neo4j)
 
     server = run_server(host=host, port=port, backend=backend, auto_port=True)
@@ -8846,13 +9000,14 @@ def search_command(
     mode: str = typer.Option("ideas", "--mode", "-m", help="Search mode: 'ideas', 'deep' (2-hop), or 'exact'."),
     top_k: int = typer.Option(10, "--top-k", "-k", help="Maximum ideas to retrieve."),
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to partial YAML config overlay applied on top of base config.yaml."),
 ):
     """
     Search ideas directly in the Bookkeeper Knowledge Graph.
     Retrieves matching ideas and their surrounding neighborhood notes (connected ideas, books, evidence).
     """
     from bookeeper.ui.backend import SearchEngineBackend
-    cfg = _get_effective_settings(config_path)
+    cfg = _get_effective_settings(config_path, config_diff=config_diff)
     backend = SearchEngineBackend(config=cfg, neo4j_config=cfg.neo4j)
     try:
         with console.status(f"[bold cyan]Searching ideas for '{query_text}'...[/bold cyan]"):
@@ -8867,6 +9022,7 @@ def lightrag_ui_command(
     host: str = typer.Option("127.0.0.1", "--host", "-h", help="Host interface to bind the LightRAG server (default: 127.0.0.1)."),
     port: int = typer.Option(9621, "--port", "-p", help="Port for the LightRAG server (default: 9621)."),
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml configuration file."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to partial YAML config overlay applied on top of base config.yaml."),
     lightrag_dir: Optional[str] = typer.Option(None, "--lightrag-dir", help="Path to LightRAG storage directory."),
 ):
     """
@@ -8875,7 +9031,7 @@ def lightrag_ui_command(
     """
     from bookeeper.ui.lightrag_server import LightRAGServerManager
 
-    cfg = _get_effective_settings(config_path)
+    cfg = _get_effective_settings(config_path, config_diff=config_diff)
     if lightrag_dir:
         target_lightrag = Path(lightrag_dir).expanduser().resolve()
         if (target_lightrag / "lightrag_storage").is_dir():
@@ -8926,6 +9082,7 @@ def lightrag_ui_command(
 def lightrag_index_command(
     book_cnt: int = typer.Argument(1, metavar="BOOK-CNT", help="Number of books to index with LightRAG native chunking."),
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to partial YAML config overlay applied on top of base config.yaml."),
     calibre_path: Optional[str] = typer.Option(None, "--calibre-path", help="Calibre library path or SMB mount."),
     books_dir: Optional[str] = typer.Option(None, "--books-dir", help="Path to folder containing books/articles."),
     lightrag_dir: Optional[str] = typer.Option(None, "--lightrag-dir", help="Working directory for LightRAG database."),
@@ -8938,7 +9095,7 @@ def lightrag_index_command(
     from bookeeper.calibre import get_book_client
     from bookeeper.rag.lightrag_service import LightRAGRawIndexer
 
-    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir)
+    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir, config_diff=config_diff)
     client = get_book_client(cfg, calibre_path=calibre_path, books_dir=books_dir)
     all_books = client.list_books()
 
@@ -8979,6 +9136,7 @@ def generate_questions_command(
     questions_per_book: int = typer.Option(5, "--questions-per-book", "-q", help="Number of questions to generate per book."),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Verification LLM model for question synthesis (default: from config)."),
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to partial YAML config overlay applied on top of base config.yaml."),
     calibre_path: Optional[str] = typer.Option(None, "--calibre-path", help="Calibre library path or SMB mount."),
     books_dir: Optional[str] = typer.Option(None, "--books-dir", help="Path to folder containing books/articles."),
     timeout: int = typer.Option(180, "--timeout", "-t", help="Timeout in seconds per LLM request for question synthesis (default: 180s)."),
@@ -8993,7 +9151,7 @@ def generate_questions_command(
     from bookeeper.calibre import get_book_client
     from bookeeper.evaluation.question_generator import QuestionGenerator
 
-    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir)
+    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir, config_diff=config_diff)
     client = get_book_client(cfg, calibre_path=calibre_path, books_dir=books_dir)
     all_books = client.list_books()
 
@@ -9041,6 +9199,7 @@ def generate_questions_command(
 def ab_benchmark_command(
     book_cnt: int = typer.Argument(1, metavar="BOOK-CNT", help="Number of books to benchmark across Bookkeeper and LightRAG."),
     config_path: Optional[str] = typer.Option(None, "--config", "-c", help="Path to config.yaml file."),
+    config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to partial YAML config overlay applied on top of base config.yaml."),
     calibre_path: Optional[str] = typer.Option(None, "--calibre-path", help="Calibre library path or SMB mount."),
     books_dir: Optional[str] = typer.Option(None, "--books-dir", help="Path to folder containing books/articles."),
     questions_file: Optional[str] = typer.Option(None, "--questions", "-q", help="Path to existing question library JSON file (if omitted, questions are generated)."),
@@ -9068,7 +9227,7 @@ def ab_benchmark_command(
     from bookeeper.evaluation.benchmark import ABBenchmarkRunner
     from bookeeper.evaluation.question_generator import QuestionLibrary
 
-    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir)
+    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir, config_diff=config_diff)
     client = get_book_client(cfg, calibre_path=calibre_path, books_dir=books_dir)
     all_books = client.list_books()
 
@@ -9141,6 +9300,7 @@ def ab_benchmark_command(
                     calibre_path=calibre_path,
                     books_dir=books_dir,
                     config_path=config_path,
+                    config_diff=config_diff,
                     from_scratch=True,
                     enable_lightrag=False,
                     clean_export=True,
@@ -9283,6 +9443,11 @@ def simulate_thresholds_command(
         "-c",
         help="Path to config.yaml file.",
     ),
+    config_diff: Optional[str] = typer.Option(
+        None,
+        "--config-diff",
+        help="Path to partial YAML config overlay applied on top of base config.yaml.",
+    ),
 ):
     """
     Simulate Knowledge Base generation across an array of (low, high) threshold pairs.
@@ -9292,7 +9457,7 @@ def simulate_thresholds_command(
     """
     from bookeeper.evaluation.threshold_simulator import run_threshold_simulation_suite
 
-    cfg = _get_effective_settings(config_path)
+    cfg = _get_effective_settings(config_path, config_diff=config_diff)
 
     # Resolve state cache directory
     if state_cache_dir:

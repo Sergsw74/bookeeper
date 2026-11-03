@@ -52,6 +52,7 @@ from bookeeper.processing.filters import (
     WEB_SCRAPE_NOISE_REGEX,
     SURVEY_QUESTION_REGEX,
     TOKENIZER_NOISE_REGEX,
+    PROSE_GUARD_REGEX,
 )
 
 logger = logging.getLogger(__name__)
@@ -116,6 +117,8 @@ class CoverDecision:
     covered_by_chunk_id: Optional[str] = None
     similarity_to_cover: float = 0.0
     section_name: str = ""
+    filter_category: str = ""
+    filter_state: str = "continue"  # "skip", "retain", "continue"
 
 
 def hierarchical_semantic_cover(
@@ -182,8 +185,8 @@ def hierarchical_semantic_cover(
     # 1. Group chunks by Section / Chapter preserving sequential document order
     sections_map: Dict[Tuple[int, str], List[Any]] = {}
     for c in chunks:
-        ch_idx = int(getattr(c, "chapter_idx", 0) or 0)
-        sec_title = str(getattr(c, "section_title", "") or getattr(c, "chapter_title", "") or "").strip()
+        ch_idx = int(get_chunk_attr(c, "chapter_idx", 0) or 0)
+        sec_title = str(get_chunk_attr(c, "section_title", "") or get_chunk_attr(c, "chapter_title", "") or "").strip()
         sec_key = (ch_idx, sec_title.lower())
         if sec_key not in sections_map:
             sections_map[sec_key] = []
@@ -192,13 +195,61 @@ def hierarchical_semantic_cover(
     processed_count = 0
     total_count = len(chunks)
     in_trailing_references_by_chapter: Dict[int, bool] = {}
+    in_document_reference_zone: bool = False
+
+    _inline_ref_heading_re = re.compile(
+        r"(?:^|\n)\s*(?:References|REFERENCES|Bibliography|BIBLIOGRAPHY|Works\s+Cited|Literature\s+Cited)\s*(?:\n|$)"
+    )
+    _appendix_exit_re = re.compile(
+        r"(?:^|\n|\.\s+)(?:Appendix|APPENDIX|Supplementary|SUPPLEMENTARY|[A-Z]\.\s+[A-Z]|[A-Z]\.\d+\s+[A-Z]|S\d+\s+[A-Z]|[A-Z]\s+[A-Z]{2,})"
+    )
+
+    def _eval_ref_zone_transition(chk_text: str, f_cat: str, is_page_sec: bool) -> bool:
+        """Update in_document_reference_zone and return True only if chunk is a short reference continuation."""
+        nonlocal in_document_reference_zone
+        if not skip_references:
+            return False
+        if in_document_reference_zone:
+            has_bib_cue = bool(
+                re.search(r"\b(?:19|20)\d{2}[a-z]?\b", chk_text)
+                or DOI_REGEX.search(chk_text)
+                or ARXIV_ID_REGEX.search(chk_text)
+                or VENUE_REGEX.search(chk_text)
+                or CITATION_BRACKET_REGEX.search(chk_text)
+                or "reference" in chk_text.lower()
+            )
+            text_no_urls = re.sub(r"https?://\S+|doi:\s*\S+|arXiv:\s*\S+|\b\d+\(\d+\):\d+", "", chk_text, flags=re.I)
+            if (
+                f_cat == "formulas"
+                or _appendix_exit_re.search(chk_text)
+                or PROSE_GUARD_REGEX.search(chk_text)
+                or not has_bib_cue
+                or len(chk_text) > 260
+                or ":" in text_no_urls
+            ):
+                if f_cat == "formulas" or _appendix_exit_re.search(chk_text) or PROSE_GUARD_REGEX.search(chk_text) or not has_bib_cue:
+                    in_document_reference_zone = False
+                return False
+            return True
+        elif is_page_sec and _inline_ref_heading_re.search(chk_text):
+            in_document_reference_zone = True
+        return False
 
     # 2. Process each section hierarchically
     for (ch_idx, sec_title_lower), sec_chunks in sections_map.items():
         sec_display = sec_title_lower or f"Chapter {ch_idx}"
+        is_page_sec = bool(re.match(r"^pages?\s+\d+", sec_display, re.I))
 
         # Check if the entire section is references/bibliography
         is_ref_section = skip_references and bool(REFERENCE_SECTION_TITLE_REGEX.search(sec_display))
+
+        # If we were in a document reference zone across PDF page sections ("Pages X-Y"),
+        # exit if we hit a named non-reference section or explicit appendix title.
+        if in_document_reference_zone:
+            if bool(re.search(r"(?:^|\b)(?:appendix|supplementary|annex)\b", sec_display, re.I)):
+                in_document_reference_zone = False
+            elif not is_page_sec and not is_ref_section:
+                in_document_reference_zone = False
 
         # Check trailing reference continuation in chapter
         if in_trailing_references_by_chapter.get(ch_idx, False):
@@ -210,13 +261,18 @@ def hierarchical_semantic_cover(
 
         if is_ref_section:
             in_trailing_references_by_chapter[ch_idx] = True
+            in_document_reference_zone = True
             for chk in sec_chunks:
+                f_dec, f_cat = effective_conveyor.verify_with_category(chk)
+                eff_cat = f_cat if f_dec == FilterDecision.SKIP else "ref_sections"
                 skipped_chunks.append(chk)
                 dec = CoverDecision(
                     chunk=chk,
                     selected=False,
                     status="skipped_reference",
                     section_name=sec_display,
+                    filter_category=eff_cat,
+                    filter_state="skip",
                 )
                 decisions.append(dec)
                 processed_count += 1
@@ -227,21 +283,30 @@ def hierarchical_semantic_cover(
         # If section has fewer chunks than min_section_chunks, keep all non-reference chunks
         if len(sec_chunks) < min_section_chunks:
             for chk in sec_chunks:
-                if effective_conveyor.should_skip(chk):
+                chk_text = str(get_chunk_attr(chk, "text", "") or "")
+                f_dec, f_cat = effective_conveyor.verify_with_category(chk)
+                skip_by_ref_zone = _eval_ref_zone_transition(chk_text, f_cat, is_page_sec)
+                if skip_by_ref_zone or f_dec == FilterDecision.SKIP:
+                    eff_cat = f_cat if f_dec == FilterDecision.SKIP else "ref_sections"
                     skipped_chunks.append(chk)
                     dec = CoverDecision(
                         chunk=chk,
                         selected=False,
                         status="skipped_reference",
                         section_name=sec_display,
+                        filter_category=eff_cat,
+                        filter_state="skip",
                     )
                 else:
                     selected_chunks.append(chk)
+                    eff_state = "retain" if (f_cat == "formulas" or (f_dec == FilterDecision.RETAIN and f_cat not in ("passed", ""))) else "continue"
                     dec = CoverDecision(
                         chunk=chk,
                         selected=True,
                         status="selected_anchor",
                         section_name=sec_display,
+                        filter_category=f_cat,
+                        filter_state=eff_state,
                     )
                 decisions.append(dec)
                 processed_count += 1
@@ -254,14 +319,21 @@ def hierarchical_semantic_cover(
         sec_selected_vectors: List[np.ndarray] = []
 
         for chk in sec_chunks:
-            # Check individual chunk for bibliography/boilerplate via conveyor
-            if effective_conveyor.should_skip(chk):
+            chk_text = str(get_chunk_attr(chk, "text", "") or "")
+
+            # Check individual chunk for bibliography/boilerplate via conveyor or active reference zone
+            f_dec, f_cat = effective_conveyor.verify_with_category(chk)
+            skip_by_ref_zone = _eval_ref_zone_transition(chk_text, f_cat, is_page_sec)
+            if skip_by_ref_zone or f_dec == FilterDecision.SKIP:
+                eff_cat = f_cat if f_dec == FilterDecision.SKIP else "ref_sections"
                 skipped_chunks.append(chk)
                 dec = CoverDecision(
                     chunk=chk,
                     selected=False,
                     status="skipped_reference",
                     section_name=sec_display,
+                    filter_category=eff_cat,
+                    filter_state="skip",
                 )
                 decisions.append(dec)
                 processed_count += 1
@@ -270,7 +342,7 @@ def hierarchical_semantic_cover(
                 continue
 
             # If chunk is verified to contain mathematical formulas, shield it from redundancy pruning
-            if get_chunk_attr(chk, "has_formula", False):
+            if get_chunk_attr(chk, "has_formula", False) or f_cat == "formulas":
                 selected_chunks.append(chk)
                 sec_selected_chunks.append(chk)
                 raw_emb = getattr(chk, "embedding", None)
@@ -284,6 +356,8 @@ def hierarchical_semantic_cover(
                     selected=True,
                     status="selected_distinct" if sec_selected_vectors else "selected_anchor",
                     section_name=sec_display,
+                    filter_category="formulas",
+                    filter_state="retain",
                 )
                 decisions.append(dec)
                 processed_count += 1
@@ -297,11 +371,14 @@ def hierarchical_semantic_cover(
                 # If chunk has no embedding, we cannot safely evaluate redundancy -> keep it
                 selected_chunks.append(chk)
                 sec_selected_chunks.append(chk)
+                eff_state = "retain" if (f_dec == FilterDecision.RETAIN and f_cat not in ("passed", "")) else "continue"
                 dec = CoverDecision(
                     chunk=chk,
                     selected=True,
                     status="selected_distinct",
                     section_name=sec_display,
+                    filter_category=f_cat,
+                    filter_state=eff_state,
                 )
                 decisions.append(dec)
                 processed_count += 1
@@ -318,11 +395,14 @@ def hierarchical_semantic_cover(
                 sec_selected_chunks.append(chk)
                 sec_selected_vectors.append(v_unit)
                 selected_chunks.append(chk)
+                eff_state = "retain" if (f_dec == FilterDecision.RETAIN and f_cat not in ("passed", "")) else "continue"
                 dec = CoverDecision(
                     chunk=chk,
                     selected=True,
                     status="selected_anchor",
                     section_name=sec_display,
+                    filter_category=f_cat,
+                    filter_state=eff_state,
                 )
                 decisions.append(dec)
                 processed_count += 1
@@ -359,18 +439,23 @@ def hierarchical_semantic_cover(
                     covered_by_chunk_id=str(getattr(best_match_chk, "chunk_id", "") or ""),
                     similarity_to_cover=max_sim,
                     section_name=sec_display,
+                    filter_category="chunk_sim",
+                    filter_state="skip",
                 )
             else:
                 # Chunk introduces a distinct thought or subtopic shift
                 sec_selected_chunks.append(chk)
                 sec_selected_vectors.append(v_unit)
                 selected_chunks.append(chk)
+                eff_state = "retain" if (chk_has_math or (f_dec == FilterDecision.RETAIN and f_cat not in ("passed", ""))) else "continue"
                 dec = CoverDecision(
                     chunk=chk,
                     selected=True,
                     status="selected_distinct",
                     similarity_to_cover=max_sim,
                     section_name=sec_display,
+                    filter_category="formulas" if chk_has_math else f_cat,
+                    filter_state=eff_state,
                 )
 
             decisions.append(dec)

@@ -228,9 +228,10 @@ filter:
   retain_formulas: true               # Priority 1: Immediately retains chunks with formulas (FilterDecision.RETAIN), halting further filtering
   reference_sections: true            # Priority 2: Drops References, Bibliography, and Acknowledgments sections
   bibliographic: true                 # Priority 2: Drops citation dumps, DOIs, arXiv headers, and short reference slices
-  technical_boilerplate: true         # Priority 2: Drops C/C++ compilation headers, license notices, and web scrape noise
-  dataset_stimulus: true              # Priority 2: Drops survey questions, Likert questionnaires, and benchmark tokenizer noise
-  diagram_ocr: true                   # Priority 2: Drops visual table/diagram OCR layout fragments (skips if has_formula=true)
+  technical_boilerplate: true         # Priority 2: Drops C/C++ compilation headers, license notices, title/affiliation blocks, and web scrape noise
+  dataset_stimulus: true              # Priority 2: Drops survey questions, Likert questionnaires, verbatim prompt schemas, and VQA question dumps
+  diagram_ocr: true                   # Priority 2: Drops visual table/diagram OCR layout fragments and checkmark matrices (skips if has_formula=true)
+  captions_and_signposts: true        # Priority 2: Drops standalone Figure/Table captions, subfigure labels, and short Appendix/Table signposts
   skip_references_sections: true      # Automatically bypass References, Bibliography, and Boilerplate in scientific white papers
 
   # 2. Idea Similarity Filter (Priority 3 - Middle Priority: Semantic routing against existing Knowledge Graph ideas)

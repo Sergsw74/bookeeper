@@ -54,15 +54,47 @@ FORMULA_REGEX = re.compile(
     re.IGNORECASE,
 )
 
-# Reference / Bibliography / Acknowledgments Section Titles
+# Reference / Bibliography / Acknowledgments / Governance Section Titles
 REFERENCE_SECTION_TITLE_REGEX = re.compile(
     r"(?:^|\b)(?:"
     r"references?|bibliography|works\s+cited|literature\s+cited|"
     r"further\s+reading|selected\s+references|bibliographic\s+notes|"
     r"acknowledg(?:e)?ments?|author\s+contributions?|competing\s+interests?|"
     r"funding|conflict\s+of\s+interests?|declarations?|data\s+availability|"
-    r"code\s+availability|broader\s+impacts?|checklist"
+    r"code\s+availability|broader\s+impacts?|checklist|"
+    r"reproducibility\s*statement|ethics\s*statement|ethical\s+considerations|"
+    r"ai\s*use\s*statement|ai\s*disclosure|appendix\s*contents|table\s*of\s*contents"
     r")(?:\b|$)",
+    re.IGNORECASE,
+)
+
+# Guard preserving active conceptual / methodological claims from aggressive boilerplate drops
+PROSE_GUARD_REGEX = re.compile(
+    r"\b(?:"
+    r"we\s+(?:propose|introduce|present|show|demonstrate|evaluate|define|observe|find|use|train|develop|analyze|study|derive|formulate|ablate|investigate|compare|report|measure|test|conduct|construct|design)|"
+    r"our\s+(?:method|approach|model|framework|experiments|results|analysis|algorithm|architecture|study|findings|benchmark)|"
+    r"this\s+(?:section|chapter|paper|appendix|table|figure)\s+(?:presents|describes|shows|details|reports|evaluates|introduces|investigates|analyzes)|"
+    r"in\s+this\s+(?:section|chapter|paper|work|study|appendix)|"
+    r"theorem\s+\d|lemma\s+\d|proposition\s+\d|corollary\s+\d|definition\s+\d"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Governance, Ethics, AI Use, Reproducibility, Funding & Conference Checklists
+GOVERNANCE_ETHICS_FUNDING_REGEX = re.compile(
+    r"(?:"
+    r"^(?:\d+(?:\.\d+)*\s+)?(?:acknowledg(?:e)?ments?|ethics\s*statement|ethical\s+considerations|reproducibility\s*statement|ai\s*use\s*statement|ai\s*disclosure|broader\s+impacts?|funding|competing\s+interests?)\b|"
+    r"\backnowledge\s+support\s+from\b|\bsupported\s+in\s+part\s+by\s+grant\b|\bcontributed\s+equally\s+to\s+this\s+work\b|"
+    r"\bno\s+additional\s+ethical\s+concerns\b|\bofficial\s+policies\s+or\s+endorsements\s+of\b|"
+    r"\bneither\s+the\s+european\s+union\s+nor\b|\bvaluable\s+comments\s+on\s+an\s+earlier\s+draft\b|"
+    r"\bAnswer:\s*\[(?:Yes|No|NA)\]\s*\n\s*Justification:\s*See\b"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Table of Contents & Appendix Directories (Leader Dots)
+TOC_LEADER_DOTS_REGEX = re.compile(
+    r"(?:(?:\.\s+){4,}\.|\.{5,}|(?:^|\n)\s*(?:APPENDIX\s*CONTENTS|TABLE\s*OF\s*CONTENTS)\b)",
     re.IGNORECASE,
 )
 
@@ -74,24 +106,29 @@ DOI_REGEX = re.compile(r"\b(?:doi(?::|\.org/)|10\.\d{4,9}/[-._;()/:A-Za-z0-9]+)\
 ARXIV_ID_REGEX = re.compile(r"\barXiv:\d{4}\.\d{4,5}(?:v\d+)?\b", re.IGNORECASE)
 URL_COUNT_REGEX = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 VENUE_REGEX = re.compile(
-    r"\b(?:"
-    r"In\s*Proceedings\s+of|In\s*Advances\s+in|Conference\s+on|Symposium\s+on|"
-    r"IEEE\s+Transactions|ACM\s+Transactions|arXiv\s+preprint|"
-    r"NeurIPS|ICML|ICLR|CVPR|ECCV|ICCV|ACL|EMNLP|NAACL|KDD|AAAI|SIGIR|IJCAI|"
-    r"vol\.\s*\d+|no\.\s*\d+|pp\.\s*\d+--\d+|pages\s+\d+--\d+"
-    r")\b",
+    r"(?:\b(?:"
+    r"In\s*Proceedings\s+of|In\s*Proceedings|Proceedings\s+of|In\s*Findings\s+of|In\s*Advances\s+in|"
+    r"Conference\s+on|Symposium\s+on|IEEE\s+Transactions|ACM\s+Transactions|"
+    r"Transactions\s+on\s+Machine\s+Learning\s+Research|Journal\s+of\s+[A-Z][a-z]+|"
+    r"Association\s+for\s+Computational\s+Linguistics|arXiv\s+preprint|"
+    r"NeurIPS|ICML|ICLR|CVPR|ECCV|ICCV|ACL|EMNLP|NAACL|KDD|AAAI|SIGIR|IJCAI|PMLR|JMLR|"
+    r"MIT\s+Press|Oxford\s+University\s+Press|Curran\s+Associates|OpenReview\.net|"
+    r"ISSN\s+\d{4}-\d{4}|ISBN\s+[\d\-]+|"
+    r"vol\.\s*\d+|volume\s+\d+|no\.\s*\d+|pp\.\s*\d+[–\-—]+\d+|pages\s+\d+[–\-—]+\d+"
+    r")\b|"
+    r"https?://(?:arxiv\.org|openreview\.net|aclanthology\.org|doi\.org|proceedings\.mlr\.press|proceedings\.iclr\.cc)|\b\d+\(\d+\):\d+[–\-—]+\d+)",
     re.IGNORECASE,
 )
 SHORT_REF_KEYWORD_REGEX = re.compile(
-    r"\b(?:In\s*Proceedings|arXiv(?:\s+preprint)?|doi(?::|\.org/)|eds?\.|vol\.\s*\d+|pp\.\s*\d+--\d+|pages\s+\d+--\d+|URL\s*https?://)\b",
+    r"\b(?:In\s*Proceedings|arXiv(?:\s+preprint)?|doi(?::|\.org/)|eds?\.|vol\.\s*\d+|pp\.\s*\d+[–\-—]+\d+|pages\s+\d+[–\-—]+\d+|URL\s*https?://)\b",
     re.IGNORECASE,
 )
 BIB_ENTRY_LINE_REGEX = re.compile(
-    r"^[ \t]*(?:\[\d{1,3}\]|[A-Z][a-zA-Z\-]+,\s+[A-Z]\.|\b(?:et\s+al\.|ed\.|eds\.)\b)",
+    r"^[ \t]*(?:\[\d{1,3}\]|\d{1,3}\.\s+[A-Z]|[A-Z][a-zA-Z´'\-]+,\s+[A-Z]\.|\b(?:et\s+al\.|ed\.|eds\.)\b)",
     re.MULTILINE,
 )
 
-# Technical Boilerplate & Licenses
+# Technical Boilerplate, Title/Affiliation Blocks & Licenses
 CODE_HEADER_BOILERPLATE_REGEX = re.compile(
     r"(?:#include\s+<[a-z0-9_./]+>|#define\s+[A-Z0-9_]+|#ifndef\s+[A-Z0-9_]+|#endif)",
     re.IGNORECASE,
@@ -104,11 +141,35 @@ WEB_SCRAPE_NOISE_REGEX = re.compile(
     r"(?:Posted\s+by\s*[:\w]+|Reply\s+with\s+quote|Join\s+Date\s*:\s*\w+|Posts\s*:\s*\d+|Location\s*:\s*\w+)",
     re.IGNORECASE,
 )
+TITLE_AFFILIATION_HEADER_REGEX = re.compile(
+    r"(?:\bCorrespondence\s+to:|\b1\s*[A-Z][a-zA-Z\s,]+(?:University|Institute|Center|College|Laboratory)\b)",
+    re.IGNORECASE,
+)
+
+# Dataset Stimulus, Verbatim Prompt Templates, Chat Wrappers & JSON Schemas
 SURVEY_QUESTION_REGEX = re.compile(
     r"(?:(?:Question|Item)\s+\d+[:.]|\bOption\s+[A-D][:.]|\b[A-D]\)\s+[A-Z]|\bLikert\s+scale\b)",
     re.IGNORECASE,
 )
 TOKENIZER_NOISE_REGEX = re.compile(r"@-@|@\.@|<unk>", re.IGNORECASE)
+PROMPT_TEMPLATE_SCHEMA_REGEX = re.compile(
+    r"(?:^<\|im_start\|>|<\|im_start\|>[\s\S]*?<\|im_end\|>|<curr_prompt>|\"zero_overlap_verified\":\s*true|"
+    r"\binstruction\s*:\s*\.\.\.\.?,?\s*output\s*:\s*\.\.\.)",
+    re.IGNORECASE,
+)
+
+# Standalone Captions & Short Cross-Reference Signposts
+STANDALONE_CAPTION_REGEX = re.compile(
+    r"^\([a-d]\)\s+[A-Z].*?\([b-e]\)\s+[A-Z]",
+    re.IGNORECASE | re.DOTALL,
+)
+CROSS_REF_SIGNPOST_REGEX = re.compile(
+    r"(?:\bAll\s+proofs\s+are\s+provided\s+in\s+Appendix\b|"
+    r"\bPlot\s+conventions\s+appear\s+in\s+Appendix\b|"
+    r"\bTables?\s+\d+[–\-—]?\d*\s+list\s+the\b.*?\bbehind\s+Figures?\b|"
+    r"\b(?:are\s+provided\s+in|appear\s+in|can\s+be\s+found\s+in)\s+Appendix\s+[A-Z0-9.\-]+)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 # ==============================================================================
@@ -148,11 +209,25 @@ def extract_chunk_text_and_titles(chunk: Any) -> Tuple[str, str, str, str]:
     return text, sec, ch, crumb
 
 
+# Pre-screening patterns for URL query strings and currency amounts before formula detection
+_URL_STRIP_REGEX = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_CURRENCY_STRIP_REGEX = re.compile(
+    r"(?<!\\)\$\d+(?:,\d{3})*(?:\.\d+)?(?:\s*(?:million|billion|trillion|k|M|B)\b)?",
+    re.IGNORECASE,
+)
+
+
 def has_mathematical_formula(text: str) -> bool:
-    """Detect whether text contains mathematical equations or derivations."""
+    """
+    Detect whether text contains mathematical equations or derivations.
+    Pre-strips URLs (e.g. openreview.net/forum?id=...) and currency amounts ($0.10, $1)
+    to prevent URL query parameters or dollar prices from triggering false formula matches.
+    """
     if not text:
         return False
-    return bool(FORMULA_REGEX.search(text))
+    cleaned = _URL_STRIP_REGEX.sub(" ", text)
+    cleaned = _CURRENCY_STRIP_REGEX.sub(" ", cleaned)
+    return bool(FORMULA_REGEX.search(cleaned))
 
 
 # ==============================================================================
@@ -204,7 +279,19 @@ class FormulaDetectionFilter(BaseChunkFilter):
             if is_formula:
                 set_chunk_attr(chunk, "has_formula", True)
         else:
-            is_formula = True
+            # Re-verify if existing was set from raw URL/currency false positive
+            is_formula = has_mathematical_formula(text) if text else True
+            set_chunk_attr(chunk, "has_formula", is_formula)
+
+        if is_formula and text:
+            # Guard: if the only formula match is a weak symbol (e.g. prime ′, ∼, ×) inside a pure bibliography slice,
+            # do not shield it from BibliographicFilter
+            cleaned = _CURRENCY_STRIP_REGEX.sub(" ", _URL_STRIP_REGEX.sub(" ", text))
+            matches = [m.strip() for m in FORMULA_REGEX.findall(cleaned)]
+            if matches and all(m in ("′", "″", "∼", "×", "⋅", "°", "…") for m in matches):
+                if BibliographicFilter().verify(chunk) == FilterDecision.SKIP:
+                    is_formula = False
+                    set_chunk_attr(chunk, "has_formula", False)
 
         if is_formula and self.retain_on_formula:
             return FilterDecision.RETAIN
@@ -223,7 +310,11 @@ class EmptyChunkFilter(BaseChunkFilter):
 
 
 class ReferenceSectionFilter(BaseChunkFilter):
-    """Rejects chunks originating from reference, bibliography, or acknowledgment sections."""
+    """
+    Rejects chunks originating from reference, bibliography, acknowledgment,
+    governance (AI disclosure, reproducibility, ethics, funding, checklists),
+    or table-of-contents directory sections.
+    """
     name: str = "ref_sections"
 
     def verify(self, chunk: Any) -> FilterDecision:
@@ -237,6 +328,15 @@ class ReferenceSectionFilter(BaseChunkFilter):
         if REFERENCE_SECTION_TITLE_REGEX.match(first_line):
             return FilterDecision.SKIP
 
+        # Table of Contents & Appendix Directories with leader dots (. . . . 24)
+        if TOC_LEADER_DOTS_REGEX.search(text) and len(text) < 900:
+            return FilterDecision.SKIP
+
+        # Governance, AI Use, Reproducibility, Ethics, Funding & Conference Checklists (strictly short blocks)
+        if GOVERNANCE_ETHICS_FUNDING_REGEX.search(text.strip()) and len(text) < 320:
+            if not PROSE_GUARD_REGEX.search(text):
+                return FilterDecision.SKIP
+
         return FilterDecision.CONTINUE
 
 
@@ -249,6 +349,7 @@ class BibliographicFilter(BaseChunkFilter):
         if not text:
             return FilterDecision.SKIP
 
+        t_len = len(text)
         lines = [l.strip() for l in text.split("\n") if l.strip()]
         bracket_cites = len(CITATION_BRACKET_REGEX.findall(text))
         dois = len(DOI_REGEX.findall(text))
@@ -267,24 +368,56 @@ class BibliographicFilter(BaseChunkFilter):
             return FilterDecision.SKIP
 
         # 3. Isolated single arXiv citation slice listing author names
-        if bool(re.search(r"arXiv:\d{4}\.\d{4,5}.*?[A-Z][a-z]+", text)) and len(lines) <= 3:
+        if bool(re.search(r"arXiv:\d{4}\.\d{4,5}.*?[A-Z][a-z]+", text, re.S)) and len(lines) <= 5:
             return FilterDecision.SKIP
 
         # 4. Isolated proceedings citation slice
-        if len(lines) <= 2 and bool(re.search(r"^(?:In\s*Proceedings|In\s*Advances|Proceedings\s+of)\b.*?pages\s+\d+--?\d+", text.strip(), re.I)):
+        if len(lines) <= 4 and bool(
+            re.search(r"^(?:In\s*Proceedings|In\s*Findings|In\s*Advances|Proceedings\s+of)\b.*?(?:pages|pp\.)\s*\d+[–\-—]+\d+", text.strip(), re.I | re.S)
+        ):
             return FilterDecision.SKIP
 
-        # 5. Pure author list fragment (comma-separated list of 4+ names in <= 2 lines with no sentences)
-        if len(lines) <= 2:
-            author_tokens = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z]\.|\s+[A-Z][a-z]+)?,", text)
-            if len(author_tokens) >= 4 and len(text) < 300:
+        # 5. Pure author list fragment (comma-separated list of 4+ names in <= 3 lines)
+        if len(lines) <= 3:
+            author_tokens = re.findall(r"\b[A-Z][a-zA-Z´'\-]+(?:\s+[A-Z]\.|\s+[A-Z][a-zA-Z´'\-]+)?,", text)
+            if len(author_tokens) >= 4 and t_len < 350:
                 return FilterDecision.SKIP
+
+        # 6. Inline References / Bibliography transition header followed by citations
+        if bool(re.search(r"(?:^|\n|\.\s+)(?:References|REFERENCES|Bibliography|BIBLIOGRAPHY)\s*\n", text)) and t_len < 650:
+            return FilterDecision.SKIP
+
+        # 7. High-precision pure author lists & venue/DOI citation tails without 'Concept: Subtitle' definitions
+        if not PROSE_GUARD_REGEX.search(text):
+            author_tokens = re.findall(r"\b[A-Z][a-zA-Z´'\-]+(?:\s+[A-Z]\.|\s+[A-Z][a-zA-Z´'\-]+)?,", text)
+            text_no_urls = re.sub(r"https?://\S+|doi:\s*\S+|arXiv:\s*\S+|\b\d+\(\d+\):\d+", "", text, flags=re.I)
+            if ":" not in text_no_urls and "?" not in text_no_urls and t_len < 280:
+                if len(lines) <= 4 and len(author_tokens) >= 5:
+                    return FilterDecision.SKIP
+                if t_len < 220 and bool(
+                    re.match(
+                        r"^(?:In\s*Proceedings|In\s*Findings|In\s*Advances|Proceedings\s+of|Association\s+for|Asso-\s*ciation\s+for|volume\s+\d+|vol\.\s*\d+|pages\s+\d+|pp\.\s*\d+|\d+\s*[–\-—]\s*\d+|doi:|URL\s*https?://)",
+                        text.strip(),
+                        re.I,
+                    )
+                ):
+                    return FilterDecision.SKIP
+                if (
+                    t_len < 250
+                    and (dois >= 1 or arxiv >= 1 or venues >= 1)
+                    and bool(re.search(r"\b(?:19|20)\d{2}[a-z]?\b", text))
+                    and (
+                        bool(re.search(r"(?:^\s*\[\d{1,3}\]|(?:^|\n)\s*\d{1,3}\.\s+[A-Z][a-zA-Z\-]+,\s*[A-Z]\.)", text))
+                        or len(author_tokens) >= 2
+                    )
+                ):
+                    return FilterDecision.SKIP
 
         return FilterDecision.CONTINUE
 
 
 class TechnicalBoilerplateFilter(BaseChunkFilter):
-    """Rejects pure C/C++ compilation headers and standalone license files."""
+    """Rejects pure C/C++ compilation headers, standalone license files, author affiliation blocks, and running page headers."""
     name: str = "tech_boiler"
 
     def verify(self, chunk: Any) -> FilterDecision:
@@ -292,22 +425,31 @@ class TechnicalBoilerplateFilter(BaseChunkFilter):
         if not text:
             return FilterDecision.SKIP
 
+        t_len = len(text)
         lines = [l.strip() for l in text.split("\n") if l.strip()]
         code_headers = len(CODE_HEADER_BOILERPLATE_REGEX.findall(text))
         if code_headers >= 3 and len(lines) <= code_headers + 3:
             return FilterDecision.SKIP
 
-        if bool(LICENSE_BOILERPLATE_REGEX.search(text)) and len(text) < 400:
+        if bool(LICENSE_BOILERPLATE_REGEX.search(text)) and t_len < 400:
             return FilterDecision.SKIP
 
         if bool(WEB_SCRAPE_NOISE_REGEX.search(text)) and len(lines) <= 5:
             return FilterDecision.SKIP
 
+        # Title / Author Affiliation Blocks (strictly short blocks without Abstract or conceptual claims)
+        if t_len < 300 and not re.search(r"\bAbstract\b", text, re.I) and not PROSE_GUARD_REGEX.search(text):
+            if bool(TITLE_AFFILIATION_HEADER_REGEX.search(text)):
+                return FilterDecision.SKIP
+
         return FilterDecision.CONTINUE
 
 
 class DatasetStimulusFilter(BaseChunkFilter):
-    """Rejects pure survey questionnaires when designated in section title or formatted as isolated question options."""
+    """
+    Rejects survey questionnaires, benchmark tokenizer noise, verbatim LLM prompt wrappers,
+    JSON agent config schemas, and dense VQA question dumps.
+    """
     name: str = "dataset_stim"
 
     def verify(self, chunk: Any) -> FilterDecision:
@@ -315,6 +457,7 @@ class DatasetStimulusFilter(BaseChunkFilter):
         if not text:
             return FilterDecision.SKIP
 
+        t_len = len(text)
         if bool(TOKENIZER_NOISE_REGEX.search(text)):
             return FilterDecision.SKIP
 
@@ -327,11 +470,19 @@ class DatasetStimulusFilter(BaseChunkFilter):
         if q_matches >= 1 and opt_matches >= 3 and len(lines) <= q_matches + opt_matches + 2:
             return FilterDecision.SKIP
 
+        # Verbatim LLM chat wrappers (<|im_start|>...<|im_end|>) and short JSON agent schemas
+        if t_len < 400 and not PROSE_GUARD_REGEX.search(text) and bool(PROMPT_TEMPLATE_SCHEMA_REGEX.search(text.strip())):
+            return FilterDecision.SKIP
+
+        # Dense VQA benchmark evaluation question lists (4+ question marks in a very short < 150 char fragment)
+        if text.count("?") >= 4 and t_len < 150 and not PROSE_GUARD_REGEX.search(text):
+            return FilterDecision.SKIP
+
         return FilterDecision.CONTINUE
 
 
 class DiagramOCRFilter(BaseChunkFilter):
-    """Rejects genuine OCR layout garbage while preserving tables, markdown, and algorithms."""
+    """Rejects genuine OCR layout garbage, checkmark benchmark matrices, and diagram step callout lists."""
     name: str = "diag_ocr"
 
     def verify(self, chunk: Any) -> FilterDecision:
@@ -342,6 +493,14 @@ class DiagramOCRFilter(BaseChunkFilter):
         # If chunk is verified to have mathematical formulas, do not drop
         if get_chunk_attr(chunk, "has_formula", False):
             return FilterDecision.CONTINUE
+
+        # Raw checkmark / cross benchmark comparison tables (e.g. × × × × ✓ ✓)
+        if bool(re.search(r"(?:[×✓✗✔✘]\s*){4,}", text)) and len(text) < 600:
+            return FilterDecision.SKIP
+
+        # Numbered diagram / exhibit step callout lists (01 Label ... 02 Label ... 03 Label ... 04 Label)
+        if bool(re.search(r"(?:^|\n)\s*01\s+[A-Z][a-z]+.*?\s+02\s+[A-Z][a-z]+.*?\s+03\s+[A-Z][a-z]+.*?\s+04\s+[A-Z][a-z]+", text, re.S)) and len(text) < 450:
+            return FilterDecision.SKIP
 
         lines = [l.strip() for l in text.split("\n") if l.strip()]
         if len(lines) >= 8:
@@ -357,6 +516,42 @@ class DiagramOCRFilter(BaseChunkFilter):
                 short_line_ratio = sum(1 for l in lines if len(l) <= 45) / len(lines)
                 if avg_len <= 22 and short_line_ratio >= 0.85:
                     return FilterDecision.SKIP
+
+        return FilterDecision.CONTINUE
+
+
+class CaptionAndSignpostFilter(BaseChunkFilter):
+    """
+    Rejects short standalone Figure/Table/Listing captions (< 140 chars without explanatory verbs),
+    subfigure labels ((a) ... (b) ... < 200 chars), and short cross-reference signpost chunks (< 160 chars)
+    that merely point to Appendices, Figures, or Tables without conceptual claims.
+    Executed before IdeaSimilarityFilter and ChunkSimilarityFilter.
+    """
+    name: str = "captions_signposts"
+
+    def verify(self, chunk: Any) -> FilterDecision:
+        text, _, _, _ = extract_chunk_text_and_titles(chunk)
+        if not text:
+            return FilterDecision.SKIP
+
+        if get_chunk_attr(chunk, "has_formula", False):
+            return FilterDecision.CONTINUE
+
+        t_len = len(text)
+
+        if t_len < 200 and not PROSE_GUARD_REGEX.search(text):
+            # 1. Subfigure label block ((a) ... (b) ...)
+            if bool(STANDALONE_CAPTION_REGEX.search(text.strip())):
+                return FilterDecision.SKIP
+
+            # 2. Short standalone Figure/Table/Listing caption without explanatory prose verbs
+            if t_len < 140 and bool(re.match(r"^(?:Figure|Fig\.|Table|Tab\.|Listing)\s*\d+[:.]", text.strip(), re.I)):
+                if not bool(re.search(r"\b(?:shows?|demonstrates?|illustrates?|compares?|presents?|reports?|reveals?|indicates?|outperforms?|achieves?|improves?)\b", text, re.I)):
+                    return FilterDecision.SKIP
+
+            # 3. Short Cross-Reference Pointers & Section Signposts
+            if t_len < 160 and bool(CROSS_REF_SIGNPOST_REGEX.search(text)):
+                return FilterDecision.SKIP
 
         return FilterDecision.CONTINUE
 
@@ -575,6 +770,7 @@ def format_filter_stats(stats: dict[str, int]) -> str:
         "formulas",
         "biblio",
         "diag_ocr",
+        "captions_signposts",
         "ref_sections",
         "tech_boiler",
         "dataset_stim",
@@ -595,10 +791,21 @@ def format_filter_stats(stats: dict[str, int]) -> str:
 
 def format_short_drop_stats(stats: dict[str, int]) -> str:
     """Format short dropped categories for progress display."""
-    order = ["biblio", "diag_ocr", "ref_sections", "tech_boiler", "dataset_stim", "empty", "limbo", "chunk_sim"]
+    order = [
+        "biblio",
+        "diag_ocr",
+        "captions_signposts",
+        "ref_sections",
+        "tech_boiler",
+        "dataset_stim",
+        "empty",
+        "limbo",
+        "chunk_sim",
+    ]
     short_names = {
         "biblio": "biblio",
         "diag_ocr": "diag_ocr",
+        "captions_signposts": "captions",
         "ref_sections": "ref",
         "tech_boiler": "tech",
         "dataset_stim": "dataset",
@@ -623,6 +830,7 @@ def build_chunk_filter_conveyor(
     skip_technical_boilerplate: bool = True,
     skip_dataset_stimulus: bool = True,
     skip_diagram_ocr: bool = True,
+    skip_captions_and_signposts: bool = True,
     skip_empty: bool = True,
     # Chunk similarity filter (hierarchical cover drop)
     enable_chunk_similarity: bool = False,
@@ -652,7 +860,7 @@ def build_chunk_filter_conveyor(
     if skip_empty:
         filters.append(EmptyChunkFilter())
 
-    # 3. High-level section references
+    # 3. High-level section references, governance, and TOC directories
     if skip_reference_sections:
         filters.append(ReferenceSectionFilter())
 
@@ -660,11 +868,11 @@ def build_chunk_filter_conveyor(
     if skip_bibliographic:
         filters.append(BibliographicFilter())
 
-    # 5. Technical code headers and software licenses
+    # 5. Technical code headers, software licenses, and affiliation headers
     if skip_technical_boilerplate:
         filters.append(TechnicalBoilerplateFilter())
 
-    # 6. Survey questions and dataset tokenizer noise
+    # 6. Survey questions, dataset tokenizer noise, and prompt wrappers
     if skip_dataset_stimulus:
         filters.append(DatasetStimulusFilter())
 
@@ -672,7 +880,11 @@ def build_chunk_filter_conveyor(
     if skip_diagram_ocr:
         filters.append(DiagramOCRFilter())
 
-    # 8. Idea similarity filter (Middle Priority: Semantic routing against graph ideas & limbo recovery)
+    # 8. Standalone figure/table captions and short cross-reference signposts (before similarity filters)
+    if skip_captions_and_signposts:
+        filters.append(CaptionAndSignpostFilter())
+
+    # 9. Idea similarity filter (Middle Priority: Semantic routing against graph ideas & limbo recovery)
     if enable_idea_similarity:
         filters.append(
             IdeaSimilarityFilter(
@@ -684,7 +896,7 @@ def build_chunk_filter_conveyor(
             )
         )
 
-    # 9. Chunk-to-chunk semantic redundancy filter (Least Priority: Hierarchical Cover intra-section pruning)
+    # 10. Chunk-to-chunk semantic redundancy filter (Least Priority: Hierarchical Cover intra-section pruning)
     if enable_chunk_similarity:
         filters.append(
             ChunkSimilarityFilter(

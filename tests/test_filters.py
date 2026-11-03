@@ -17,6 +17,7 @@ from bookeeper.processing.filters import (
     TechnicalBoilerplateFilter,
     DatasetStimulusFilter,
     DiagramOCRFilter,
+    CaptionAndSignpostFilter,
     EmptyChunkFilter,
     ChunkSimilarityFilter,
     IdeaSimilarityFilter,
@@ -319,7 +320,7 @@ def test_empty_conveyor_processes_all_chunks():
 
 def test_build_chunk_filter_conveyor_switchers():
     """Verify build_chunk_filter_conveyor respects on/off switches for each filter."""
-    # All enabled: 7 filters in conveyor
+    # All enabled: 8 filters in conveyor
     full_conv = build_chunk_filter_conveyor(
         enable_formula_detection=True,
         skip_empty=True,
@@ -328,15 +329,16 @@ def test_build_chunk_filter_conveyor_switchers():
         skip_technical_boilerplate=True,
         skip_dataset_stimulus=True,
         skip_diagram_ocr=True,
+        skip_captions_and_signposts=True,
     )
-    assert len(full_conv.filters) == 7
+    assert len(full_conv.filters) == 8
 
     # Disable formula detection and diagram ocr
     custom_conv = build_chunk_filter_conveyor(
         enable_formula_detection=False,
         skip_diagram_ocr=False,
     )
-    assert len(custom_conv.filters) == 5
+    assert len(custom_conv.filters) == 6
     assert not any(isinstance(f, FormulaDetectionFilter) for f in custom_conv.filters)
     assert not any(isinstance(f, DiagramOCRFilter) for f in custom_conv.filters)
 
@@ -349,6 +351,7 @@ def test_build_chunk_filter_conveyor_switchers():
         skip_technical_boilerplate=False,
         skip_dataset_stimulus=False,
         skip_diagram_ocr=False,
+        skip_captions_and_signposts=False,
     )
     assert len(none_conv.filters) == 0
 
@@ -796,6 +799,183 @@ def test_state_restoration_re_evaluates_against_active_conveyor():
     dec_math, cat_math = conv.verify_with_category(c_math)
     assert dec_math == FilterDecision.RETAIN
     assert cat_math == "formulas"
+
+
+def test_categories_1_to_8_zero_idea_optimizations():
+    """Verify Categories 1-8 structural filters and ensure they run before similarity filters."""
+    from bookeeper.config import Settings
+    from bookeeper.processing.hierarchical_cover import hierarchical_semantic_cover
+
+    conv = build_chunk_filter_conveyor()
+
+    # Category 1: Multi-line FirstName LastName bibliography & OpenReview/PMLR venues
+    c_bib_multiline = DummyChunk(
+        chunk_id="cat1_bib",
+        text=(
+            "Aaron Jaech, Adam Kalai, Adam Lerer, Adam Richardson, Ahmed El-Kishky, Aiden Low, Alec\n"
+            "Helyar, Aleksander Madry, Alex Beutel, Alex Carney, et al. Openai o1 system card. arXiv\n"
+            "preprint arXiv:2412.16720, 2024."
+        ),
+        section_title="Pages 11-12",
+    )
+    assert conv.verify_with_category(c_bib_multiline) == (FilterDecision.SKIP, "biblio")
+
+    # Category 2: False-positive math in URLs (?id=H...) and currency ($0.10)
+    url_bib_text = (
+        "Angeliki Lazaridou, Alexander Peysakhovich, and Marco Baroni. Multi-agent cooperation and the\n"
+        "emergence of (natural) language. In International Conference on Learning Representations, 2017.\n"
+        "URL https://openreview.net/forum?id=HyzdRiR9Y7."
+    )
+    assert has_mathematical_formula(url_bib_text) is False
+    c_url_bib = DummyChunk(chunk_id="cat2_url", text=url_bib_text, section_title="Pages 11-12")
+    assert conv.verify_with_category(c_url_bib) == (FilterDecision.SKIP, "biblio")
+
+    currency_text = "Each human annotator was paid $0.10 per HIT with a bonus of $1 for completing the survey."
+    assert has_mathematical_formula(currency_text) is False
+
+    # Category 3: Standalone captions, subfigure labels, and checkmark matrices
+    c_caption = DummyChunk(
+        chunk_id="cat3_cap",
+        text="Table 1: Performance comparison of baseline models across five benchmark datasets. Best results are in bold.",
+    )
+    assert conv.verify_with_category(c_caption) == (FilterDecision.SKIP, "captions_signposts")
+
+    c_subfig = DummyChunk(
+        chunk_id="cat3_subfig",
+        text="(a) Validation accuracy over training steps. (b) Token efficiency versus latency.",
+    )
+    assert conv.verify_with_category(c_subfig) == (FilterDecision.SKIP, "captions_signposts")
+
+    c_matrix = DummyChunk(
+        chunk_id="cat3_matrix",
+        text="Method A ✓ ✓ × × ✓ ×\nMethod B × ✓ ✓ × × ✓",
+    )
+    assert conv.verify_with_category(c_matrix) == (FilterDecision.SKIP, "diag_ocr")
+
+    # Category 4: Governance, AI disclosure, Reproducibility, Ethics, Funding, NeurIPS Checklist
+    c_ai_use = DummyChunk(
+        chunk_id="cat4_ai",
+        text="AI USE STATEMENT\nLarge language models were used strictly for grammar polishing and formatting.",
+        section_title="Pages 9-10",
+    )
+    assert conv.verify_with_category(c_ai_use) == (FilterDecision.SKIP, "ref_sections")
+
+    c_checklist = DummyChunk(
+        chunk_id="cat4_checklist",
+        text="Question: Do the main claims made in the abstract and introduction accurately reflect the paper's contributions?\nAnswer: [Yes]\nJustification: See Section 3 and Section 4.",
+        section_title="Pages 15-16",
+    )
+    assert conv.verify_with_category(c_checklist) == (FilterDecision.SKIP, "ref_sections")
+
+    # Category 5: Prompt wrappers, JSON agent schemas, VQA question dumps
+    c_prompt = DummyChunk(
+        chunk_id="cat5_prompt",
+        text="<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nSolve the task.",
+    )
+    assert conv.verify_with_category(c_prompt) == (FilterDecision.SKIP, "dataset_stim")
+
+    c_questions = DummyChunk(
+        chunk_id="cat5_qdump",
+        text="What color is the car? Where is the dog standing? How many people are visible in the background? Is it raining?",
+    )
+    assert conv.verify_with_category(c_questions) == (FilterDecision.SKIP, "dataset_stim")
+
+    # Category 6: Title/Affiliation blocks and running headers
+    c_affil = DummyChunk(
+        chunk_id="cat6_affil",
+        text="1Department of Computer Science, Stanford University, USA 2Google DeepMind\nCorrespondence to: Jane Doe <janedoe@stanford.edu>.",
+    )
+    assert conv.verify_with_category(c_affil) == (FilterDecision.SKIP, "tech_boiler")
+
+    # Category 7: Short cross-reference signposts
+    c_signpost = DummyChunk(
+        chunk_id="cat7_signpost",
+        text="Full experimental hyperparameters, ablation tables, and implementation details are provided in Appendix B.2.",
+    )
+    assert conv.verify_with_category(c_signpost) == (FilterDecision.SKIP, "captions_signposts")
+
+    # Category 8: Table of contents leader dots
+    c_toc = DummyChunk(
+        chunk_id="cat8_toc",
+        text="APPENDIX CONTENTS\nA Experimental Setup . . . . . . . . . . . . . . . . 14\nB Additional Results . . . . . . . . . . . . . . . . 18",
+        section_title="Pages 13-14",
+    )
+    assert conv.verify_with_category(c_toc) == (FilterDecision.SKIP, "ref_sections")
+
+    # Verify ordering: all structural filters (including CaptionAndSignpostFilter) precede IdeaSimilarityFilter & ChunkSimilarityFilter
+    cfg = Settings(
+        filter={
+            "enabled": True,
+            "captions_and_signposts": True,
+            "idea_similarity": {"enabled": True},
+            "chunk_similarity": {"enabled": True},
+        }
+    )
+    full_conveyor = cfg.get_chunk_filter_conveyor(include_idea_similarity=True, include_chunk_similarity=True)
+    names = [getattr(f, "name", "") for f in full_conveyor.filters]
+    assert "captions_signposts" in names
+    assert names.index("captions_signposts") < names.index("limbo")
+    assert names.index("limbo") < names.index("chunk_sim")
+
+    # Verify stateful document-order reference zone across "Pages X-Y" with Appendix exit
+    doc_chunks = [
+        DummyChunk("d1", "We conclude our study with future directions.\nReferences\n[1] First Ref, 2020.", section_title="Pages 9-10"),
+        DummyChunk("d2", "Unnumbered multi-line reference entry without obvious venue token on page 11.", section_title="Pages 11-12"),
+        DummyChunk("d3", "Appendix A. Proof of Theorem 1\nHere we prove the main convergence result in detail.", section_title="Pages 13-14"),
+    ]
+    for idx, ch in enumerate(doc_chunks):
+        ch.chapter_idx = idx + 1
+        ch.embedding = [1.0, 0.0]
+
+    selected, skipped, decisions = hierarchical_semantic_cover(
+        chunks=doc_chunks,
+        skip_references=True,
+        enable_chunk_similarity=False,
+        filter_conveyor=conv,
+    )
+    dec_map = {d.chunk.chunk_id: d.status for d in decisions}
+    # d1 contains prose before "References", d2 is inside reference zone (skipped), d3 exits reference zone at Appendix A
+    assert dec_map["d2"] == "skipped_reference"
+    assert dec_map["d3"] == "selected_anchor"
+
+
+def test_chunk_node_filter_state_and_verifier_metrics():
+    """Verify that filter_state ('skip', 'retain', 'continue') on Chunk nodes is correctly queried by KG verifier."""
+    from bookeeper.graph.store import ConceptGraphStore
+    from bookeeper.processing.graph_evaluator import get_chunk_filter_states, get_parent_chunk_ids
+
+    store = ConceptGraphStore()
+    c_skip = DummyChunk("c_skip", "Bibliographic reference chunk")
+    c_retain = DummyChunk("c_retain", "Mathematical theorem equation chunk")
+    c_continue = DummyChunk("c_continue", "Prose concept chunk extracted")
+
+    store.add_chunk(c_skip, filter_state="skip")
+    store.add_chunk(c_retain, filter_state="retain")
+    store.add_chunk(c_continue, filter_state="continue")
+
+    # Check node attributes directly in store
+    node_skip = store.graph.nodes["chunk:c_skip"]
+    node_retain = store.graph.nodes["chunk:c_retain"]
+    node_continue = store.graph.nodes["chunk:c_continue"]
+
+    assert node_skip.get("filter_state") == "skip"
+    assert node_retain.get("filter_state") == "retain"
+    assert node_continue.get("filter_state") == "continue"
+
+    # Verify get_chunk_filter_states
+    fstates = get_chunk_filter_states(store)
+    assert fstates["c_skip"] == "skip"
+    assert fstates["c_retain"] == "retain"
+    assert fstates["c_continue"] == "continue"
+
+    # Verify get_parent_chunk_ids uses filter_state:
+    # parent chunks are retain + continue, while skip is excluded
+    parents = get_parent_chunk_ids(store)
+    assert "c_retain" in parents
+    assert "c_continue" in parents
+    assert "c_skip" not in parents
+
+
 
 
 

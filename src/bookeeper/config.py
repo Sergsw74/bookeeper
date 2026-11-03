@@ -5,8 +5,9 @@ Configuration management for bookeeper using pydantic-settings.
 import logging
 import re
 from functools import lru_cache
+import os
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -613,6 +614,10 @@ class FilterConfig(BaseModel):
         default=True,
         description="Filter out diagram OCR fragments and visual table scraps.",
     )
+    captions_and_signposts: bool = Field(
+        default=True,
+        description="Filter out standalone figure/table captions, subfigure labels, and short cross-reference signposts.",
+    )
 
 
 class Settings(BaseSettings):
@@ -678,6 +683,7 @@ class Settings(BaseSettings):
                 "filter_technical_boilerplate": "technical_boilerplate",
                 "filter_dataset_stimulus": "dataset_stimulus",
                 "filter_diagram_ocr": "diagram_ocr",
+                "filter_captions_and_signposts": "captions_and_signposts",
             }
             filter_dict = dict(data.get("filter") or {})
             for flat_k, sub_k in flat_to_filter.items():
@@ -1168,6 +1174,10 @@ class Settings(BaseSettings):
         default=True,
         description="Filter out diagram OCR fragments and visual table scraps.",
     )
+    filter_captions_and_signposts: bool = Field(
+        default=True,
+        description="Filter out standalone figure/table captions, subfigure labels, and short cross-reference signposts.",
+    )
     filter_detect_formulas: bool = Field(
         default=True,
         description="Detect mathematical formulas in chunks and set has_formula flag.",
@@ -1196,6 +1206,7 @@ class Settings(BaseSettings):
             skip_technical_boilerplate=self.filter.technical_boilerplate,
             skip_dataset_stimulus=self.filter.dataset_stimulus,
             skip_diagram_ocr=self.filter.diagram_ocr,
+            skip_captions_and_signposts=self.filter.captions_and_signposts,
             enable_chunk_similarity=include_chunk_similarity and self.filter.chunk_similarity.enabled,
             chunk_similarity_threshold=self.filter.chunk_similarity.threshold,
             chunk_window_size=self.filter.chunk_similarity.window_size,
@@ -1392,6 +1403,7 @@ class Settings(BaseSettings):
             self.filter_technical_boilerplate = False
             self.filter_dataset_stimulus = False
             self.filter_diagram_ocr = False
+            self.filter_captions_and_signposts = False
             self.enable_hierarchical_cover = False
             self.skip_limbo_chunks = False
             self.filter.chunk_similarity.enabled = False
@@ -1409,6 +1421,7 @@ class Settings(BaseSettings):
             self.filter_technical_boilerplate = self.filter.technical_boilerplate
             self.filter_dataset_stimulus = self.filter.dataset_stimulus
             self.filter_diagram_ocr = self.filter.diagram_ocr
+            self.filter_captions_and_signposts = self.filter.captions_and_signposts
 
             # Synchronize chunk_similarity
             self.enable_hierarchical_cover = self.filter.chunk_similarity.enabled
@@ -1489,23 +1502,27 @@ class Settings(BaseSettings):
         path_str = self.calibre_library_path.strip().lower()
         return path_str.startswith("http://") or path_str.startswith("https://")
 
+    @staticmethod
+    def deep_merge_dicts(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+        """Deep merge overlay dictionary on top of base dictionary, recursively overwriting values."""
+        return deep_merge_dicts(base, overlay)
+
     @classmethod
-    def from_yaml(cls, path: Path | str) -> "Settings":
-        """Load settings from a YAML file with path expansion."""
-        resolved = Path(path).expanduser().resolve()
-        if not resolved.is_file():
-            raise FileNotFoundError(f"Config file not found at {resolved}")
-
-        with open(resolved, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-
+    def from_dict(cls, data: Dict[str, Any]) -> "Settings":
+        """Construct Settings from a configuration dictionary (handling nested or flat YAML keys)."""
         # Handle nested or flat YAML
-        flat_data = {}
+        flat_data: Dict[str, Any] = {}
         for key, val in data.items():
             if key == "neo4j" and isinstance(val, dict):
                 flat_data["neo4j"] = val
             elif key in ("filter", "filters") and isinstance(val, dict):
                 flat_data["filter"] = val
+            elif key in ("chunk_similarity", "idea_similarity") and isinstance(val, dict):
+                filter_dict = flat_data.get("filter", {})
+                if not isinstance(filter_dict, dict):
+                    filter_dict = {}
+                filter_dict[key] = val
+                flat_data["filter"] = filter_dict
             elif key == "recent_ideas" and isinstance(val, dict):
                 flat_data["recent_ideas"] = val
             elif key == "verification" and isinstance(val, dict):
@@ -1543,25 +1560,181 @@ class Settings(BaseSettings):
 
         return cls(**flat_data)
 
+    @classmethod
+    def from_yaml(
+        cls,
+        path: Path | str,
+        config_diff: Optional[Path | str | Dict[str, Any]] = None,
+    ) -> "Settings":
+        """Load settings from a YAML file with path expansion and optional diff overlay."""
+        data = _load_yaml_dict(path, label="Config")
+        if config_diff is not None:
+            diff_data = _load_yaml_dict(config_diff, label="Config diff")
+            data = deep_merge_dicts(data, diff_data)
+        return cls.from_dict(data)
+
+
+_ACTIVE_CONFIG_DIFF: Optional[str] = None
+
+
+def set_active_config_diff(config_diff: Optional[str]) -> None:
+    """Set or clear the active CLI config diff path for fallback resolution in get_settings()."""
+    global _ACTIVE_CONFIG_DIFF
+    _ACTIVE_CONFIG_DIFF = str(config_diff) if config_diff else None
+
+
+def get_active_config_diff() -> Optional[str]:
+    """Return the active CLI config diff path if set."""
+    return _ACTIVE_CONFIG_DIFF
+
+
+def _load_yaml_dict(source: Path | str | Dict[str, Any], label: str = "Config") -> Dict[str, Any]:
+    """Load a YAML configuration dictionary from a file path or return a copy of a dict."""
+    if isinstance(source, dict):
+        return dict(source)
+    resolved = Path(source).expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"{label} file not found at {resolved}")
+    with open(resolved, "r", encoding="utf-8") as f:
+        loaded = yaml.safe_load(f) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{label} file at {resolved} must contain a YAML mapping (got {type(loaded).__name__}).")
+    return loaded
+
+
+def deep_merge_dicts(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Deep merge overlay dictionary on top of base dictionary, recursively overwriting values.
+    Canonicalizes section aliases ('filters' -> 'filter', 'idea_postprocessor' -> 'dual_pass',
+    'token_pricing' -> 'pricing') and synchronizes flat/nested filter overrides.
+    """
+    alias_map = {
+        "filters": "filter",
+        "idea_postprocessor": "dual_pass",
+        "token_pricing": "pricing",
+    }
+    merged: Dict[str, Any] = {}
+    for k, v in base.items():
+        ck = alias_map.get(k, k)
+        if ck in merged and isinstance(merged[ck], dict) and isinstance(v, dict):
+            merged[ck] = deep_merge_dicts(merged[ck], v)
+        else:
+            merged[ck] = dict(v) if isinstance(v, dict) else v
+
+    for key, val in overlay.items():
+        ck = alias_map.get(key, key)
+        if ck in merged and isinstance(merged[ck], dict) and isinstance(val, dict):
+            merged[ck] = deep_merge_dicts(merged[ck], val)
+        else:
+            merged[ck] = dict(val) if isinstance(val, dict) else val
+
+    # Synchronize flat <-> nested filter overrides when overlay modifies one form
+    overlay_filter = overlay.get("filter") or overlay.get("filters")
+    if isinstance(overlay_filter, dict):
+        flat_to_filter = {
+            "skip_references_sections": "skip_references_sections",
+            "filter_detect_formulas": "detect_formulas",
+            "filter_retain_formulas": "retain_formulas",
+            "retain_formulas": "retain_formulas",
+            "retain_on_formula": "retain_formulas",
+            "filter_reference_sections": "reference_sections",
+            "filter_bibliographic": "bibliographic",
+            "filter_technical_boilerplate": "technical_boilerplate",
+            "filter_dataset_stimulus": "dataset_stimulus",
+            "filter_diagram_ocr": "diagram_ocr",
+            "filter_captions_and_signposts": "captions_and_signposts",
+        }
+        for flat_k, sub_k in flat_to_filter.items():
+            if sub_k in overlay_filter and flat_k in merged and flat_k not in overlay:
+                merged[flat_k] = overlay_filter[sub_k]
+
+        cs_over = overlay_filter.get("chunk_similarity")
+        if isinstance(cs_over, dict):
+            cs_flat_map = {
+                "enable_hierarchical_cover": "enabled",
+                "cover_similarity_threshold": "threshold",
+                "cover_window_size": "window_size",
+                "cover_min_section_chunks": "min_section_chunks",
+            }
+            for flat_k, sub_k in cs_flat_map.items():
+                if sub_k in cs_over and flat_k in merged and flat_k not in overlay:
+                    merged[flat_k] = cs_over[sub_k]
+
+        is_over = overlay_filter.get("idea_similarity")
+        if isinstance(is_over, dict):
+            is_flat_map = {
+                "similarity_unassigned_threshold": "unassigned_threshold",
+                "similarity_high_confidence_threshold": "high_confidence_threshold",
+                "skip_limbo_chunks": "skip_limbo_chunks",
+                "max_batch_chunk_size": "max_batch_chunk_size",
+            }
+            for flat_k, sub_k in is_flat_map.items():
+                if sub_k in is_over and flat_k in merged and flat_k not in overlay:
+                    merged[flat_k] = is_over[sub_k]
+
+    # Conversely, if overlay sets legacy flat filter keys, propagate them into merged["filter"]
+    if "filter" in merged and isinstance(merged["filter"], dict):
+        f_merged = dict(merged["filter"])
+        cs_flat_map = {
+            "enable_hierarchical_cover": "enabled",
+            "cover_similarity_threshold": "threshold",
+            "cover_window_size": "window_size",
+            "cover_min_section_chunks": "min_section_chunks",
+        }
+        for flat_k, sub_k in cs_flat_map.items():
+            if flat_k in overlay:
+                cs_dict = dict(f_merged.get("chunk_similarity") or {})
+                cs_dict[sub_k] = overlay[flat_k]
+                f_merged["chunk_similarity"] = cs_dict
+
+        is_flat_map = {
+            "similarity_unassigned_threshold": "unassigned_threshold",
+            "similarity_high_confidence_threshold": "high_confidence_threshold",
+            "skip_limbo_chunks": "skip_limbo_chunks",
+            "max_batch_chunk_size": "max_batch_chunk_size",
+        }
+        for flat_k, sub_k in is_flat_map.items():
+            if flat_k in overlay:
+                is_dict = dict(f_merged.get("idea_similarity") or {})
+                is_dict[sub_k] = overlay[flat_k]
+                f_merged["idea_similarity"] = is_dict
+        merged["filter"] = f_merged
+
+    return merged
+
 
 @lru_cache()
-def get_settings(config_path: Optional[str] = None) -> Settings:
-    """
-    Retrieve application settings. Checks:
-    1. Explicit config_path if provided
-    2. ./config.yaml
-    3. ~/.config/bookeeper/config.yaml
-    4. Default settings with env vars
-    """
+def _cached_get_settings(
+    config_path: Optional[str] = None,
+    config_diff: Optional[str] = None,
+) -> Settings:
     candidates = []
     if config_path:
         candidates.append(Path(config_path).expanduser())
     candidates.extend(
         [
             Path("config.yaml"),
+            Path("config.yml"),
             Path("~/.config/bookeeper/config.yaml").expanduser(),
         ]
     )
+
+    base_file: Optional[Path] = None
+    for p in candidates:
+        if p.is_file():
+            base_file = p
+            break
+
+    if config_diff:
+        diff_data = _load_yaml_dict(config_diff, label="Config diff")
+        base_data: Dict[str, Any] = {}
+        if base_file is not None:
+            try:
+                base_data = _load_yaml_dict(base_file, label="Config")
+            except Exception as e:
+                logger.warning(f"Could not load base configuration from '{base_file}': {e}. Applying diff onto defaults.")
+        merged_data = deep_merge_dicts(base_data, diff_data)
+        return Settings.from_dict(merged_data)
 
     for p in candidates:
         if p.is_file():
@@ -1571,3 +1744,26 @@ def get_settings(config_path: Optional[str] = None) -> Settings:
                 logger.warning(f"Could not load configuration from '{p}': {e}. Using default settings or next candidate.")
 
     return Settings()
+
+
+def get_settings(
+    config_path: Optional[str] = None,
+    config_diff: Optional[str] = None,
+) -> Settings:
+    """
+    Retrieve application settings. Checks:
+    1. Explicit config_path if provided
+    2. ./config.yaml (or ./config.yml)
+    3. ~/.config/bookeeper/config.yaml
+    4. Default settings with env vars
+    If config_diff (or BOOKEEPER_CONFIG_DIFF / active CLI --config-diff) is provided,
+    deep-merges the diff YAML on top of the resolved base configuration.
+    """
+    effective_diff = config_diff or _ACTIVE_CONFIG_DIFF or os.environ.get("BOOKEEPER_CONFIG_DIFF") or None
+    return _cached_get_settings(
+        str(config_path) if config_path else None,
+        str(effective_diff) if effective_diff else None,
+    )
+
+
+get_settings.cache_clear = _cached_get_settings.cache_clear  # type: ignore[attr-defined]

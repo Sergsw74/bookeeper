@@ -35,7 +35,19 @@ RUN uv sync --frozen --no-dev --no-install-project
 # Copy application source code
 COPY src ./src
 COPY archive_downloader/src ./archive_downloader/src
+COPY scripts/stamp_version.py ./scripts/stamp_version.py
 COPY config.yaml ./config.yaml.default
+
+# Build arguments for automatic versioning and release date stamping
+ARG APP_VERSION=""
+ARG RELEASE_DATE=""
+
+# Automatically stamp build date and version into application files at Docker build time
+RUN python3 scripts/stamp_version.py --version "${APP_VERSION}" --date "${RELEASE_DATE}"
+
+# Set runtime default environment variables
+ENV BOOKEEPER_VERSION="${APP_VERSION}" \
+    BOOKEEPER_RELEASE_DATE="${RELEASE_DATE}"
 
 # Install the workspace packages into the virtual environment
 RUN uv sync --frozen --no-dev

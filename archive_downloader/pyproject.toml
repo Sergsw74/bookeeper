@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "archive-downloader"
-version = "0.1.0"
+version = "0.1.1"
 description = "Automated arXiv and scientific article downloader with pagination, indexing, deduplication, and Calibre-compatible metadata."
 readme = "README.md"
 requires-python = ">=3.10"

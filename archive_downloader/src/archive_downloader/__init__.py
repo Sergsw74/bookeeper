@@ -2,7 +2,7 @@
 Archive Downloader - Automated arXiv & scientific paper crawler with indexing, deduplication, and Calibre metadata.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from archive_downloader.models import ArticleMetadata, DownloadStats, IndexEntry
 from archive_downloader.indexer import DownloadIndex

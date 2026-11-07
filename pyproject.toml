@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bookeeper"
-version = "0.1.0"
+version = "0.1.1"
 description = "Calibre library ingester, LLM metadata normalizer, and concept knowledge graph extractor using local Ollama."
 readme = "README.md"
 authors = [

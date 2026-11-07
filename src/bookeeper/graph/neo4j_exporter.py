@@ -3,16 +3,21 @@ Neo4j Graph Database Exporter for Concept Knowledge Graph.
 Performs high-throughput upsert (insert new, update existing) for nodes and relationships via Cypher.
 """
 
+import atexit
 import hashlib
 import json
 import logging
 import os
+import platform
 import re
+import socket
+import subprocess
 import time
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
+from urllib.parse import urlparse
 
 try:
     from rich.console import Console
@@ -43,6 +48,73 @@ from bookeeper.graph.embedding_codec import get_node_embedding
 from bookeeper.graph.store import ConceptGraphStore
 
 logger = logging.getLogger(__name__)
+
+_ACTIVE_BRIDGES: set[subprocess.Popen] = set()
+
+
+def _cleanup_all_bridges():
+    for p in list(_ACTIVE_BRIDGES):
+        try:
+            if p.poll() is None:
+                p.terminate()
+                p.wait(timeout=1.0)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+    _ACTIVE_BRIDGES.clear()
+
+
+atexit.register(_cleanup_all_bridges)
+
+_MACOS_BRIDGE_SCRIPT = """
+import socket, sys, threading
+
+def fwd(src, dst):
+    try:
+        while True:
+            buf = src.recv(65536)
+            if not buf:
+                break
+            dst.sendall(buf)
+    except Exception:
+        pass
+    finally:
+        try:
+            src.close()
+        except Exception:
+            pass
+        try:
+            dst.close()
+        except Exception:
+            pass
+
+def main():
+    target_host = sys.argv[1]
+    target_port = int(sys.argv[2])
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(('127.0.0.1', 0))
+    local_port = server.getsockname()[1]
+    server.listen(64)
+    print(local_port, flush=True)
+
+    while True:
+        try:
+            client_sock, _ = server.accept()
+            remote_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            remote_sock.connect((target_host, target_port))
+            t1 = threading.Thread(target=fwd, args=(client_sock, remote_sock), daemon=True)
+            t2 = threading.Thread(target=fwd, args=(remote_sock, client_sock), daemon=True)
+            t1.start()
+            t2.start()
+        except Exception:
+            pass
+
+if __name__ == '__main__':
+    main()
+"""
 
 
 def sanitize_label(label: str) -> str:
@@ -127,6 +199,8 @@ class Neo4jExporter:
         self.clean_export = clean_export
         self.incremental_sync = incremental_sync
         self._driver = None
+        self._bridge_proc: Optional[subprocess.Popen] = None
+        self._bridge_uri: Optional[str] = None
         self._captured_search_indexes: list[dict[str, Any]] = []
 
     @classmethod
@@ -143,24 +217,112 @@ class Neo4jExporter:
             incremental_sync=getattr(config, "incremental_sync", True),
         )
 
+    @property
+    def effective_uri(self) -> str:
+        """Return the effective URI, using local loopback bridge if active."""
+        return self._bridge_uri or self.uri
+
+    def _ensure_macos_local_bridge(self):
+        """
+        Check if macOS Local Network Privacy blocks direct access to target host (Errno 65).
+        If so, proactively start a transparent loopback relay using /usr/bin/python3.
+        """
+        if platform.system() != "Darwin":
+            return
+        if self._bridge_proc is not None and self._bridge_proc.poll() is None:
+            return
+
+        try:
+            parsed = urlparse(self.uri)
+            host = parsed.hostname
+            port = parsed.port or 7687
+            if not host or host in ("127.0.0.1", "localhost", "::1"):
+                return
+
+            needs_bridge = False
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.3)
+                s.connect((host, port))
+                s.close()
+            except OSError as e:
+                if getattr(e, "errno", None) == 65 or "no route to host" in str(e).lower():
+                    needs_bridge = True
+
+            if needs_bridge:
+                self._start_macos_bridge(host, port)
+        except Exception as e:
+            logger.debug(f"macOS bridge check error: {e}")
+
+    def _start_macos_bridge(self, host: str, port: int):
+        """Start a local loopback relay on 127.0.0.1 forwarding to host:port via /usr/bin/python3."""
+        if not os.path.exists("/usr/bin/python3"):
+            return
+        if self._bridge_proc is not None and self._bridge_proc.poll() is None:
+            return
+
+        try:
+            proc = subprocess.Popen(
+                ["/usr/bin/python3", "-c", _MACOS_BRIDGE_SCRIPT, host, str(port)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            line = proc.stdout.readline().strip()
+            if not line:
+                return
+            local_port = int(line)
+            _ACTIVE_BRIDGES.add(proc)
+            self._bridge_proc = proc
+            parsed = urlparse(self.uri)
+            scheme = parsed.scheme or "bolt"
+            query = f"?{parsed.query}" if parsed.query else ""
+            self._bridge_uri = f"{scheme}://127.0.0.1:{local_port}{query}"
+            logger.info(
+                f"macOS Local Network Privacy bypass active: bridged {host}:{port} -> 127.0.0.1:{local_port}"
+            )
+        except Exception as e:
+            logger.warning(f"Could not start macOS local network bridge: {e}")
+
     def get_driver(self):
         """Get or create Neo4j driver instance."""
         if self._driver is None:
+            self._ensure_macos_local_bridge()
             self._driver = GraphDatabase.driver(
-                self.uri,
+                self.effective_uri,
                 auth=(self.user, self.password),
                 connection_timeout=self.connection_timeout,
             )
         return self._driver
 
     def close(self):
-        """Close Neo4j driver connection."""
+        """Close Neo4j driver connection and terminate any local network bridge."""
         if self._driver is not None:
             try:
                 self._driver.close()
             except Exception:
                 pass
             self._driver = None
+        if self._bridge_proc is not None:
+            _ACTIVE_BRIDGES.discard(self._bridge_proc)
+            try:
+                if self._bridge_proc.poll() is None:
+                    self._bridge_proc.terminate()
+                    self._bridge_proc.wait(timeout=1.0)
+            except Exception:
+                try:
+                    self._bridge_proc.kill()
+                except Exception:
+                    pass
+            self._bridge_proc = None
+            self._bridge_uri = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __enter__(self):
         return self
@@ -173,6 +335,8 @@ class Neo4jExporter:
         Verify driver connectivity to Neo4j database.
         Automatically falls back from neo4j:// routing protocol to bolt:// direct connection
         if the target is a standalone instance that does not support routing tables.
+        Also automatically establishes a loopback bridge on macOS if Local Network Privacy
+        blocks direct socket access (Errno 65 / No route to host).
         """
         driver = self.get_driver()
         try:
@@ -180,6 +344,36 @@ class Neo4jExporter:
             return True
         except Exception as e:
             err_msg = str(e).lower()
+
+            # 1. macOS Local Network Privacy restriction (Errno 65 / No route to host)
+            if (
+                platform.system() == "Darwin"
+                and self._bridge_proc is None
+                and ("65" in err_msg or "no route to host" in err_msg or "ehostunreach" in err_msg)
+            ):
+                try:
+                    parsed = urlparse(self.uri)
+                    host = parsed.hostname
+                    port = parsed.port or 7687
+                    if host and host not in ("127.0.0.1", "localhost", "::1"):
+                        logger.warning(
+                            f"Neo4j direct connection failed with macOS Local Network restriction ('{e}'). "
+                            f"Establishing automatic loopback bridge to {host}:{port}..."
+                        )
+                        self._start_macos_bridge(host, port)
+                        if self._driver is not None:
+                            try:
+                                self._driver.close()
+                            except Exception:
+                                pass
+                            self._driver = None
+                        driver = self.get_driver()
+                        driver.verify_connectivity()
+                        return True
+                except Exception as bridge_err:
+                    logger.debug(f"Failed to establish macOS bridge: {bridge_err}")
+
+            # 2. Neo4j routing failure on standalone instances
             routing_err = "routing" in err_msg or "unable to retrieve routing" in err_msg
             if routing_err:
                 fallback_scheme = None
@@ -199,8 +393,16 @@ class Neo4jExporter:
                         f"Neo4j routing failed ('{e}'). Standalone instance detected. "
                         f"Automatically switching protocol from '{self.uri}' to direct connection '{fallback_uri}'."
                     )
-                    self.close()
+                    if self._driver is not None:
+                        try:
+                            self._driver.close()
+                        except Exception:
+                            pass
+                        self._driver = None
                     self.uri = fallback_uri
+                    if self._bridge_uri is not None:
+                        parsed_b = urlparse(self._bridge_uri)
+                        self._bridge_uri = f"{fallback_scheme}{parsed_b.netloc}{parsed_b.path}"
                     driver = self.get_driver()
                     driver.verify_connectivity()
                     return True

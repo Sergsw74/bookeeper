@@ -416,6 +416,70 @@ def test_neo4j_routing_error_fallback_to_bolt():
         assert mock_bolt_driver.verify_connectivity.called
 
 
+def test_neo4j_macos_local_network_privacy_bridge_proactive():
+    """Verify that macOS Local Network Privacy restrictions caught during socket probe proactively launch loopback bridge."""
+    mock_socket = MagicMock()
+    mock_socket.connect.side_effect = OSError(65, "No route to host")
+
+    mock_driver = MagicMock()
+    mock_driver.verify_connectivity.return_value = None
+
+    with patch("bookeeper.graph.neo4j_exporter.platform.system", return_value="Darwin"), \
+         patch("bookeeper.graph.neo4j_exporter.os.path.exists", return_value=True), \
+         patch("bookeeper.graph.neo4j_exporter.socket.socket", return_value=mock_socket), \
+         patch("bookeeper.graph.neo4j_exporter.subprocess.Popen") as mock_popen, \
+         patch("bookeeper.graph.neo4j_exporter.GraphDatabase.driver", return_value=mock_driver) as mock_driver_factory:
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.stdout.readline.return_value = "59999\n"
+        mock_popen.return_value = mock_proc
+
+        exporter = Neo4jExporter(uri="bolt://192.168.50.20:7687")
+        assert exporter.verify_connectivity() is True
+        assert exporter.effective_uri == "bolt://127.0.0.1:59999"
+        assert exporter._bridge_proc is not None
+        mock_driver_factory.assert_called_with("bolt://127.0.0.1:59999", auth=("neo4j", "password"), connection_timeout=10.0)
+
+        exporter.close()
+        assert exporter._bridge_proc is None
+        mock_proc.terminate.assert_called_once()
+
+
+def test_neo4j_macos_local_network_privacy_bridge_reactive():
+    """Verify that macOS Local Network Privacy restrictions caught during verify_connectivity reactively launch loopback bridge."""
+    mock_socket = MagicMock()
+    mock_socket.connect.return_value = None  # Probe succeeded or was not triggered
+
+    mock_blocked_driver = MagicMock()
+    mock_blocked_driver.verify_connectivity.side_effect = OSError(65, "No route to host")
+
+    mock_bridged_driver = MagicMock()
+    mock_bridged_driver.verify_connectivity.return_value = None
+
+    drivers = [mock_blocked_driver, mock_bridged_driver]
+
+    with patch("bookeeper.graph.neo4j_exporter.platform.system", return_value="Darwin"), \
+         patch("bookeeper.graph.neo4j_exporter.os.path.exists", return_value=True), \
+         patch("bookeeper.graph.neo4j_exporter.socket.socket", return_value=mock_socket), \
+         patch("bookeeper.graph.neo4j_exporter.subprocess.Popen") as mock_popen, \
+         patch("bookeeper.graph.neo4j_exporter.GraphDatabase.driver", side_effect=drivers):
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.stdout.readline.return_value = "58888\n"
+        mock_popen.return_value = mock_proc
+
+        exporter = Neo4jExporter(uri="bolt://192.168.50.20:7687")
+        assert exporter.verify_connectivity() is True
+        assert exporter.effective_uri == "bolt://127.0.0.1:58888"
+        assert exporter._bridge_proc is not None
+
+        exporter.close()
+        assert exporter._bridge_proc is None
+        mock_proc.terminate.assert_called_once()
+
+
 def test_neo4j_search_index_suspension_and_bulk_recreation_during_export():
     """
     Verify that during export:

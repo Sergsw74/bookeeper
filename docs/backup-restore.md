@@ -85,6 +85,9 @@ Calculates a conceptual diff between current workspace artifacts and a baseline 
   - Blends the incremental archive into the target environment without wiping the existing knowledge base.
   - Merges graph nodes and edges: retains existing nodes, updates concept significance weights using `max(existing, incoming)`, preserves earliest historical occurrence dates (`min(date)`), and links new relationships.
   - Incrementally updates Neo4j via Cypher `MERGE` statements without clearing existing data or dropping vector indexes.
+* **Transparent macOS Local Network Relay**:
+  - On macOS 15+ (Sequoia), non-system binaries often face `[Errno 65] No route to host` due to Local Network Privacy restrictions when accessing LAN Neo4j servers (e.g. `192.168.x.x:7687`).
+  - Bookkeeper automatically detects `Errno 65` and initiates a zero-overhead transparent loopback bridge (`127.0.0.1:<port>` -> target host) using the entitled system Python runtime `/usr/bin/python3`, allowing CLI backups and sync operations to work seamlessly without manual security prompts or OS adjustments.
 
 ---
 

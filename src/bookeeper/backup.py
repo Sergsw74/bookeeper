@@ -1333,6 +1333,7 @@ def get_baseline_books(
     if is_neo4j:
         from bookeeper.graph.neo4j_exporter import Neo4jExporter
 
+        owns_exporter = False
         if hasattr(baseline, "fetch_remote_books"):
             exporter = baseline
         else:
@@ -1344,14 +1345,19 @@ def get_baseline_books(
                 cfg = get_settings()
                 neo4j_config = cfg.neo4j
             exporter = Neo4jExporter.from_config(neo4j_config)
+            owns_exporter = True
 
-        if not exporter.verify_connectivity():
-            raise ConnectionError(
-                f"Neo4j database is not reachable at {getattr(exporter, 'uri', 'localhost:7687')}. "
-                "Please ensure Neo4j is running or provide a backup archive as baseline."
-            )
-        books = exporter.fetch_remote_books()
-        return books, "neo4j", getattr(exporter, "uri", "neo4j")
+        try:
+            if not exporter.verify_connectivity():
+                raise ConnectionError(
+                    f"Neo4j database is not reachable at {getattr(exporter, 'uri', 'localhost:7687')}. "
+                    "Please ensure Neo4j is running or provide a backup archive as baseline."
+                )
+            books = exporter.fetch_remote_books()
+            return books, "neo4j", getattr(exporter, "uri", "neo4j")
+        finally:
+            if owns_exporter:
+                exporter.close()
 
     # Case 2: Backup archive or directory or file
     p = Path(baseline).expanduser().resolve()
@@ -2000,6 +2006,8 @@ def create_incremental_backup(
         "filename": dest_archive.name,
         "format": fmt,
         "backup_type": "incremental",
+        "baseline_type": diff_res.baseline_type,
+        "baseline_reference": diff_res.baseline_reference,
         "new_books_count": len(diff_res.new_books),
         "related_books_count": len(diff_res.related_books),
         "include_books": include_books,

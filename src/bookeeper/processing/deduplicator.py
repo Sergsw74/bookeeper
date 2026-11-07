@@ -63,11 +63,13 @@ class EntityDeduplicator:
         similarity_threshold: float = 0.80,
         high_similarity_threshold: float = 0.95,
         extractor: Optional[Any] = None,
+        enable_llm_disambiguation: bool = True,
     ):
         self.embeddings = embeddings
         self.similarity_threshold = similarity_threshold
         self.high_similarity_threshold = high_similarity_threshold
         self.extractor = extractor
+        self.enable_llm_disambiguation = bool(enable_llm_disambiguation)
 
         # Canonical name -> (Normalized unit vector, Concept instance)
         self._cache: Dict[str, Tuple[Optional[np.ndarray], Concept]] = {}
@@ -153,11 +155,19 @@ class EntityDeduplicator:
                 logger.warning(f"Could not initialize FailoverOllamaEmbeddings: {e}")
                 embeddings = None
 
+        enable_llm_disambig = True
+        jepa_cfg = getattr(settings, "jepa", None)
+        if jepa_cfg and getattr(jepa_cfg, "enabled", False):
+            enable_llm_disambig = bool(getattr(jepa_cfg, "llm_disambiguation", False))
+        elif hasattr(settings, "enable_llm_disambiguation"):
+            enable_llm_disambig = bool(getattr(settings, "enable_llm_disambiguation"))
+
         return cls(
             embeddings=embeddings,
             similarity_threshold=s_thresh,
             high_similarity_threshold=high_s_thresh,
             extractor=extractor,
+            enable_llm_disambiguation=enable_llm_disambig,
         )
 
     @staticmethod
@@ -326,7 +336,7 @@ class EntityDeduplicator:
 
             # Case B: Probable match (0.80 <= similarity < 0.95) -> Disambiguate and synthesize via LLM
             if best_match is not None and best_sim >= self.similarity_threshold:
-                if self.extractor is not None:
+                if self.extractor is not None and self.enable_llm_disambiguation:
                     decision = self._ask_llm_disambiguation(best_match, concept, best_sim)
                     if decision.is_same_concept:
                         logger.info(
@@ -541,7 +551,7 @@ class EntityDeduplicator:
 
         # Pre-pass: identify any probable matches (0.80 <= sim < 0.95) against existing cache/HNSW
         # so we can run LLM disambiguation concurrently across the Ollama pool instead of sequentially!
-        if self.extractor is not None:
+        if self.extractor is not None and self.enable_llm_disambiguation:
             pending_disambiguations: Dict[Tuple[str, str], Tuple[Concept, Concept, float]] = {}
             for idx, concept in enumerate(concepts):
                 raw_name = concept.name
@@ -742,7 +752,7 @@ class EntityDeduplicator:
 
             # Case B: Probable match (0.80 <= similarity < 0.95) -> LLM disambiguation (reusing parallel pre-pass cache)
             if best_match is not None and best_sim >= self.similarity_threshold:
-                if self.extractor is not None:
+                if self.extractor is not None and self.enable_llm_disambiguation:
                     pair_key = (self._normalize_name(best_match.name), norm_name)
                     decision = self._disambiguation_cache.get(pair_key)
                     if decision is None:
@@ -1088,7 +1098,7 @@ class EntityDeduplicator:
 
             # Case B: Probable match (0.80 <= similarity < 0.95) -> Disambiguate with LLM
             if sim >= self.similarity_threshold:
-                if self.extractor is not None:
+                if self.extractor is not None and self.enable_llm_disambiguation:
                     concept_obj1 = c1 if isinstance(c1, Concept) else Concept(name=name1)
                     concept_obj2 = c2 if isinstance(c2, Concept) else Concept(name=name2)
                     decision = self._ask_llm_disambiguation(concept_obj1, concept_obj2, sim)

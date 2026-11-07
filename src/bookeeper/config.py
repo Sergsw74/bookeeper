@@ -440,6 +440,10 @@ class JEPAConfig(BaseModel):
         default=0.5,
         description="Weight for predictive alignment on positive pairs.",
     )
+    llm_disambiguation: bool = Field(
+        default=False,
+        description="Whether to invoke LLM for concept disambiguation in the probable zone (default: False under JEPA, letting JEPA zero-isotropic similarity resolve matches directly).",
+    )
 
 
 class DualPassConfig(BaseModel):

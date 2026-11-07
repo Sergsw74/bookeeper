@@ -49,6 +49,9 @@ from bookeeper.graph.store import ConceptGraphStore
 
 logger = logging.getLogger(__name__)
 
+# Suppress cosmetic Neo4j DBMS server GQL compile notifications (e.g. absent schema property keys)
+logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
+
 _ACTIVE_BRIDGES: set[subprocess.Popen] = set()
 
 
@@ -673,8 +676,7 @@ class Neo4jExporter:
         self.verify_connectivity()
         query = """
         MATCH (b:Book)
-        RETURN b.id AS id, b.book_id AS book_id, b.title AS title, b.author AS author,
-               b.arxiv_id AS arxiv_id, b.content_hash AS content_hash
+        RETURN b.id AS id, properties(b) AS props
         """
         def _run(s):
             try:
@@ -689,13 +691,22 @@ class Neo4jExporter:
                     row = dict(rec) if not isinstance(rec, dict) else rec
                 except Exception:
                     continue
+                props = row.get("props")
+                if not isinstance(props, dict):
+                    props = {}
+                bid = props.get("book_id")
+                if bid is None and row.get("id"):
+                    try:
+                        bid = int(str(row["id"]).replace("book:", ""))
+                    except (ValueError, TypeError):
+                        pass
                 books.append({
-                    "id": row.get("id"),
-                    "book_id": row.get("book_id"),
-                    "title": row.get("title"),
-                    "author": row.get("author"),
-                    "arxiv_id": row.get("arxiv_id"),
-                    "content_hash": row.get("content_hash"),
+                    "id": row.get("id") or props.get("id"),
+                    "book_id": bid,
+                    "title": props.get("title") or (f"Book {bid}" if bid else "Untitled"),
+                    "author": props.get("author", "Unknown"),
+                    "arxiv_id": props.get("arxiv_id"),
+                    "content_hash": props.get("content_hash"),
                 })
             return books
 

@@ -387,6 +387,14 @@ def hierarchical_semantic_cover(
                 continue
 
             arr = np.array(raw_emb, dtype=np.float32)
+            if arr.shape[0] != 768 and arr.shape[0] == 1024 and Path("output/jepa_768_weights.npz").is_file():
+                try:
+                    from bookeeper.evaluation.jepa_encoder import LightweightJEPAEncoder
+                    if not hasattr(hierarchical_cover_filter, "_jepa_proj"):
+                        hierarchical_cover_filter._jepa_proj = LightweightJEPAEncoder.load("output/jepa_768_weights.npz")
+                    arr = hierarchical_cover_filter._jepa_proj.project(arr)
+                except Exception:
+                    pass
             norm = float(np.linalg.norm(arr))
             v_unit = (arr / norm) if norm > 1e-12 else arr
 

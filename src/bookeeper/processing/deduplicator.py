@@ -193,6 +193,11 @@ class EntityDeduplicator:
             emb_list: Optional[List[float]] = None
             if existing_emb is not None and isinstance(existing_emb, (list, np.ndarray)) and len(existing_emb) > 1:
                 arr = np.array(existing_emb, dtype=np.float32)
+                if arr.shape[0] != 768 and arr.shape[0] == 1024 and hasattr(self.embeddings, "project_vectors"):
+                    try:
+                        arr = self.embeddings.project_vectors(arr)
+                    except Exception:
+                        pass
                 norm = float(np.linalg.norm(arr))
                 vec_arr = (arr / norm) if norm > 0.0 else arr
                 emb_list = vec_arr.tolist()
@@ -447,7 +452,7 @@ class EntityDeduplicator:
                     )
 
             pooled_ok = False
-            if isinstance(self.embeddings, FailoverOllamaEmbeddings):
+            if hasattr(self.embeddings, "embed_documents"):
                 try:
                     raw_vecs = self.embeddings.embed_documents(
                         missing_texts,

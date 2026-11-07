@@ -2449,10 +2449,65 @@
               Manage full system archives, export knowledge graphs, or restore backups directly into Bookeeper and Neo4j.
             </span>
           </div>
-          <div style="display:flex; gap:10px;">
+          <div style="display:flex; gap:10px; align-items:center;">
             <button class="debug-action-btn" onclick="checkDatabaseConsistency(true)" title="Check database consistency and sync state">
               <span>🔄</span> Verify Database Sync
             </button>
+            <button class="debug-action-btn" id="btn-sync-neo4j-header" onclick="startKnowledgeGraphSync()" title="Synchronize Neo4j strictly from local Knowledge Graph, deleting any discrepancies" style="background:linear-gradient(135deg, #4f46e5, #06b6d4); color:#fff; border-color:#6366f1; font-weight:600;">
+              <span>⚡</span> Sync Neo4j from KG
+            </button>
+          </div>
+        </div>
+
+        <!-- Dedicated Synchronization Panel (KG as Source of Truth) -->
+        <div class="br-card" id="page-sync-card" style="border:1px solid rgba(99,102,241,0.4); background:linear-gradient(180deg, rgba(30,41,59,0.85) 0%, rgba(15,23,42,0.95) 100%);">
+          <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:16px;">
+            <div style="display:flex; align-items:flex-start; gap:14px; flex:1; min-width:280px;">
+              <span style="font-size:1.8rem; line-height:1;">🔄</span>
+              <div>
+                <div style="display:flex; align-items:center; gap:10px; margin-bottom:4px;">
+                  <h3 style="font-size:1.15rem; font-weight:700; color:var(--text-main); margin:0;">Strict Database Synchronization</h3>
+                  <span class="version-badge" style="background:rgba(99,102,241,0.25); border-color:#6366f1; color:#a5b4fc; font-size:0.75rem; padding:2px 8px;">KG = Single Source of Truth</span>
+                </div>
+                <div style="font-size:0.86rem; color:var(--text-muted); line-height:1.5;">
+                  Treats the local Knowledge Graph (<code style="color:#a5b4fc;">knowledge_graph.json</code>) as the authoritative source of truth. Any discrepancies in Neo4j (obsolete books, chunks, sections, or stale concepts and relationships) are permanently deleted, and all missing/updated graph data is exported to achieve 100% database parity.
+                </div>
+              </div>
+            </div>
+            <div style="display:flex; gap:10px; align-items:center;">
+              <button id="btn-sync-neo4j-page" class="search-btn" onclick="startKnowledgeGraphSync()" style="background:linear-gradient(135deg, #4f46e5, #06b6d4); padding:10px 20px; font-size:0.92rem; font-weight:700; justify-content:center; white-space:nowrap; box-shadow:0 4px 14px rgba(79,70,229,0.35);">
+                <span>⚡ Synchronize Neo4j (Delete Discrepancies)</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Sync Progress Area -->
+          <div id="page-sync-progress-area" style="display:none; margin-top:16px; background:rgba(15,23,42,0.8); padding:14px; border-radius:8px; border:1px solid var(--border);">
+            <div style="display:flex; align-items:center; gap:10px; margin-bottom:6px;">
+              <div class="spinner" style="width:18px; height:18px; border-width:2px; margin:0;"></div>
+              <span id="page-sync-progress-text" style="font-size:0.88rem; color:var(--text-main); font-weight:600;">Synchronizing Knowledge Graph to Neo4j...</span>
+            </div>
+            <div id="page-sync-progress-sub" style="font-size:0.78rem; color:var(--text-muted); margin-bottom:8px;">Scanning discrepancies and reconciling database...</div>
+            
+            <div style="background:var(--bg-dark, #0f172a); border-radius:6px; height:10px; width:100%; overflow:hidden; margin:8px 0 4px; border:1px solid var(--border, #334155);">
+              <div id="page-sync-progress-bar" style="background:linear-gradient(90deg, #6366f1, #06b6d4); height:100%; width:0%; transition:width 0.2s ease; border-radius:5px;"></div>
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size:0.75rem; color:var(--text-muted); margin-bottom:10px;">
+              <span id="page-sync-progress-metrics">Initializing sync...</span>
+              <span id="page-sync-console-status" style="color:#38bdf8;">Processing...</span>
+            </div>
+
+            <div style="margin-top:6px;">
+              <pre id="page-sync-console" style="background:#090d16; border:1px solid #1e293b; border-radius:6px; padding:8px 10px; font-family:'JetBrains Mono','Fira Code',ui-monospace,monospace; font-size:0.75rem; color:#94a3b8; height:130px; overflow-y:auto; white-space:pre-wrap; word-break:break-word; margin:0; line-height:1.45;"></pre>
+            </div>
+          </div>
+
+          <!-- Sync Result Area -->
+          <div id="page-sync-result-area" style="display:none; margin-top:16px; background:rgba(16,185,129,0.12); padding:14px; border-radius:8px; border:1px solid #10b981;">
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px; color:#34d399; font-weight:700;">
+              <span>✓</span> Database Synchronization Complete!
+            </div>
+            <div id="page-sync-result-details" style="font-size:0.84rem; color:var(--text-main); line-height:1.6;"></div>
           </div>
         </div>
 
@@ -4714,6 +4769,140 @@
         startBtn: document.getElementById('btn-page-restore-start'),
         cancelBtn: null,
       });
+    }
+
+    async function startKnowledgeGraphSync() {
+      if (isRestoreInProgress) {
+        alert('A restore or synchronization operation is already in progress.');
+        return;
+      }
+
+      if (!confirm('Synchronize connected Neo4j database using local Knowledge Graph as the authoritative source of truth?\n\nAny discrepancies (stale concepts, obsolete books, chunks, sections, or relationships) in Neo4j will be permanently deleted.')) {
+        return;
+      }
+
+      isRestoreInProgress = true;
+      const syncBtnPage = document.getElementById('btn-sync-neo4j-page');
+      const syncBtnHeader = document.getElementById('btn-sync-neo4j-header');
+      if (syncBtnPage) syncBtnPage.disabled = true;
+      if (syncBtnHeader) syncBtnHeader.disabled = true;
+
+      const progressArea = document.getElementById('page-sync-progress-area');
+      const progressBar = document.getElementById('page-sync-progress-bar');
+      const progressText = document.getElementById('page-sync-progress-text');
+      const progressSub = document.getElementById('page-sync-progress-sub');
+      const progressMetrics = document.getElementById('page-sync-progress-metrics');
+      const consoleElem = document.getElementById('page-sync-console');
+      const consoleStatus = document.getElementById('page-sync-console-status');
+      const resultArea = document.getElementById('page-sync-result-area');
+      const resultDetails = document.getElementById('page-sync-result-details');
+
+      if (resultArea) resultArea.style.display = 'none';
+      if (progressArea) progressArea.style.display = 'block';
+      if (progressBar) progressBar.style.width = '10%';
+      if (progressText) progressText.textContent = 'Initializing Knowledge Graph synchronization...';
+      if (progressSub) progressSub.textContent = 'Connecting to Neo4j and reading local Knowledge Graph...';
+      if (progressMetrics) progressMetrics.textContent = '10% (initializing)';
+      if (consoleStatus) consoleStatus.textContent = 'Connecting...';
+      if (consoleElem) consoleElem.textContent = '🔄 Starting Knowledge Graph -> Neo4j synchronization...\n';
+
+      let seenLogCount = 0;
+      const pollTimer = setInterval(async () => {
+        try {
+          const stResp = await fetch('/api/backup/restore/status');
+          if (!stResp.ok) return;
+          const stData = await stResp.json();
+          if (stData.logs && Array.isArray(stData.logs)) {
+            while (seenLogCount < stData.logs.length) {
+              if (consoleElem) {
+                consoleElem.textContent += stData.logs[seenLogCount] + '\n';
+                consoleElem.scrollTop = consoleElem.scrollHeight;
+              }
+              seenLogCount++;
+            }
+          }
+          if (stData.progress_pct !== undefined && progressBar) {
+            progressBar.style.width = Math.min(98, stData.progress_pct) + '%';
+            if (progressMetrics) progressMetrics.textContent = `${stData.progress_pct}% (${stData.stage || 'syncing'})`;
+          }
+          if (stData.message && progressText) progressText.textContent = stData.message;
+          if (stData.stage && consoleStatus) consoleStatus.textContent = `Stage: ${stData.stage}`;
+        } catch (e) {}
+      }, 750);
+
+      try {
+        const resp = await fetch('/api/sync/reconcile', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prune_discrepancies: true })
+        });
+        clearInterval(pollTimer);
+
+        // Fetch final logs
+        try {
+          const finalResp = await fetch('/api/backup/restore/status');
+          if (finalResp.ok) {
+            const finalData = await finalResp.json();
+            if (finalData.logs && Array.isArray(finalData.logs)) {
+              while (seenLogCount < finalData.logs.length) {
+                if (consoleElem) {
+                  consoleElem.textContent += finalData.logs[seenLogCount] + '\n';
+                  consoleElem.scrollTop = consoleElem.scrollHeight;
+                }
+                seenLogCount++;
+              }
+            }
+          }
+        } catch (e) {}
+
+        const data = await resp.json();
+        if (!resp.ok || data.error) {
+          throw new Error(data.error || 'Synchronization failed.');
+        }
+
+        if (progressBar) progressBar.style.width = '100%';
+        if (progressText) progressText.textContent = '✓ Synchronization Complete!';
+        if (progressMetrics) progressMetrics.textContent = '100% complete';
+        if (consoleStatus) consoleStatus.textContent = 'Completed';
+
+        if (resultArea && resultDetails) {
+          resultArea.style.display = 'block';
+          const localS = data.local_stats || {};
+          const neoS = data.neo4j_stats || {};
+          resultDetails.innerHTML = `
+            <div style="display:flex; flex-direction:column; gap:8px;">
+              <div>
+                <strong>Reconciliation Summary:</strong> Pruned <span style="color:#f87171; font-weight:700;">${(data.pruned_nodes || 0).toLocaleString()}</span> stale node(s) and <span style="color:#f87171; font-weight:700;">${(data.pruned_edges || 0).toLocaleString()}</span> stale relationship(s) from Neo4j.
+              </div>
+              <div style="display:flex; gap:16px; flex-wrap:wrap; background:rgba(0,0,0,0.3); padding:10px; border-radius:6px; font-family:monospace; font-size:0.8rem;">
+                <div>📚 <strong>Books:</strong> ${(localS.books || 0).toLocaleString()} (Neo4j: ${(neoS.books || 0).toLocaleString()})</div>
+                <div>📄 <strong>Chunks:</strong> ${(localS.chunks || 0).toLocaleString()} (Neo4j: ${(neoS.chunks || 0).toLocaleString()})</div>
+                <div>💡 <strong>Ideas:</strong> ${(localS.ideas || 0).toLocaleString()} (Neo4j: ${(neoS.ideas || 0).toLocaleString()})</div>
+                <div>🌐 <strong>Nodes:</strong> ${(localS.total_nodes || 0).toLocaleString()} (Neo4j: ${(neoS.total_nodes || 0).toLocaleString()})</div>
+                <div>🔗 <strong>Edges:</strong> ${(localS.total_edges || 0).toLocaleString()} (Neo4j: ${(neoS.total_edges || 0).toLocaleString()})</div>
+              </div>
+              <div style="color:${data.is_consistent ? '#34d399' : '#fbbf24'}; font-weight:600;">
+                ${data.is_consistent ? '✓ 100% Full Parity Achieved. All entities match Knowledge Graph.' : '⚠️ Discrepancies remaining: ' + (data.discrepancies || []).join('; ')}
+              </div>
+              <div style="font-size:0.75rem; color:var(--text-muted);">Execution time: ${data.elapsed_seconds || 0}s</div>
+            </div>
+          `;
+        }
+
+        // Automatically re-validate consistency badge in UI
+        if (typeof checkDatabaseConsistency === 'function') {
+          checkDatabaseConsistency(true);
+        }
+      } catch (err) {
+        clearInterval(pollTimer);
+        alert('Synchronization failed: ' + err.message);
+        if (progressText) progressText.textContent = '❌ Synchronization Failed: ' + err.message;
+        if (consoleStatus) consoleStatus.textContent = 'Failed';
+      } finally {
+        isRestoreInProgress = false;
+        if (syncBtnPage) syncBtnPage.disabled = false;
+        if (syncBtnHeader) syncBtnHeader.disabled = false;
+      }
     }
 
     async function executeSearch() {

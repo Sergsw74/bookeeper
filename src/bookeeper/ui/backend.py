@@ -722,6 +722,10 @@ class SearchEngineBackend:
 
             if self._neo4j_exporter is None:
                 self._neo4j_exporter = Neo4jExporter.from_config(self.neo4j_cfg)
+            try:
+                self._neo4j_exporter.verify_connectivity()
+            except Exception as e:
+                logger.debug(f"verify_connectivity check in get_neo4j_driver: {e}")
             self._neo4j_driver = self._neo4j_exporter.get_driver()
         return self._neo4j_driver
 
@@ -3518,6 +3522,239 @@ class SearchEngineBackend:
                 self._restore_status["in_progress"] = False
                 self._restore_status["stage"] = "failed"
                 self._restore_status["message"] = f"Restore failed: {e}"
+                self._restore_status["error"] = str(e)
+            raise
+        finally:
+            self._is_restoring = False
+
+    def sync_neo4j_from_knowledge_graph(
+        self,
+        prune_discrepancies: bool = True,
+        kg_path: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        """
+        Synchronize the connected Neo4j database strictly with the local Knowledge Graph
+        as the authoritative source of truth.
+
+        When prune_discrepancies is True:
+        - Any node in Neo4j (Book, Chunk, Section, Concept, Idea) that is not in local KG is deleted.
+        - Any relationship in Neo4j that is not in local KG is deleted.
+        - Missing/modified nodes and relationships from KG are exported into Neo4j.
+        - Verifies database consistency and reports exact counts of pruned/synced entities.
+        """
+        from bookeeper.graph.neo4j_exporter import Neo4jExporter
+        from bookeeper.graph.store import ConceptGraphStore
+
+        with self._restore_lock:
+            if self._is_restoring:
+                raise RuntimeError("A database restore or synchronization operation is already in progress.")
+            self._is_restoring = True
+            now_str = datetime.datetime.now().strftime("%H:%M:%S")
+            t0 = time.time()
+            self._restore_status = {
+                "in_progress": True,
+                "stage": "starting_sync",
+                "message": "Initializing strict Knowledge Graph -> Neo4j synchronization...",
+                "started_at": now_str,
+                "progress_pct": 5,
+                "logs": [f"[{now_str}] 🔄 Initializing Knowledge Graph -> Neo4j synchronization (KG is source of truth)..."],
+                "error": None,
+            }
+
+        try:
+            if not self.is_neo4j_enabled:
+                raise RuntimeError("Neo4j is disabled in configuration (neo4j.enabled: false).")
+
+            exporter = Neo4jExporter.from_config(self.neo4j_cfg)
+            if not exporter.verify_connectivity():
+                raise RuntimeError(f"Could not connect to Neo4j instance at {self.neo4j_cfg.uri}")
+
+            out_dir = getattr(self.config, "resolved_output_dir", None) or Path(getattr(self.config, "output_dir", "output"))
+            if kg_path is None:
+                kg_path = out_dir / "knowledge_graph.json"
+            if not kg_path.is_file():
+                raise FileNotFoundError(f"Knowledge Graph file not found: {kg_path}")
+
+            self._add_restore_log(
+                f"📖 Loading local Knowledge Graph from {kg_path.name}...",
+                stage="loading_graph",
+                progress_pct=15,
+            )
+            store = ConceptGraphStore()
+            store.output_dir = out_dir
+            store.load(kg_path)
+            g = store.graph
+            total_local_nodes = g.number_of_nodes()
+            total_local_edges = g.number_of_edges()
+            self._add_restore_log(
+                f"✓ Loaded {total_local_nodes:,} nodes and {total_local_edges:,} edges from local Knowledge Graph.",
+                progress_pct=25,
+            )
+
+            pruned_nodes_count = 0
+            pruned_edges_count = 0
+            driver = exporter.get_driver()
+
+            if prune_discrepancies:
+                self._add_restore_log(
+                    "🔍 Comparing Neo4j database against local Knowledge Graph to identify discrepancies...",
+                    stage="identifying_discrepancies",
+                    progress_pct=35,
+                )
+                local_node_ids = set(g.nodes())
+                local_edges = set((u, v) for u, v in g.edges())
+
+                with driver.session(database=self.neo4j_cfg.database) as session:
+                    # 1. Query remote nodes (excluding internal :BookeeperSync metadata node)
+                    remote_nodes_res = session.run(
+                        "MATCH (n) WHERE NOT n:BookeeperSync RETURN n.id AS id, labels(n) AS labels"
+                    )
+                    stale_by_label: Dict[str, list[str]] = {}
+                    all_stale_ids: set[str] = set()
+                    for rec in remote_nodes_res:
+                        nid = rec["id"]
+                        if nid and nid not in local_node_ids:
+                            all_stale_ids.add(nid)
+                            lbls = [l for l in rec["labels"] if l != "Idea"]
+                            primary_lbl = lbls[0] if lbls else "Concept"
+                            if primary_lbl not in stale_by_label:
+                                stale_by_label[primary_lbl] = []
+                            stale_by_label[primary_lbl].append(nid)
+
+                    if all_stale_ids:
+                        self._add_restore_log(
+                            f"✂️ Found {len(all_stale_ids):,} stale node(s) in Neo4j not present in Knowledge Graph. Deleting discrepancies...",
+                            stage="pruning_nodes",
+                            progress_pct=45,
+                        )
+                        for lbl, nids in stale_by_label.items():
+                            for i in range(0, len(nids), 1000):
+                                batch = nids[i : i + 1000]
+                                session.run(
+                                    f"UNWIND $batch AS nid MATCH (n:`{lbl}` {{id: nid}}) DETACH DELETE n",
+                                    batch=batch,
+                                )
+                        pruned_nodes_count = len(all_stale_ids)
+                        self._add_restore_log(
+                            f"✓ Pruned {pruned_nodes_count:,} stale node(s) from Neo4j.",
+                            progress_pct=55,
+                        )
+                    else:
+                        self._add_restore_log("✓ No stale nodes found in Neo4j.", progress_pct=55)
+
+                    # 2. Check for stale relationships between surviving nodes
+                    self._add_restore_log(
+                        "🔍 Inspecting Neo4j relationships against Knowledge Graph...",
+                        stage="inspecting_edges",
+                        progress_pct=60,
+                    )
+                    remote_edges_res = session.run(
+                        "MATCH (u)-[r]->(v) WHERE NOT u:BookeeperSync AND NOT v:BookeeperSync "
+                        "RETURN u.id AS src, labels(u) AS u_labels, v.id AS tgt, labels(v) AS v_labels"
+                    )
+                    stale_edges_by_labels: Dict[tuple[str, str], list[Dict[str, str]]] = {}
+                    total_stale_edges = 0
+                    for rec in remote_edges_res:
+                        src_id = rec["src"]
+                        tgt_id = rec["tgt"]
+                        if (src_id, tgt_id) not in local_edges:
+                            u_lbls = [l for l in rec["u_labels"] if l != "Idea"]
+                            v_lbls = [l for l in rec["v_labels"] if l != "Idea"]
+                            u_lbl = u_lbls[0] if u_lbls else "Concept"
+                            v_lbl = v_lbls[0] if v_lbls else "Concept"
+                            k = (u_lbl, v_lbl)
+                            if k not in stale_edges_by_labels:
+                                stale_edges_by_labels[k] = []
+                            stale_edges_by_labels[k].append({"src": src_id, "tgt": tgt_id})
+                            total_stale_edges += 1
+
+                    if total_stale_edges > 0:
+                        self._add_restore_log(
+                            f"✂️ Found {total_stale_edges:,} stale relationship(s) in Neo4j. Deleting discrepancies...",
+                            stage="pruning_edges",
+                            progress_pct=65,
+                        )
+                        for (u_lbl, v_lbl), edge_batch in stale_edges_by_labels.items():
+                            for i in range(0, len(edge_batch), 1000):
+                                eb = edge_batch[i : i + 1000]
+                                session.run(
+                                    f"UNWIND $batch AS row MATCH (u:`{u_lbl}` {{id: row.src}})-[r]->(v:`{v_lbl}` {{id: row.tgt}}) DELETE r",
+                                    batch=eb,
+                                )
+                        pruned_edges_count = total_stale_edges
+                        self._add_restore_log(
+                            f"✓ Pruned {pruned_edges_count:,} stale relationship(s) from Neo4j.",
+                            progress_pct=70,
+                        )
+                    else:
+                        self._add_restore_log("✓ No stale relationships found in Neo4j.", progress_pct=70)
+
+            # 3. Export Knowledge Graph to Neo4j
+            self._add_restore_log(
+                "🚀 Synchronizing Knowledge Graph nodes and relationships into Neo4j...",
+                stage="exporting_neo4j",
+                progress_pct=75,
+            )
+
+            def sync_cb(cat: str, curr: int, tot: int, msg: str):
+                pct = 75 + int((curr / max(1, tot)) * 18)
+                self._add_restore_log(
+                    f"[{cat}] {msg} ({curr:,}/{tot:,})",
+                    stage="exporting_neo4j",
+                    progress_pct=pct,
+                )
+
+            export_result = exporter.export(
+                store,
+                clean=False,
+                incremental_sync=True,
+                allow_book_removal=True,
+                show_progress=False,
+                progress_callback=sync_cb,
+            )
+            self._add_restore_log("✓ Export to Neo4j complete.", progress_pct=95)
+
+            # 4. Final verification
+            self._add_restore_log("🔍 Validating final database consistency...", stage="validating", progress_pct=97)
+            consistency = self.validate_database_consistency(force_refresh=True)
+
+            if consistency.get("is_consistent"):
+                self._add_restore_log(
+                    "✓ Database consistency verified: 100% parity between Knowledge Graph and Neo4j.",
+                    stage="completed",
+                    progress_pct=100,
+                )
+            else:
+                disc = ", ".join(consistency.get("discrepancies", []))
+                self._add_restore_log(f"⚠️ Consistency note: {disc}", stage="completed", progress_pct=100)
+
+            elapsed = time.time() - t0
+            summary = {
+                "success": True,
+                "elapsed_seconds": round(elapsed, 2),
+                "pruned_nodes": pruned_nodes_count,
+                "pruned_edges": pruned_edges_count,
+                "local_stats": consistency.get("local_stats"),
+                "neo4j_stats": consistency.get("neo4j_stats"),
+                "is_consistent": consistency.get("is_consistent", False),
+                "discrepancies": consistency.get("discrepancies", []),
+                "export_result": export_result,
+            }
+            with self._restore_lock:
+                self._restore_status["in_progress"] = False
+                self._restore_status["stage"] = "completed"
+                self._restore_status["message"] = (
+                    f"Synchronization complete: {pruned_nodes_count:,} nodes pruned, {pruned_edges_count:,} edges pruned. Parity: {consistency.get('is_consistent')}"
+                )
+                self._restore_status["progress_pct"] = 100
+            return summary
+        except Exception as e:
+            logger.error(f"Synchronization failed: {e}", exc_info=True)
+            self._add_restore_log(f"❌ Synchronization failed: {e}", stage="failed", progress_pct=100)
+            with self._restore_lock:
+                self._restore_status["in_progress"] = False
+                self._restore_status["stage"] = "failed"
+                self._restore_status["message"] = f"Synchronization failed: {e}"
                 self._restore_status["error"] = str(e)
             raise
         finally:

@@ -479,6 +479,30 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/")
 
         content_length = int(self.headers.get("Content-Length", 0))
+
+        # Database Reconcile / Synchronize API (/api/sync/reconcile, /api/sync/neo4j, /api/backup/sync)
+        # Treats Knowledge Graph as source of truth and deletes any discrepancies in Neo4j
+        if path in ("/api/sync/reconcile", "/api/sync/neo4j", "/api/backup/sync"):
+            if self.backend.is_restoring:
+                self._send_json({"error": "A database restore or synchronization operation is already in progress."}, HTTPStatus.CONFLICT)
+                return
+            prune_discrepancies = True
+            if content_length > 0:
+                try:
+                    body_str = self.rfile.read(content_length).decode("utf-8")
+                    if body_str.strip():
+                        body = json.loads(body_str)
+                        prune_discrepancies = body.get("prune_discrepancies", True)
+                except Exception:
+                    pass
+            try:
+                res = self.backend.sync_neo4j_from_knowledge_graph(prune_discrepancies=prune_discrepancies)
+                self._send_json(res)
+            except Exception as e:
+                logger.error(f"Synchronization failed: {e}", exc_info=True)
+                self._send_json({"error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
         if content_length <= 0:
             self._send_json({"error": "Empty request body."}, HTTPStatus.BAD_REQUEST)
             return

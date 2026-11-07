@@ -1982,6 +1982,125 @@ def test_setup_cli_logging():
     assert len(logging.getLogger().handlers) > 0
 
 
+def test_ui_index_html_has_sync_neo4j_button_and_card():
+    """Verify that index.html contains the synchronization button and panel in Backup & Restore."""
+    from pathlib import Path
+    html_file = Path("src/bookeeper/ui/static/index.html")
+    assert html_file.is_file()
+    content = html_file.read_text(encoding="utf-8")
+    assert 'btn-sync-neo4j-header' in content
+    assert 'page-sync-card' in content
+    assert 'startKnowledgeGraphSync' in content
+    assert 'Strict Database Synchronization' in content
+    assert 'KG = Single Source of Truth' in content
+
+
+def test_ui_sync_neo4j_endpoint(mock_backend):
+    """Test /api/sync/reconcile and /api/sync/neo4j endpoints in server."""
+    from bookeeper.ui.server import run_server
+    import threading
+    import urllib.request
+    import json
+
+    mock_backend.sync_neo4j_from_knowledge_graph = MagicMock(return_value={
+        "success": True,
+        "pruned_nodes": 5,
+        "pruned_edges": 3,
+        "is_consistent": True,
+        "discrepancies": [],
+    })
+
+    server = run_server(host="127.0.0.1", port=0, backend=mock_backend)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    port = server.server_port
+
+    try:
+        # POST /api/sync/reconcile
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/sync/reconcile",
+            data=json.dumps({"prune_discrepancies": True}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            assert resp.status == 200
+            data = json.loads(resp.read().decode("utf-8"))
+            assert data["success"] is True
+            assert data["pruned_nodes"] == 5
+            mock_backend.sync_neo4j_from_knowledge_graph.assert_called_with(prune_discrepancies=True)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_ui_backend_sync_neo4j_from_knowledge_graph_flow(mock_backend, tmp_path):
+    """Test sync_neo4j_from_knowledge_graph backend workflow with discrepancy pruning."""
+    import json
+    from unittest.mock import patch, MagicMock
+
+    kg_path = tmp_path / "knowledge_graph.json"
+    kg_data = {
+        "nodes": [
+            {"id": "book:1", "type": "Book", "title": "Paper 1"},
+            {"id": "chunk:1:0:0", "type": "Chunk", "book_id": "1"},
+            {"id": "concept:RAG", "type": "Concept", "name": "RAG"},
+        ],
+        "edges": [
+            {"source": "book:1", "target": "concept:RAG", "relation": "EXPLORES_IDEA"}
+        ]
+    }
+    kg_path.write_text(json.dumps(kg_data), encoding="utf-8")
+    mock_backend.output_dir = tmp_path
+
+    # Mock Neo4j session with 1 stale node and 1 stale edge
+    mock_session = MagicMock()
+    # Remote nodes: book:1, chunk:1:0:0, concept:RAG, and stale concept:OldIdea
+    mock_session.run.side_effect = [
+        # 1. remote_nodes_res
+        [
+            {"id": "book:1", "labels": ["Book"]},
+            {"id": "chunk:1:0:0", "labels": ["Chunk"]},
+            {"id": "concept:RAG", "labels": ["Concept"]},
+            {"id": "concept:OldIdea", "labels": ["Concept"]},
+        ],
+        # 2. UNWIND delete stale nodes
+        MagicMock(),
+        # 3. remote_edges_res
+        [
+            {"src": "book:1", "u_labels": ["Book"], "tgt": "concept:RAG", "v_labels": ["Concept"]},
+            {"src": "book:1", "u_labels": ["Book"], "tgt": "concept:OldRel", "v_labels": ["Concept"]},
+        ],
+        # 4. UNWIND delete stale edges
+        MagicMock(),
+    ]
+
+    mock_driver = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    mock_exporter = MagicMock()
+    mock_exporter.verify_connectivity.return_value = True
+    mock_exporter.get_driver.return_value = mock_driver
+    mock_exporter.export.return_value = {"nodes_upserted": 3, "relationships_upserted": 1}
+
+    mock_backend.neo4j_cfg.enabled = True
+    mock_backend.validate_database_consistency = MagicMock(return_value={
+        "is_consistent": True,
+        "discrepancies": [],
+        "local_stats": {"books": 1, "chunks": 1, "ideas": 1, "total_nodes": 3, "total_edges": 1},
+        "neo4j_stats": {"books": 1, "chunks": 1, "ideas": 1, "total_nodes": 3, "total_edges": 1},
+    })
+
+    with patch("bookeeper.graph.neo4j_exporter.Neo4jExporter.from_config", return_value=mock_exporter):
+        res = mock_backend.sync_neo4j_from_knowledge_graph(prune_discrepancies=True, kg_path=kg_path)
+
+    assert res["success"] is True
+    assert res["pruned_nodes"] == 1
+    assert res["pruned_edges"] == 1
+    assert res["is_consistent"] is True
+    assert mock_exporter.export.called
+
+
 
 
 

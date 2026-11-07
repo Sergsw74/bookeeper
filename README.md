@@ -50,8 +50,8 @@ Bookkeeper provides a rich set of CLI commands. Below is a high-level overview o
 | **`status`** | `bookeeper status` | Displays progress checkpoints, completed book counts, assigned fast-path chunks, and skipped limbo chunks. | [Get Started](docs/get-started.md) |
 | **`stats`** | `bookeeper stats` | Displays graph metrics (node counts, edge counts, categories, significance weights). | [Get Started](docs/get-started.md) |
 | **`config`** | `bookeeper config` | Displays active settings, resolved server pool, and node capabilities. | [Get Started](docs/get-started.md) |
-| **`backup`** | `bookeeper backup --full -o backup.zip` | Creates a compressed archive (`.zip` / `.7z`) of the graph, vault, chunks, book states, and optionally source books. | [Backup & Restore](docs/backup-restore.md) |
-| **`restore`** | `bookeeper restore backup.zip --clean` | Restores knowledge graph, vault, chunks, checkpoints, and source books from an archive with safety audits. | [Backup & Restore](docs/backup-restore.md) |
+| **`backup`** | `bookeeper backup --incremental --diff-against neo4j` | Creates a compressed archive (`.zip` / `.7z`) of the graph, vault, chunks, book states, or packages strictly the incremental diff against Neo4j / previous backups. | [Backup & Restore](docs/backup-restore.md) |
+| **`restore`** | `bookeeper restore backup.zip --incremental` | Restores knowledge graph, vault, chunks, checkpoints, and source books from an archive with safety audits, supporting non-destructive incremental merges into Neo4j. | [Backup & Restore](docs/backup-restore.md) |
 | **`ab-compare`** | `bookeeper ab-compare backup_a.zip [backup_b.zip]` | Instant comparative A/B evaluation (topology, cross-check NLI, or embedding space) between archived backups or active graph with live performance status. | [A/B Testing](docs/ab-tests.md) |
 
 ---
@@ -123,8 +123,10 @@ To handle massive knowledge bases efficiently without ingestion lag or GPU bottl
   - **Forced Chunk Size Recovery (`--max-batch-chunk-size`)**: If a limbo chunk is this character size or bigger, it is forcibly recovered from limbo and restored to the Priority 1 unprocessed queue, even if embeddings suggested limbo or skipping. Resuming with this threshold also recovers previously skipped limbo chunks.
 - **Neo4j Search Index Suspension**: During bulk node and edge exports, Bookkeeper discovers and temporarily suspends `VECTOR` (`idea_idx`, `chunk_idx`) and `FULLTEXT` indexes while preserving unique ID constraints for $O(1)$ `MERGE`. Indexes are recreated in parallel post-ingestion and polled until reaching `ONLINE` state.
 - **Incremental Batch Sync**: Automatically exports only affected (dirty) nodes and edges after each configured book batch (default: 10 books).
+- **Incremental Diff Backup & Graph Merging**: Calculates diffs against active Neo4j or previous archives (`--incremental`, `--diff-against`), identifying newly indexed books along with conceptually related literature connected via shared knowledge graph nodes. Restoring with `--incremental` performs a non-destructive merge into existing KG artifacts and Neo4j.
 - **At-Most-Once LLM Refinement**: The `IdeaPostProcessor` clusters ideas semantically across the whole graph, but synthesizes each cluster at most once (tracking via `refined` state flags), bypassing thousands of untouched clusters in seconds.
 - **Strict 10.0 GB RSS Memory Guard**: `MemoryGuard` tracks process memory dynamically, enforcing a strict 10.0 GB ceiling across all verification and processing modes with proactive garbage collection at 85%. Employs a Dual Spectral Gram matrix reduction for Vendi diversity scores ($< 5\text{ MB}$ RAM vs $28.8\text{ GB}$ naive) and memory-capped cosine similarity projections (64 MB chunk cap).
+- **Hard Stop on Disk Full (`[Errno 28] / ENOSPC`)**: Detects out-of-space disk errors across all processing loops immediately, safely cleaning temporary chunk files, skipping downstream dual-pass/exporters, and terminating with POSIX exit code `28` to prevent data corruption.
 - **Immediate Graceful Ctrl+C Cancellation**: Background thread futures poll every 150ms for instant SIGINT signal propagation; heavy downstream export tasks are automatically bypassed on cancellation, preserving atomic checkpoints and cleanly exiting with exit code 130 without hanging or freezing.
 
 ---

@@ -16,6 +16,7 @@ Bookkeeper extracts structured ideas, architectural principles, domain patterns,
   - [Common Usage Patterns](#common-usage-patterns)
   - [Full Flag Reference](#full-flag-reference)
   - [Graceful Immediate Cancellation (Ctrl+C / SIGINT)](#graceful-immediate-cancellation-ctrlc--sigint)
+  - [Hard Stop on Disk Full ([Errno 28] / ENOSPC)](#hard-stop-on-disk-full-errno-28--enospc)
 - [8. Instant Offline Rebuilds (`rebuild-graph`)](#8-instant-offline-rebuilds-rebuild-graph)
 - [9. Removing Books (`remove-book`)](#9-removing-books-remove-book)
 - [10. Concept Significance Weighting (0 to 10)](#10-concept-significance-weighting-0-to-10)
@@ -240,6 +241,19 @@ When ingesting large collections of books, you may need to stop execution at any
   - On `Ctrl+C`, Bookkeeper immediately skips these heavy downstream operations to prevent slow terminal freezes or corrupt partial vault writes.
 - **Preserves In-Flight Checkpoints**: Any book that finished Step 4 before the interrupt remains safely recorded in `.book_states/book_<id>_state.json` and `output/knowledge_graph.json`. You can resume seamlessly with `bookeeper build-graph --continue`.
 - **Clean Exit Code**: Returns standard POSIX interrupt exit code `130` (`typer.Exit(code=130)`).
+
+### Hard Stop on Disk Full (`[Errno 28] No space left on device` / ENOSPC)
+
+Knowledge graph construction generates extensive volumes of text chunks, embedding vectors, and graph states. If available disk storage becomes exhausted (`[Errno 28] No space left on device`), continued execution risks truncating SQLite databases, corrupting `knowledge_graph.json`, or emitting zero-byte chunk cache files.
+
+Bookkeeper implements an immediate, strict **Hard Stop** whenever an ENOSPC condition is detected:
+
+- **Recursive Error Detection (`is_disk_full_error`)**: Recursively examines exception causes, contexts, and POSIX errno codes (`errno.ENOSPC == 28`) across standard library and external library calls.
+- **Immediate Loop Abort**: In `build-graph`, processing halts immediately upon the first disk-full error. Bookkeeper does not attempt to process subsequent books in the queue.
+- **Thread Pool Cancellation**: In `clean-metadata`, background worker threads are immediately canceled, and pending tasks in the pool are aborted.
+- **Partial File Cleanup**: In `save_chunks`, any temporary `.tmp` staging files that fail mid-write are safely deleted rather than leaving corrupted fragments on disk.
+- **Bypasses Heavy Exporters**: Skips second-pass idea clustering (`--dual-pass`), Obsidian Markdown export, GraphML generation, and Neo4j synchronization during cleanup, avoiding further disk writes when storage is exhausted.
+- **Fail-Safe Exit Code**: The process aborts immediately with POSIX exit code `28` (`typer.Exit(code=28)`), allowing orchestration scripts and container runners to detect disk exhaustion without misinterpreting it as an application crash or regular termination.
 
 ---
 

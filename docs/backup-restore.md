@@ -10,12 +10,15 @@ Bookkeeper includes an enterprise-grade standalone backup and restoration engine
 - [2. Backup Types & Scopes](#2-backup-types--scopes)
   - [Knowledge-Only Backup (Default)](#knowledge-only-backup-default)
   - [Full Backup (`--full` / `--type full`)](#full-backup---full----type-full)
+  - [Incremental Backup & Update (`--incremental` / `-inc`)](#incremental-backup--update---incremental---inc)
 - [3. CLI Commands & Flags](#3-cli-commands--flags)
   - [`bookeeper backup`](#bookeeper-backup)
   - [`bookeeper restore`](#bookeeper-restore)
 - [4. Automated Invariant & Integrity Checks](#4-automated-invariant--integrity-checks)
 - [5. Integration with A/B Testing & Evaluation](#5-integration-with-ab-testing--evaluation)
 - [6. Web UI Backup & Restore](#6-web-ui-backup--restore)
+  - [Interactive Incremental Diff Preview & Preparation](#interactive-incremental-diff-preview--preparation)
+  - [Incremental Restore Mode](#incremental-restore-mode)
 
 ---
 
@@ -71,6 +74,18 @@ Includes everything from the **Knowledge-Only** backup **plus** the original dig
 * By default, includes only the **indexed source books** that contributed to the graph.
 * Adding `--all-books` packages all book files found in `--books-dir` regardless of indexing status.
 
+### Incremental Backup & Update (`--incremental` / `-inc`)
+Calculates a conceptual diff between current workspace artifacts and a baseline (**active Neo4j instance** or a **historical backup archive `.zip` / `.7z`**), packaging strictly the incremental changes:
+* **Diff Detection Engine (`calculate_incremental_diff`)**:
+  - Compares book signatures (`calibre_id`, `title`, `author`, `format`, `size_bytes`) to identify brand-new books added since the baseline.
+  - **Knowledge Graph Traversal for Related Books**: Queries the local knowledge graph to discover existing books that share extracted concepts/ideas with the newly added books.
+  - **Targeted Diff Packaging (`create_incremental_backup`)**: Packages only the new books, their related literature, connected idea nodes, associated `.book_states/` checkpoints, pre-computed chunks, and Obsidian markdown notes.
+  - **Incremental Manifest**: Embeds an enriched `backup_manifest.json` containing `is_incremental: true`, baseline book IDs, lists of new and related books, and shared concept counts.
+* **Non-Destructive Incremental Restore (`apply_incremental_update`)**:
+  - Blends the incremental archive into the target environment without wiping the existing knowledge base.
+  - Merges graph nodes and edges: retains existing nodes, updates concept significance weights using `max(existing, incoming)`, preserves earliest historical occurrence dates (`min(date)`), and links new relationships.
+  - Incrementally updates Neo4j via Cypher `MERGE` statements without clearing existing data or dropping vector indexes.
+
 ---
 
 ## 3. CLI Commands & Flags
@@ -87,8 +102,10 @@ Usage: bookeeper backup [OPTIONS] [destination]
 | :--- | :---: | :---: | :--- |
 | `[destination]`, `-o`, `--output` | `PATH` | `./backup_<timestamp>.<ext>` | Destination archive file path (e.g. `backup.zip`, `my_run.7z`) or output directory. |
 | `-f`, `--format` | `STR` | Auto / `zip` | Archive compression format: `zip` or `7z`. |
-| `-t`, `--type` | `STR` | `knowledge` | Backup type: `knowledge` or `full`. |
+| `-t`, `--type` | `STR` | `knowledge` | Backup type: `knowledge`, `full`, or `incremental`. |
 | `--full` | `FLAG` | `False` | Shorthand flag to create a full backup (knowledge + indexed books). |
+| `--incremental`, `-inc` | `FLAG` | `False` | Create an incremental backup containing only new & related books diff compared to a baseline. |
+| `--diff-against` | `STR` | `neo4j` | Baseline to diff against for incremental backup: `neo4j` (default) or path to an archive `.zip` / `.7z`. |
 | `-b`, `--books-dir` | `PATH` | Config `books_dir` | Directory containing source books for full backups. |
 | `--all-books` | `FLAG` | `False` | For full backups: include all books in `books_dir` instead of only indexed books. |
 | `--output-dir` | `PATH` | Config `output_dir` | Source directory containing graph artifacts. |
@@ -117,7 +134,13 @@ bookeeper backup --full -o ./backups/full_archive.zip
 # 5. Full backup containing ALL books in downloads directory:
 bookeeper backup --full --all-books --books-dir ./archive_downloader/downloads -o full_all.zip
 
-# 6. Minimal graph backup excluding chunks and states:
+# 6. Incremental backup against active Neo4j database:
+bookeeper backup --incremental -o ./backups/incremental_diff.zip
+
+# 7. Incremental backup diffed against an earlier archive baseline:
+bookeeper backup --incremental --diff-against ./backups/october_run.zip -o ./backups/diff_since_october.zip
+
+# 8. Minimal graph backup excluding chunks and states:
 bookeeper backup --no-chunks --no-states -o minimal.zip
 ```
 
@@ -137,6 +160,7 @@ Usage: bookeeper restore [OPTIONS] [archive_path]
 | `-o`, `--output-dir` | `PATH` | Config `output_dir` | Target directory to extract knowledge artifacts into. |
 | `-b`, `--books-dir` | `PATH` | Config `books_dir` | Target directory to extract source books into (for full backups). |
 | `--clean` | `FLAG` | `False` | Wipe existing knowledge graph, Obsidian vault, chunks, and states before restoring. |
+| `--incremental`, `-inc` | `FLAG` | `False` | Force incremental merge into existing KG and Neo4j without wiping existing nodes. |
 | `--dry-run` | `FLAG` | `False` | Inspect archive manifest, count files, and show summary table without writing. |
 | `-c`, `--config` | `PATH` | `None` | Path to `config.yaml`. |
 | `--calibre-path` | `PATH` | `None` | Custom path to Calibre library. |
@@ -152,6 +176,9 @@ bookeeper restore ./backups/october_run.7z --clean --output-dir ./restored_outpu
 
 # 3. Restore full archive including source books:
 bookeeper restore ./backups/full_archive.zip --books-dir ./restored_books
+
+# 4. Incrementally merge diff archive into active knowledge base and Neo4j:
+bookeeper restore ./backups/incremental_diff.zip --incremental
 ```
 
 ---
@@ -186,6 +213,20 @@ bookeeper verify --graph-file backups/run_a.zip --mode kg --tau 0.75
 ## 6. Web UI Backup & Restore
 
 Bookkeeper's Web UI provides a dedicated interface:
-* Access via the **💾 Backup & Restore** navigation tab (`?tab=backup`).
-* Choose between **Knowledge Only** and **Full Backup**.
+* Access via the **💾 Backup & Restore** navigation tab (`?tab=backup`) or dedicated modal dialogs.
+* Choose between **Knowledge Only**, **Full Backup**, and **Incremental Backup**.
 * Trigger backups, download generated `.zip` / `.7z` archives via direct browser download, or drag-and-drop an archive to restore with live progress updates.
+
+### Interactive Incremental Diff Preview & Preparation
+The Web UI includes integrated incremental backup workflows:
+* **Baseline Selection**: Choose between **Active Neo4j Database** or any **Historical Backup Archive** on disk as the comparison reference.
+* **Live Diff Preview**: Clicking **[ 🔍 Preview Incremental Diff ]** displays an instant table showing:
+  - **New Books**: Freshly indexed literature not yet present in the baseline.
+  - **Related Books in KG**: Existing books in your library that connect to the new books via shared concepts/ideas.
+  - **Shared Concepts**: Concept count forming the semantic bridge between new and existing books.
+* **1-Click Generation**: Prepare and download the incremental package containing only the identified diff.
+
+### Incremental Restore Mode
+When restoring archives in the UI:
+* An **Incremental Update (Merge into existing KG & Neo4j)** toggle is available in both the Restore modal and the dedicated page.
+* When enabled, the incoming archive is merged into the local graph and Neo4j without wiping existing nodes or constraints, safely blending new ideas, weights, and relationships.

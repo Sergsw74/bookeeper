@@ -134,11 +134,13 @@ flowchart TD
 ### Dedicated Backup & Restore Management Page
 - Access directly via the **💾 Backup & Restore** navigation menu item or `?tab=backup`.
 - **Backup Creation & Download Card**:
-  - Choose backup scope: **Full Backup** (Graph artifacts, state files, and indexed source books) or **Knowledge Only**.
+  - Choose backup scope: **Full Backup** (Graph artifacts, state files, and indexed source books), **Knowledge Only**, or **Incremental Backup**.
+  - **Incremental Diff Preview**: For incremental backups, select baseline source (Active Neo4j or previous backup archive) and preview the diff (new books, related books connected in the graph, and shared concepts) prior to building the archive.
   - Choose compression format: **ZIP (.zip)** for universal compatibility or **7-Zip (.7z)** for maximum compression.
   - Generates download URL and triggers automatic browser download upon preparation.
 - **Restore Backup Archive Card**:
   - File picker for `.zip` or `.7z` archives.
+  - **Incremental Update Toggle**: Merge incoming archive into the existing knowledge graph and Neo4j without wiping existing data.
   - Option to perform a clean wipe before restore.
   - Real-time upload and unpack progress display with Neo4j synchronization and consistency re-validation.
   - Prevents race conditions by automatically locking queries while restore runs.
@@ -218,7 +220,9 @@ The Bookkeeper UI server provides both the native Web UI API and a **LightRAG-co
 | `/api/books` / `/api/books/indexed` | `GET` | Returns list of indexed books in descending chronological order, including highlighted top ideas scored by `occurrences * weight`. |
 | `/api/backup/prepare` | `POST` | Packages and creates a full or knowledge backup archive (`{"type": "full", "format": "zip"}`). |
 | `/api/backup/download` | `GET` | Downloads generated backup archive directly via attachment streaming (`?filename=...`). |
-| `/api/backup/restore` | `POST` | Uploads and unpacks backup archive (`multipart/form-data`), updates Neo4j database, and reruns validation. Search queries are locked during execution. |
+| `/api/backup/incremental/preview` | `GET`, `POST` | Previews incremental diff against Neo4j or another archive (returns `baseline_books`, `new_books`, `related_books`, and `shared_concepts`). |
+| `/api/backup/incremental/prepare` | `POST` | Prepares and packages an incremental backup archive containing only new and related books diff. |
+| `/api/backup/restore` | `POST` | Uploads and unpacks backup archive (`multipart/form-data`), updates Neo4j database, and reruns validation. Supports `incremental=true` parameter for non-destructive merges. Search queries are locked during execution. |
 | `/api/backup/restore/status` | `GET` | Returns active restore progress status and stage. |
 | `/api/node` | `GET` | Returns full properties and categorized relationships for a node (`?id=<node_id>`). |
 | `/api/node/expand` | `POST`, `GET` | **Interactive Undirected Neighborhood Expansion** (Neo4j Browser-style). Pulls undirected 1-hop connected neighbors (`all`, `Concept`, `Book`, `Chunk`, `Section`). |

@@ -10395,6 +10395,124 @@ def simulate_thresholds_command(
     )
 
 
+@app.command("compare-jepa")
+@app.command("jepa-eval")
+def compare_jepa_command(
+    state_cache_dir: Optional[str] = typer.Option(
+        None,
+        "--state-cache-dir",
+        "--cache-dir",
+        help="Path to state cache directory containing book_*_state.json files (default: output_dir/.book_states).",
+    ),
+    graph_path: Optional[str] = typer.Option(
+        None,
+        "--graph-path",
+        "--kg",
+        help="Path to knowledge_graph.json to extract concept relations (default: output_dir/knowledge_graph.json).",
+    ),
+    max_books: Optional[int] = typer.Option(
+        10,
+        "--max-books",
+        "-b",
+        help="Maximum number of books to sample from book states for fast comparison (default: 10).",
+    ),
+    max_pairs: int = typer.Option(
+        2000,
+        "--max-pairs",
+        "-p",
+        help="Maximum pairs evaluated per regime (default: 2000).",
+    ),
+    latent_dim: int = typer.Option(
+        256,
+        "--latent-dim",
+        "-d",
+        help="Dimensionality of the decorrelated JEPA latent space (default: 256).",
+    ),
+    output_report: Optional[str] = typer.Option(
+        None,
+        "--output-report",
+        "--output",
+        "-o",
+        help="Destination path for Markdown comparison report (default: output_dir/jepa_comparison_report.md).",
+    ),
+    config_path: Optional[str] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to config.yaml file.",
+    ),
+):
+    """
+    Fast Performance Comparison: Current Embedding Model vs. Lightweight JEPA Encoder.
+    Evaluates Chunk vs Chunk, Idea vs Chunk, and Idea vs Idea semantic representation separation.
+    """
+    from bookeeper.config import get_settings
+    from bookeeper.evaluation.jepa_comparator import (
+        JEPAComparatorEngine,
+        generate_markdown_report,
+        load_reference_data,
+        print_comparison_tables,
+    )
+
+    cfg = get_settings(config_path)
+    console = Console()
+
+    # Resolve directories
+    out_dir = Path(cfg.output_dir)
+    resolved_state_dir = Path(state_cache_dir) if state_cache_dir else (out_dir / ".book_states")
+    if not resolved_state_dir.is_dir():
+        resolved_state_dir = out_dir
+
+    resolved_kg_path = Path(graph_path) if graph_path else (out_dir / "knowledge_graph.json")
+    resolved_report_path = Path(output_report) if output_report else (out_dir / "jepa_comparison_report.md")
+
+    console.print(
+        Panel.fit(
+            f"[bold cyan]⚡ JEPA Encoder vs. Current Embedding Model Evaluation[/bold cyan]\n"
+            f"• State Cache Dir: [cyan]{resolved_state_dir}[/cyan]\n"
+            f"• Sample Limit: [bold green]{max_books or 'All'} books[/bold green], [bold green]{max_pairs} pairs/regime[/bold green]\n"
+            f"• Target JEPA Latent Dim: [bold]{latent_dim}[/bold]\n"
+            f"• Base Embedding Model: [bold yellow]{cfg.embedding_model}[/bold yellow]",
+            title="JEPA Benchmark Setup",
+            border_style="cyan",
+        )
+    )
+
+    with console.status("[bold green]Loading book state files & reference relationships...[/bold green]"):
+        dataset = load_reference_data(
+            state_dir=resolved_state_dir,
+            kg_path=resolved_kg_path if resolved_kg_path.is_file() else None,
+            max_books=max_books,
+        )
+
+    if not dataset.chunks:
+        console.print("[bold red]Error: No chunks with embeddings found in specified state directory.[/bold red]")
+        raise typer.Exit(code=1)
+
+    with console.status("[bold green]Fitting lightweight JEPA projector and benchmarking representations...[/bold green]"):
+        engine = JEPAComparatorEngine(
+            dataset=dataset,
+            latent_dim=latent_dim,
+            max_pairs_per_regime=max_pairs,
+        )
+        report = engine.evaluate_all()
+
+    # 1. Print Rich tables
+    print_comparison_tables(report, console=console)
+
+    # 2. Write Markdown visual report
+    generate_markdown_report(report, resolved_report_path)
+
+    console.print(
+        Panel.fit(
+            f"[bold green]✓ JEPA Comparison Benchmark Complete[/bold green]\n"
+            f"• Markdown Visual Report: [bold underline cyan]{resolved_report_path}[/bold underline cyan]\n"
+            f"  (Includes separation metrics, rank adjustment scaling, and Mermaid visual chart)",
+            title="Benchmark Finished",
+            border_style="green",
+        )
+    )
+
 
 if __name__ == "__main__":
     app()

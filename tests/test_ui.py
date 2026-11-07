@@ -1859,6 +1859,108 @@ def test_ui_incremental_restore_flow(mock_backend, tmp_path):
         server.server_close()
 
 
+def test_parse_multipart_to_file(tmp_path):
+    """Test streaming multipart upload directly to temporary file."""
+    import io
+    from bookeeper.ui.server import parse_multipart_to_file
+
+    payload = (
+        b"------TestBoundary123\r\n"
+        b'Content-Disposition: form-data; name="incremental"\r\n\r\n'
+        b"true\r\n"
+        b"------TestBoundary123\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="diff_backup.zip"\r\n'
+        b"Content-Type: application/zip\r\n\r\n"
+        b"PK\x03\x04STREAMING_TEST_CONTENT_1234567890\r\n"
+        b"------TestBoundary123\r\n"
+        b'Content-Disposition: form-data; name="clean"\r\n\r\n'
+        b"false\r\n"
+        b"------TestBoundary123--\r\n"
+    )
+
+    out_file = tmp_path / "streamed_out.zip"
+    with open(out_file, "wb") as f:
+        fname, fields, written = parse_multipart_to_file(
+            io.BytesIO(payload),
+            "----TestBoundary123",
+            f,
+            max_content_length=len(payload),
+        )
+
+    assert fname == "diff_backup.zip"
+    assert fields.get("incremental") == "true"
+    assert fields.get("clean") == "false"
+    assert written == len(b"PK\x03\x04STREAMING_TEST_CONTENT_1234567890")
+    assert out_file.read_bytes() == b"PK\x03\x04STREAMING_TEST_CONTENT_1234567890"
+
+
+def test_ui_broken_pipe_resilience(mock_backend):
+    """Test that BrokenPipeError and ConnectionResetError are safely caught without crashing the server."""
+    from unittest.mock import MagicMock
+    from bookeeper.ui.server import BookeeperUIRequestHandler, run_server
+
+    class MockSocket:
+        def sendall(self, *args, **kwargs):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def write(self, *args, **kwargs):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    handler = BookeeperUIRequestHandler.__new__(BookeeperUIRequestHandler)
+    handler.backend = mock_backend
+    handler.wfile = MockSocket()
+    handler.send_response = MagicMock()
+    handler.send_header = MagicMock()
+    handler.end_headers = MagicMock()
+
+    # These should not raise BrokenPipeError
+    handler._send_html("<html>Test</html>")
+    handler._send_json({"status": "ok"})
+
+    # Test ReusableThreadingServer.handle_error suppressing BrokenPipeError
+    server = run_server(host="127.0.0.1", port=0, backend=mock_backend)
+    try:
+        with patch("sys.exc_info", return_value=(BrokenPipeError, BrokenPipeError(32, "Broken pipe"), None)):
+            # Should safely return without calling super().handle_error or printing traceback
+            server.handle_error(None, ("127.0.0.1", 12345))
+
+        with patch("sys.exc_info", return_value=(ConnectionResetError, ConnectionResetError(54, "Connection reset by peer"), None)):
+            server.handle_error(None, ("127.0.0.1", 12345))
+    finally:
+        server.server_close()
+
+
+def test_ui_backend_restore_from_backup_reuses_incremental_neo4j_export(mock_backend, tmp_path):
+    """Verify that incremental restore reuses the diff export without re-loading the full knowledge graph."""
+    from unittest.mock import patch
+
+    archive_zip = tmp_path / "inc_restore_test.zip"
+    archive_zip.write_bytes(b"dummy")
+
+    mock_inc_restore_res = {
+        "success": True,
+        "backup_type": "incremental",
+        "files_restored": 5,
+        "bytes_restored": 2048,
+        "merge_stats": {"nodes_added": 12, "edges_added": 18},
+        "neo4j_export": {"status": "ok", "nodes_upserted": 12, "edges_upserted": 18},
+    }
+
+    with patch("bookeeper.backup.restore_backup", return_value=mock_inc_restore_res), \
+         patch.object(mock_backend, "validate_database_consistency", return_value={"is_consistent": True}), \
+         patch("bookeeper.graph.store.ConceptGraphStore") as mock_store_cls:
+
+        res = mock_backend.restore_from_backup(archive_file=archive_zip, incremental=True, export_neo4j=True)
+
+        # ConceptGraphStore should NOT have been loaded because incremental diff was already synced
+        mock_store_cls.assert_not_called()
+        assert res["backup_type"] == "incremental"
+        assert res["restored_files"] == 5
+        assert res["merge_stats"]["nodes_added"] == 12
+        assert res["neo4j_export"]["nodes_upserted"] == 12
+
+
+
 
 
 

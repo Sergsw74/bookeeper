@@ -7,6 +7,7 @@ and serves the frontend web UI.
 import json
 import logging
 import re
+import sys
 import tempfile
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,41 +23,190 @@ logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
 
 
+def parse_multipart_to_file(
+    stream: Any,
+    boundary: str,
+    dest_file_obj: Any,
+    max_content_length: Optional[int] = None,
+) -> tuple[Optional[str], dict[str, str], int]:
+    """
+    Stream a multipart/form-data payload directly from stream to disk.
+    Avoids loading large uploaded archive files into RAM.
+    Returns (filename, fields_dict, bytes_written).
+    """
+    raw_boundary = boundary.encode("ascii") if isinstance(boundary, str) else boundary
+    delimiter = b"\r\n--" + raw_boundary
+    delim_len = len(delimiter)
+
+    remaining = [max_content_length] if max_content_length is not None else [float("inf")]
+
+    def read_exact_or_less(n: int) -> bytes:
+        if remaining[0] <= 0:
+            return b""
+        to_read = min(n, int(remaining[0]))
+        chunk = stream.read(to_read)
+        remaining[0] -= len(chunk)
+        return chunk
+
+    buf = bytearray()
+
+    def read_line() -> bytes:
+        nonlocal buf
+        while b"\n" not in buf:
+            chunk = read_exact_or_less(8192)
+            if not chunk:
+                break
+            buf.extend(chunk)
+        if not buf:
+            return b""
+        idx = buf.find(b"\n")
+        if idx != -1:
+            line = bytes(buf[:idx + 1])
+            del buf[:idx + 1]
+            return line
+        line = bytes(buf)
+        buf.clear()
+        return line
+
+    fields: dict[str, str] = {}
+    filename: Optional[str] = None
+    file_bytes_written = 0
+
+    first_line = read_line().strip()
+    if not first_line.startswith(b"--" + raw_boundary):
+        raise ValueError(f"Invalid multipart start: {first_line}")
+    if first_line.endswith(b"--"):
+        return filename, fields, file_bytes_written
+
+    while True:
+        headers = []
+        while True:
+            hline = read_line()
+            if not hline or hline in (b"\r\n", b"\n"):
+                break
+            headers.append(hline.decode("latin1", errors="replace"))
+        if not headers:
+            break
+        header_text = "".join(headers)
+        fname_m = re.search(r'filename="([^"]+)"', header_text)
+        name_m = re.search(r'name="([^"]+)"', header_text)
+        name = name_m.group(1) if name_m else None
+
+        if fname_m:
+            filename = fname_m.group(1)
+            # Stream binary file content directly to dest_file_obj in 64KB chunks
+            while True:
+                idx = buf.find(delimiter)
+                if idx != -1:
+                    dest_file_obj.write(buf[:idx])
+                    file_bytes_written += idx
+                    del buf[:idx + len(delimiter)]
+                    post_line = read_line()
+                    if post_line.strip().startswith(b"--"):
+                        return filename, fields, file_bytes_written
+                    break
+                else:
+                    safe = len(buf) - delim_len
+                    if safe > 0:
+                        dest_file_obj.write(buf[:safe])
+                        file_bytes_written += safe
+                        del buf[:safe]
+                    chunk = read_exact_or_less(65536)
+                    if not chunk:
+                        dest_file_obj.write(buf)
+                        file_bytes_written += len(buf)
+                        buf.clear()
+                        return filename, fields, file_bytes_written
+                    buf.extend(chunk)
+        else:
+            # Regular text field: read until next delimiter
+            val_parts = []
+            while True:
+                idx = buf.find(delimiter)
+                if idx != -1:
+                    val_parts.append(buf[:idx])
+                    del buf[:idx + len(delimiter)]
+                    post_line = read_line()
+                    val = b"".join(val_parts).rstrip(b"\r\n").decode("utf-8", errors="replace")
+                    if name:
+                        fields[name] = val
+                    if post_line.strip().startswith(b"--"):
+                        return filename, fields, file_bytes_written
+                    break
+                else:
+                    safe = len(buf) - delim_len
+                    if safe > 0:
+                        val_parts.append(bytes(buf[:safe]))
+                        del buf[:safe]
+                    chunk = read_exact_or_less(8192)
+                    if not chunk:
+                        val_parts.append(bytes(buf))
+                        buf.clear()
+                        val = b"".join(val_parts).rstrip(b"\r\n").decode("utf-8", errors="replace")
+                        if name:
+                            fields[name] = val
+                        return filename, fields, file_bytes_written
+                    buf.extend(chunk)
+
+    return filename, fields, file_bytes_written
+
+
 class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
     """HTTP Request Handler for Bookeeper UI and REST API."""
 
     backend: SearchEngineBackend = None  # Class-level reference set by server
     lightrag_mgr: Optional[Any] = None  # Optional stub for backward compatibility
 
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            logger.debug(f"Client disconnected during request from {self.client_address}")
+
+    def send_error(self, code, message=None, explain=None):
+        try:
+            super().send_error(code, message=message, explain=explain)
+        except (BrokenPipeError, ConnectionResetError):
+            logger.debug("Client disconnected while sending error response")
+
     def _send_json(self, data: dict, status: int = HTTPStatus.OK):
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            logger.debug("Client disconnected while sending JSON response")
 
     def _send_html(self, content: str, status: int = HTTPStatus.OK):
-        body = content.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = content.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            logger.debug("Client disconnected while sending HTML response")
 
     def _send_file(self, file_path: Path, content_type: str = "text/plain"):
-        if not file_path.is_file():
-            self.send_error(HTTPStatus.NOT_FOUND, "File Not Found")
-            return
-        data = file_path.read_bytes()
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            if not file_path.is_file():
+                self.send_error(HTTPStatus.NOT_FOUND, "File Not Found")
+                return
+            data = file_path.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            logger.debug("Client disconnected while sending file response")
 
     def do_OPTIONS(self):
         """Handle CORS pre-flight requests."""
@@ -340,61 +490,59 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "A restore operation is already in progress."}, HTTPStatus.CONFLICT)
                 return
 
-            raw_bytes = self.rfile.read(content_length)
-            archive_bytes = None
             orig_filename = "uploaded_backup.zip"
             clean_mode = False
             clean_neo4j = False
             incremental_mode = False
-
-            if "multipart/form-data" in content_type:
-                boundary_match = re.search(r'boundary=([^;]+)', content_type)
-                if not boundary_match:
-                    self._send_json({"error": "Missing multipart boundary."}, HTTPStatus.BAD_REQUEST)
-                    return
-                boundary = boundary_match.group(1).strip().strip('"').encode("ascii")
-                parts = raw_bytes.split(b"--" + boundary)
-                for part in parts:
-                    if not part or part in (b"--\r\n", b"--", b"\r\n"):
-                        continue
-                    if b"\r\n\r\n" not in part:
-                        continue
-                    headers_part, body_part = part.split(b"\r\n\r\n", 1)
-                    if body_part.endswith(b"\r\n"):
-                        body_part = body_part[:-2]
-                    headers_text = headers_part.decode("latin1", errors="replace")
-                    
-                    fname_m = re.search(r'filename="([^"]+)"', headers_text)
-                    name_m = re.search(r'name="([^"]+)"', headers_text)
-
-                    if fname_m:
-                        orig_filename = fname_m.group(1)
-                        archive_bytes = body_part
-                    elif name_m and name_m.group(1) == "clean":
-                        clean_mode = body_part.decode("utf-8", errors="replace").strip().lower() in ("true", "1", "yes")
-                    elif name_m and name_m.group(1) in ("clean_neo4j", "clean-neo4j"):
-                        clean_neo4j = body_part.decode("utf-8", errors="replace").strip().lower() in ("true", "1", "yes")
-                    elif name_m and name_m.group(1) in ("incremental", "is_incremental"):
-                        incremental_mode = body_part.decode("utf-8", errors="replace").strip().lower() in ("true", "1", "yes")
-            else:
-                # Raw binary payload
-                archive_bytes = raw_bytes
-                qs = parse_qs(parsed.query)
-                orig_filename = qs.get("filename", [orig_filename])[0]
-                clean_mode = qs.get("clean", ["false"])[0].lower() in ("true", "1", "yes")
-                clean_neo4j = qs.get("clean_neo4j", ["false"])[0].lower() in ("true", "1", "yes")
-                incremental_mode = qs.get("incremental", ["false"])[0].lower() in ("true", "1", "yes")
-
-            if not archive_bytes:
-                self._send_json({"error": "No backup file uploaded in request payload."}, HTTPStatus.BAD_REQUEST)
-                return
-
-            ext = Path(orig_filename).suffix.lower() or ".zip"
             temp_file = None
+
             try:
-                with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tf:
-                    tf.write(archive_bytes)
+                # Stream uploaded archive directly to temporary file on disk
+                with tempfile.NamedTemporaryFile(suffix=".tmp", delete=False) as tf:
                     temp_file = Path(tf.name)
+
+                    if "multipart/form-data" in content_type:
+                        boundary_match = re.search(r'boundary=([^;]+)', content_type)
+                        if not boundary_match:
+                            self._send_json({"error": "Missing multipart boundary."}, HTTPStatus.BAD_REQUEST)
+                            return
+                        boundary = boundary_match.group(1).strip().strip('"')
+                        fname, fields, _ = parse_multipart_to_file(
+                            self.rfile, boundary, tf, max_content_length=content_length
+                        )
+                        if fname:
+                            orig_filename = fname
+                        clean_mode = fields.get("clean", "").strip().lower() in ("true", "1", "yes")
+                        clean_neo4j = fields.get("clean_neo4j", "").strip().lower() in ("true", "1", "yes")
+                        incremental_mode = fields.get(
+                            "incremental", fields.get("is_incremental", "")
+                        ).strip().lower() in ("true", "1", "yes")
+                    else:
+                        # Raw binary payload
+                        remaining = content_length
+                        while remaining > 0:
+                            chunk_size = min(remaining, 65536)
+                            chunk = self.rfile.read(chunk_size)
+                            if not chunk:
+                                break
+                            tf.write(chunk)
+                            remaining -= len(chunk)
+                        qs = parse_qs(parsed.query)
+                        orig_filename = qs.get("filename", [orig_filename])[0]
+                        clean_mode = qs.get("clean", ["false"])[0].lower() in ("true", "1", "yes")
+                        clean_neo4j = qs.get("clean_neo4j", ["false"])[0].lower() in ("true", "1", "yes")
+                        incremental_mode = qs.get("incremental", ["false"])[0].lower() in ("true", "1", "yes")
+
+                if not temp_file.is_file() or temp_file.stat().st_size == 0:
+                    self._send_json({"error": "No backup file uploaded in request payload."}, HTTPStatus.BAD_REQUEST)
+                    return
+
+                # Ensure temp file has proper archive extension
+                ext = Path(orig_filename).suffix.lower() or ".zip"
+                if temp_file.suffix != ext:
+                    proper_temp_file = temp_file.with_suffix(ext)
+                    temp_file.replace(proper_temp_file)
+                    temp_file = proper_temp_file
 
                 res = self.backend.restore_from_backup(
                     archive_file=temp_file,
@@ -618,6 +766,13 @@ def run_server(
 
     class ReusableThreadingServer(ThreadingHTTPServer):
         allow_reuse_address = True
+
+        def handle_error(self, request, client_address):
+            exc_type, _, _ = sys.exc_info()
+            if exc_type in (BrokenPipeError, ConnectionResetError):
+                logger.debug(f"Client disconnected ({exc_type.__name__}) from {client_address}")
+                return
+            super().handle_error(request, client_address)
 
     current_port = port
     max_attempts = 20 if auto_port else 1

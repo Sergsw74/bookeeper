@@ -3302,6 +3302,8 @@ class SearchEngineBackend:
                 clean=clean,
                 dry_run=False,
                 incremental=incremental,
+                export_neo4j=export_neo4j,
+                neo4j_config=self.neo4j_cfg,
             )
 
             files_cnt = restore_result.get("files_restored", 0)
@@ -3337,7 +3339,27 @@ class SearchEngineBackend:
             # 2. Export / update Neo4j database with restored graph
             neo4j_export_result = None
             kg_path = out_dir / "knowledge_graph.json"
-            if export_neo4j and kg_path.is_file():
+            if is_inc_restore and "neo4j_export" in restore_result:
+                # Incremental restore already synchronized the diff store into Neo4j
+                neo4j_export_result = restore_result.get("neo4j_export")
+                if neo4j_export_result:
+                    if neo4j_export_result.get("error"):
+                        self._add_restore_log(
+                            f"⚠️ Neo4j incremental export warning: {neo4j_export_result['error']}",
+                            progress_pct=90,
+                        )
+                    else:
+                        unch = neo4j_export_result.get("books_unchanged", 0)
+                        mod = neo4j_export_result.get("books_modified", 0)
+                        ups_n = neo4j_export_result.get("nodes_upserted", 0)
+                        ups_e = neo4j_export_result.get("edges_upserted", 0)
+                        self._add_restore_log(
+                            f"✓ Neo4j incremental sync complete ({unch} books unchanged, {mod} books updated, {ups_n:,} nodes, {ups_e:,} relationships).",
+                            progress_pct=90,
+                        )
+                else:
+                    self._add_restore_log("Neo4j export skipped (offline / not configured).", progress_pct=90)
+            elif export_neo4j and kg_path.is_file():
                 self._add_restore_log(
                     "Loading restored knowledge graph and preparing incremental Neo4j synchronization...",
                     stage="exporting_neo4j",
@@ -3419,6 +3441,12 @@ class SearchEngineBackend:
                 "consistency": consistency_result,
                 "completed_at": datetime.datetime.now().isoformat(),
             }
+            if "merge_stats" in restore_result:
+                final_result["merge_stats"] = restore_result["merge_stats"]
+            if "new_books" in restore_result:
+                final_result["new_books"] = restore_result["new_books"]
+            if "related_books" in restore_result:
+                final_result["related_books"] = restore_result["related_books"]
 
             self._add_restore_log(
                 "🎉 Restore and synchronization completed successfully!",

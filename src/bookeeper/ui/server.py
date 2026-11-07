@@ -772,6 +772,19 @@ def run_server(
         cfg = get_settings(config_path)
         backend = SearchEngineBackend(cfg)
 
+    # Ensure console logging is active for server milestone events
+    if not logging.getLogger().handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(
+            logging.Formatter(
+                fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        logging.getLogger().addHandler(handler)
+        logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger("bookeeper").setLevel(logging.INFO)
+
     BookeeperUIRequestHandler.backend = backend
     BookeeperUIRequestHandler.lightrag_mgr = lightrag_mgr
 

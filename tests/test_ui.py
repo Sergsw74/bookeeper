@@ -1960,6 +1960,29 @@ def test_ui_backend_restore_from_backup_reuses_incremental_neo4j_export(mock_bac
         assert res["neo4j_export"]["nodes_upserted"] == 12
 
 
+def test_ui_restore_logging(mock_backend, caplog):
+    """Test that _add_restore_log records in in-memory status and emits to python logger."""
+    import logging
+    with caplog.at_level(logging.INFO):
+        mock_backend._add_restore_log("Step 1: Test restore message", stage="restoring", progress_pct=42)
+
+    status = mock_backend.get_restore_status()
+    assert status["stage"] == "restoring"
+    assert status["progress_pct"] == 42
+    assert any("Test restore message" in log for log in status["logs"])
+    assert any("[RESTORE] Step 1: Test restore message" in record.message for record in caplog.records)
+
+
+def test_setup_cli_logging():
+    """Test setup_cli_logging configures root and bookeeper loggers."""
+    import logging
+    from bookeeper.cli import setup_cli_logging
+    setup_cli_logging(level=logging.INFO)
+    assert logging.getLogger("bookeeper").level == logging.INFO
+    assert len(logging.getLogger().handlers) > 0
+
+
+
 
 
 

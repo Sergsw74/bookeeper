@@ -146,6 +146,23 @@ logger = logging.getLogger(__name__)
 logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 
+def setup_cli_logging(level: int = logging.INFO) -> None:
+    """Ensure root logger and bookeeper logger output INFO milestones to stderr."""
+    root = logging.getLogger()
+    if not root.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        formatter = logging.Formatter(
+            fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        handler.setFormatter(formatter)
+        root.addHandler(handler)
+    root.setLevel(level)
+    logging.getLogger("bookeeper").setLevel(level)
+    logging.getLogger("pypdf").setLevel(logging.ERROR)
+    logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
+
+
 @app.callback()
 def _main_callback(
     config_diff: Optional[str] = typer.Option(
@@ -156,6 +173,7 @@ def _main_callback(
     ),
 ) -> None:
     """Global CLI callback supporting --config-diff before subcommands."""
+    setup_cli_logging()
     resolved_diff = _resolve_opt(config_diff)
     if resolved_diff:
         set_active_config_diff(str(resolved_diff))
@@ -9749,6 +9767,7 @@ def ui_command(
     from bookeeper.ui.backend import SearchEngineBackend
     from bookeeper.ui.server import run_server
 
+    setup_cli_logging()
     cfg = _get_effective_settings(config_path, config_diff=config_diff)
     backend = SearchEngineBackend(config=cfg, neo4j_config=cfg.neo4j)
 

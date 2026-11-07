@@ -169,6 +169,7 @@ class SearchEngineBackend:
             self._restore_status["message"] = message
             if progress_pct is not None:
                 self._restore_status["progress_pct"] = max(0, min(100, progress_pct))
+        logger.info(f"[RESTORE] {message}")
 
     @property
     def is_restoring(self) -> bool:

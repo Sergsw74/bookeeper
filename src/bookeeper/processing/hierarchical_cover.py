@@ -59,6 +59,25 @@ from bookeeper.processing.filters import (
 logger = logging.getLogger(__name__)
 
 
+def _normalize_and_project_vector(raw_emb: Any) -> Optional[np.ndarray]:
+    """Normalize embedding vector and project legacy 1024-d vectors into 768-d JEPA space."""
+    if raw_emb is None or len(raw_emb) <= 1:
+        return None
+    arr = np.asarray(raw_emb, dtype=np.float32)
+    if arr.ndim != 1:
+        arr = arr.flatten()
+    if arr.shape[0] != 768 and arr.shape[0] == 1024 and Path("output/jepa_768_weights.npz").is_file():
+        try:
+            from bookeeper.evaluation.jepa_encoder import LightweightJEPAEncoder
+            if not hasattr(hierarchical_semantic_cover, "_jepa_proj"):
+                hierarchical_semantic_cover._jepa_proj = LightweightJEPAEncoder.load("output/jepa_768_weights.npz")
+            arr = hierarchical_semantic_cover._jepa_proj.project(arr)
+        except Exception:
+            pass
+    norm = float(np.linalg.norm(arr))
+    return (arr / norm) if norm > 1e-12 else arr
+
+
 def compute_cosine_similarity(vec1: Sequence[float], vec2: Sequence[float]) -> float:
     """Compute cosine similarity between two 1D numerical vectors."""
     a = np.asarray(vec1, dtype=np.float32)
@@ -346,11 +365,8 @@ def hierarchical_semantic_cover(
             if get_chunk_attr(chk, "has_formula", False) or f_cat == "formulas":
                 selected_chunks.append(chk)
                 sec_selected_chunks.append(chk)
-                raw_emb = getattr(chk, "embedding", None)
-                if raw_emb is not None and len(raw_emb) > 1:
-                    arr = np.array(raw_emb, dtype=np.float32)
-                    norm = float(np.linalg.norm(arr))
-                    v_unit = (arr / norm) if norm > 1e-12 else arr
+                v_unit = _normalize_and_project_vector(getattr(chk, "embedding", None))
+                if v_unit is not None:
                     sec_selected_vectors.append(v_unit)
                 dec = CoverDecision(
                     chunk=chk,
@@ -367,8 +383,8 @@ def hierarchical_semantic_cover(
                 continue
 
             # Check if chunk has a valid embedding
-            raw_emb = getattr(chk, "embedding", None)
-            if raw_emb is None or len(raw_emb) <= 1:
+            v_unit = _normalize_and_project_vector(getattr(chk, "embedding", None))
+            if v_unit is None:
                 # If chunk has no embedding, we cannot safely evaluate redundancy -> keep it
                 selected_chunks.append(chk)
                 sec_selected_chunks.append(chk)
@@ -386,18 +402,6 @@ def hierarchical_semantic_cover(
                 if on_progress:
                     on_progress(processed_count, total_count)
                 continue
-
-            arr = np.array(raw_emb, dtype=np.float32)
-            if arr.shape[0] != 768 and arr.shape[0] == 1024 and Path("output/jepa_768_weights.npz").is_file():
-                try:
-                    from bookeeper.evaluation.jepa_encoder import LightweightJEPAEncoder
-                    if not hasattr(hierarchical_semantic_cover, "_jepa_proj"):
-                        hierarchical_semantic_cover._jepa_proj = LightweightJEPAEncoder.load("output/jepa_768_weights.npz")
-                    arr = hierarchical_semantic_cover._jepa_proj.project(arr)
-                except Exception:
-                    pass
-            norm = float(np.linalg.norm(arr))
-            v_unit = (arr / norm) if norm > 1e-12 else arr
 
             # First non-reference chunk of the section is always the section anchor
             if not sec_selected_chunks:
@@ -423,11 +427,16 @@ def hierarchical_semantic_cover(
             window_vectors = sec_selected_vectors[-sliding_window_size:]
             window_chunks = sec_selected_chunks[-sliding_window_size:]
 
-            M_sec = np.stack(window_vectors, axis=0)  # Shape: (W, D)
-            sims = M_sec @ v_unit  # Shape: (W,)
-            max_sim = float(np.max(sims))
-            best_match_idx = int(np.argmax(sims))
-            best_match_chk = window_chunks[best_match_idx]
+            compat_window_vectors = [v for v in window_vectors if v.shape == v_unit.shape]
+            if compat_window_vectors:
+                M_sec = np.stack(compat_window_vectors, axis=0)  # Shape: (W, D)
+                sims = M_sec @ v_unit  # Shape: (W,)
+                max_sim = float(np.max(sims))
+                best_match_idx = int(np.argmax(sims))
+                best_match_chk = window_chunks[best_match_idx] if best_match_idx < len(window_chunks) else window_chunks[0]
+            else:
+                max_sim = -1.0
+                best_match_chk = window_chunks[-1]
 
             chk_text_len = len(str(getattr(chk, "text", "") or ""))
             best_text_len = len(str(getattr(best_match_chk, "text", "") or ""))

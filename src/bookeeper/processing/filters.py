@@ -585,9 +585,21 @@ class ChunkSimilarityFilter(BaseChunkFilter):
         if emb is None or len(emb) <= 1:
             return FilterDecision.CONTINUE
 
+        from pathlib import Path
         import numpy as np
 
         arr = np.asarray(emb, dtype=np.float32)
+        if arr.ndim != 1:
+            arr = arr.flatten()
+        if arr.shape[0] != 768 and arr.shape[0] == 1024 and Path("output/jepa_768_weights.npz").is_file():
+            try:
+                from bookeeper.evaluation.jepa_encoder import LightweightJEPAEncoder
+                if not hasattr(self, "_jepa_proj"):
+                    self._jepa_proj = LightweightJEPAEncoder.load("output/jepa_768_weights.npz")
+                arr = self._jepa_proj.project(arr)
+            except Exception:
+                pass
+
         norm = float(np.linalg.norm(arr))
         if norm < 1e-12:
             return FilterDecision.CONTINUE
@@ -608,9 +620,13 @@ class ChunkSimilarityFilter(BaseChunkFilter):
             return FilterDecision.CONTINUE
 
         # Compare against recently retained chunks in this section (within sliding window)
-        W = np.stack(window[-self.sliding_window_size:], axis=0)
-        sims = W @ v_unit
-        max_sim = float(np.max(sims))
+        compat_window = [w for w in window[-self.sliding_window_size:] if w.shape == v_unit.shape]
+        if not compat_window:
+            max_sim = -1.0
+        else:
+            W = np.stack(compat_window, axis=0)
+            sims = W @ v_unit
+            max_sim = float(np.max(sims))
 
         # Formula safeguard: Math formulas have absolute highest priority - NEVER drop as redundant!
         text = str(getattr(chunk, "text", "") or "")

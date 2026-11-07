@@ -86,6 +86,15 @@ def decode_embedding(
     Returns:
         Float32 array/list, or None if input was empty.
     """
+    if encoded is None:
+        return None
+
+    if isinstance(encoded, (list, tuple, np.ndarray)):
+        if len(encoded) == 0:
+            return None
+        arr = np.asarray(encoded, dtype=np.float32)
+        return arr if return_numpy else arr.tolist()
+
     if not encoded:
         return None
 
@@ -96,7 +105,7 @@ def decode_embedding(
         b64_str = encoded
         eff_dtype = dtype or "float16"
     else:
-        raise TypeError(f"Expected str or dict for decode_embedding, got {type(encoded)}")
+        raise TypeError(f"Expected str, dict, list, or ndarray for decode_embedding, got {type(encoded)}")
 
     if not b64_str:
         return None

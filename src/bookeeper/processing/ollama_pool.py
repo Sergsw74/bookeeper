@@ -1197,8 +1197,21 @@ class FailoverOllamaEmbeddings(Embeddings):
         cls,
         settings: Any,
         model: Optional[str] = None,
-    ) -> "FailoverOllamaEmbeddings":
-        """Instantiate FailoverOllamaEmbeddings using dedicated embedding servers or fallback pool."""
+        bypass_jepa_check: bool = False,
+    ) -> Any:
+        """Instantiate Embeddings wrapper from settings (JEPA or FailoverOllamaEmbeddings)."""
+        eff_model = model or getattr(settings, "embedding_model", "jepa-768")
+        eff_provider = str(getattr(settings, "embedding_provider", "")).lower()
+        jepa_cfg = getattr(settings, "jepa", None)
+        jepa_enabled = getattr(jepa_cfg, "enabled", False) if jepa_cfg else False
+
+        if not bypass_jepa_check and (eff_provider == "jepa" or jepa_enabled or "jepa" in str(eff_model).lower()):
+            try:
+                from bookeeper.evaluation.jepa_embeddings import JEPAEmbeddings
+                return JEPAEmbeddings.from_settings(settings, model=eff_model)
+            except Exception as e:
+                logger.warning(f"Could not initialize JEPAEmbeddings, falling back to Ollama embeddings: {e}")
+
         servers = getattr(settings, "resolved_embedding_servers", None) or getattr(settings, "resolved_ollama_servers", [])
         cooldown = getattr(settings, "failover_cooldown_seconds", 600)
         pool = OllamaPool(
@@ -1208,7 +1221,7 @@ class FailoverOllamaEmbeddings(Embeddings):
         )
         return cls(
             pool=pool,
-            model=model or getattr(settings, "embedding_model", "nomic-embed-text"),
+            model=eff_model,
         )
 
     def reset_stats(self) -> None:

@@ -405,6 +405,43 @@ class VerificationConfig(BaseModel):
         super().__init__(**data)
 
 
+class JEPAConfig(BaseModel):
+    """Configuration for JEPA (Joint Embedding Predictive Architecture) zero-isotropic encoder."""
+
+    enabled: bool = Field(
+        default=True,
+        description="Whether to use JEPA zero-isotropic encoder as primary representation (default: True).",
+    )
+    dimension: int = Field(
+        default=768,
+        description="Latent vector dimensionality of JEPA embeddings (default: 768).",
+    )
+    unrelated_baseline: float = Field(
+        default=0.00,
+        description="Expected cosine similarity for completely unrelated concepts (default: 0.00).",
+    )
+    model_type: str = Field(
+        default="whitened_projector",
+        description="JEPA model type: 'whitened_projector', 'direct_network', or 'all-mpnet-base-v2'.",
+    )
+    weights_path: str = Field(
+        default="output/jepa_768_weights.npz",
+        description="File path to persist/load fitted JEPA covariance whitening weights.",
+    )
+    base_embedding_model: str = Field(
+        default="bge-m3:latest",
+        description="Base embedding model to whiten if model_type is 'whitened_projector'.",
+    )
+    epsilon: float = Field(
+        default=1e-3,
+        description="Shrinkage regularization parameter for covariance inversion.",
+    )
+    align_alpha: float = Field(
+        default=0.5,
+        description="Weight for predictive alignment on positive pairs.",
+    )
+
+
 class DualPassConfig(BaseModel):
     """Configuration for two-pass idea postprocessing, aggregation, and synthesis."""
 
@@ -848,8 +885,20 @@ class Settings(BaseSettings):
         default=None,
         description="Alias for llm_model_fallback.",
     )
+    embedding_provider: str = Field(
+        default="jepa",
+        description="Embedding provider engine: 'jepa' for 768-d zero-isotropic space or 'ollama' for classical embeddings.",
+    )
+    embedding_dim: int = Field(
+        default=768,
+        description="Dimensionality of semantic embeddings (768 for JEPA, 1024 for BGE-M3).",
+    )
+    jepa: JEPAConfig = Field(
+        default_factory=JEPAConfig,
+        description="JEPA zero-isotropic representation settings.",
+    )
     embedding_model: str = Field(
-        default="nomic-embed-text",
+        default="jepa-768",
         description="Embedding model for semantic chunking and entity deduplication.",
     )
     embedding_base_url: Optional[str] = Field(

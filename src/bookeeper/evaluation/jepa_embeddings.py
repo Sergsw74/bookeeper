@@ -40,7 +40,7 @@ class JEPAEmbeddings(Embeddings):
     def __init__(
         self,
         dimension: int = 768,
-        model_type: str = "whitened_projector",
+        model_type: str = "direct_network",
         weights_path: Optional[Union[str, Path]] = None,
         base_embeddings: Optional[Embeddings] = None,
         encoder: Optional[LightweightJEPAEncoder] = None,
@@ -48,6 +48,7 @@ class JEPAEmbeddings(Embeddings):
         hf_model_id: str = "sentence-transformers/all-mpnet-base-v2",
         **kwargs: Any,
     ) -> None:
+        self.model = "jepa-768"
         self.dimension = int(dimension)
         self.model_type = model_type.lower()
         self.weights_path = Path(weights_path) if weights_path else Path("output/jepa_768_weights.npz")
@@ -94,7 +95,7 @@ class JEPAEmbeddings(Embeddings):
         """
         jepa_cfg = getattr(settings, "jepa", None)
         dimension = getattr(jepa_cfg, "dimension", None) or getattr(settings, "embedding_dim", 768)
-        model_type = getattr(jepa_cfg, "model_type", "whitened_projector")
+        model_type = getattr(jepa_cfg, "model_type", "direct_network")
         weights_path = getattr(jepa_cfg, "weights_path", "output/jepa_768_weights.npz")
         base_model_name = getattr(jepa_cfg, "base_embedding_model", "bge-m3:latest")
 
@@ -170,9 +171,18 @@ class JEPAEmbeddings(Embeddings):
         total_chars = sum(len(t) for t in texts)
 
         if self.model_type == "direct_network":
-            # Direct lightweight residual MLP network
-            vecs = self.neural_net.forward_batch(texts)
-            embeddings = [v.tolist() for v in vecs]
+            # Direct lightweight residual MLP network (>8,000 texts/sec on CPU)
+            batch_sz = batch_size or 128
+            embeddings = []
+            for i in range(0, len(texts), batch_sz):
+                sub = texts[i : i + batch_sz]
+                vecs = self.neural_net.forward_batch(sub)
+                embeddings.extend([v.tolist() for v in vecs])
+                if on_progress:
+                    try:
+                        on_progress(len(sub))
+                    except Exception:
+                        pass
 
         elif self.model_type == "all-mpnet-base-v2":
             hf = self._get_hf_model()

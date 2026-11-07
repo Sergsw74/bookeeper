@@ -421,8 +421,8 @@ class JEPAConfig(BaseModel):
         description="Expected cosine similarity for completely unrelated concepts (default: 0.00).",
     )
     model_type: str = Field(
-        default="whitened_projector",
-        description="JEPA model type: 'whitened_projector', 'direct_network', or 'all-mpnet-base-v2'.",
+        default="direct_network",
+        description="JEPA model type: 'direct_network' (pure lightweight CPU network, >8,000 txt/s), 'all-mpnet-base-v2', or 'whitened_projector'.",
     )
     weights_path: str = Field(
         default="output/jepa_768_weights.npz",

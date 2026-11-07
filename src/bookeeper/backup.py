@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -577,6 +578,7 @@ def create_backup(
     ext = f".{fmt}"
 
     # Determine destination archive path
+    t0 = time.time()
     now = datetime.datetime.now()
     timestamp_str = now.strftime("%Y%m%d_%H%M%S")
     prefix = "full_backup" if is_full else "knowledge_backup"
@@ -595,6 +597,9 @@ def create_backup(
                 dest_archive = dest_path
 
     dest_archive.parent.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        f"[BACKUP] Packaging {'full' if is_full else 'knowledge'} backup -> '{dest_archive.name}' (format: {fmt})"
+    )
 
     # 1. Collect knowledge files
     file_list = collect_knowledge_files(
@@ -692,6 +697,12 @@ def create_backup(
                 pass
 
     compressed_size = dest_archive.stat().st_size if dest_archive.is_file() else 0
+    elapsed = time.time() - t0
+    logger.info(
+        f"[BACKUP] Successfully created '{dest_archive.name}' "
+        f"({compressed_size / (1024 * 1024):.2f} MB, {total_files} files: "
+        f"{knowledge_count} knowledge, {len(book_files)} books) in {elapsed:.2f}s"
+    )
 
     return {
         "destination": dest_archive,
@@ -852,12 +863,19 @@ def restore_backup(
 
     target_dir = target_dir.expanduser().resolve()
     fmt = detect_archive_format(archive_path)
+    t0 = time.time()
 
     # 1. Inspect archive first
     inspection = inspect_backup(archive_path)
     b_type = inspection.get("backup_type", "knowledge")
     is_incremental = (b_type == "incremental") or incremental
     is_full = b_type == "full" or inspection.get("categories", {}).get("books", 0) > 0
+
+    mode_label = "dry-run" if dry_run else ("incremental" if is_incremental else ("clean" if clean else "standard"))
+    logger.info(
+        f"[RESTORE] Starting restore from '{archive_path.name}' ({fmt}) -> '{target_dir}' "
+        f"(type: {b_type}, mode: {mode_label}, {inspection.get('total_files', 0)} files in archive)"
+    )
 
     if is_incremental:
         if dry_run:
@@ -997,6 +1015,13 @@ def restore_backup(
                 books_alias.symlink_to(target_books_dir, target_is_directory=True)
             except (OSError, NotImplementedError):
                 pass
+
+    elapsed = time.time() - t0
+    logger.info(
+        f"[RESTORE] Completed restore from '{archive_path.name}': {restored_count} files "
+        f"({restored_bytes / (1024 * 1024):.2f} MB) restored in {elapsed:.2f}s "
+        f"({restored_knowledge_count} knowledge, {restored_books_count} books)"
+    )
 
     return {
         "dry_run": False,
@@ -1636,6 +1661,12 @@ def calculate_incremental_diff(
     diff_subgraph = current_store.graph.subgraph(diff_nodes).copy()
     diff_store = ConceptGraphStore(diff_subgraph)
 
+    logger.info(
+        f"[INCREMENTAL-DIFF] Completed diff vs '{baseline_ref}' ({baseline_type}): "
+        f"{len(new_books)} new books, {len(related_books_list)} related books, "
+        f"subgraph: {diff_store.graph.number_of_nodes()} nodes, {diff_store.graph.number_of_edges()} edges"
+    )
+
     return IncrementalDiffResult(
         new_books=new_books,
         related_books=related_books_list,
@@ -1878,6 +1909,12 @@ def create_incremental_backup(
             dest_archive = dest_path if dest_path.suffix else dest_path.with_suffix(ext)
 
     dest_archive.parent.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    logger.info(
+        f"[INCREMENTAL-BACKUP] Packaging incremental archive -> '{dest_archive.name}' "
+        f"({len(diff_res.new_books)} new books, {len(diff_res.related_books)} related books, "
+        f"subgraph: {diff_res.diff_node_count} nodes, format: {fmt})"
+    )
 
     with tempfile.TemporaryDirectory() as td:
         stage_dir = Path(td)
@@ -2000,6 +2037,12 @@ def create_incremental_backup(
                         progress_callback(idx, total_files, f"Packing {arcname}")
 
     compressed_size = dest_archive.stat().st_size
+    elapsed = time.time() - t0
+    logger.info(
+        f"[INCREMENTAL-BACKUP] Created incremental archive '{dest_archive.name}' "
+        f"({compressed_size / (1024 * 1024):.2f} MB compressed, {len(diff_res.new_books)} new books, "
+        f"{len(diff_res.related_books)} related books, {total_files} files) in {elapsed:.2f}s"
+    )
     return {
         "success": True,
         "destination": str(dest_archive),
@@ -2044,6 +2087,8 @@ def apply_incremental_update(
 
     target_dir = Path(target_dir).expanduser().resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    logger.info(f"[RESTORE-INC] Applying incremental update from '{archive_path.name}' into '{target_dir}'")
 
     with tempfile.TemporaryDirectory() as td:
         extract_dir = Path(td)
@@ -2154,9 +2199,21 @@ def apply_incremental_update(
                 exporter = Neo4jExporter.from_config(neo4j_config)
                 if exporter.verify_connectivity():
                     neo4j_result = exporter.export(diff_store, clean=False, show_progress=False)
+                    logger.info(
+                        f"[RESTORE-INC] Neo4j incremental sync complete: "
+                        f"{neo4j_result.get('nodes_upserted', 0):,} nodes, "
+                        f"{neo4j_result.get('edges_upserted', 0):,} relationships"
+                    )
             except Exception as e:
-                logger.warning(f"Could not update Neo4j during incremental restore: {e}")
+                logger.warning(f"[RESTORE-INC] Neo4j sync warning: {e}")
                 neo4j_result = {"error": str(e)}
+
+    elapsed = time.time() - t0
+    logger.info(
+        f"[RESTORE-INC] Incremental restore '{archive_path.name}' finished in {elapsed:.2f}s: "
+        f"+{merge_stats.get('nodes_added', 0)} nodes, +{merge_stats.get('edges_added', 0)} edges, "
+        f"{files_restored} files extracted ({bytes_restored / (1024 * 1024):.2f} MB)"
+    )
 
     return {
         "success": True,

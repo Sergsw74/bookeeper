@@ -9,6 +9,7 @@ import logging
 import re
 import sys
 import tempfile
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -495,6 +496,7 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
             clean_neo4j = False
             incremental_mode = False
             temp_file = None
+            t0 = time.time()
 
             try:
                 # Stream uploaded archive directly to temporary file on disk
@@ -533,6 +535,11 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
                         clean_neo4j = qs.get("clean_neo4j", ["false"])[0].lower() in ("true", "1", "yes")
                         incremental_mode = qs.get("incremental", ["false"])[0].lower() in ("true", "1", "yes")
 
+                logger.info(
+                    f"[API-RESTORE] Upload received: file='{orig_filename}', "
+                    f"size={content_length / (1024 * 1024):.2f} MB, clean={clean_mode}, inc={incremental_mode}"
+                )
+
                 if not temp_file.is_file() or temp_file.stat().st_size == 0:
                     self._send_json({"error": "No backup file uploaded in request payload."}, HTTPStatus.BAD_REQUEST)
                     return
@@ -550,6 +557,10 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
                     export_neo4j=True,
                     clean_neo4j=clean_neo4j,
                     incremental=incremental_mode,
+                )
+                logger.info(
+                    f"[API-RESTORE] Restore completed in {time.time() - t0:.2f}s: "
+                    f"{res.get('restored_files', 0)} files restored"
                 )
                 self._send_json(res)
             except Exception as e:

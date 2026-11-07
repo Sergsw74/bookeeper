@@ -129,6 +129,7 @@ class SearchEngineBackend:
         self.lightrag_dir = lightrag_dir or getattr(config, "resolved_lightrag_dir", None)
         self.neo4j_cfg = neo4j_config or config.neo4j
         self._neo4j_driver: Optional[neo4j.Driver] = None
+        self._neo4j_exporter: Optional[Any] = None
         self._concept_vectorizer: Optional[FastConceptVectorizer] = None
         self._concept_embedding_index: Optional[ConceptEmbeddingIndex] = None
         self._books_index_cache: Optional[Dict[str, Any]] = None
@@ -712,20 +713,27 @@ class SearchEngineBackend:
         return False
 
     def get_neo4j_driver(self) -> neo4j.Driver:
-        """Get or initialize the Neo4j driver."""
+        """Get or initialize the Neo4j driver using Neo4jExporter (supporting macOS Sequoia network bridge)."""
         if not self.is_neo4j_enabled:
             raise RuntimeError("Neo4j is disabled in configuration (neo4j.enabled: false).")
         if self._neo4j_driver is None:
-            self._neo4j_driver = neo4j.GraphDatabase.driver(
-                self.neo4j_cfg.uri,
-                auth=(self.neo4j_cfg.user, self.neo4j_cfg.password),
-                connection_timeout=self.neo4j_cfg.connection_timeout,
-            )
+            from bookeeper.graph.neo4j_exporter import Neo4jExporter
+
+            if self._neo4j_exporter is None:
+                self._neo4j_exporter = Neo4jExporter.from_config(self.neo4j_cfg)
+            self._neo4j_driver = self._neo4j_exporter.get_driver()
         return self._neo4j_driver
 
     def close(self):
-        """Clean up connections."""
-        if self._neo4j_driver is not None:
+        """Clean up connections and any active network bridge."""
+        if self._neo4j_exporter is not None:
+            try:
+                self._neo4j_exporter.close()
+            except Exception:
+                pass
+            self._neo4j_exporter = None
+            self._neo4j_driver = None
+        elif self._neo4j_driver is not None:
             try:
                 self._neo4j_driver.close()
             except Exception:
@@ -3272,6 +3280,11 @@ class SearchEngineBackend:
             self._is_restoring = True
             now_str = datetime.datetime.now().strftime("%H:%M:%S")
             file_mb = round(archive_file.stat().st_size / (1024 * 1024), 1) if (archive_file and archive_file.is_file()) else 0.0
+            t0 = time.time()
+            logger.info(
+                f"[RESTORE-PIPELINE] Initializing restore for '{archive_file.name}' "
+                f"({file_mb} MB, clean={clean}, incremental={incremental}, export_neo4j={export_neo4j})"
+            )
             self._restore_status = {
                 "in_progress": True,
                 "stage": "unpacking",
@@ -3452,6 +3465,11 @@ class SearchEngineBackend:
                 "🎉 Restore and synchronization completed successfully!",
                 stage="completed",
                 progress_pct=100,
+            )
+            elapsed = time.time() - t0
+            logger.info(
+                f"[RESTORE-PIPELINE] Finished restore for '{archive_file.name}' in {elapsed:.2f}s: "
+                f"{files_cnt} files restored, consistent={consistency_result.get('is_consistent')}"
             )
 
             with self._restore_lock:

@@ -625,11 +625,15 @@ def test_cli_sync_flow_no_clean(tmp_path):
     }).encode("utf-8")
     mock_restore_response.__enter__.return_value = mock_restore_response
 
+    books_dir = tmp_path / "books"
+    books_dir.mkdir()
+
     with patch("urllib.request.urlopen", return_value=mock_restore_response) as mock_urlopen:
         res = runner.invoke(app, [
             "sync",
             "http://example.com:8000",
             "--output-dir", str(out_dir),
+            "--books-dir", str(books_dir),
         ])
 
         assert res.exit_code == 0, f"Error: {res.stdout}"
@@ -899,6 +903,131 @@ def test_incremental_backup_against_archive_baseline(tmp_path: Path):
     assert merged_store.graph.has_node("concept:JEPA")
     assert merged_store.graph.has_node("concept:Quantum Supremacy")
     assert merged_store.graph.has_node("concept:World Models")
+
+
+def test_incremental_full_backup_cli_only_packages_inc_books(tmp_path: Path):
+    """
+    Ensure that 'bookeeper backup --incremental --full' creates an incremental backup
+    containing original source books ONLY for books belonging to the incremental diff,
+    omitting baseline books and unindexed books.
+    Also verify that 'bookeeper backup --incremental' (without --full) does NOT include books.
+    """
+    from bookeeper.graph.store import ConceptGraphStore
+    from bookeeper.processing.extractor import Concept
+    from bookeeper.backup import inspect_backup, create_backup
+
+    # 1. Setup baseline directory with Book 1
+    baseline_out = tmp_path / "baseline_out"
+    baseline_out.mkdir()
+    b_store = ConceptGraphStore()
+    b_store.add_book(1, title="Quantum Computing Fundamentals", author="Alice", arxiv_id="2101.11111")
+    c1 = Concept(name="Qubit", category="Idea", summary="Quantum bit", weight=5)
+    b_store.add_concept(c1)
+    b_store.add_book_idea_link(1, "Qubit")
+    b_store.save(baseline_out / "knowledge_graph.json")
+
+    # Baseline archive
+    baseline_zip = tmp_path / "baseline_archive.zip"
+    create_backup(
+        source_dir=baseline_out,
+        destination=baseline_zip,
+        backup_type="knowledge",
+    )
+
+    # 2. Setup current workspace with Book 1 (baseline) and Book 2 (NEW)
+    current_out = tmp_path / "current_out"
+    current_out.mkdir()
+    curr_store = ConceptGraphStore()
+    curr_store.add_book(1, title="Quantum Computing Fundamentals", author="Alice", arxiv_id="2101.11111")
+    curr_store.add_concept(c1)
+    curr_store.add_book_idea_link(1, "Qubit")
+
+    # Book 2 is NEW
+    curr_store.add_book(2, title="JEPA Architectures and Energy Models", author="Bob", arxiv_id="2405.22222")
+    c2 = Concept(name="JEPA", category="Idea", summary="Joint Embedding Predictive Architecture", weight=7)
+    curr_store.add_concept(c2)
+    curr_store.add_book_idea_link(2, "JEPA")
+    curr_store.add_book_idea_link(2, "Qubit")  # Shared concept
+    curr_store.save(current_out / "knowledge_graph.json")
+
+    # Setup source books directory containing:
+    # - Book 1 (baseline book)
+    # - Book 2 (inc book)
+    # - Book 3 (unindexed book)
+    books_dir = tmp_path / "source_books"
+    books_dir.mkdir()
+    (books_dir / "2101.11111_Quantum_Computing.pdf").write_bytes(b"%PDF-1.4 Book 1 baseline")
+    (books_dir / "2405.22222_JEPA_Architectures.pdf").write_bytes(b"%PDF-1.4 Book 2 incremental")
+    (books_dir / "9999.99999_Unindexed_Book.pdf").write_bytes(b"%PDF-1.4 Book 3 unindexed")
+
+    # 3. Test: 'backup --incremental' (WITHOUT --full) -> Must NOT package books
+    inc_knowledge_zip = tmp_path / "inc_knowledge.zip"
+    res_know = runner.invoke(
+        app,
+        [
+            "backup",
+            str(inc_knowledge_zip),
+            "--incremental",
+            "--diff-against", str(baseline_zip),
+            "--output-dir", str(current_out),
+            "--books-dir", str(books_dir),
+        ],
+    )
+    assert res_know.exit_code == 0, f"Error: {res_know.stdout}"
+    assert "INCREMENTAL (KNOWLEDGE)" in res_know.stdout
+    info_know = inspect_backup(inc_knowledge_zip)
+    assert info_know["categories"]["books"] == 0
+
+    # 4. Test: 'backup --incremental --full' -> MUST package ONLY Book 2
+    inc_full_zip = tmp_path / "inc_full.zip"
+    res_full = runner.invoke(
+        app,
+        [
+            "backup",
+            str(inc_full_zip),
+            "--incremental",
+            "--full",
+            "--diff-against", str(baseline_zip),
+            "--output-dir", str(current_out),
+            "--books-dir", str(books_dir),
+        ],
+    )
+    assert res_full.exit_code == 0, f"Error: {res_full.stdout}"
+    assert "INCREMENTAL (FULL)" in res_full.stdout
+    assert "Indexed Books Packaged" in res_full.stdout
+
+    info_full = inspect_backup(inc_full_zip)
+    book_entries = [e["path"] for e in info_full["entries"] if e["path"].startswith("books/")]
+    assert len(book_entries) >= 1
+    # Book 2 must be present
+    assert any("2405.22222" in p for p in book_entries)
+    # Book 1 (baseline) must NOT be present
+    assert not any("2101.11111" in p for p in book_entries)
+    # Book 3 (unindexed) must NOT be present
+    assert not any("9999.99999" in p for p in book_entries)
+
+    # 5. Test: Restore the incremental full backup into target environment
+    restored_out = tmp_path / "restored_out"
+    restored_books = tmp_path / "restored_books"
+    res_restore = runner.invoke(
+        app,
+        [
+            "restore",
+            str(inc_full_zip),
+            "--output-dir", str(restored_out),
+            "--books-dir", str(restored_books),
+            "--incremental",
+        ],
+    )
+    assert res_restore.exit_code == 0, f"Error: {res_restore.stdout}"
+    assert "Incremental Update Summary" in res_restore.stdout
+
+    # Verify that Book 2 was restored to restored_books
+    assert (restored_books / "2405.22222_JEPA_Architectures.pdf").is_file()
+    # Baseline book 1 and unindexed book 3 should not be there
+    assert not (restored_books / "2101.11111_Quantum_Computing.pdf").exists()
+    assert not (restored_books / "9999.99999_Unindexed_Book.pdf").exists()
+
 
 
 

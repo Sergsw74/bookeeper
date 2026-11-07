@@ -134,13 +134,16 @@ bookeeper backup --full -o ./backups/full_archive.zip
 # 5. Full backup containing ALL books in downloads directory:
 bookeeper backup --full --all-books --books-dir ./archive_downloader/downloads -o full_all.zip
 
-# 6. Incremental backup against active Neo4j database:
+# 6. Incremental knowledge backup against active Neo4j database (no source books):
 bookeeper backup --incremental -o ./backups/incremental_diff.zip
 
-# 7. Incremental backup diffed against an earlier archive baseline:
+# 7. Incremental full backup including source books (ONLY for books in the incremental diff):
+bookeeper backup --incremental --full -o ./backups/incremental_full.zip
+
+# 8. Incremental backup diffed against an earlier archive baseline:
 bookeeper backup --incremental --diff-against ./backups/october_run.zip -o ./backups/diff_since_october.zip
 
-# 8. Minimal graph backup excluding chunks and states:
+# 9. Minimal graph backup excluding chunks and states:
 bookeeper backup --no-chunks --no-states -o minimal.zip
 ```
 

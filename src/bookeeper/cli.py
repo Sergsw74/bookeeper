@@ -9078,9 +9078,11 @@ def backup_command(
         console.print(f"[bold red]Source output directory not found:[/bold red] {source_dir}")
         raise typer.Exit(1)
 
-    effective_type = "incremental" if (incremental or (backup_type and backup_type.lower() == "incremental")) else ("full" if (full or (backup_type and backup_type.lower() == "full")) else "knowledge")
+    is_full = bool(full or (backup_type and backup_type.lower() == "full"))
+    is_incremental = bool(incremental or (backup_type and backup_type.lower() == "incremental"))
+    effective_type = "incremental" if is_incremental else ("full" if is_full else "knowledge")
     effective_books_dir = None
-    if effective_type in ("full", "incremental"):
+    if is_full or effective_type in ("full", "incremental"):
         if books_dir:
             effective_books_dir = Path(books_dir).expanduser().resolve()
         elif cfg.resolved_books_dir:
@@ -9089,7 +9091,7 @@ def backup_command(
             default_books = Path("archive_downloader/downloads").resolve()
             effective_books_dir = default_books
 
-        if effective_type == "full" and not effective_books_dir.is_dir():
+        if is_full and (effective_books_dir is None or not effective_books_dir.is_dir()):
             console.print(f"[bold red]Source books directory not found:[/bold red] {effective_books_dir}")
             raise typer.Exit(1)
 
@@ -9102,7 +9104,11 @@ def backup_command(
         from bookeeper.backup import create_incremental_backup
 
         baseline_val = diff_against or ("neo4j" if cfg.neo4j.enabled else "neo4j")
-        console.print(f"[bold cyan]Creating incremental diff backup against baseline: [bold white]{baseline_val}[/bold white]...[/bold cyan]")
+        console.print(
+            f"[bold cyan]Creating incremental diff full backup (knowledge + source books from inc diff) against baseline: [bold white]{baseline_val}[/bold white]...[/bold cyan]"
+            if is_full
+            else f"[bold cyan]Creating incremental diff knowledge backup against baseline: [bold white]{baseline_val}[/bold white]...[/bold cyan]"
+        )
         try:
             result = create_incremental_backup(
                 source_dir=source_dir,
@@ -9110,8 +9116,8 @@ def backup_command(
                 neo4j_config=cfg.neo4j,
                 destination=Path(target_dest) if target_dest else None,
                 format_type=format_type or "zip",
-                books_dir=effective_books_dir if effective_books_dir and effective_books_dir.is_dir() else None,
-                include_books=not all_books,
+                books_dir=effective_books_dir if is_full and effective_books_dir and effective_books_dir.is_dir() else None,
+                include_books=is_full,
                 include_chunks=not no_chunks,
                 include_obsidian=not no_obsidian,
                 include_states=not no_states,
@@ -9126,11 +9132,14 @@ def backup_command(
         table.add_column("Property", style="bold")
         table.add_column("Details", style="cyan")
         table.add_row("Backup Archive", str(dest_path))
-        table.add_row("Backup Type", "INCREMENTAL")
+        table.add_row("Backup Type", "INCREMENTAL (FULL)" if is_full else "INCREMENTAL (KNOWLEDGE)")
         table.add_row("Baseline Type", str(result.get("baseline_type", "")).upper())
         table.add_row("Baseline Reference", str(result.get("baseline_reference", "")))
         table.add_row("New Books in Diff", f"{result.get('new_books_count', 0):,}")
         table.add_row("Related Books Connected", f"{result.get('related_books_count', 0):,}")
+        if is_full:
+            table.add_row("Indexed Books Packaged", f"{result.get('books_count', 0):,}")
+            table.add_row("Source Books Directory", str(effective_books_dir))
         table.add_row("Diff Subgraph Nodes", f"{result.get('diff_nodes', 0):,}")
         table.add_row("Diff Subgraph Edges", f"{result.get('diff_edges', 0):,}")
         table.add_row("Total Files Archived", f"{result.get('total_files', 0):,}")
@@ -9334,14 +9343,18 @@ def restore_command(
         return
 
     if is_inc:
-        from bookeeper.backup import apply_incremental_update
+        from bookeeper.backup import apply_incremental_update, resolve_target_books_dir
+
+        target_books_dir = explicit_books_dir
+        if not target_books_dir and (info.get("categories", {}).get("books", 0) > 0 or info.get("backup_type") == "full"):
+            target_books_dir = resolve_target_books_dir(target_dir, info.get("metadata"), explicit_books_dir)
 
         console.print(f"[bold cyan]Applying incremental update from [bold white]{archive_file.name}[/bold white]...[/bold cyan]")
         try:
             res = apply_incremental_update(
                 archive_path=archive_file,
                 target_dir=target_dir,
-                books_dir=explicit_books_dir,
+                books_dir=target_books_dir,
                 neo4j_config=cfg.neo4j,
                 export_neo4j=cfg.neo4j.enabled,
             )

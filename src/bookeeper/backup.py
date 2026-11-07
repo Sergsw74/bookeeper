@@ -1643,6 +1643,187 @@ def calculate_incremental_diff(
     )
 
 
+def collect_incremental_source_books(
+    books_dir: Path,
+    books: List[Dict[str, Any]],
+    target_books_dir: Path,
+    source_dir: Optional[Path] = None,
+    destination_archive: Optional[Path] = None,
+) -> int:
+    """
+    Collect original source book files ONLY for the specified books (from incremental diff)
+    and copy them into target_books_dir preserving relative paths.
+    Returns the count of distinct book document files copied.
+    """
+    b_dir_p = Path(books_dir).expanduser().resolve()
+    if not b_dir_p.is_dir() or not books:
+        return 0
+
+    target_books_dir.mkdir(parents=True, exist_ok=True)
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", s.lower()) if s else ""
+
+    book_targets = []
+    for b in books:
+        bid = b.get("book_id")
+        bid_str = str(bid).replace("book:", "").strip() if bid is not None else None
+        aid = str(b.get("arxiv_id") or "").strip()
+        t = str(b.get("title") or b.get("name") or "").strip()
+        norm_t = _norm(t)
+        exp_p = b.get("path") or b.get("file_path")
+        # Check .book_states for extra metadata if available
+        if source_dir and bid_str:
+            st_file = Path(source_dir).expanduser().resolve() / ".book_states" / f"book_{bid_str}_state.json"
+            if st_file.is_file():
+                try:
+                    with open(st_file, "r", encoding="utf-8") as sf:
+                        s_data = json.load(sf)
+                    if not exp_p:
+                        exp_p = s_data.get("file_path") or s_data.get("book_path")
+                    if not aid and s_data.get("arxiv_id"):
+                        aid = str(s_data.get("arxiv_id")).strip()
+                    if not t and s_data.get("book_title"):
+                        t = str(s_data.get("book_title")).strip()
+                        norm_t = _norm(t)
+                except Exception:
+                    pass
+
+        book_targets.append({
+            "book_id": bid_str,
+            "arxiv_id": aid if aid else None,
+            "title": t,
+            "norm_title": norm_t,
+            "explicit_path": exp_p,
+            "matched_files": set(),
+        })
+
+    # 1. Match from index.json in books_dir if present
+    index_file = b_dir_p / "index.json"
+    index_entries = {}
+    matched_index_entries = {}
+    if index_file.is_file():
+        try:
+            with open(index_file, "r", encoding="utf-8") as f:
+                index_entries = json.load(f)
+        except Exception:
+            pass
+
+    if index_entries:
+        for k, val in index_entries.items():
+            if not isinstance(val, dict):
+                continue
+            v_title = _norm(str(val.get("title", "")))
+            v_aid = str(val.get("arxiv_id", "")).strip()
+            v_bid = str(val.get("book_id", "")).strip()
+            k_clean = str(k).strip()
+
+            for bt in book_targets:
+                is_match = False
+                if bt["arxiv_id"] and (bt["arxiv_id"] == v_aid or bt["arxiv_id"] == k_clean):
+                    is_match = True
+                elif bt["book_id"] and (bt["book_id"] == v_bid or bt["book_id"] == k_clean):
+                    is_match = True
+                elif bt["norm_title"] and v_title and (bt["norm_title"] == v_title or bt["norm_title"] in v_title or v_title in bt["norm_title"]):
+                    is_match = True
+
+                if is_match:
+                    fpath_str = val.get("file_path")
+                    if fpath_str:
+                        candidate = b_dir_p / fpath_str
+                        if candidate.is_file() and not is_excluded_file(candidate, destination_archive):
+                            bt["matched_files"].add(candidate)
+                            matched_index_entries[k] = val
+
+    # 2. Recursive scan in books_dir for book targets
+    for root, dirs, files in os.walk(b_dir_p):
+        dirs[:] = [d for d in dirs if d not in EXCLUDED_DIR_NAMES]
+        root_p = Path(root)
+        for fname in files:
+            fpath = root_p / fname
+            if fpath.suffix.lower() not in BOOK_EXTENSIONS:
+                continue
+            if is_excluded_file(fpath, destination_archive):
+                continue
+
+            stem_norm = _norm(fpath.stem)
+            parent_name = fpath.parent.name
+
+            for bt in book_targets:
+                is_match = False
+                # Explicit path or filename match
+                if bt["explicit_path"]:
+                    exp_name = Path(bt["explicit_path"]).name
+                    if fname == exp_name or str(fpath).endswith(str(bt["explicit_path"])):
+                        is_match = True
+                # arXiv ID match in filename
+                if not is_match and bt["arxiv_id"] and bt["arxiv_id"] in fname:
+                    is_match = True
+                # Calibre ID token in folder or filename: "(42)", "42_", "42 - "
+                if not is_match and bt["book_id"]:
+                    bid_token = f"({bt['book_id']})"
+                    if bid_token in parent_name or bid_token in fpath.stem or fpath.stem.startswith(f"{bt['book_id']}_") or fpath.stem.startswith(f"{bt['book_id']} -"):
+                        if not bt["norm_title"] or bt["norm_title"] in stem_norm or stem_norm in bt["norm_title"] or len(stem_norm) >= 3:
+                            is_match = True
+                # Normalized title match
+                if not is_match and bt["norm_title"]:
+                    if bt["norm_title"] == stem_norm or (len(bt["norm_title"]) >= 6 and (bt["norm_title"] in stem_norm or stem_norm in bt["norm_title"])):
+                        is_match = True
+
+                if is_match:
+                    bt["matched_files"].add(fpath)
+
+    # 3. Copy matched files and companion .opf into target_books_dir
+    copied_files = set()
+    for bt in book_targets:
+        for fpath in bt["matched_files"]:
+            if fpath in copied_files:
+                continue
+            copied_files.add(fpath)
+
+            try:
+                rel = fpath.relative_to(b_dir_p)
+                dest = target_books_dir / rel
+            except ValueError:
+                dest = target_books_dir / fpath.name
+
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(fpath, dest)
+
+            # Check for companion .opf
+            opf1 = fpath.with_suffix(".opf")
+            if opf1.is_file() and opf1 not in copied_files:
+                try:
+                    rel_opf = opf1.relative_to(b_dir_p)
+                    dest_opf = target_books_dir / rel_opf
+                except ValueError:
+                    dest_opf = target_books_dir / opf1.name
+                dest_opf.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(opf1, dest_opf)
+                copied_files.add(opf1)
+
+            opf_meta = fpath.parent / "metadata.opf"
+            if opf_meta.is_file() and opf_meta not in copied_files:
+                try:
+                    rel_meta = opf_meta.relative_to(b_dir_p)
+                    dest_meta = target_books_dir / rel_meta
+                except ValueError:
+                    dest_meta = target_books_dir / opf_meta.name
+                dest_meta.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(opf_meta, dest_meta)
+                copied_files.add(opf_meta)
+
+    # 4. If matched index entries exist, write pruned index.json for incremental books
+    if matched_index_entries:
+        (target_books_dir / "index.json").write_text(
+            json.dumps(matched_index_entries, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    # Return distinct book document count
+    return sum(1 for p in copied_files if p.suffix.lower() in BOOK_EXTENSIONS)
+
+
 def create_incremental_backup(
     source_dir: Path,
     baseline: Union[str, Path, Any] = "neo4j",
@@ -1751,29 +1932,17 @@ def create_incremental_backup(
                                 dest_f.parent.mkdir(parents=True, exist_ok=True)
                                 shutil.copy2(src_f, dest_f)
 
-        # 5. Collect original source book files for new books
+        # 5. Collect original source book files for new books (ONLY from incremental diff)
+        books_copied_count = 0
         if include_books and books_dir:
-            b_dir_p = Path(books_dir).expanduser().resolve()
-            if b_dir_p.is_dir():
-                target_books = stage_dir / "books"
-                target_books.mkdir(parents=True, exist_ok=True)
-                for b in diff_res.new_books:
-                    b_aid = b.get("arxiv_id")
-                    b_title_clean = re.sub(r"[^a-z0-9]", "", str(b.get("title") or "").lower())
-                    for item in b_dir_p.iterdir():
-                        if not item.is_file() or item.suffix.lower() not in BOOK_EXTENSIONS:
-                            continue
-                        matched = False
-                        if b_aid and b_aid in item.name:
-                            matched = True
-                        elif b_title_clean and b_title_clean in re.sub(r"[^a-z0-9]", "", item.stem.lower()):
-                            matched = True
-                        if matched:
-                            shutil.copy2(item, target_books / item.name)
-                            opf = item.with_suffix(".opf")
-                            if opf.is_file():
-                                shutil.copy2(opf, target_books / opf.name)
-                            break
+            target_books = stage_dir / "books"
+            books_copied_count = collect_incremental_source_books(
+                books_dir=Path(books_dir),
+                books=diff_res.new_books,
+                target_books_dir=target_books,
+                source_dir=source_dir,
+                destination_archive=dest_archive,
+            )
 
         # 6. Write backup_metadata.json
         meta = {
@@ -1784,11 +1953,14 @@ def create_incremental_backup(
             "source_directory": str(source_dir),
             "baseline_type": diff_res.baseline_type,
             "baseline_reference": diff_res.baseline_reference,
+            "include_books": include_books,
+            "books_count": books_copied_count,
             "new_books": diff_res.new_books,
             "related_books": diff_res.related_books,
             "stats": {
                 "new_books_count": len(diff_res.new_books),
                 "related_books_count": len(diff_res.related_books),
+                "books_count": books_copied_count,
                 "diff_nodes": diff_res.diff_node_count,
                 "diff_edges": diff_res.diff_edge_count,
                 "baseline_book_count": diff_res.baseline_book_count,
@@ -1830,6 +2002,8 @@ def create_incremental_backup(
         "backup_type": "incremental",
         "new_books_count": len(diff_res.new_books),
         "related_books_count": len(diff_res.related_books),
+        "include_books": include_books,
+        "books_count": books_copied_count,
         "diff_nodes": diff_res.diff_node_count,
         "diff_edges": diff_res.diff_edge_count,
         "new_books": diff_res.new_books,
@@ -1948,11 +2122,15 @@ def apply_incremental_update(
         if inc_books.is_dir() and books_dir:
             b_dir_p = Path(books_dir).expanduser().resolve()
             b_dir_p.mkdir(parents=True, exist_ok=True)
-            for bf in inc_books.iterdir():
-                if bf.is_file():
-                    shutil.copy2(bf, b_dir_p / bf.name)
+            for root, _, files in os.walk(inc_books):
+                for f in files:
+                    src_f = Path(root) / f
+                    rel_f = src_f.relative_to(inc_books)
+                    dest_f = b_dir_p / rel_f
+                    dest_f.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_f, dest_f)
                     files_restored += 1
-                    bytes_restored += bf.stat().st_size
+                    bytes_restored += src_f.stat().st_size
 
         # 4. Synchronize into Neo4j if active
         neo4j_result = None

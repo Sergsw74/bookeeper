@@ -15,6 +15,7 @@ Core Principles:
 
 from dataclasses import dataclass
 import logging
+from pathlib import Path
 import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -390,9 +391,9 @@ def hierarchical_semantic_cover(
             if arr.shape[0] != 768 and arr.shape[0] == 1024 and Path("output/jepa_768_weights.npz").is_file():
                 try:
                     from bookeeper.evaluation.jepa_encoder import LightweightJEPAEncoder
-                    if not hasattr(hierarchical_cover_filter, "_jepa_proj"):
-                        hierarchical_cover_filter._jepa_proj = LightweightJEPAEncoder.load("output/jepa_768_weights.npz")
-                    arr = hierarchical_cover_filter._jepa_proj.project(arr)
+                    if not hasattr(hierarchical_semantic_cover, "_jepa_proj"):
+                        hierarchical_semantic_cover._jepa_proj = LightweightJEPAEncoder.load("output/jepa_768_weights.npz")
+                    arr = hierarchical_semantic_cover._jepa_proj.project(arr)
                 except Exception:
                     pass
             norm = float(np.linalg.norm(arr))

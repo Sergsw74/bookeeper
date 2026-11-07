@@ -2198,7 +2198,13 @@ def apply_incremental_update(
                     neo4j_config = cfg.neo4j
                 exporter = Neo4jExporter.from_config(neo4j_config)
                 if exporter.verify_connectivity():
-                    neo4j_result = exporter.export(diff_store, clean=False, show_progress=False)
+                    diff_store.output_dir = extract_dir
+                    neo4j_result = exporter.export(
+                        diff_store,
+                        clean=False,
+                        show_progress=False,
+                        allow_book_removal=False,
+                    )
                     logger.info(
                         f"[RESTORE-INC] Neo4j incremental sync complete: "
                         f"{neo4j_result.get('nodes_upserted', 0):,} nodes, "

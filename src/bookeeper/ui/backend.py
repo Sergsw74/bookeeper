@@ -812,6 +812,7 @@ class SearchEngineBackend:
             with driver.session(database=self.neo4j_cfg.database) as session:
                 q_nodes = """
                 MATCH (n)
+                WHERE NOT n:BookeeperSync
                 RETURN
                     count(n) AS total_nodes,
                     count(CASE WHEN n:Book THEN 1 END) AS books,
@@ -3438,7 +3439,35 @@ class SearchEngineBackend:
             )
 
             consistency_result = self.validate_database_consistency(force_refresh=True)
-            if consistency_result.get("is_consistent"):
+            if not consistency_result.get("is_consistent") and export_neo4j and consistency_result.get("neo4j_connected") and kg_path.is_file():
+                self._add_restore_log(
+                    "⚠️ Database inconsistency detected after restore. Synchronizing Knowledge Graph into Neo4j to achieve full parity...",
+                    stage="exporting_neo4j",
+                    progress_pct=93,
+                )
+                try:
+                    store = ConceptGraphStore()
+                    store.output_dir = out_dir
+                    store.load(kg_path)
+                    neo_exp = Neo4jExporter.from_config(self.neo4j_cfg)
+                    recovery_res = neo_exp.export(
+                        store,
+                        clean=False,
+                        incremental_sync=True,
+                        show_progress=False,
+                        progress_callback=neo4j_progress_cb if "neo4j_progress_cb" in locals() else None,
+                    )
+                    neo4j_export_result = recovery_res
+                    consistency_result = self.validate_database_consistency(force_refresh=True)
+                    if consistency_result.get("is_consistent"):
+                        self._add_restore_log("✓ Neo4j database successfully synchronized to full consistency.", progress_pct=98)
+                    else:
+                        disc = ", ".join(consistency_result.get("discrepancies", []))
+                        self._add_restore_log(f"⚠️ Consistency check note: {disc}", progress_pct=98)
+                except Exception as sync_err:
+                    logger.warning(f"Neo4j consistency recovery sync error: {sync_err}")
+                    self._add_restore_log(f"⚠️ Neo4j sync warning: {sync_err}", progress_pct=98)
+            elif consistency_result.get("is_consistent"):
                 self._add_restore_log("✓ Database consistency check passed. All book/chunk counts match.", progress_pct=98)
             else:
                 disc = ", ".join(consistency_result.get("discrepancies", []))

@@ -1353,6 +1353,7 @@ class Neo4jExporter:
         index_poll_interval: float = 3.0,
         incremental_sync: Optional[bool] = None,
         backup_hash: Optional[str] = None,
+        allow_book_removal: bool = True,
     ) -> dict[str, Any]:
         """
         Export ConceptGraphStore into Neo4j via batched upsert with live progress display.
@@ -1484,29 +1485,35 @@ class Neo4jExporter:
                             if bid in remote_book_hashes and remote_book_hashes[bid] == h and h != ""
                         }
                         modified_books = set(local_book_hashes.keys()) - unchanged_books
-                        removed_books = set(remote_book_hashes.keys()) - set(local_book_hashes.keys())
+                        removed_books = (
+                            set(remote_book_hashes.keys()) - set(local_book_hashes.keys())
+                            if (allow_book_removal and not incremental_mode and not only_affected)
+                            else set()
+                        )
 
                         # Purge subgraphs for modified books and removed books
                         for mod_bid in modified_books:
                             if mod_bid in remote_book_hashes:
                                 self.purge_book_subgraph(session, mod_bid)
-                        for rem_bid in removed_books:
-                            self.purge_book_subgraph(session, rem_bid)
-                            try:
-                                session.run("MATCH (b:Book {id: $bid}) DETACH DELETE b", bid=rem_bid)
-                            except Exception:
-                                pass
+                        if removed_books:
+                            for rem_bid in removed_books:
+                                self.purge_book_subgraph(session, rem_bid)
+                                try:
+                                    session.run("MATCH (b:Book {id: $bid}) DETACH DELETE b", bid=rem_bid)
+                                except Exception:
+                                    pass
 
                         if unchanged_books:
-                            # Collect chunk and section node IDs belonging to unchanged books
-                            for ub in unchanged_books:
-                                ub_num = str(ub).replace("book:", "")
-                                for n in g.nodes:
-                                    if n.startswith(f"section:{ub_num}:"):
+                            # Collect chunk and section node IDs belonging to unchanged books (O(N) single-pass)
+                            unchanged_bids = {str(ub).replace("book:", "") for ub in unchanged_books}
+                            for n, d in g.nodes(data=True):
+                                n_str = str(n)
+                                if n_str.startswith("section:"):
+                                    parts = n_str.split(":")
+                                    if len(parts) >= 2 and parts[1] in unchanged_bids:
                                         skipped_subgraph_nodes.add(n)
-                                for n, d in g.nodes(data=True):
-                                    if d.get("type") == "Chunk" and str(d.get("book_id")) == ub_num:
-                                        skipped_subgraph_nodes.add(n)
+                                elif d.get("type") == "Chunk" and str(d.get("book_id", "")) in unchanged_bids:
+                                    skipped_subgraph_nodes.add(n)
 
                             cluster_msg = (
                                 f"Per-Book Cluster Sync: {len(unchanged_books)} books unchanged "

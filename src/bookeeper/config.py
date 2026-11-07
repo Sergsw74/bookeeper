@@ -172,6 +172,10 @@ class Neo4jConfig(BaseModel):
         default=False,
         description="Whether to perform a clean start (delete all existing content in database before export).",
     )
+    incremental_sync: bool = Field(
+        default=True,
+        description="Whether to perform smart incremental synchronization by comparing per-book and node content hashes.",
+    )
 
 
 class SingleVerifierConfig(BaseModel):
@@ -440,6 +444,14 @@ class DualPassConfig(BaseModel):
         default=True,
         description="Whether to persist postprocessor state checkpoints asynchronously in a background thread without pausing the worker loop (default: True).",
     )
+    max_idea_batch: int = Field(
+        default=15,
+        description="Maximum number of idea clusters to combine into a single LLM consolidation prompt (default: 15).",
+    )
+    max_context_size: int = Field(
+        default=7168,
+        description="Maximum context size in bytes for idea consolidation prompt joining (default: 7168 bytes / 7KB).",
+    )
 
 
 class RecentIdeasConfig(BaseModel):
@@ -660,6 +672,10 @@ class Settings(BaseSettings):
         default=None,
         description="Optional custom local path for staged metadata.db (default: output_dir/.staged_metadata.db).",
     )
+    file_list: Optional[str] = Field(
+        default=None,
+        description="Path to a text file containing book/article filenames, paths, or arXiv IDs to prioritize and process (one per line).",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -668,6 +684,9 @@ class Settings(BaseSettings):
             for alias in ("download_dir", "downloads_dir", "source_dir"):
                 if alias in data and "books_dir" not in data:
                     data["books_dir"] = data.pop(alias)
+            for alias in ("files_list", "file_manifest", "manifest_file"):
+                if alias in data and "file_list" not in data:
+                    data["file_list"] = data.pop(alias)
             # Support filters as alias for filter
             if "filters" in data and "filter" not in data:
                 data["filter"] = data.pop("filters")
@@ -750,6 +769,13 @@ class Settings(BaseSettings):
         """Return expanded Path for books_dir if configured."""
         if self.books_dir:
             return Path(self.books_dir).expanduser().resolve()
+        return None
+
+    @property
+    def resolved_file_list(self) -> Optional[Path]:
+        """Return expanded Path for file_list if configured."""
+        if self.file_list:
+            return Path(self.file_list).expanduser().resolve()
         return None
 
     # Local / Remote Ollama LLM & Embeddings
@@ -979,9 +1005,20 @@ class Settings(BaseSettings):
             return res
         return v
 
+    @field_validator("ollama_base_url", mode="before")
+    @classmethod
+    def parse_ollama_base_url(cls, v: Any) -> Any:
+        env_url = (os.environ.get("BOOKEEPER_OLLAMA_BASE_URL") or os.environ.get("OLLAMA_BASE_URL") or "").strip()
+        if env_url:
+            return env_url
+        return v
+
     @property
     def resolved_ollama_servers(self) -> List[OllamaServerConfig]:
         """Return list of all configured servers sorted by priority ascending (1 = highest priority)."""
+        env_url = (os.environ.get("BOOKEEPER_OLLAMA_BASE_URL") or os.environ.get("OLLAMA_BASE_URL") or "").strip()
+        if env_url:
+            return [OllamaServerConfig(url=env_url, priority=1, name="env_override", capability=["llm", "embedding", "verification"])]
         if self.ollama_servers:
             return sorted(self.ollama_servers, key=lambda s: s.priority)
         return [OllamaServerConfig(url=self.ollama_base_url, priority=1, name="default")]
@@ -996,6 +1033,12 @@ class Settings(BaseSettings):
     @property
     def resolved_embedding_servers(self) -> List[OllamaServerConfig]:
         """Return dedicated list of servers for embeddings, or pool servers supporting embedding tasks."""
+        env_embed_url = (os.environ.get("BOOKEEPER_EMBEDDING_BASE_URL") or os.environ.get("EMBEDDING_BASE_URL") or "").strip()
+        if env_embed_url and env_embed_url.lower() != "pool":
+            return [OllamaServerConfig(url=env_embed_url, priority=1, name="env_embeddings", capability=["embedding"])]
+        env_ollama_url = (os.environ.get("BOOKEEPER_OLLAMA_BASE_URL") or os.environ.get("OLLAMA_BASE_URL") or "").strip()
+        if env_ollama_url and not self.embedding_servers:
+            return [OllamaServerConfig(url=env_ollama_url, priority=1, name="env_override", capability=["embedding"])]
         if self.embedding_servers:
             valid_servers = [s for s in self.embedding_servers if s.url.strip().lower() != "pool"]
             if valid_servers:
@@ -1274,11 +1317,35 @@ class Settings(BaseSettings):
     @field_validator("neo4j", mode="before")
     @classmethod
     def parse_neo4j_config(cls, v: Any) -> Any:
-        if v is None:
-            return Neo4jConfig()
-        if isinstance(v, dict):
-            return Neo4jConfig(**v)
-        return v
+        cfg_dict: Dict[str, Any] = {}
+        if isinstance(v, Neo4jConfig):
+            cfg_dict = v.model_dump()
+        elif isinstance(v, dict):
+            cfg_dict = dict(v)
+
+        # Check environment variable overrides (BOOKEEPER_NEO4J_* and NEO4J_*)
+        env_uri = (os.environ.get("BOOKEEPER_NEO4J_URI") or os.environ.get("NEO4J_URI") or "").strip()
+        env_user = (os.environ.get("BOOKEEPER_NEO4J_USER") or os.environ.get("NEO4J_USER") or "").strip()
+        env_password = os.environ.get("BOOKEEPER_NEO4J_PASSWORD") or os.environ.get("NEO4J_PASSWORD")
+        env_database = (os.environ.get("BOOKEEPER_NEO4J_DATABASE") or os.environ.get("NEO4J_DATABASE") or "").strip()
+        env_enabled_str = os.environ.get("BOOKEEPER_NEO4J_ENABLED") or os.environ.get("NEO4J_ENABLED")
+
+        if env_uri:
+            cfg_dict["uri"] = env_uri
+        if env_user:
+            cfg_dict["user"] = env_user
+        if env_password is not None:
+            cfg_dict["password"] = env_password
+        if env_database:
+            cfg_dict["database"] = env_database
+
+        if env_enabled_str is not None:
+            cfg_dict["enabled"] = env_enabled_str.strip().lower() in ("1", "true", "yes", "on")
+        elif env_uri:
+            # If an explicit Neo4j URI was provided via environment variable, auto-enable Neo4j
+            cfg_dict["enabled"] = True
+
+        return Neo4jConfig(**cfg_dict)
 
     # Knowledge Graph Factual Verification
     verification: VerificationConfig = Field(

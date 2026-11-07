@@ -22,11 +22,15 @@ from rich.table import Table
 from archive_downloader.downloader import DEFAULT_URL, ArxivDownloader
 from archive_downloader.indexer import DownloadIndex
 from archive_downloader.models import ArticleMetadata
-from archive_downloader.parser import normalize_arxiv_url, parse_arxiv_list_page
+from archive_downloader.parser import (
+    build_arxiv_search_url,
+    normalize_arxiv_url,
+    parse_arxiv_page,
+)
 
 app = typer.Typer(
     name="archive-downloader",
-    help="Automated arXiv article downloader with pagination, deduplication, and Calibre metadata.",
+    help="Automated arXiv article downloader with search queries, pagination, deduplication, and Calibre metadata.",
     add_completion=False,
 )
 console = Console()
@@ -34,11 +38,23 @@ console = Console()
 
 @app.command("download")
 def download_command(
-    url: str = typer.Option(
-        DEFAULT_URL,
+    query: Optional[str] = typer.Option(
+        None,
+        "--query",
+        "-q",
+        help="Search query to search and download articles from arXiv (e.g. 'jepa' or 'world model').",
+    ),
+    exact: bool = typer.Option(
+        False,
+        "--exact/--no-exact",
+        "--exact-match",
+        help="Enforce exact match query syntax in arXiv search and verify keywords.",
+    ),
+    url: Optional[str] = typer.Option(
+        None,
         "--url",
         "-u",
-        help="Source URL to scrape and download articles from.",
+        help="Source URL to scrape and download articles from (list URL or search URL).",
     ),
     limit: int = typer.Option(
         100,
@@ -47,11 +63,11 @@ def download_command(
         "--count",
         help="Target number of articles to download / process.",
     ),
-    output_dir: Path = typer.Option(
-        Path("./downloads"),
+    output_dir: Optional[Path] = typer.Option(
+        None,
         "--output-dir",
         "-o",
-        help="Subdirectory to store downloaded books and articles.",
+        help="Directory to store downloaded books and articles (default: original download storage).",
     ),
     count_existing: bool = typer.Option(
         True,
@@ -59,10 +75,10 @@ def download_command(
         help="Count already downloaded articles towards the limit target (default: True). Use --new-only to download N new articles.",
     ),
     page_size: int = typer.Option(
-        500,
+        100,
         "--page-size",
         "--show",
-        help="Number of entries to fetch per page on arXiv (e.g. 50, 100, 250, 500, 1000, 2000).",
+        help="Number of entries to fetch per page on arXiv (e.g. 50, 100, 250, 500, 1000).",
     ),
     delay: float = typer.Option(
         0.5,
@@ -74,33 +90,61 @@ def download_command(
         "--no-opf",
         help="Skip generating Calibre .opf metadata XML files alongside PDFs.",
     ),
+    file_list: Optional[Path] = typer.Option(
+        None,
+        "--file-list",
+        "--manifest",
+        "--output-list",
+        "--list-file",
+        "-m",
+        help="Path to simple text file where full names of processed files (both newly downloaded and skipped) are written (one per line).",
+    ),
+    full_path: bool = typer.Option(
+        False,
+        "--full-path/--filename-only",
+        help="Write full absolute filesystem path instead of filename in the text file list (default: filename).",
+    ),
 ):
     """
-    Download articles from arXiv up to the specified limit with automatic pagination and deduplication.
+    Download articles from arXiv matching a category list or search query up to the specified limit.
     """
-    dest_dir = output_dir.expanduser().resolve()
-    effective_url = normalize_arxiv_url(url, default_show=page_size)
-    console.print(
-        Panel.fit(
-            f"[bold]Source URL:[/bold] [cyan]{effective_url}[/cyan]\n"
-            f"[bold]Destination:[/bold] [green]{dest_dir}[/green]\n"
-            f"[bold]Target Limit:[/bold] [yellow]{limit}[/yellow] articles\n"
-            f"[bold]Page Size (show):[/bold] [cyan]{page_size}[/cyan] entries/page\n"
-            f"[bold]Accounting Mode:[/bold] [dim]{'Count existing & new' if count_existing else 'New downloads only'}[/dim]\n"
-            f"[bold]Calibre Metadata (.opf):[/bold] [dim]{'Disabled' if no_opf else 'Enabled'}[/dim]",
-            title="Archive Downloader Starting",
-            border_style="cyan",
-        )
+    dest_dir = (
+        output_dir.expanduser().resolve()
+        if output_dir
+        else ArxivDownloader.resolve_default_downloads_dir()
     )
 
     downloader = ArxivDownloader(
-        base_url=effective_url,
+        base_url=url,
+        query=query,
+        exact_match=exact,
         output_dir=dest_dir,
+        file_list=file_list,
+        full_path=full_path,
         limit=limit,
         page_size=page_size,
         count_existing=count_existing,
         request_delay=delay,
         write_opf=not no_opf,
+    )
+
+    effective_url = downloader.base_url
+
+    query_info = f"[bold]Search Query:[/bold] [yellow]{query}[/yellow] {'[magenta](Exact Match)[/magenta]' if exact else ''}\n" if query else ""
+    manifest_info = f"[bold]File List Output:[/bold] [yellow]{file_list}[/yellow] {'[dim](full absolute path)[/dim]' if full_path else '[dim](full filename)[/dim]'}\n" if file_list else ""
+    console.print(
+        Panel.fit(
+            f"{query_info}"
+            f"{manifest_info}"
+            f"[bold]Source URL:[/bold] [cyan]{effective_url}[/cyan]\n"
+            f"[bold]Destination:[/bold] [green]{dest_dir}[/green]\n"
+            f"[bold]Target Limit:[/bold] [yellow]{limit}[/yellow] articles\n"
+            f"[bold]Page Size (show/size):[/bold] [cyan]{page_size}[/cyan] entries/page\n"
+            f"[bold]Accounting Mode:[/bold] [dim]{'Count existing & new' if count_existing else 'New downloads only'}[/dim]\n"
+            f"[bold]Calibre Metadata (.opf):[/bold] [dim]{'Disabled' if no_opf else 'Enabled'}[/dim]",
+            title="Archive Downloader Starting",
+            border_style="cyan",
+        )
     )
 
     with Progress(
@@ -146,6 +190,11 @@ def download_command(
     table.add_row("Duration", f"{stats.duration_seconds}s")
     table.add_row("Storage Directory", str(dest_dir))
     table.add_row("Total Indexed in Storage", str(downloader.indexer.count()))
+    if stats.manifest_file:
+        table.add_row(
+            "File List Stored",
+            f"[bold green]{stats.manifest_file}[/bold green] ({len(stats.recorded_files)} files)",
+        )
 
     console.print("\n", table)
     console.print(f"[bold green]✓ Download session completed successfully![/bold green]\n")
@@ -153,11 +202,11 @@ def download_command(
 
 @app.command("status")
 def status_command(
-    output_dir: Path = typer.Option(
-        Path("./downloads"),
+    output_dir: Optional[Path] = typer.Option(
+        None,
         "--output-dir",
         "-o",
-        help="Subdirectory where downloads and index are stored.",
+        help="Subdirectory where downloads and index are stored (default: original download storage).",
     ),
     limit: int = typer.Option(
         15,
@@ -169,7 +218,11 @@ def status_command(
     """
     Display statistics, disk usage, and recent items from the download index.
     """
-    dest_dir = output_dir.expanduser().resolve()
+    dest_dir = (
+        output_dir.expanduser().resolve()
+        if output_dir
+        else ArxivDownloader.resolve_default_downloads_dir()
+    )
     index = DownloadIndex(dest_dir)
     entries = index.all_entries()
 
@@ -217,8 +270,20 @@ def status_command(
 
 @app.command("inspect")
 def inspect_command(
-    url: str = typer.Option(
-        DEFAULT_URL,
+    query: Optional[str] = typer.Option(
+        None,
+        "--query",
+        "-q",
+        help="Search query to preview.",
+    ),
+    exact: bool = typer.Option(
+        False,
+        "--exact/--no-exact",
+        "--exact-match",
+        help="Enforce exact match query in preview.",
+    ),
+    url: Optional[str] = typer.Option(
+        None,
         "--url",
         "-u",
         help="Source URL to inspect.",
@@ -230,18 +295,28 @@ def inspect_command(
         help="Number of articles to preview.",
     ),
     page_size: int = typer.Option(
-        500,
+        100,
         "--page-size",
         "--show",
         help="Number of entries to fetch per page on arXiv (e.g. 50, 100, 250, 500).",
     ),
 ):
     """
-    Inspect an arXiv list page and preview article metadata without downloading.
+    Inspect an arXiv list or search page and preview article metadata without downloading.
     """
     import httpx
 
-    effective_url = normalize_arxiv_url(url, default_show=page_size)
+    if query and not url:
+        effective_url = build_arxiv_search_url(
+            query=query,
+            exact_match=exact,
+            size=min(page_size, 200),
+        )
+    elif url:
+        effective_url = normalize_arxiv_url(url, default_show=page_size)
+    else:
+        effective_url = normalize_arxiv_url(DEFAULT_URL, default_show=page_size)
+
     console.print(f"[bold cyan]Fetching page for inspection:[/bold cyan] {effective_url}")
     try:
         resp = httpx.get(
@@ -255,7 +330,7 @@ def inspect_command(
         console.print(f"[bold red]Failed to fetch URL:[/bold red] {e}")
         raise typer.Exit(1)
 
-    articles, next_url = parse_arxiv_list_page(resp.text, current_url=url)
+    articles, next_url = parse_arxiv_page(resp.text, current_url=effective_url)
     table = Table(title=f"Articles Found ({len(articles)} on page)", border_style="cyan")
     table.add_column("arXiv ID", style="bold cyan")
     table.add_column("Title", style="white")

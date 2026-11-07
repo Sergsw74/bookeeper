@@ -20,6 +20,7 @@ runner = CliRunner()
 @pytest.fixture
 def mock_backend(tmp_path):
     cfg = Settings(output_dir=str(tmp_path))
+    cfg.neo4j.enabled = True
     backend = SearchEngineBackend(config=cfg, lightrag_dir=tmp_path)
     backend.get_neo4j_stats = MagicMock(return_value=(False, None, "Connection refused"))
     return backend
@@ -160,6 +161,83 @@ def test_ui_backend_node_details_with_mocks(mock_backend):
         assert len(details["books"]) == 1
         assert details["books"][0]["target_name"] == "Sample AI Book"
         assert "telemetry" in details
+
+
+def test_ui_get_node_details_deduplicates_books_and_evidence(mock_backend):
+    """Verify that multiple relations between concept and the same book or chunk do not produce duplicate entries."""
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    mock_node = MagicMock()
+    mock_node.labels = ["Idea"]
+    mock_node.get.side_effect = lambda k, d=None: {
+        "id": "concept:Consensus",
+        "name": "Consensus",
+    }.get(k, d)
+    mock_node.keys.return_value = ["id", "name"]
+    mock_node.__iter__.return_value = ["id", "name"]
+    mock_node.__getitem__.side_effect = lambda k: {
+        "id": "concept:Consensus",
+        "name": "Consensus",
+    }[k]
+
+    # Two edges to the same book (FEATURED_IN and EXPLORES_IDEA) and two to the same chunk (SUPPORTED_BY and SUPPORTS_IDEA)
+    mock_rec = MagicMock()
+    mock_rec.__getitem__.side_effect = lambda k: {
+        "n": mock_node,
+        "relations": [
+            {
+                "type": "FEATURED_IN",
+                "direction": "outgoing",
+                "other_id": "book:42",
+                "other_name": "Multi-Agent Systems",
+                "other_labels": ["Book"],
+                "other_category": "Book",
+                "properties": {},
+            },
+            {
+                "type": "EXPLORES_IDEA",
+                "direction": "incoming",
+                "other_id": "book:42",
+                "other_name": "Multi-Agent Systems",
+                "other_labels": ["Book"],
+                "other_category": "Book",
+                "properties": {},
+            },
+            {
+                "type": "SUPPORTED_BY",
+                "direction": "outgoing",
+                "other_id": "chunk:101",
+                "other_name": "Chunk 101",
+                "other_labels": ["Chunk"],
+                "other_category": "Chunk",
+                "properties": {"breadcrumb": "Ch 1"},
+                "other_properties": {"text": "Evidence 1"},
+            },
+            {
+                "type": "SUPPORTS_IDEA",
+                "direction": "incoming",
+                "other_id": "chunk:101",
+                "other_name": "Chunk 101",
+                "other_labels": ["Chunk"],
+                "other_category": "Chunk",
+                "properties": {"breadcrumb": "Ch 1"},
+                "other_properties": {"text": "Evidence 1"},
+            },
+        ],
+    }[k]
+    mock_session.run.return_value.single.return_value = mock_rec
+
+    with patch.object(mock_backend, "get_neo4j_driver", return_value=mock_driver):
+        details = mock_backend.get_node_details("concept:Consensus")
+        # Books must be strictly deduplicated
+        assert len(details["books"]) == 1
+        assert details["books"][0]["target_id"] == "book:42"
+        # Evidence must be strictly deduplicated
+        assert len(details["evidence"]) == 1
+        assert details["evidence"][0]["target_id"] == "chunk:101"
+
 
 
 def test_ui_http_server_endpoints(mock_backend, tmp_path):
@@ -1401,6 +1479,44 @@ def test_ui_backend_restore_from_backup_flow(mock_backend, tmp_path):
         assert res["consistency"]["is_consistent"] is True
 
 
+def test_ui_backend_restore_from_backup_uses_incremental_neo4j_sync(mock_backend, tmp_path):
+    """Verify that UI restore uses incremental restore for Neo4j (clean=False, incremental_sync=True) even if clean=True."""
+    import zipfile
+    from unittest.mock import MagicMock
+
+    archive_zip = tmp_path / "restore_test.zip"
+    kg_file = tmp_path / "knowledge_graph.json"
+    kg_file.write_text(json.dumps({"nodes": [], "edges": []}))
+
+    with zipfile.ZipFile(archive_zip, "w") as zf:
+        zf.writestr("knowledge_graph.json", json.dumps({"nodes": [], "edges": []}))
+
+    mock_exporter = MagicMock()
+    mock_exporter.export.return_value = {
+        "status": "already_synchronized",
+        "clean_start": False,
+        "incremental_sync": True,
+        "nodes_upserted": 0,
+        "edges_upserted": 0,
+    }
+
+    with patch("bookeeper.backup.restore_backup", return_value={"files_restored": 1, "bytes_restored": 100, "backup_type": "knowledge"}), \
+         patch("bookeeper.graph.neo4j_exporter.Neo4jExporter.from_config", return_value=mock_exporter), \
+         patch.object(mock_backend, "validate_database_consistency", return_value={"neo4j_connected": True, "is_consistent": True, "discrepancies": []}), \
+         patch.object(mock_backend.config, "output_dir", str(tmp_path)):
+
+        # Even with clean=True for local files, Neo4j export MUST use incremental sync (clean=False)
+        res = mock_backend.restore_from_backup(archive_file=archive_zip, clean=True, export_neo4j=True)
+        assert res["success"] is True
+        assert res["neo4j_export"]["status"] == "already_synchronized"
+
+        # Verify export was invoked with clean=False and incremental_sync=True
+        mock_exporter.export.assert_called_once()
+        _, kwargs = mock_exporter.export.call_args
+        assert kwargs.get("clean") is False
+        assert kwargs.get("incremental_sync") is True
+
+
 def test_ui_restore_endpoint_flow(mock_backend, tmp_path):
     """Test /api/backup/restore POST endpoint with multipart upload."""
     import urllib.request
@@ -1427,6 +1543,8 @@ def test_ui_restore_endpoint_flow(mock_backend, tmp_path):
                 assert st_resp.status == 200
                 st_data = json.loads(st_resp.read().decode())
                 assert "in_progress" in st_data
+                assert "logs" in st_data
+                assert "progress_pct" in st_data
 
             # 2. Upload multipart restore request
             boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
@@ -1530,6 +1648,217 @@ def test_ui_backup_endpoints(mock_backend, tmp_path):
         finally:
             server.shutdown()
             server.server_close()
+
+
+def test_ui_backend_neo4j_disabled(tmp_path):
+    """Verify backend operates safely in pure standalone mode when neo4j.enabled is False."""
+    cfg = Settings(output_dir=str(tmp_path))
+    cfg.neo4j.enabled = False
+    backend = SearchEngineBackend(config=cfg, lightrag_dir=tmp_path)
+
+    # 1. Properties
+    assert backend.is_neo4j_enabled is False
+
+    # 2. Driver access raises RuntimeError
+    with pytest.raises(RuntimeError, match="disabled in configuration"):
+        backend.get_neo4j_driver()
+
+    # 3. get_neo4j_stats returns graceful False
+    connected, stats, err = backend.get_neo4j_stats()
+    assert connected is False
+    assert stats is None
+    assert "disabled" in err.lower()
+
+    # 4. validate_database_consistency returns standalone_mode=True and consistent
+    val = backend.validate_database_consistency()
+    assert val["neo4j_connected"] is False
+    assert val["is_consistent"] is True
+    assert val["standalone_mode"] is True
+
+    # 5. query_ideas runs fallback and notes telemetry status as disabled
+    res = backend.query_ideas("What is test query?")
+    assert "graph" in res
+    assert res.get("telemetry", {}).get("neo4j", {}).get("status") == "disabled"
+
+
+def test_ui_version_endpoint(mock_backend):
+    """Verify that /api/version and /health return version and release date."""
+    from bookeeper import __version__, __release_date__
+    from bookeeper.ui.server import run_server
+    import threading
+    import urllib.request
+
+    server = run_server(host="127.0.0.1", port=0, backend=mock_backend)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    port = server.server_port
+
+    try:
+        # 1. /api/version
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/version")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            assert resp.status == 200
+            data = json.loads(resp.read().decode("utf-8"))
+            assert data["version"] == __version__
+            assert data["release_date"] == __release_date__
+
+        # 2. /api/health
+        req2 = urllib.request.Request(f"http://127.0.0.1:{port}/api/health")
+        with urllib.request.urlopen(req2, timeout=3) as resp2:
+            assert resp2.status == 200
+            data2 = json.loads(resp2.read().decode("utf-8"))
+            assert data2["version"] == __version__
+            assert data2["release_date"] == __release_date__
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_ui_incremental_backup_preview_and_prepare(mock_backend, tmp_path):
+    """Test /api/backup/incremental/preview and /api/backup/incremental/prepare server endpoints."""
+    from bookeeper.ui.server import run_server
+    import threading
+    import urllib.request
+    import json
+
+    mock_backend.preview_incremental_diff = MagicMock(return_value={
+        "baseline_type": "neo4j",
+        "baseline_reference": "bolt://localhost:7687",
+        "new_books_count": 2,
+        "related_books_count": 1,
+        "diff_nodes": 15,
+        "diff_edges": 12,
+        "new_books": [{"book_id": 2, "title": "New Paper"}],
+        "related_books": [{"book_id": 1, "title": "Existing Paper"}],
+    })
+
+    mock_backend.prepare_incremental_backup = MagicMock(return_value={
+        "success": True,
+        "filename": "incremental_backup_20261106.zip",
+        "download_url": "/api/backup/download?filename=incremental_backup_20261106.zip",
+        "format": "zip",
+        "file_size": 2048,
+        "total_files": 5,
+        "new_books_count": 2,
+        "related_books_count": 1,
+        "diff_nodes": 15,
+        "diff_edges": 12,
+    })
+
+    server = run_server(host="127.0.0.1", port=0, backend=mock_backend)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    port = server.server_port
+
+    try:
+        # 1. Preview via GET
+        req_prev_get = urllib.request.Request(f"http://127.0.0.1:{port}/api/backup/incremental/preview?baseline_type=neo4j")
+        with urllib.request.urlopen(req_prev_get, timeout=3) as resp:
+            assert resp.status == 200
+            data = json.loads(resp.read().decode("utf-8"))
+            assert data["new_books_count"] == 2
+            assert data["related_books_count"] == 1
+            mock_backend.preview_incremental_diff.assert_called_with(baseline_type="neo4j", baseline_path=None)
+
+        # 2. Preview via POST
+        post_body = json.dumps({"baseline_type": "archive", "baseline_path": "/path/prev.zip"}).encode("utf-8")
+        req_prev_post = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/backup/incremental/preview",
+            data=post_body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req_prev_post, timeout=3) as resp:
+            assert resp.status == 200
+            mock_backend.preview_incremental_diff.assert_called_with(baseline_type="archive", baseline_path="/path/prev.zip")
+
+        # 3. Prepare via POST
+        prep_body = json.dumps({
+            "baseline_type": "neo4j",
+            "format": "zip",
+            "include_books": True,
+        }).encode("utf-8")
+        req_prep = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/backup/incremental/prepare",
+            data=prep_body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req_prep, timeout=3) as resp:
+            assert resp.status == 200
+            prep_data = json.loads(resp.read().decode("utf-8"))
+            assert prep_data["success"] is True
+            assert prep_data["new_books_count"] == 2
+            mock_backend.prepare_incremental_backup.assert_called_once()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_ui_incremental_restore_flow(mock_backend, tmp_path):
+    """Test /api/backup/restore POST endpoint with multipart upload specifying incremental=true."""
+    import urllib.request
+    from bookeeper.ui.server import run_server
+    import threading
+    import zipfile
+    import json
+
+    server = run_server(host="127.0.0.1", port=0, backend=mock_backend)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    port = server.server_port
+
+    try:
+        # Create a small sample zip
+        zip_path = tmp_path / "test_inc.zip"
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("backup_metadata.json", json.dumps({"backup_type": "incremental"}))
+        zip_bytes = zip_path.read_bytes()
+
+        boundary = "----WebKitFormBoundaryIncTest"
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="clean"\r\n\r\n'
+            f"false\r\n"
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="incremental"\r\n\r\n'
+            f"true\r\n"
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="test_inc.zip"\r\n'
+            f"Content-Type: application/zip\r\n\r\n"
+        ).encode("utf-8") + zip_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        mock_backend.restore_from_backup = MagicMock(return_value={
+            "success": True,
+            "backup_type": "incremental",
+            "restored_files": 3,
+            "restored_bytes": 1024,
+            "merge_stats": {"nodes_added": 5, "edges_added": 8},
+            "neo4j_export": {"status": "ok", "nodes_upserted": 5, "edges_upserted": 8},
+            "consistency": {"is_consistent": True, "discrepancies": []},
+        })
+
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/backup/restore",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+            data = json.loads(resp.read().decode("utf-8"))
+            assert data["success"] is True
+            assert data["backup_type"] == "incremental"
+            assert data["merge_stats"]["nodes_added"] == 5
+
+        # Verify restore_from_backup was invoked with incremental=True and clean=False
+        mock_backend.restore_from_backup.assert_called_once()
+        _, kwargs = mock_backend.restore_from_backup.call_args
+        assert kwargs.get("clean") is False
+        assert kwargs.get("incremental") is True
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 
 
 

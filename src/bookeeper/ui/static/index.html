@@ -79,6 +79,21 @@
       font-weight: 800;
     }
 
+    .version-badge {
+      background: rgba(255, 255, 255, 0.07);
+      color: #94a3b8;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 0.72rem;
+      font-weight: 500;
+      letter-spacing: 0.2px;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+
     .nav-tabs {
       display: flex;
       gap: 6px;
@@ -1943,6 +1958,11 @@
       <div class="logo-area">
         <span>📖 Bookeeper</span>
         <span class="logo-badge">Idea Engine</span>
+        <span class="version-badge" id="app-version-badge" title="Bookeeper Release Version and Build Date">
+          <span style="color:#38bdf8;">v0.1.0</span>
+          <span style="color:#64748b;">•</span>
+          <span>2026-11-04</span>
+        </span>
       </div>
       <div class="nav-tabs">
         <button class="nav-tab-btn active" id="tab-btn-graph" onclick="switchTab('graph')">
@@ -2449,10 +2469,33 @@
 
             <div class="br-form-group">
               <label class="br-form-label">Backup Scope:</label>
-              <select id="page-backup-type-select" class="toolbar-select" style="width:100%; padding:10px 12px; font-size:0.9rem;">
+              <select id="page-backup-type-select" class="toolbar-select" onchange="onPageBackupTypeChange()" style="width:100%; padding:10px 12px; font-size:0.9rem;">
                 <option value="full" selected>Full Backup (Knowledge Graph + Indexed Source Books)</option>
                 <option value="knowledge">Knowledge Only (Graph, Chunks, Notes, State Checkpoints)</option>
+                <option value="incremental">Incremental Diff Backup (New Books + Related Connections)</option>
               </select>
+            </div>
+
+            <div id="page-incremental-options" style="display:none; background:rgba(30,41,59,0.7); border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:14px;">
+              <div style="font-weight:700; font-size:0.85rem; color:#a5b4fc; margin-bottom:8px;">⚖️ Incremental Diff Configuration:</div>
+              <div class="br-form-group" style="margin-bottom:8px;">
+                <label class="br-form-label" style="font-size:0.8rem;">Compare Baseline Against:</label>
+                <select id="page-incremental-baseline-type" class="toolbar-select" onchange="onPageBaselineTypeChange()" style="width:100%; padding:8px 10px; font-size:0.85rem;">
+                  <option value="neo4j" selected>Active Neo4j Database</option>
+                  <option value="archive">Previous Backup Archive (.zip / .7z / knowledge_graph.json)</option>
+                </select>
+              </div>
+              <div id="page-incremental-path-group" class="br-form-group" style="display:none; margin-bottom:8px;">
+                <label class="br-form-label" style="font-size:0.8rem;">Baseline Archive/File Path:</label>
+                <input type="text" id="page-incremental-baseline-path" class="toolbar-input" placeholder="/path/to/previous_backup.zip or knowledge_graph.json" style="width:100%; padding:8px 10px; font-size:0.85rem;" />
+              </div>
+              <div style="display:flex; gap:8px; align-items:center;">
+                <button type="button" class="search-btn" onclick="previewPageIncrementalDiff()" style="background:#6366f1; padding:6px 12px; font-size:0.82rem;">
+                  <span>🔍 Preview Diff</span>
+                </button>
+                <span id="page-incremental-preview-status" style="font-size:0.78rem; color:var(--text-muted);"></span>
+              </div>
+              <div id="page-incremental-preview-result" style="display:none; margin-top:10px; font-size:0.8rem; background:rgba(15,23,42,0.8); border:1px solid rgba(99,102,241,0.3); border-radius:6px; padding:10px;"></div>
             </div>
 
             <div class="br-form-group">
@@ -2463,7 +2506,7 @@
               </select>
             </div>
 
-            <div class="br-info-box info">
+            <div class="br-info-box info" id="page-backup-tip">
               💡 <strong>Tip:</strong> Full backups include original source PDFs/EPUBs and can be completely restored into a new empty Bookeeper instance.
             </div>
 
@@ -2519,9 +2562,16 @@
             </div>
 
             <div style="display:flex; align-items:center; gap:8px;">
-              <input type="checkbox" id="page-restore-clean-chk" checked style="accent-color:var(--accent); width:18px; height:18px; cursor:pointer;" />
+              <input type="checkbox" id="page-restore-clean-chk" style="accent-color:var(--accent); width:18px; height:18px; cursor:pointer;" />
               <label for="page-restore-clean-chk" style="font-size:0.86rem; color:var(--text-main); cursor:pointer;">
-                Clean restore (purge existing artifacts and wipe Neo4j before importing)
+                Clean filesystem extraction (purge local target directory before extracting; Neo4j uses incremental synchronization)
+              </label>
+            </div>
+
+            <div style="display:flex; align-items:center; gap:8px;">
+              <input type="checkbox" id="page-restore-incremental-chk" checked style="accent-color:var(--accent); width:18px; height:18px; cursor:pointer;" />
+              <label for="page-restore-incremental-chk" style="font-size:0.86rem; color:var(--text-main); cursor:pointer;">
+                Incremental Update (merge incoming books & concepts into existing Knowledge Graph and Neo4j)
               </label>
             </div>
 
@@ -2530,7 +2580,25 @@
                 <div class="spinner" style="width:18px; height:18px; border-width:2px; margin:0;"></div>
                 <span id="page-restore-progress-text" style="font-size:0.88rem; color:var(--text-main); font-weight:600;">Uploading and unpacking archive...</span>
               </div>
-              <div id="page-restore-progress-sub" style="font-size:0.78rem; color:var(--text-muted);">Please keep this window open while files are being restored and Neo4j is updated.</div>
+              <div id="page-restore-progress-sub" style="font-size:0.78rem; color:var(--text-muted); margin-bottom:8px;">Please keep this window open while files are being restored and Neo4j is updated.</div>
+              
+              <!-- Progress Bar -->
+              <div style="background:var(--bg-dark, #0f172a); border-radius:6px; height:10px; width:100%; overflow:hidden; margin:8px 0 4px; border:1px solid var(--border, #334155);">
+                <div id="page-restore-progress-bar" style="background:linear-gradient(90deg, var(--accent, #6366f1), #38bdf8); height:100%; width:0%; transition:width 0.2s ease; border-radius:5px;"></div>
+              </div>
+              <div style="display:flex; justify-content:space-between; font-size:0.75rem; color:var(--text-muted); margin-bottom:10px;">
+                <span id="page-restore-progress-metrics">Preparing upload...</span>
+                <span id="page-restore-progress-speed">-- MB/s</span>
+              </div>
+
+              <!-- Live Restore Console Box -->
+              <div style="margin-top:6px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                  <span style="font-size:0.74rem; color:var(--text-muted); font-weight:600; text-transform:uppercase; letter-spacing:0.04em;">🖥️ Restore Console Logs</span>
+                  <span id="page-restore-console-status" style="font-size:0.72rem; color:#38bdf8;">Connecting...</span>
+                </div>
+                <pre id="page-restore-console" style="background:#090d16; border:1px solid #1e293b; border-radius:6px; padding:8px 10px; font-family:'JetBrains Mono','Fira Code',ui-monospace,monospace; font-size:0.75rem; color:#94a3b8; height:130px; overflow-y:auto; white-space:pre-wrap; word-break:break-word; margin:0; line-height:1.45;"></pre>
+              </div>
             </div>
 
             <div id="page-restore-result-area" style="display:none; background:rgba(16,185,129,0.12); padding:14px; border-radius:8px; border:1px solid #10b981;">
@@ -2553,6 +2621,23 @@
     <!-- View 3: Dedicated Debug & Telemetry Tab -->
     <div class="view-pane" id="pane-debug">
       <div class="debug-container" style="max-width:1100px; margin:0 auto; padding:20px; overflow-y:auto; height:100%;">
+        <!-- System & Version Information Panel -->
+        <div class="debug-card" style="margin-bottom: 20px; background:var(--bg-panel); border:1px solid var(--border); border-radius:10px; padding:16px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+            <div style="display:flex; align-items:center; gap:10px;">
+              <span style="font-size:1.3rem;">ℹ️</span>
+              <strong style="color:var(--text-main); font-size:1rem;">System & Version Information</strong>
+            </div>
+            <span class="version-badge" style="font-size:0.75rem;">Release v0.1.0</span>
+          </div>
+          <div style="display:flex; gap:24px; flex-wrap:wrap; font-size:0.88rem; color:var(--text-muted); line-height:1.6; background:rgba(15,23,42,0.6); padding:10px 14px; border-radius:6px;">
+            <div><strong style="color:#94a3b8;">Release Version:</strong> <span id="debug-sys-version" style="color:#38bdf8; font-weight:600; font-family:monospace;">0.1.0</span></div>
+            <div><strong style="color:#94a3b8;">Release Date:</strong> <span id="debug-sys-date" style="color:#e2e8f0; font-family:monospace;">2026-11-04</span></div>
+            <div><strong style="color:#94a3b8;">Service:</strong> <span style="color:#e2e8f0;">Bookeeper Knowledge Engine</span></div>
+            <div><strong style="color:#94a3b8;">UI Status:</strong> <span style="color:#34d399;">● Online</span></div>
+          </div>
+        </div>
+
         <!-- Database Consistency & Sync Panel -->
         <div id="debug-sync-panel" class="debug-card" style="margin-bottom: 20px; background:var(--bg-panel); border:1px solid var(--border); border-radius:10px; padding:16px;">
           <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
@@ -2598,10 +2683,33 @@
           
           <div style="display:flex; flex-direction:column; gap:6px;">
             <label style="font-size:0.8rem; font-weight:600; color:var(--text-muted); text-transform:uppercase;">Backup Type:</label>
-            <select id="backup-type-select" class="toolbar-select" style="width:100%; padding:8px 10px;">
+            <select id="backup-type-select" class="toolbar-select" onchange="onModalBackupTypeChange()" style="width:100%; padding:8px 10px;">
               <option value="full" selected>Full Backup (Knowledge Graph + Indexed Source Books)</option>
               <option value="knowledge">Knowledge Only (Graph, Chunks, Notes, State Checkpoints)</option>
+              <option value="incremental">Incremental Diff Backup (New Books + Related Connections)</option>
             </select>
+          </div>
+
+          <div id="modal-incremental-options" style="display:none; background:rgba(30,41,59,0.7); border:1px solid var(--border); border-radius:8px; padding:10px; margin-top:2px;">
+            <div style="font-weight:700; font-size:0.82rem; color:#a5b4fc; margin-bottom:6px;">⚖️ Incremental Diff Configuration:</div>
+            <div class="br-form-group" style="margin-bottom:6px;">
+              <label class="br-form-label" style="font-size:0.78rem;">Compare Baseline Against:</label>
+              <select id="modal-incremental-baseline-type" class="toolbar-select" onchange="onModalBaselineTypeChange()" style="width:100%; padding:6px 8px; font-size:0.82rem;">
+                <option value="neo4j" selected>Active Neo4j Database</option>
+                <option value="archive">Previous Backup Archive (.zip / .7z / knowledge_graph.json)</option>
+              </select>
+            </div>
+            <div id="modal-incremental-path-group" class="br-form-group" style="display:none; margin-bottom:6px;">
+              <label class="br-form-label" style="font-size:0.78rem;">Baseline Archive/File Path:</label>
+              <input type="text" id="modal-incremental-baseline-path" class="toolbar-input" placeholder="/path/to/previous_backup.zip or knowledge_graph.json" style="width:100%; padding:6px 8px; font-size:0.82rem;" />
+            </div>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <button type="button" class="search-btn" onclick="previewModalIncrementalDiff()" style="background:#6366f1; padding:5px 10px; font-size:0.8rem;">
+                <span>🔍 Preview Diff</span>
+              </button>
+              <span id="modal-incremental-preview-status" style="font-size:0.75rem; color:var(--text-muted);"></span>
+            </div>
+            <div id="modal-incremental-preview-result" style="display:none; margin-top:8px; font-size:0.78rem; background:rgba(15,23,42,0.8); border:1px solid rgba(99,102,241,0.3); border-radius:6px; padding:8px;"></div>
           </div>
 
           <div style="display:flex; flex-direction:column; gap:6px;">
@@ -2668,18 +2776,43 @@
           </div>
 
           <div style="display:flex; align-items:center; gap:8px;">
-            <input type="checkbox" id="restore-clean-chk" checked style="accent-color:var(--accent); width:16px; height:16px; cursor:pointer;" />
+            <input type="checkbox" id="restore-clean-chk" style="accent-color:var(--accent); width:16px; height:16px; cursor:pointer;" />
             <label for="restore-clean-chk" style="font-size:0.85rem; color:var(--text-main); cursor:pointer;">
-              Clean restore (purge existing artifacts and wipe Neo4j before importing)
+              Clean filesystem extraction (purge local target directory before extracting; Neo4j uses incremental synchronization)
+            </label>
+          </div>
+
+          <div style="display:flex; align-items:center; gap:8px;">
+            <input type="checkbox" id="restore-incremental-chk" checked style="accent-color:var(--accent); width:16px; height:16px; cursor:pointer;" />
+            <label for="restore-incremental-chk" style="font-size:0.85rem; color:var(--text-main); cursor:pointer;">
+              Incremental Update (merge incoming books & concepts into existing Knowledge Graph and Neo4j)
             </label>
           </div>
 
           <div id="restore-progress-area" style="display:none; background:rgba(15,23,42,0.6); padding:12px; border-radius:6px; border:1px solid var(--border);">
             <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
               <div class="spinner" style="width:16px; height:16px; border-width:2px; margin:0;"></div>
-              <span id="restore-progress-text" style="font-size:0.85rem; color:var(--text-main);">Uploading and unpacking archive...</span>
+              <span id="restore-progress-text" style="font-size:0.85rem; color:var(--text-main); font-weight:600;">Uploading and unpacking archive...</span>
             </div>
-            <div id="restore-progress-sub" style="font-size:0.75rem; color:var(--text-muted);">Please keep this window open while files are being restored and Neo4j is updated.</div>
+            <div id="restore-progress-sub" style="font-size:0.75rem; color:var(--text-muted); margin-bottom:6px;">Please keep this window open while files are being restored and Neo4j is updated.</div>
+            
+            <!-- Progress Bar -->
+            <div style="background:var(--bg-dark, #0f172a); border-radius:6px; height:8px; width:100%; overflow:hidden; margin:6px 0 4px; border:1px solid var(--border, #334155);">
+              <div id="restore-progress-bar" style="background:linear-gradient(90deg, var(--accent, #6366f1), #38bdf8); height:100%; width:0%; transition:width 0.2s ease; border-radius:4px;"></div>
+            </div>
+            <div style="display:flex; justify-content:space-between; font-size:0.74rem; color:var(--text-muted); margin-bottom:8px;">
+              <span id="restore-progress-metrics">Preparing upload...</span>
+              <span id="restore-progress-speed">-- MB/s</span>
+            </div>
+
+            <!-- Live Restore Console Box -->
+            <div style="margin-top:6px;">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                <span style="font-size:0.72rem; color:var(--text-muted); font-weight:600; text-transform:uppercase; letter-spacing:0.04em;">🖥️ Restore Console Logs</span>
+                <span id="restore-console-status" style="font-size:0.7rem; color:#38bdf8;">Connecting...</span>
+              </div>
+              <pre id="restore-console" style="background:#090d16; border:1px solid #1e293b; border-radius:6px; padding:8px 10px; font-family:'JetBrains Mono','Fira Code',ui-monospace,monospace; font-size:0.74rem; color:#94a3b8; height:120px; overflow-y:auto; white-space:pre-wrap; word-break:break-word; margin:0; line-height:1.45;"></pre>
+            </div>
           </div>
 
           <div id="restore-result-area" style="display:none; background:rgba(16,185,129,0.12); padding:12px; border-radius:6px; border:1px solid #10b981;">
@@ -3941,6 +4074,65 @@
       if (modal) modal.style.display = 'none';
     }
 
+    function onModalBackupTypeChange() {
+      const typeSelect = document.getElementById('backup-type-select');
+      const incOpt = document.getElementById('modal-incremental-options');
+      const isInc = typeSelect && typeSelect.value === 'incremental';
+      if (incOpt) incOpt.style.display = isInc ? 'block' : 'none';
+    }
+
+    function onModalBaselineTypeChange() {
+      const btype = document.getElementById('modal-incremental-baseline-type');
+      const pathGroup = document.getElementById('modal-incremental-path-group');
+      if (pathGroup) pathGroup.style.display = (btype && btype.value === 'archive') ? 'block' : 'none';
+    }
+
+    async function previewModalIncrementalDiff() {
+      const btype = document.getElementById('modal-incremental-baseline-type')?.value || 'neo4j';
+      const bpath = document.getElementById('modal-incremental-baseline-path')?.value || '';
+      const statusSpan = document.getElementById('modal-incremental-preview-status');
+      const resDiv = document.getElementById('modal-incremental-preview-result');
+
+      if (statusSpan) statusSpan.textContent = 'Calculating diff...';
+      if (resDiv) resDiv.style.display = 'none';
+
+      try {
+        const resp = await fetch('/api/backup/incremental/preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ baseline_type: btype, baseline_path: bpath || undefined })
+        });
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+
+        if (statusSpan) statusSpan.textContent = `✓ Diff calculated`;
+        if (resDiv) {
+          resDiv.style.display = 'block';
+          const newBooksCount = data.new_books_count || 0;
+          const relBooksCount = data.related_books_count || 0;
+          const diffNodes = data.diff_nodes || 0;
+          const diffEdges = data.diff_edges || 0;
+          const newTitles = (data.new_books || []).map(b => b.title || b.id).slice(0, 3).join(', ');
+          const extraNew = (data.new_books || []).length > 3 ? ` (+${data.new_books.length - 3} more)` : '';
+
+          resDiv.innerHTML = `
+            <div style="color:#38bdf8; font-weight:600; margin-bottom:4px;">
+              Diff Summary (Baseline: ${escapeHtml(data.baseline_type.toUpperCase())})
+            </div>
+            <div>• <strong>New Books:</strong> <span style="color:#34d399;">${newBooksCount}</span> ${newTitles ? '(' + escapeHtml(newTitles) + extraNew + ')' : ''}</div>
+            <div>• <strong>Related Books:</strong> <span style="color:#a5b4fc;">${relBooksCount}</span></div>
+            <div>• <strong>Diff Subgraph:</strong> ${diffNodes.toLocaleString()} nodes, ${diffEdges.toLocaleString()} edges</div>
+          `;
+        }
+      } catch (err) {
+        if (statusSpan) statusSpan.textContent = '✗ Error';
+        if (resDiv) {
+          resDiv.style.display = 'block';
+          resDiv.innerHTML = `<span style="color:#ef4444;">Failed to calculate diff: ${escapeHtml(err.message)}</span>`;
+        }
+      }
+    }
+
     async function startBackupCreation() {
       const typeSelect = document.getElementById('backup-type-select');
       const formatSelect = document.getElementById('backup-format-select');
@@ -3960,14 +4152,22 @@
       if (startBtn) startBtn.disabled = true;
       if (cancelBtn) cancelBtn.disabled = true;
       if (progressText) {
-        progressText.textContent = `Packaging ${backupType === 'full' ? 'full backup (with source books)' : 'knowledge backup'} as .${backupFormat}...`;
+        const typeLabel = backupType === 'incremental' ? 'incremental diff backup' : (backupType === 'full' ? 'full backup (with source books)' : 'knowledge backup');
+        progressText.textContent = `Packaging ${typeLabel} as .${backupFormat}...`;
       }
 
       try {
-        const resp = await fetch('/api/backup/prepare', {
+        const endpoint = backupType === 'incremental' ? '/api/backup/incremental/prepare' : '/api/backup/prepare';
+        const btype = document.getElementById('modal-incremental-baseline-type')?.value || 'neo4j';
+        const bpath = document.getElementById('modal-incremental-baseline-path')?.value || '';
+        const bodyPayload = backupType === 'incremental'
+          ? { baseline_type: btype, baseline_path: bpath || undefined, format: backupFormat, include_books: true }
+          : { type: backupType, format: backupFormat, indexed_only: true };
+
+        const resp = await fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: backupType, format: backupFormat, indexed_only: true })
+          body: JSON.stringify(bodyPayload)
         });
         const data = await resp.json();
 
@@ -4061,6 +4261,222 @@
       }
     }
 
+    function executeRestoreWithProgress(file, isClean, isIncremental, refs) {
+      if (!file) return;
+
+      if (refs.progressArea) refs.progressArea.style.display = 'block';
+      if (refs.resultArea) refs.resultArea.style.display = 'none';
+      if (refs.startBtn) refs.startBtn.disabled = true;
+      if (refs.cancelBtn) refs.cancelBtn.disabled = true;
+      if (refs.progressBar) refs.progressBar.style.width = '0%';
+      if (refs.progressMetrics) refs.progressMetrics.textContent = 'Preparing upload...';
+      if (refs.progressSpeed) refs.progressSpeed.textContent = '-- MB/s';
+      if (refs.consoleStatus) refs.consoleStatus.textContent = 'Uploading...';
+      if (refs.consoleElem) {
+        refs.consoleElem.textContent = '';
+      }
+
+      isRestoreInProgress = true;
+      const searchBtn = document.getElementById('search-btn');
+      if (searchBtn) searchBtn.disabled = true;
+
+      const totalMB = (file.size / (1024 * 1024)).toFixed(1);
+      const appendConsole = (msg) => {
+        if (!refs.consoleElem) return;
+        const now = new Date().toTimeString().split(' ')[0];
+        refs.consoleElem.textContent += `[${now}] ${msg}\n`;
+        refs.consoleElem.scrollTop = refs.consoleElem.scrollHeight;
+      };
+
+      const modeDesc = isIncremental ? 'incremental update' : (isClean ? 'clean restore' : 'restore');
+      appendConsole(`Starting upload of "${file.name}" (${totalMB} MB, mode: ${modeDesc})...`);
+
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/backup/restore');
+
+      let lastLoaded = 0;
+      let lastTime = Date.now();
+      let pollTimer = null;
+      let seenLogCount = 0;
+
+      // 1. Upload progress tracking
+      xhr.upload.onprogress = function(e) {
+        if (e.lengthComputable && e.total > 0) {
+          const pct = Math.round((e.loaded / e.total) * 100);
+          const loadedMB = (e.loaded / (1024 * 1024)).toFixed(1);
+          const now = Date.now();
+          const elapsedSec = (now - lastTime) / 1000;
+          let speedStr = '';
+          if (elapsedSec >= 0.5) {
+            const bytesPerSec = (e.loaded - lastLoaded) / elapsedSec;
+            speedStr = (bytesPerSec / (1024 * 1024)).toFixed(1) + ' MB/s';
+            lastLoaded = e.loaded;
+            lastTime = now;
+          }
+
+          // Upload phase represents 0% - 40% of overall visual bar
+          const barPct = Math.min(40, Math.round(pct * 0.4));
+          if (refs.progressBar) refs.progressBar.style.width = barPct + '%';
+          if (refs.progressText) refs.progressText.textContent = `Uploading archive: ${pct}% (${loadedMB} MB / ${totalMB} MB)...`;
+          if (refs.progressMetrics) refs.progressMetrics.textContent = `Upload: ${pct}% (${loadedMB} / ${totalMB} MB)`;
+          if (refs.progressSpeed && speedStr) refs.progressSpeed.textContent = speedStr;
+
+          if (pct === 25 || pct === 50 || pct === 75) {
+            appendConsole(`Upload progress: ${pct}% (${loadedMB} MB / ${totalMB} MB)`);
+          }
+        }
+      };
+
+      xhr.upload.onload = function() {
+        if (refs.progressBar) refs.progressBar.style.width = '42%';
+        if (refs.progressText) refs.progressText.textContent = 'Upload complete! Server extracting archive & syncing Neo4j...';
+        if (refs.progressMetrics) refs.progressMetrics.textContent = 'Upload 100% complete';
+        if (refs.progressSpeed) refs.progressSpeed.textContent = 'Server processing...';
+        if (refs.consoleStatus) refs.consoleStatus.textContent = 'Processing on server...';
+        appendConsole(`✓ Upload complete (${totalMB} MB). Server is unpacking archive and syncing database...`);
+
+        // Start polling server-side status
+        pollTimer = setInterval(async () => {
+          try {
+            const stResp = await fetch('/api/backup/restore/status');
+            if (!stResp.ok) return;
+            const stData = await stResp.json();
+            if (stData.logs && Array.isArray(stData.logs)) {
+              while (seenLogCount < stData.logs.length) {
+                if (refs.consoleElem) {
+                  refs.consoleElem.textContent += stData.logs[seenLogCount] + '\n';
+                  refs.consoleElem.scrollTop = refs.consoleElem.scrollHeight;
+                }
+                seenLogCount++;
+              }
+            }
+            if (stData.progress_pct !== undefined) {
+              const overallPct = 40 + Math.round(stData.progress_pct * 0.58);
+              if (refs.progressBar) refs.progressBar.style.width = Math.min(98, overallPct) + '%';
+              if (refs.progressMetrics) refs.progressMetrics.textContent = `Progress: ${overallPct}% (${stData.stage || 'syncing'})`;
+            }
+            if (stData.message && refs.progressText) {
+              refs.progressText.textContent = stData.message;
+            }
+            if (stData.stage && refs.consoleStatus) {
+              refs.consoleStatus.textContent = `Stage: ${stData.stage}`;
+            }
+          } catch (pollErr) {
+            console.debug('Restore status polling error:', pollErr);
+          }
+        }, 750);
+      };
+
+      xhr.onload = async function() {
+        if (pollTimer) clearInterval(pollTimer);
+
+        // Fetch final status logs to ensure console is complete
+        try {
+          const finalStResp = await fetch('/api/backup/restore/status');
+          if (finalStResp.ok) {
+            const finalStData = await finalStResp.json();
+            if (finalStData.logs && Array.isArray(finalStData.logs)) {
+              while (seenLogCount < finalStData.logs.length) {
+                if (refs.consoleElem) {
+                  refs.consoleElem.textContent += finalStData.logs[seenLogCount] + '\n';
+                  refs.consoleElem.scrollTop = refs.consoleElem.scrollHeight;
+                }
+                seenLogCount++;
+              }
+            }
+          }
+        } catch (e) {}
+
+        if (refs.progressBar) refs.progressBar.style.width = '100%';
+        if (refs.progressMetrics) refs.progressMetrics.textContent = '100% (Completed)';
+        if (refs.progressSpeed) refs.progressSpeed.textContent = 'Done';
+        if (refs.consoleStatus) refs.consoleStatus.textContent = 'Completed';
+
+        let data = null;
+        try {
+          data = JSON.parse(xhr.responseText);
+        } catch (e) {
+          data = { error: 'Invalid JSON response from server' };
+        }
+
+        if (xhr.status >= 200 && xhr.status < 300 && data && !data.error) {
+          appendConsole(`🎉 Restore finished successfully!`);
+          if (refs.progressArea) refs.progressArea.style.display = 'none';
+          if (refs.resultArea) refs.resultArea.style.display = 'block';
+
+          let neo4jMsg = '<span style="color:#94a3b8;">Neo4j export skipped (offline / not configured)</span>';
+          if (data.neo4j_export) {
+            if (data.neo4j_export.error) {
+              neo4jMsg = `<span style="color:#f87171;">Neo4j export warning: ${escapeHtml(data.neo4j_export.error)}</span>`;
+            } else if (data.neo4j_export.status === 'already_synchronized') {
+              neo4jMsg = `<span style="color:#34d399;">✓ Neo4j database already fully synchronized (0ms incremental skip, graph hash ${escapeHtml((data.neo4j_export.graph_hash || '').substring(0, 10))}...).</span>`;
+            } else {
+              const upNodes = data.neo4j_export.nodes_upserted || 0;
+              const upEdges = data.neo4j_export.edges_upserted || 0;
+              const unchBooks = data.neo4j_export.books_unchanged !== undefined ? ` (${data.neo4j_export.books_unchanged} books unchanged, ${data.neo4j_export.books_modified || 0} updated)` : '';
+              neo4jMsg = `<span style="color:#34d399;">✓ Neo4j database incrementally updated${unchBooks}: ${upNodes.toLocaleString()} nodes, ${upEdges.toLocaleString()} relationships.</span>`;
+            }
+          }
+
+          const consistency = data.consistency || {};
+          let consistencyMsg = '';
+          if (consistency.is_consistent) {
+            consistencyMsg = '<span style="color:#34d399;">✓ Local files and Neo4j database are fully synchronized.</span>';
+          } else if (consistency.discrepancies && consistency.discrepancies.length > 0) {
+            consistencyMsg = `<span style="color:#fcd34d;">⚠️ Consistency Discrepancies: ${escapeHtml(consistency.discrepancies.join(', '))}</span>`;
+          }
+
+          let incStatsMsg = '';
+          if (data.merge_stats) {
+            const ms = data.merge_stats;
+            incStatsMsg = `<br><strong>Incremental KG Merge:</strong> +${(ms.nodes_added || 0).toLocaleString()} nodes, +${(ms.edges_added || 0).toLocaleString()} relationships`;
+          }
+
+          if (refs.resultDetails) {
+            refs.resultDetails.innerHTML = `
+              <strong>Files Restored:</strong> ${data.restored_files.toLocaleString()} files (${(data.restored_bytes / (1024*1024)).toFixed(2)} MB)<br>
+              <strong>Neo4j Status:</strong> ${neo4jMsg}<br>
+              <strong>Validation:</strong> ${consistencyMsg}${incStatsMsg}
+            `;
+          }
+
+          checkDatabaseConsistency(true);
+          loadIndexedBooks(true);
+        } else {
+          const errMsg = (data && data.error) ? data.error : ('Server returned HTTP ' + xhr.status);
+          appendConsole(`❌ Error: ${errMsg}`);
+          if (refs.consoleStatus) refs.consoleStatus.textContent = 'Failed';
+          alert('Restore failed: ' + errMsg);
+          if (refs.progressArea) refs.progressArea.style.display = 'none';
+        }
+
+        isRestoreInProgress = false;
+        if (refs.startBtn) refs.startBtn.disabled = false;
+        if (refs.cancelBtn) refs.cancelBtn.disabled = false;
+        if (searchBtn) searchBtn.disabled = false;
+      };
+
+      xhr.onerror = function() {
+        if (pollTimer) clearInterval(pollTimer);
+        appendConsole(`❌ Network connection error occurred during restore.`);
+        if (refs.consoleStatus) refs.consoleStatus.textContent = 'Network Error';
+        alert('Network connection error occurred during restore.');
+        isRestoreInProgress = false;
+        if (refs.startBtn) refs.startBtn.disabled = false;
+        if (refs.cancelBtn) refs.cancelBtn.disabled = false;
+        if (searchBtn) searchBtn.disabled = false;
+        if (refs.progressArea) refs.progressArea.style.display = 'none';
+      };
+
+      const formData = new FormData();
+      formData.append('file', file, file.name);
+      formData.append('clean', isClean ? 'true' : 'false');
+      formData.append('clean_neo4j', 'false');
+      formData.append('incremental', isIncremental ? 'true' : 'false');
+
+      xhr.send(formData);
+    }
+
     async function startBackupRestore() {
       const fileInput = document.getElementById('restore-file-input');
       if (!fileInput || !fileInput.files || !fileInput.files[0]) {
@@ -4070,90 +4486,95 @@
 
       const file = fileInput.files[0];
       const cleanChk = document.getElementById('restore-clean-chk');
-      const isClean = cleanChk ? cleanChk.checked : true;
+      const incChk = document.getElementById('restore-incremental-chk');
+      const isClean = cleanChk ? cleanChk.checked : false;
+      const isIncremental = incChk ? incChk.checked : true;
 
-      const progressArea = document.getElementById('restore-progress-area');
-      const progressText = document.getElementById('restore-progress-text');
-      const progressSub = document.getElementById('restore-progress-sub');
-      const resultArea = document.getElementById('restore-result-area');
-      const resultDetails = document.getElementById('restore-result-details');
-      const startBtn = document.getElementById('btn-restore-start');
-      const cancelBtn = document.getElementById('btn-restore-cancel');
-
-      if (progressArea) progressArea.style.display = 'block';
-      if (resultArea) resultArea.style.display = 'none';
-      if (startBtn) startBtn.disabled = true;
-      if (cancelBtn) cancelBtn.disabled = true;
-      isRestoreInProgress = true;
-
-      // Lock search UI while restore is running
-      const searchBtn = document.getElementById('search-btn');
-      if (searchBtn) searchBtn.disabled = true;
-
-      if (progressText) progressText.textContent = `Uploading "${file.name}" and extracting files...`;
-
-      try {
-        const formData = new FormData();
-        formData.append('file', file, file.name);
-        formData.append('clean', isClean ? 'true' : 'false');
-
-        const resp = await fetch('/api/backup/restore', {
-          method: 'POST',
-          body: formData,
-        });
-
-        const data = await resp.json();
-        if (!resp.ok || data.error) {
-          throw new Error(data.error || 'Server returned error ' + resp.status);
-        }
-
-        if (progressArea) progressArea.style.display = 'none';
-        if (resultArea) resultArea.style.display = 'block';
-
-        let neo4jMsg = '<span style="color:#94a3b8;">Neo4j export skipped (offline / not configured)</span>';
-        if (data.neo4j_export) {
-          if (data.neo4j_export.error) {
-            neo4jMsg = `<span style="color:#f87171;">Neo4j export warning: ${escapeHtml(data.neo4j_export.error)}</span>`;
-          } else {
-            const upNodes = data.neo4j_export.nodes_upserted || 0;
-            const upEdges = data.neo4j_export.edges_upserted || 0;
-            neo4jMsg = `<span style="color:#34d399;">✓ Neo4j database updated: ${upNodes.toLocaleString()} nodes, ${upEdges.toLocaleString()} relationships.</span>`;
-          }
-        }
-
-        const consistency = data.consistency || {};
-        let consistencyMsg = '';
-        if (consistency.is_consistent) {
-          consistencyMsg = '<span style="color:#34d399;">✓ Local files and Neo4j database are fully synchronized.</span>';
-        } else if (consistency.discrepancies && consistency.discrepancies.length > 0) {
-          consistencyMsg = `<span style="color:#fcd34d;">⚠️ Consistency Discrepancies: ${escapeHtml(consistency.discrepancies.join(', '))}</span>`;
-        }
-
-        if (resultDetails) {
-          resultDetails.innerHTML = `
-            <strong>Files Restored:</strong> ${data.restored_files.toLocaleString()} files (${(data.restored_bytes / (1024*1024)).toFixed(2)} MB)<br>
-            <strong>Neo4j Status:</strong> ${neo4jMsg}<br>
-            <strong>Validation:</strong> ${consistencyMsg}
-          `;
-        }
-
-        // Re-run consistency checks in main application
-        checkDatabaseConsistency(true);
-        // Refresh indexed books table
-        loadIndexedBooks(true);
-
-      } catch (err) {
-        alert('Restore failed: ' + err.message);
-        if (progressArea) progressArea.style.display = 'none';
-      } finally {
-        isRestoreInProgress = false;
-        if (startBtn) startBtn.disabled = false;
-        if (cancelBtn) cancelBtn.disabled = false;
-        if (searchBtn) searchBtn.disabled = false;
-      }
+      executeRestoreWithProgress(file, isClean, isIncremental, {
+        progressArea: document.getElementById('restore-progress-area'),
+        progressBar: document.getElementById('restore-progress-bar'),
+        progressText: document.getElementById('restore-progress-text'),
+        progressSub: document.getElementById('restore-progress-sub'),
+        progressMetrics: document.getElementById('restore-progress-metrics'),
+        progressSpeed: document.getElementById('restore-progress-speed'),
+        consoleElem: document.getElementById('restore-console'),
+        consoleStatus: document.getElementById('restore-console-status'),
+        resultArea: document.getElementById('restore-result-area'),
+        resultDetails: document.getElementById('restore-result-details'),
+        startBtn: document.getElementById('btn-restore-start'),
+        cancelBtn: document.getElementById('btn-restore-cancel'),
+      });
     }
 
     // Dedicated Page Handlers for Backup & Restore Tab
+    function onPageBackupTypeChange() {
+      const typeSelect = document.getElementById('page-backup-type-select');
+      const incOpt = document.getElementById('page-incremental-options');
+      const tipBox = document.getElementById('page-backup-tip');
+      const isInc = typeSelect && typeSelect.value === 'incremental';
+      if (incOpt) incOpt.style.display = isInc ? 'block' : 'none';
+      if (tipBox) {
+        if (isInc) {
+          tipBox.innerHTML = '⚖️ <strong>Incremental Diff:</strong> Compares Knowledge Graph against active Neo4j or previous backup, archiving only new books and their related connecting concepts/subgraphs.';
+        } else if (typeSelect && typeSelect.value === 'full') {
+          tipBox.innerHTML = '💡 <strong>Tip:</strong> Full backups include original source PDFs/EPUBs and can be completely restored into a new empty Bookeeper instance.';
+        } else {
+          tipBox.innerHTML = '💡 <strong>Tip:</strong> Knowledge backups include knowledge graph, chunks, notes, and checkpoints without original book documents.';
+        }
+      }
+    }
+
+    function onPageBaselineTypeChange() {
+      const btype = document.getElementById('page-incremental-baseline-type');
+      const pathGroup = document.getElementById('page-incremental-path-group');
+      if (pathGroup) {
+        pathGroup.style.display = (btype && btype.value === 'archive') ? 'block' : 'none';
+      }
+    }
+
+    async function previewPageIncrementalDiff() {
+      const btype = document.getElementById('page-incremental-baseline-type')?.value || 'neo4j';
+      const bpath = document.getElementById('page-incremental-baseline-path')?.value || '';
+      const statusSpan = document.getElementById('page-incremental-preview-status');
+      const resDiv = document.getElementById('page-incremental-preview-result');
+
+      if (statusSpan) statusSpan.textContent = 'Calculating diff...';
+      if (resDiv) resDiv.style.display = 'none';
+
+      try {
+        const resp = await fetch('/api/backup/incremental/preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ baseline_type: btype, baseline_path: bpath }),
+        });
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+
+        if (statusSpan) statusSpan.textContent = '✓ Diff calculated';
+        if (resDiv) {
+          resDiv.style.display = 'block';
+          const nbList = (data.new_books || []).map(b => `<li style="margin:2px 0;"><strong>${escapeHtml(b.title || 'Untitled')}</strong> ${b.arxiv_id ? '<span style="color:#a5b4fc;">[' + escapeHtml(b.arxiv_id) + ']</span>' : ''}</li>`).join('');
+          const rbList = (data.related_books || []).map(b => `<li style="margin:2px 0;"><strong>${escapeHtml(b.title || 'Untitled')}</strong> <span style="color:#34d399;">(shared: ${(b.shared_concepts || []).slice(0, 3).join(', ')})</span></li>`).join('');
+          resDiv.innerHTML = `
+            <div style="display:flex; gap:12px; margin-bottom:8px; flex-wrap:wrap;">
+              <span style="background:rgba(99,102,241,0.25); color:#a5b4fc; padding:2px 8px; border-radius:4px; font-weight:700;">${data.new_books_count} New Books</span>
+              <span style="background:rgba(16,185,129,0.25); color:#6ee7b7; padding:2px 8px; border-radius:4px; font-weight:700;">${data.related_books_count} Related Books</span>
+              <span style="background:rgba(245,158,11,0.25); color:#fcd34d; padding:2px 8px; border-radius:4px;">${data.diff_nodes} Nodes / ${data.diff_edges} Edges</span>
+            </div>
+            <div style="font-size:0.75rem; color:var(--text-muted); margin-bottom:4px;">Baseline: <code>${escapeHtml(data.baseline_reference || data.baseline_type)}</code> (${data.baseline_book_count} baseline books vs ${data.current_book_count} current)</div>
+            ${data.new_books_count > 0 ? '<div style="margin-top:6px; font-weight:600; color:#e2e8f0;">New Books:</div><ul style="padding-left:16px; margin:4px 0; max-height:80px; overflow-y:auto;">' + nbList + '</ul>' : '<div style="color:#94a3b8; font-style:italic; margin-top:4px;">No new books detected compared to baseline.</div>'}
+            ${data.related_books_count > 0 ? '<div style="margin-top:6px; font-weight:600; color:#e2e8f0;">Related Books in Graph:</div><ul style="padding-left:16px; margin:4px 0; max-height:80px; overflow-y:auto;">' + rbList + '</ul>' : ''}
+          `;
+        }
+      } catch (err) {
+        if (statusSpan) statusSpan.textContent = '✗ Error';
+        if (resDiv) {
+          resDiv.style.display = 'block';
+          resDiv.innerHTML = `<span style="color:#ef4444;">Failed to calculate diff: ${escapeHtml(err.message)}</span>`;
+        }
+      }
+    }
+
     async function startPageBackupCreation() {
       const typeSelect = document.getElementById('page-backup-type-select');
       const formatSelect = document.getElementById('page-backup-format-select');
@@ -4166,20 +4587,37 @@
 
       const backupType = typeSelect ? typeSelect.value : 'full';
       const backupFormat = formatSelect ? formatSelect.value : 'zip';
+      const isInc = backupType === 'incremental';
 
       if (progressArea) progressArea.style.display = 'block';
       if (resultArea) resultArea.style.display = 'none';
       if (startBtn) startBtn.disabled = true;
       if (downloadBtn) downloadBtn.style.display = 'none';
       if (progressText) {
-        progressText.textContent = `Packaging ${backupType === 'full' ? 'full backup (with source books)' : 'knowledge backup'} as .${backupFormat}...`;
+        const typeLabel = isInc ? 'incremental diff backup' : (backupType === 'full' ? 'full backup (with source books)' : 'knowledge backup');
+        progressText.textContent = `Packaging ${typeLabel} as .${backupFormat}...`;
       }
 
       try {
-        const resp = await fetch('/api/backup/prepare', {
+        let endpoint = '/api/backup/prepare';
+        let bodyPayload = { type: backupType, format: backupFormat, indexed_only: true };
+
+        if (isInc) {
+          endpoint = '/api/backup/incremental/prepare';
+          const btype = document.getElementById('page-incremental-baseline-type')?.value || 'neo4j';
+          const bpath = document.getElementById('page-incremental-baseline-path')?.value || '';
+          bodyPayload = {
+            baseline_type: btype,
+            baseline_path: bpath,
+            format: backupFormat,
+            include_books: true,
+          };
+        }
+
+        const resp = await fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: backupType, format: backupFormat, indexed_only: true })
+          body: JSON.stringify(bodyPayload)
         });
         const data = await resp.json();
 
@@ -4192,9 +4630,18 @@
 
         const sizeMb = (data.file_size / (1024 * 1024)).toFixed(2);
         if (resultDetails) {
+          let extraInfo = '';
+          if (data.new_books_count !== undefined) {
+            extraInfo = `
+              <strong>New Books in Diff:</strong> ${data.new_books_count}<br>
+              <strong>Related Books Linked:</strong> ${data.related_books_count}<br>
+              <strong>Diff Subgraph:</strong> ${data.diff_nodes || 0} nodes, ${data.diff_edges || 0} edges<br>
+            `;
+          }
           resultDetails.innerHTML = `
             <strong>Archive:</strong> <code>${escapeHtml(data.filename)}</code><br>
             <strong>Size:</strong> ${sizeMb} MB (${data.file_size.toLocaleString()} bytes)<br>
+            ${extraInfo}
             <strong>Archived Files:</strong> ${data.total_files.toLocaleString()} entries<br>
             <span style="color:#6ee7b7; font-size:0.78rem;">Your browser download has started automatically, or use the button below.</span>
           `;
@@ -4249,83 +4696,24 @@
 
       const file = fileInput.files[0];
       const cleanChk = document.getElementById('page-restore-clean-chk');
-      const isClean = cleanChk ? cleanChk.checked : true;
+      const incChk = document.getElementById('page-restore-incremental-chk');
+      const isClean = cleanChk ? cleanChk.checked : false;
+      const isIncremental = incChk ? incChk.checked : true;
 
-      const progressArea = document.getElementById('page-restore-progress-area');
-      const progressText = document.getElementById('page-restore-progress-text');
-      const resultArea = document.getElementById('page-restore-result-area');
-      const resultDetails = document.getElementById('page-restore-result-details');
-      const startBtn = document.getElementById('btn-page-restore-start');
-
-      if (progressArea) progressArea.style.display = 'block';
-      if (resultArea) resultArea.style.display = 'none';
-      if (startBtn) startBtn.disabled = true;
-      isRestoreInProgress = true;
-
-      // Lock search button
-      const searchBtn = document.getElementById('search-btn');
-      if (searchBtn) searchBtn.disabled = true;
-
-      if (progressText) progressText.textContent = `Uploading "${file.name}" and extracting archive...`;
-
-      try {
-        const formData = new FormData();
-        formData.append('file', file, file.name);
-        formData.append('clean', isClean ? 'true' : 'false');
-
-        const resp = await fetch('/api/backup/restore', {
-          method: 'POST',
-          body: formData,
-        });
-
-        const data = await resp.json();
-        if (!resp.ok || data.error) {
-          throw new Error(data.error || 'Server returned error ' + resp.status);
-        }
-
-        if (progressArea) progressArea.style.display = 'none';
-        if (resultArea) resultArea.style.display = 'block';
-
-        let neo4jMsg = '<span style="color:#94a3b8;">Neo4j export skipped (offline / not configured)</span>';
-        if (data.neo4j_export) {
-          if (data.neo4j_export.error) {
-            neo4jMsg = `<span style="color:#f87171;">Neo4j export warning: ${escapeHtml(data.neo4j_export.error)}</span>`;
-          } else {
-            const upNodes = data.neo4j_export.nodes_upserted || 0;
-            const upEdges = data.neo4j_export.edges_upserted || 0;
-            neo4jMsg = `<span style="color:#34d399;">✓ Neo4j database updated: ${upNodes.toLocaleString()} nodes, ${upEdges.toLocaleString()} relationships.</span>`;
-          }
-        }
-
-        const consistency = data.consistency || {};
-        let consistencyMsg = '';
-        if (consistency.is_consistent) {
-          consistencyMsg = '<span style="color:#34d399;">✓ Local knowledge base and Neo4j database are fully synchronized.</span>';
-        } else if (consistency.discrepancies && consistency.discrepancies.length > 0) {
-          consistencyMsg = `<span style="color:#fcd34d;">⚠️ Discrepancies: ${escapeHtml(consistency.discrepancies.join(', '))}</span>`;
-        }
-
-        if (resultDetails) {
-          resultDetails.innerHTML = `
-            <strong>Restored Files:</strong> ${data.restored_files.toLocaleString()} files (${(data.restored_bytes / (1024*1024)).toFixed(2)} MB)<br>
-            <strong>Neo4j Status:</strong> ${neo4jMsg}<br>
-            <strong>Validation:</strong> ${consistencyMsg}
-          `;
-        }
-
-        // Re-run consistency checks
-        checkDatabaseConsistency(true);
-        // Refresh indexed books
-        loadIndexedBooks(true);
-
-      } catch (err) {
-        alert('Restore failed: ' + err.message);
-        if (progressArea) progressArea.style.display = 'none';
-      } finally {
-        isRestoreInProgress = false;
-        if (startBtn) startBtn.disabled = false;
-        if (searchBtn) searchBtn.disabled = false;
-      }
+      executeRestoreWithProgress(file, isClean, isIncremental, {
+        progressArea: document.getElementById('page-restore-progress-area'),
+        progressBar: document.getElementById('page-restore-progress-bar'),
+        progressText: document.getElementById('page-restore-progress-text'),
+        progressSub: document.getElementById('page-restore-progress-sub'),
+        progressMetrics: document.getElementById('page-restore-progress-metrics'),
+        progressSpeed: document.getElementById('page-restore-progress-speed'),
+        consoleElem: document.getElementById('page-restore-console'),
+        consoleStatus: document.getElementById('page-restore-console-status'),
+        resultArea: document.getElementById('page-restore-result-area'),
+        resultDetails: document.getElementById('page-restore-result-details'),
+        startBtn: document.getElementById('btn-page-restore-start'),
+        cancelBtn: null,
+      });
     }
 
     async function executeSearch() {
@@ -4726,7 +5114,11 @@
         // 4. Books Featuring this Idea
         if (data.books && data.books.length > 0) {
           html += `<div class="note-heading">📚 Featured in Books</div><div style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:15px;">`;
+          const seenBookKeys = new Set();
           data.books.forEach(b => {
+            const bKey = (b.target_id || b.target_name || '').trim().toLowerCase();
+            if (seenBookKeys.has(bKey)) return;
+            seenBookKeys.add(bKey);
             const bf = b.book_file;
             const bPub = b.publication_date || (bf ? bf.publication_date : '');
             const pubBadge = bPub ? `<span class="book-meta-badge" style="font-size:0.7rem; color:#38bdf8; margin-left:4px;" title="Publication Date">📅 ${escapeHtml(bPub)}</span>` : '';
@@ -5583,10 +5975,12 @@
           badge.textContent = 'Offline / Standalone';
         }
         const loc = data.local_stats || {};
+        const errDetail = data.error ? `<div style="color:#f87171; font-size:0.8rem; margin-top:4px; font-family:monospace; background:rgba(239,68,68,0.1); padding:4px 8px; border-radius:4px; border:1px solid rgba(239,68,68,0.2); word-break:break-all;"><strong>Error:</strong> ${escapeHtml(data.error)}</div>` : '';
         details.innerHTML = `
           <div style="margin-bottom:8px;">
-            <strong style="color:#94a3b8;">Neo4j Database:</strong> <span style="color:#e2e8f0;">Offline / Unreachable</span>
+            <strong style="color:#94a3b8;">Neo4j Database:</strong> <span style="color:#f87171;">Offline / Unreachable</span>
             <span style="color:#64748b; font-size:0.8rem; margin-left:8px;">(Operating in standalone mode from local knowledge_graph.json)</span>
+            ${errDetail}
           </div>
           <div style="display:flex; gap:16px; flex-wrap:wrap; background:rgba(15,23,42,0.6); padding:10px 14px; border-radius:6px;">
             <div><strong>Books:</strong> ${loc.books || 0}</div>
@@ -5660,10 +6054,32 @@
       }
     }
 
+    async function fetchVersionInfo() {
+      try {
+        const res = await fetch('/api/version');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.version) {
+          const vBadge = document.getElementById('app-version-badge');
+          if (vBadge) {
+            vBadge.innerHTML = `<span style="color:#38bdf8;">v${escapeHtml(data.version)}</span><span style="color:#64748b;">•</span><span>${escapeHtml(data.release_date || '')}</span>`;
+            vBadge.title = `Bookeeper v${data.version} (Released: ${data.release_date || 'N/A'})`;
+          }
+          const sysV = document.getElementById('debug-sys-version');
+          if (sysV) sysV.textContent = data.version;
+          const sysD = document.getElementById('debug-sys-date');
+          if (sysD) sysD.textContent = data.release_date || 'N/A';
+        }
+      } catch (e) {
+        // Fallback default rendered statically in HTML
+      }
+    }
+
     // Auto-initialize Cytoscape and input event handlers on page load
     window.addEventListener('DOMContentLoaded', () => {
       initCytoscape();
       initSplitter();
+      fetchVersionInfo();
       checkDatabaseConsistency();
       loadIndexedBooks();
 

@@ -141,11 +141,33 @@ class SearchEngineBackend:
             "in_progress": False,
             "stage": "idle",
             "message": "",
+            "logs": [],
+            "progress_pct": 0,
             "started_at": None,
             "completed_at": None,
             "result": None,
             "error": None,
         }
+
+    def _add_restore_log(
+        self,
+        message: str,
+        stage: Optional[str] = None,
+        progress_pct: Optional[int] = None,
+    ) -> None:
+        """Append a timestamped log line to restore status and optionally update stage/progress."""
+        with self._restore_lock:
+            now_str = datetime.datetime.now().strftime("%H:%M:%S")
+            log_line = f"[{now_str}] {message}"
+            logs = self._restore_status.setdefault("logs", [])
+            logs.append(log_line)
+            if len(logs) > 500:
+                self._restore_status["logs"] = logs[-500:]
+            if stage is not None:
+                self._restore_status["stage"] = stage
+            self._restore_status["message"] = message
+            if progress_pct is not None:
+                self._restore_status["progress_pct"] = max(0, min(100, progress_pct))
 
     @property
     def is_restoring(self) -> bool:
@@ -330,19 +352,21 @@ class SearchEngineBackend:
             pass
 
         # 4. Check Neo4j if available
-        try:
-            bid_num = int(bid_str)
-            driver = self.get_neo4j_driver()
-            with driver.session(database=self.neo4j_cfg.database) as s:
-                rec = s.run(
-                    "MATCH (c:Chunk) WHERE c.book_id = $bid AND c.book_title IS NOT NULL AND toLower(c.book_title) <> 'sample' RETURN c.book_title AS bt LIMIT 1",
-                    {"bid": bid_num},
-                ).single()
-                if rec and rec["bt"]:
-                    res_bt = rec["bt"].strip()
-                    self._book_id_title_map[bid_str] = res_bt
-                    return res_bt
-        except Exception:
+        if self.is_neo4j_enabled:
+            try:
+                bid_num = int(bid_str)
+                driver = self.get_neo4j_driver()
+                with driver.session(database=self.neo4j_cfg.database) as s:
+                    rec = s.run(
+                        "MATCH (c:Chunk) WHERE c.book_id = $bid AND c.book_title IS NOT NULL AND toLower(c.book_title) <> 'sample' RETURN c.book_title AS bt LIMIT 1",
+                        {"bid": bid_num},
+                    ).single()
+                    if rec and rec["bt"]:
+                        res_bt = rec["bt"].strip()
+                        self._book_id_title_map[bid_str] = res_bt
+                        return res_bt
+            except Exception:
+                pass
             pass
 
         return None
@@ -541,7 +565,7 @@ class SearchEngineBackend:
                         break
 
         # 5. Online Neo4j fallback if still not found
-        if not target_file and book_id is not None:
+        if not target_file and book_id is not None and self.is_neo4j_enabled:
             try:
                 bid_num = int(str(book_id).replace("book:", ""))
                 driver = self.get_neo4j_driver()
@@ -668,8 +692,29 @@ class SearchEngineBackend:
         self._concept_embedding_index = index
         return self._concept_embedding_index
 
+    @property
+    def is_neo4j_enabled(self) -> bool:
+        """Check if Neo4j is enabled or configured for UI graph queries."""
+        if not self.neo4j_cfg:
+            return False
+        env_enabled_str = os.environ.get("BOOKEEPER_NEO4J_ENABLED") or os.environ.get("NEO4J_ENABLED")
+        if env_enabled_str is not None and env_enabled_str.strip().lower() in ("0", "false", "no", "off"):
+            return False
+        if getattr(self.neo4j_cfg, "enabled", False):
+            return True
+        # If an environment variable or remote/custom URI is configured, allow UI to connect
+        env_uri = (os.environ.get("BOOKEEPER_NEO4J_URI") or os.environ.get("NEO4J_URI") or "").strip()
+        if env_uri:
+            return True
+        uri = getattr(self.neo4j_cfg, "uri", "")
+        if uri and uri != "bolt://localhost:7687":
+            return True
+        return False
+
     def get_neo4j_driver(self) -> neo4j.Driver:
         """Get or initialize the Neo4j driver."""
+        if not self.is_neo4j_enabled:
+            raise RuntimeError("Neo4j is disabled in configuration (neo4j.enabled: false).")
         if self._neo4j_driver is None:
             self._neo4j_driver = neo4j.GraphDatabase.driver(
                 self.neo4j_cfg.uri,
@@ -751,6 +796,8 @@ class SearchEngineBackend:
         Return (connected, stats_dict, error_message).
         Queries high-level node and relationship counts from Neo4j.
         """
+        if not self.is_neo4j_enabled:
+            return False, None, "Neo4j is disabled in configuration (neo4j.enabled: false)."
         try:
             driver = self.get_neo4j_driver()
             with driver.session(database=self.neo4j_cfg.database) as session:
@@ -851,6 +898,8 @@ class SearchEngineBackend:
         corpus: Dict[str, str] = {}
         # Try Neo4j first if available
         try:
+            if not self.is_neo4j_enabled:
+                raise RuntimeError("Neo4j is disabled in configuration")
             driver = self.get_neo4j_driver()
             with driver.session(database=self.neo4j_cfg.database) as session:
                 res = session.run(
@@ -1646,6 +1695,8 @@ class SearchEngineBackend:
 
         # Check direct Neo4j exact/prefix name and ID matches for Idea / Concept nodes
         try:
+            if not self.is_neo4j_enabled:
+                raise RuntimeError("Neo4j is disabled in configuration")
             driver = self.get_neo4j_driver()
             with driver.session(database=self.neo4j_cfg.database) as session:
                 exact_res = session.run(
@@ -1801,13 +1852,15 @@ class SearchEngineBackend:
             },
         }
 
-        driver = self.get_neo4j_driver()
         nodes_map: Dict[str, Dict[str, Any]] = {}
         edges_list: List[Dict[str, Any]] = []
         seed_nodes: Dict[str, Dict[str, Any]] = {}
         seed_neighbors: Dict[str, List[Dict[str, Any]]] = {}
 
         try:
+            if not self.is_neo4j_enabled:
+                raise RuntimeError("Neo4j is disabled in configuration")
+            driver = self.get_neo4j_driver()
             with driver.session(database=self.neo4j_cfg.database) as session:
                 result = session.run(cypher_query, cypher_params)
                 for record in result:
@@ -1947,9 +2000,12 @@ class SearchEngineBackend:
             telemetry["neo4j"]["seed_ideas"] = [n["name"] for n in seed_nodes.values()]
 
         except Exception as e:
-            logger.info(f"Neo4j is unavailable ({e}). Falling back to local Knowledge Graph.")
-            telemetry["neo4j"]["status"] = "offline"
-            telemetry["neo4j"]["error"] = str(e)
+            if self.is_neo4j_enabled:
+                logger.info(f"Neo4j is unavailable ({e}). Falling back to local Knowledge Graph.")
+                telemetry["neo4j"]["status"] = "offline"
+                telemetry["neo4j"]["error"] = str(e)
+            else:
+                telemetry["neo4j"]["status"] = "disabled"
 
         # Fallback to local knowledge_graph.json if Neo4j is offline or produced no nodes
         if not nodes_map:
@@ -2180,6 +2236,8 @@ class SearchEngineBackend:
 
         # 1. Try querying Neo4j if available
         try:
+            if not self.is_neo4j_enabled:
+                raise RuntimeError("Neo4j is disabled in configuration")
             driver = self.get_neo4j_driver()
             with driver.session(database=self.neo4j_cfg.database) as session:
                 cypher = """
@@ -2637,6 +2695,8 @@ class SearchEngineBackend:
 
         # 1. Try Neo4j first
         try:
+            if not self.is_neo4j_enabled:
+                raise RuntimeError("Neo4j is disabled in configuration")
             driver = self.get_neo4j_driver()
             with driver.session(database=self.neo4j_cfg.database) as session:
                 cypher = """
@@ -3095,17 +3155,112 @@ class SearchEngineBackend:
             "created_at": datetime.datetime.now().isoformat(),
         }
 
+    def preview_incremental_diff(
+        self,
+        baseline_type: str = "neo4j",
+        baseline_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Preview the incremental diff between the current Knowledge Graph and the baseline
+        (Neo4j or a backup archive/file).
+        """
+        from bookeeper.backup import calculate_incremental_diff
+
+        out_dir = Path(getattr(self.config, "resolved_output_dir", Path("output"))).expanduser().resolve()
+        baseline_target: Any = baseline_type
+        if baseline_type in ("archive", "file", "directory"):
+            if not baseline_path:
+                raise ValueError("baseline_path is required when baseline_type is 'archive' or 'file'")
+            baseline_target = Path(baseline_path).expanduser().resolve()
+        elif baseline_type == "neo4j":
+            baseline_target = self.neo4j_cfg
+
+        diff_res = calculate_incremental_diff(
+            source_dir=out_dir,
+            baseline=baseline_target,
+            neo4j_config=self.neo4j_cfg,
+            current_store=self.store,
+        )
+
+        return {
+            "success": True,
+            "baseline_type": diff_res.baseline_type,
+            "baseline_reference": diff_res.baseline_reference,
+            "baseline_book_count": diff_res.baseline_book_count,
+            "current_book_count": diff_res.current_book_count,
+            "new_books_count": len(diff_res.new_books),
+            "related_books_count": len(diff_res.related_books),
+            "diff_nodes": diff_res.diff_node_count,
+            "diff_edges": diff_res.diff_edge_count,
+            "new_books": diff_res.new_books,
+            "related_books": diff_res.related_books,
+        }
+
+    def prepare_incremental_backup(
+        self,
+        baseline_type: str = "neo4j",
+        baseline_path: Optional[str] = None,
+        format_type: str = "zip",
+        include_books: bool = True,
+        destination_dir: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create and package an incremental backup archive (.zip or .7z) containing only
+        the diff (new books, related books, and their interconnecting concepts/sections/chunks).
+        """
+        from bookeeper.backup import create_incremental_backup
+
+        out_dir = Path(getattr(self.config, "resolved_output_dir", Path("output"))).expanduser().resolve()
+        dest_dir = Path(destination_dir).expanduser().resolve() if destination_dir else (out_dir / "backups")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        baseline_target: Any = baseline_type
+        if baseline_type in ("archive", "file", "directory"):
+            if not baseline_path:
+                raise ValueError("baseline_path is required when baseline_type is 'archive' or 'file'")
+            baseline_target = Path(baseline_path).expanduser().resolve()
+        elif baseline_type == "neo4j":
+            baseline_target = self.neo4j_cfg
+
+        b_dir = self._get_books_dir()
+        if not b_dir:
+            candidate_dirs = self._get_all_books_dirs()
+            b_dir = candidate_dirs[0] if candidate_dirs else None
+
+        res = create_incremental_backup(
+            source_dir=out_dir,
+            baseline=baseline_target,
+            neo4j_config=self.neo4j_cfg,
+            destination=dest_dir,
+            format_type=format_type,
+            books_dir=b_dir,
+            include_books=include_books,
+            current_store=self.store,
+        )
+
+        dest_file = Path(res["destination"])
+        download_url = f"/api/backup/download?filename={dest_file.name}"
+        res["download_url"] = download_url
+        res["absolute_path"] = str(dest_file)
+        return res
+
     def restore_from_backup(
         self,
         archive_file: Path,
         clean: bool = False,
         export_neo4j: bool = True,
+        clean_neo4j: bool = False,
+        incremental: bool = False,
     ) -> Dict[str, Any]:
         """
         Unpack a backup archive, restore knowledge artifacts and source books,
         export/update the connected Neo4j database with the restored ConceptGraphStore,
         and re-run validation between local files and Neo4j.
         Blocks search queries during execution via self._is_restoring flag.
+
+        By default, clean_neo4j is False, ensuring UI restore performs incremental
+        synchronization (per-book cluster diffs, node content hashes, and preserved vector indexes)
+        instead of clean database wipes.
         """
         from bookeeper.backup import restore_backup
         from bookeeper.graph.neo4j_exporter import Neo4jExporter
@@ -3115,10 +3270,17 @@ class SearchEngineBackend:
             if self._is_restoring:
                 raise RuntimeError("A restore operation is already in progress.")
             self._is_restoring = True
+            now_str = datetime.datetime.now().strftime("%H:%M:%S")
+            file_mb = round(archive_file.stat().st_size / (1024 * 1024), 1) if (archive_file and archive_file.is_file()) else 0.0
             self._restore_status = {
                 "in_progress": True,
                 "stage": "unpacking",
-                "message": "Extracting backup archive...",
+                "message": f"Archive received ({file_mb} MB). Unpacking backup files...",
+                "logs": [
+                    f"[{now_str}] 📦 Archive payload received ({file_mb} MB). Initializing restore pipeline...",
+                    f"[{now_str}] 📂 Extracting archive contents into target directory...",
+                ],
+                "progress_pct": 10,
                 "started_at": datetime.datetime.now().isoformat(),
                 "completed_at": None,
                 "result": None,
@@ -3139,9 +3301,32 @@ class SearchEngineBackend:
                 books_dir=b_dir,
                 clean=clean,
                 dry_run=False,
+                incremental=incremental,
             )
 
+            files_cnt = restore_result.get("files_restored", 0)
+            bytes_cnt = restore_result.get("bytes_restored", 0)
+            mb_cnt = round(bytes_cnt / (1024 * 1024), 2)
+            is_inc_restore = restore_result.get("backup_type") == "incremental" or incremental
+            if is_inc_restore and "merge_stats" in restore_result:
+                ms = restore_result["merge_stats"]
+                self._add_restore_log(
+                    f"✓ Incremental KG merged: +{ms.get('nodes_added', 0)} nodes, +{ms.get('edges_added', 0)} edges ({files_cnt} files unpacked, {mb_cnt} MB).",
+                    stage="cache_invalidation",
+                    progress_pct=35,
+                )
+            else:
+                self._add_restore_log(
+                    f"✓ Filesystem extraction complete: {files_cnt} files restored ({mb_cnt} MB).",
+                    stage="cache_invalidation",
+                    progress_pct=35,
+                )
+
             # Invalidate all caches
+            self._add_restore_log(
+                "Refreshing local Knowledge Graph memory caches and vector indexes...",
+                progress_pct=40,
+            )
             self._local_kg_stats_cache = None
             self._local_kg_mtime = 0.0
             self._books_index_cache = None
@@ -3153,31 +3338,75 @@ class SearchEngineBackend:
             neo4j_export_result = None
             kg_path = out_dir / "knowledge_graph.json"
             if export_neo4j and kg_path.is_file():
-                with self._restore_lock:
-                    self._restore_status["stage"] = "exporting_neo4j"
-                    self._restore_status["message"] = "Updating Neo4j database with restored knowledge graph..."
+                self._add_restore_log(
+                    "Loading restored knowledge graph and preparing incremental Neo4j synchronization...",
+                    stage="exporting_neo4j",
+                    progress_pct=45,
+                )
 
                 try:
                     store = ConceptGraphStore()
+                    store.output_dir = out_dir
                     store.load(kg_path)
+                    num_nodes = store.graph.number_of_nodes()
+                    num_edges = store.graph.number_of_edges()
+                    self._add_restore_log(
+                        f"Knowledge graph loaded ({num_nodes:,} nodes, {num_edges:,} edges). Connecting to Neo4j...",
+                        progress_pct=50,
+                    )
 
                     neo_exp = Neo4jExporter.from_config(self.neo4j_cfg)
-                    # Clean previous content if requested so Neo4j mirrors restored snapshot
+
+                    def neo4j_progress_cb(stage: str, current: int, total: int, detail: str) -> None:
+                        step_pct = 50 + int((current / max(1, total)) * 38)
+                        msg = f"Neo4j {stage}: {current:,}/{total:,} {detail}".strip()
+                        self._add_restore_log(msg, progress_pct=step_pct)
+
+                    # UI restore uses incremental restore for Neo4j instead of clean wipe
                     neo4j_export_result = neo_exp.export(
                         store,
-                        clean=clean,
+                        clean=clean_neo4j,
+                        incremental_sync=True,
                         show_progress=False,
+                        progress_callback=neo4j_progress_cb,
                     )
+
+                    status = neo4j_export_result.get("status")
+                    if status == "already_synchronized":
+                        gh = str(neo4j_export_result.get("graph_hash") or "")[:10]
+                        self._add_restore_log(
+                            f"✓ Neo4j database is already fully synchronized (0ms incremental skip, graph hash {gh}...).",
+                            progress_pct=90,
+                        )
+                    else:
+                        unch = neo4j_export_result.get("books_unchanged", 0)
+                        mod = neo4j_export_result.get("books_modified", 0)
+                        ups_n = neo4j_export_result.get("nodes_upserted", 0)
+                        ups_e = neo4j_export_result.get("edges_upserted", 0)
+                        self._add_restore_log(
+                            f"✓ Neo4j sync complete ({unch} books unchanged, {mod} books updated, {ups_n:,} nodes, {ups_e:,} relationships).",
+                            progress_pct=90,
+                        )
                 except Exception as e:
                     logger.warning(f"Neo4j export after restore encountered error: {e}")
+                    self._add_restore_log(f"⚠️ Neo4j export warning: {e}", progress_pct=90)
                     neo4j_export_result = {"error": str(e), "success": False}
+            elif not export_neo4j:
+                self._add_restore_log("Neo4j export skipped (export_neo4j=False).", progress_pct=90)
 
             # 3. Re-run validation: Neo4j vs local files
-            with self._restore_lock:
-                self._restore_status["stage"] = "validating"
-                self._restore_status["message"] = "Validating database consistency (Neo4j vs local files)..."
+            self._add_restore_log(
+                "Validating database consistency between local files and Neo4j...",
+                stage="validating",
+                progress_pct=92,
+            )
 
             consistency_result = self.validate_database_consistency(force_refresh=True)
+            if consistency_result.get("is_consistent"):
+                self._add_restore_log("✓ Database consistency check passed. All book/chunk counts match.", progress_pct=98)
+            else:
+                disc = ", ".join(consistency_result.get("discrepancies", []))
+                self._add_restore_log(f"⚠️ Consistency check note: {disc}", progress_pct=98)
 
             final_result = {
                 "success": True,
@@ -3191,6 +3420,12 @@ class SearchEngineBackend:
                 "completed_at": datetime.datetime.now().isoformat(),
             }
 
+            self._add_restore_log(
+                "🎉 Restore and synchronization completed successfully!",
+                stage="completed",
+                progress_pct=100,
+            )
+
             with self._restore_lock:
                 self._restore_status["in_progress"] = False
                 self._restore_status["stage"] = "completed"
@@ -3202,6 +3437,7 @@ class SearchEngineBackend:
 
         except Exception as e:
             logger.error(f"Restore failed: {e}", exc_info=True)
+            self._add_restore_log(f"❌ Restore failed: {e}", stage="failed", progress_pct=100)
             with self._restore_lock:
                 self._restore_status["in_progress"] = False
                 self._restore_status["stage"] = "failed"
@@ -3253,6 +3489,8 @@ class SearchEngineBackend:
         }
 
         try:
+            if not self.is_neo4j_enabled:
+                raise RuntimeError("Neo4j is disabled in configuration")
             driver = self.get_neo4j_driver()
             with driver.session(database=self.neo4j_cfg.database) as session:
                 result = session.run(cypher, node_params)
@@ -3265,6 +3503,10 @@ class SearchEngineBackend:
                     related_concepts = []
                     evidence = []
                     other_rels = []
+
+                    seen_book_keys = set()
+                    seen_evidence_keys = set()
+                    seen_concept_keys = set()
 
                     for r in raw_relations:
                         if not r.get("other_id"):
@@ -3306,6 +3548,10 @@ class SearchEngineBackend:
                         }
 
                         if "Book" in labels:
+                            book_key = str(other_bid or r.get("other_id") or name).strip().lower()
+                            if book_key in seen_book_keys:
+                                continue
+                            seen_book_keys.add(book_key)
                             bf = self.resolve_book_file(
                                 title=name or other_props.get("title") or book_title_str,
                                 book_id=other_bid,
@@ -3319,8 +3565,16 @@ class SearchEngineBackend:
                             )
                             books.append(rel_entry)
                         elif "Concept" in labels or "Idea" in labels:
+                            concept_key = (str(r.get("other_id") or name).strip(), r.get("type"))
+                            if concept_key in seen_concept_keys:
+                                continue
+                            seen_concept_keys.add(concept_key)
                             related_concepts.append(rel_entry)
                         elif "Chunk" in labels or "Section" in labels:
+                            ev_key = str(r.get("other_id") or "").strip()
+                            if ev_key in seen_evidence_keys:
+                                continue
+                            seen_evidence_keys.add(ev_key)
                             bf = self.resolve_book_file(
                                 title=book_title_str,
                                 book_id=other_bid,
@@ -3390,6 +3644,9 @@ class SearchEngineBackend:
                     related_concepts = []
                     evidence = []
                     other_rels = []
+                    seen_book_keys = set()
+                    seen_evidence_keys = set()
+                    seen_concept_keys = set()
                     for edge in data.get("edges", []):
                         src = edge.get("source")
                         tgt = edge.get("target")
@@ -3422,6 +3679,10 @@ class SearchEngineBackend:
                                 "other_properties": other_node,
                             }
                             if "Book" in labels or other_node.get("category") == "Book":
+                                book_key = str(other_bid or other_id or name).strip().lower()
+                                if book_key in seen_book_keys:
+                                    continue
+                                seen_book_keys.add(book_key)
                                 bf = self.resolve_book_file(
                                     title=name or other_node.get("title") or book_title_str,
                                     book_id=other_bid,
@@ -3435,8 +3696,16 @@ class SearchEngineBackend:
                                 )
                                 books.append(rel_entry)
                             elif "Concept" in labels or "Idea" in labels or other_node.get("category") in ("Concept", "Idea"):
+                                concept_key = (str(other_id or name).strip(), rel_type)
+                                if concept_key in seen_concept_keys:
+                                    continue
+                                seen_concept_keys.add(concept_key)
                                 related_concepts.append(rel_entry)
                             elif "Chunk" in labels or "Section" in labels or other_node.get("category") in ("Chunk", "Section"):
+                                ev_key = str(other_id or "").strip()
+                                if ev_key in seen_evidence_keys:
+                                    continue
+                                seen_evidence_keys.add(ev_key)
                                 bf = self.resolve_book_file(
                                     title=book_title_str,
                                     book_id=other_bid,
@@ -3560,6 +3829,8 @@ class SearchEngineBackend:
         edges_list: List[Dict[str, Any]] = []
 
         try:
+            if not self.is_neo4j_enabled:
+                raise RuntimeError("Neo4j is disabled in configuration")
             driver = self.get_neo4j_driver()
             with driver.session(database=self.neo4j_cfg.database) as session:
                 result = session.run(cypher_query, cypher_params)

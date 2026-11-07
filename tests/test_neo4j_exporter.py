@@ -2,6 +2,7 @@
 Tests for Neo4j knowledge graph exporter with upsert semantics.
 """
 
+import json
 from unittest.mock import MagicMock, patch
 
 from typer.testing import CliRunner
@@ -116,12 +117,12 @@ def test_neo4j_export_upsert_flow():
     # Verify constraints were checked/created
     assert any("CREATE CONSTRAINT" in q or "CREATE INDEX" in q for q in executed_queries)
 
-    # Verify upsert queries: MERGE with ON CREATE SET and ON MATCH SET
+    # Verify upsert queries: MERGE with ON CREATE SET and ON MATCH SET (with Strategy B content_hash guard)
     node_upserts = [q for q in executed_queries if "MERGE (n:" in q]
     assert len(node_upserts) > 0
     for q in node_upserts:
         assert "ON CREATE SET n += row.properties" in q
-        assert "ON MATCH SET n += row.properties" in q
+        assert "ON MATCH SET n += CASE WHEN" in q or "ON MATCH SET n += row.properties" in q
 
     edge_upserts = [q for q in executed_queries if "MERGE (source)-[r:" in q]
     assert len(edge_upserts) > 0
@@ -589,6 +590,288 @@ def test_neo4j_search_index_suspension_recreates_on_exception_and_timeout():
                 timeout_sec=0,
                 poll_interval=0.01,
             )
+
+
+def test_strategy_a_per_book_cluster_sync():
+    """
+    Verify Strategy A (Per-Book Cluster Synchronization):
+    - Book 1 has identical hash in Neo4j -> its sections and chunks are skipped.
+    - Book 2 is new/modified -> its sections and chunks are upserted.
+    """
+    store = ConceptGraphStore()
+    store.add_book(book_id=1, title="Book One", author="Author 1")
+    store.add_section(book_id=1, chapter_idx=1, title="Chapter 1.1")
+    c1 = HierarchicalChunk(
+        chunk_id="b1_c1",
+        book_id=1,
+        book_title="Book One",
+        chapter_idx=1,
+        chunk_idx=1,
+        section_title="Chapter 1.1",
+        text="Book 1 chunk text",
+    )
+    store.add_chunk(c1)
+
+    store.add_book(book_id=2, title="Book Two", author="Author 2")
+    store.add_section(book_id=2, chapter_idx=1, title="Chapter 2.1")
+    c2 = HierarchicalChunk(
+        chunk_id="b2_c1",
+        book_id=2,
+        book_title="Book Two",
+        chapter_idx=1,
+        chunk_idx=1,
+        section_title="Chapter 2.1",
+        text="Book 2 chunk text",
+    )
+    store.add_chunk(c2)
+
+    # Compute expected hash for Book 1
+    b1_hash = Neo4jExporter.compute_book_content_hash(1, store=store)
+
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    executed_queries: list[str] = []
+    executed_params: list[dict] = []
+
+    def _mock_run(query: str, **params):
+        executed_queries.append(query)
+        executed_params.append(params)
+        # 1. Book hashes query: Neo4j already has Book 1 with identical hash, but not Book 2
+        if "MATCH (b:Book) RETURN b.id AS id, b.content_hash AS content_hash" in query:
+            return [{"id": "book:1", "content_hash": b1_hash}]
+        # 2. Sync metadata query: return empty or outdated
+        if "MATCH (s:BookeeperSync {id: 'sync_metadata'})" in query:
+            mock_res = MagicMock()
+            mock_res.single.return_value = {"graph_hash": "outdated_hash"}
+            return mock_res
+        return MagicMock()
+
+    mock_session.run.side_effect = _mock_run
+
+    with patch("bookeeper.graph.neo4j_exporter.GraphDatabase.driver", return_value=mock_driver):
+        exporter = Neo4jExporter(uri="bolt://localhost:7687", database="neo4j")
+        result = exporter.export(store, incremental_sync=True)
+
+    assert result["status"] == "success"
+    assert result["books_evaluated"] == 2
+    assert result["books_unchanged"] == 1
+    assert result["books_modified"] == 1
+    assert result["chunks_skipped"] >= 1
+
+    # Verify that Book 1's chunk 'b1_c1' was NEVER included in the upsert batch!
+    upserted_ids = set()
+    for p in executed_params:
+        if "batch" in p:
+            for item in p["batch"]:
+                if "id" in item:
+                    upserted_ids.add(item["id"])
+                elif "source_id" in item:
+                    upserted_ids.add(item["source_id"])
+                    upserted_ids.add(item["target_id"])
+
+    # Book 2's chunk MUST be upserted
+    assert "chunk:b2_c1" in upserted_ids
+    # Book 1's chunk MUST NOT be upserted (skipped!)
+    assert "chunk:b1_c1" not in upserted_ids
+    assert "section:1:1" not in upserted_ids
+
+
+def test_strategy_b_node_content_hash_guard():
+    """
+    Verify Strategy B (Node-Level content_hash Guard):
+    - Tests determinism of compute_node_content_hash.
+    - Tests that Cypher UNWIND query contains the CASE WHEN content_hash check.
+    """
+    # 1. Determinism
+    props_a = {"name": "Attention", "category": "Deep Learning", "weight": 8}
+    props_b = {"name": "Attention", "category": "Deep Learning", "weight": 8}
+    props_modified = {"name": "Attention", "category": "Deep Learning", "weight": 9}
+
+    hash_a = Neo4jExporter.compute_node_content_hash("concept:Attention", "Concept", props_a)
+    hash_b = Neo4jExporter.compute_node_content_hash("concept:Attention", "Concept", props_b)
+    hash_mod = Neo4jExporter.compute_node_content_hash("concept:Attention", "Concept", props_modified)
+
+    assert hash_a == hash_b
+    assert hash_a != hash_mod
+
+    # 2. Query structure check
+    store = ConceptGraphStore()
+    store.add_concept(Concept(name="Attention", category="Deep Learning", summary="Self attention mechanism"))
+
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    executed_queries: list[str] = []
+
+    def _mock_run(query: str, **params):
+        executed_queries.append(query)
+        return MagicMock()
+
+    mock_session.run.side_effect = _mock_run
+
+    with patch("bookeeper.graph.neo4j_exporter.GraphDatabase.driver", return_value=mock_driver):
+        exporter = Neo4jExporter(uri="bolt://localhost:7687", database="neo4j")
+        exporter.export(store)
+
+    concept_upserts = [q for q in executed_queries if "MERGE (n:`Concept`" in q]
+    assert len(concept_upserts) > 0
+    query = concept_upserts[0]
+    assert "n.content_hash = row.content_hash" in query
+    assert "CASE WHEN n.content_hash IS NULL OR n.content_hash <> row.content_hash THEN row.properties ELSE {} END" in query
+
+
+def test_strategy_c_preserve_vector_indexes_during_incremental_sync():
+    """
+    Verify Strategy C: When unchanged books are present (incremental update),
+    vector indexes are preserved online (search_indexes_suspended = False).
+    """
+    store = ConceptGraphStore()
+    store.add_book(book_id=1, title="Book One")
+    store.add_book(book_id=2, title="Book Two")
+    b1_hash = Neo4jExporter.compute_book_content_hash(1, store=store)
+
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    def _mock_run(query: str, **params):
+        if "MATCH (b:Book) RETURN b.id AS id, b.content_hash AS content_hash" in query:
+            return [{"id": "book:1", "content_hash": b1_hash}]
+        return MagicMock()
+
+    mock_session.run.side_effect = _mock_run
+
+    with patch("bookeeper.graph.neo4j_exporter.GraphDatabase.driver", return_value=mock_driver):
+        exporter = Neo4jExporter(uri="bolt://localhost:7687", database="neo4j")
+        result = exporter.export(store, incremental_sync=True)
+
+    # Strategy C: Vector indexes were kept online!
+    assert result["search_indexes_suspended"] is False
+
+
+def test_sync_metadata_skip_when_already_synced():
+    """
+    Verify Technical Sync Metadata Node:
+    When Neo4j has matching graph_hash, export returns immediately with 0ms overhead.
+    """
+    store = ConceptGraphStore()
+    store.add_book(book_id=42, title="Hitchhiker's Guide", author="Douglas Adams")
+    store.add_concept(Concept(name="42", category="Philosophy", summary="Answer to life"))
+
+    b_hash = Neo4jExporter.compute_book_content_hash(42, store=store)
+    expected_graph_hash = Neo4jExporter.compute_graph_hash(store, book_hashes={"book:42": b_hash})
+
+    mock_driver = MagicMock()
+    mock_session = MagicMock()
+    mock_driver.session.return_value.__enter__.return_value = mock_session
+
+    executed_queries: list[str] = []
+
+    def _mock_run(query: str, **params):
+        executed_queries.append(query)
+        if "MATCH (s:BookeeperSync {id: 'sync_metadata'})" in query:
+            mock_res = MagicMock()
+            mock_res.single.return_value = {
+                "graph_hash": expected_graph_hash,
+                "synced_at_iso": "2026-11-03T20:00:00Z",
+                "total_books": 1,
+                "total_nodes": 2,
+                "total_edges": 0,
+                "book_hashes": '{"book:42": "' + b_hash + '"}',
+            }
+            return mock_res
+        return MagicMock()
+
+    mock_session.run.side_effect = _mock_run
+
+    with patch("bookeeper.graph.neo4j_exporter.GraphDatabase.driver", return_value=mock_driver):
+        exporter = Neo4jExporter(uri="bolt://localhost:7687", database="neo4j")
+        result = exporter.export(store, incremental_sync=True)
+
+    assert result["status"] == "already_synchronized"
+    assert result["nodes_upserted"] == 0
+    assert result["edges_upserted"] == 0
+    assert result["graph_hash"] == expected_graph_hash
+
+    # Verify no node MERGE statements were executed!
+    assert not any("MERGE (n:" in q for q in executed_queries)
+
+
+def test_compute_book_content_hash_with_files(tmp_path):
+    """Verify compute_book_content_hash hashes chunks.json and state.json files from disk."""
+    chunks_dir = tmp_path / "chunks"
+    chunks_dir.mkdir(parents=True)
+    chunks_file = chunks_dir / "book_77_chunks.json"
+    chunks_file.write_text(json.dumps([{"chunk_id": "c77_1", "text": "Sample text"}]))
+
+    states_dir = tmp_path / ".book_states"
+    states_dir.mkdir(parents=True)
+    state_file = states_dir / "book_77_state.json"
+    state_file.write_text(json.dumps({"book_id": 77, "status": "indexed"}))
+
+    hash1 = Neo4jExporter.compute_book_content_hash(77, output_dir=tmp_path)
+    assert len(hash1) == 64  # SHA-256 hex string
+
+    # Modifying state changes the hash
+    state_file.write_text(json.dumps({"book_id": 77, "status": "reindexed", "extra": 123}))
+    hash2 = Neo4jExporter.compute_book_content_hash(77, output_dir=tmp_path)
+    assert hash1 != hash2
+
+
+def test_neo4j_and_ollama_environment_variable_overrides(monkeypatch):
+    """Verify that BOOKEEPER_NEO4J_* and BOOKEEPER_OLLAMA_BASE_URL env vars override config values."""
+    from bookeeper.config import Settings
+    from bookeeper.ui.backend import SearchEngineBackend
+
+    base_yaml = {
+        "ollama_servers": [
+            {"url": "http://192.168.1.100:11434", "priority": 1, "name": "yaml_server"}
+        ],
+        "neo4j": {
+            "enabled": False,
+            "uri": "bolt://localhost:7687",
+            "user": "neo4j",
+            "password": "old_password",
+        }
+    }
+
+    # 1. Without env vars: disabled and points to localhost
+    cfg = Settings.from_dict(base_yaml)
+    assert cfg.neo4j.enabled is False
+    assert cfg.neo4j.uri == "bolt://localhost:7687"
+    backend = SearchEngineBackend(config=cfg)
+    assert backend.is_neo4j_enabled is False
+
+    # 2. With BOOKEEPER_NEO4J_URI: auto-enabled and uses new URI + credentials
+    monkeypatch.setenv("BOOKEEPER_NEO4J_URI", "bolt://192.168.50.20:7687")
+    monkeypatch.setenv("BOOKEEPER_NEO4J_PASSWORD", "cThuTQ83")
+    cfg2 = Settings.from_dict(base_yaml)
+    assert cfg2.neo4j.enabled is True
+    assert cfg2.neo4j.uri == "bolt://192.168.50.20:7687"
+    assert cfg2.neo4j.password == "cThuTQ83"
+    backend2 = SearchEngineBackend(config=cfg2)
+    assert backend2.is_neo4j_enabled is True
+
+    # 3. With explicit BOOKEEPER_NEO4J_ENABLED=false: respects disabled setting
+    monkeypatch.setenv("BOOKEEPER_NEO4J_ENABLED", "false")
+    cfg3 = Settings.from_dict(base_yaml)
+    assert cfg3.neo4j.enabled is False
+    backend3 = SearchEngineBackend(config=cfg3)
+    assert backend3.is_neo4j_enabled is False
+
+    # 4. Ollama base URL override
+    monkeypatch.delenv("BOOKEEPER_NEO4J_ENABLED", raising=False)
+    monkeypatch.setenv("BOOKEEPER_OLLAMA_BASE_URL", "http://192.168.50.20:11434")
+    cfg4 = Settings.from_dict(base_yaml)
+    assert cfg4.ollama_base_url == "http://192.168.50.20:11434"
+    assert len(cfg4.resolved_ollama_servers) == 1
+    assert cfg4.resolved_ollama_servers[0].url == "http://192.168.50.20:11434"
+    assert cfg4.resolved_llm_servers[0].url == "http://192.168.50.20:11434"
+    assert cfg4.resolved_embedding_servers[0].url == "http://192.168.50.20:11434"
+
 
 
 

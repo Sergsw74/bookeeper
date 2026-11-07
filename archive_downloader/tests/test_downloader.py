@@ -181,3 +181,40 @@ def test_cli_commands(tmp_path: Path):
         assert res_status.exit_code == 0
         assert "Download Index Status" in res_status.stdout
         assert "Total Articles Indexed: 2" in res_status.stdout
+
+        # 3. Download via search URL
+        res_search = runner.invoke(
+            app,
+            [
+                "download",
+                "--url",
+                "https://arxiv.org/search/?searchtype=all&query=jepa&abstracts=show&size=100&order=-announced_date_first",
+                "--output-dir",
+                str(tmp_path),
+                "--limit",
+                "2",
+                "--delay",
+                "0",
+            ],
+        )
+        assert res_search.exit_code == 0
+        assert "Download Run Summary" in res_search.stdout
+
+        # 4. Download via query
+        res_query = runner.invoke(
+            app,
+            [
+                "download",
+                "--query",
+                "jepa",
+                "--exact",
+                "--output-dir",
+                str(tmp_path),
+                "--limit",
+                "2",
+                "--delay",
+                "0",
+            ],
+        )
+        assert res_query.exit_code == 0
+        assert "Download Run Summary" in res_query.stdout

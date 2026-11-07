@@ -14,6 +14,7 @@ class ArticleMetadata(BaseModel):
     authors: List[str] = Field(default_factory=list, description="List of author names.")
     primary_category: str = Field(default="", description="Primary subject classification (e.g. cs.AI).")
     categories: List[str] = Field(default_factory=list, description="All subject classifications.")
+    abstract: str = Field(default="", description="Article abstract or summary.")
     abstract_url: str = Field(default="", description="URL to the abstract page.")
     pdf_url: str = Field(default="", description="Direct URL to download PDF.")
     available_formats: List[str] = Field(default_factory=list, description="List of formats found (pdf, html, other).")
@@ -47,3 +48,11 @@ class DownloadStats(BaseModel):
     total_bytes: int = 0
     duration_seconds: float = 0.0
     pages_visited: int = 0
+    recorded_files: List[str] = Field(
+        default_factory=list,
+        description="List of full names or paths of processed files (both newly downloaded and skipped).",
+    )
+    manifest_file: Optional[str] = Field(
+        default=None,
+        description="Path to the manifest text file if generated.",
+    )

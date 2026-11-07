@@ -4,6 +4,7 @@ Indexing and deduplication engine for downloaded articles.
 
 import json
 import logging
+import re
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -60,21 +61,24 @@ class DownloadIndex:
         """
         Check if an article has already been downloaded and exists on disk.
         If registered in index but the file was deleted or corrupted, returns False.
+        Handles both versioned (2611.08156v1) and canonical base (2611.08156) IDs.
         """
         clean_id = arxiv_id.strip()
-        if clean_id not in self.entries:
-            # Also check if a file matching this arxiv_id exists on disk directly
-            matching = list(self.storage_dir.glob(f"{clean_id}*.pdf"))
+        base_id = re.sub(r"v\d+$", "", clean_id)
+
+        for cid in (clean_id, base_id):
+            if cid in self.entries:
+                entry = self.entries[cid]
+                full_path = self.storage_dir / entry.file_path
+                if full_path.is_file() and full_path.stat().st_size > 0:
+                    return True
+
+        # Check disk directly for matching PDF
+        for pattern in (f"{clean_id}*.pdf", f"{base_id}*.pdf"):
+            matching = list(self.storage_dir.glob(pattern))
             if matching and matching[0].is_file() and matching[0].stat().st_size > 0:
                 return True
-            return False
 
-        entry = self.entries[clean_id]
-        full_path = self.storage_dir / entry.file_path
-        if full_path.is_file() and full_path.stat().st_size > 0:
-            return True
-
-        # File is missing from disk
         return False
 
     def add(self, entry: IndexEntry) -> None:
@@ -84,7 +88,9 @@ class DownloadIndex:
 
     def get(self, arxiv_id: str) -> Optional[IndexEntry]:
         """Get index entry by arXiv ID."""
-        return self.entries.get(arxiv_id.strip())
+        clean_id = arxiv_id.strip()
+        base_id = re.sub(r"v\d+$", "", clean_id)
+        return self.entries.get(clean_id) or self.entries.get(base_id)
 
     def count(self) -> int:
         """Total number of indexed entries."""

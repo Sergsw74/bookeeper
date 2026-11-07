@@ -74,13 +74,26 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
 
         # 1. API: Health Check & System Status
         if path in ("/health", "/api/health"):
+            from bookeeper import __version__, __release_date__
             consistency = self.backend.validate_database_consistency()
             self._send_json({
                 "status": "ok",
                 "service": "bookkeeper-search",
+                "version": __version__,
+                "release_date": __release_date__,
                 "neo4j_uri": self.backend.neo4j_cfg.uri,
                 "neo4j_db": self.backend.neo4j_cfg.database,
                 "consistency": consistency,
+            })
+            return
+
+        # 1a. API: Version Information
+        if path == "/api/version":
+            from bookeeper import __version__, __release_date__
+            self._send_json({
+                "version": __version__,
+                "release_date": __release_date__,
+                "service": "bookkeeper-search",
             })
             return
 
@@ -267,6 +280,22 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
             self._send_json(status)
             return
 
+        # 2h. API: Incremental Backup Diff Preview
+        if path == "/api/backup/incremental/preview":
+            qs = parse_qs(parsed.query)
+            baseline_type = qs.get("baseline_type", ["neo4j"])[0]
+            baseline_path = qs.get("baseline_path", [None])[0]
+            try:
+                preview = self.backend.preview_incremental_diff(
+                    baseline_type=baseline_type,
+                    baseline_path=baseline_path,
+                )
+                self._send_json(preview)
+            except Exception as e:
+                logger.error(f"Failed to preview incremental diff: {e}", exc_info=True)
+                self._send_json({"error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
         # 3. Serve Frontend HTML / Static files
         if path in ("/", "/index.html"):
             index_html = STATIC_DIR / "index.html"
@@ -314,7 +343,9 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
             raw_bytes = self.rfile.read(content_length)
             archive_bytes = None
             orig_filename = "uploaded_backup.zip"
-            clean_mode = True
+            clean_mode = False
+            clean_neo4j = False
+            incremental_mode = False
 
             if "multipart/form-data" in content_type:
                 boundary_match = re.search(r'boundary=([^;]+)', content_type)
@@ -341,12 +372,18 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
                         archive_bytes = body_part
                     elif name_m and name_m.group(1) == "clean":
                         clean_mode = body_part.decode("utf-8", errors="replace").strip().lower() in ("true", "1", "yes")
+                    elif name_m and name_m.group(1) in ("clean_neo4j", "clean-neo4j"):
+                        clean_neo4j = body_part.decode("utf-8", errors="replace").strip().lower() in ("true", "1", "yes")
+                    elif name_m and name_m.group(1) in ("incremental", "is_incremental"):
+                        incremental_mode = body_part.decode("utf-8", errors="replace").strip().lower() in ("true", "1", "yes")
             else:
                 # Raw binary payload
                 archive_bytes = raw_bytes
                 qs = parse_qs(parsed.query)
                 orig_filename = qs.get("filename", [orig_filename])[0]
-                clean_mode = qs.get("clean", ["true"])[0].lower() in ("true", "1", "yes")
+                clean_mode = qs.get("clean", ["false"])[0].lower() in ("true", "1", "yes")
+                clean_neo4j = qs.get("clean_neo4j", ["false"])[0].lower() in ("true", "1", "yes")
+                incremental_mode = qs.get("incremental", ["false"])[0].lower() in ("true", "1", "yes")
 
             if not archive_bytes:
                 self._send_json({"error": "No backup file uploaded in request payload."}, HTTPStatus.BAD_REQUEST)
@@ -363,6 +400,8 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
                     archive_file=temp_file,
                     clean=clean_mode,
                     export_neo4j=True,
+                    clean_neo4j=clean_neo4j,
+                    incremental=incremental_mode,
                 )
                 self._send_json(res)
             except Exception as e:
@@ -399,11 +438,62 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
+        # Incremental Backup Diff Preview API (/api/backup/incremental/preview)
+        if path == "/api/backup/incremental/preview":
+            baseline_type = body.get("baseline_type", "neo4j")
+            baseline_path = body.get("baseline_path")
+            try:
+                preview = self.backend.preview_incremental_diff(
+                    baseline_type=baseline_type,
+                    baseline_path=baseline_path,
+                )
+                self._send_json(preview)
+            except Exception as e:
+                logger.error(f"Failed to preview incremental diff: {e}", exc_info=True)
+                self._send_json({"error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        # Incremental Backup Prepare API (/api/backup/incremental/prepare)
+        if path == "/api/backup/incremental/prepare":
+            baseline_type = body.get("baseline_type", "neo4j")
+            baseline_path = body.get("baseline_path")
+            fmt = body.get("format", "zip")
+            include_books = body.get("include_books", True)
+            try:
+                res = self.backend.prepare_incremental_backup(
+                    baseline_type=baseline_type,
+                    baseline_path=baseline_path,
+                    format_type=fmt,
+                    include_books=include_books,
+                )
+                self._send_json(res)
+            except Exception as e:
+                logger.error(f"Failed to prepare incremental backup: {e}", exc_info=True)
+                self._send_json({"error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
         # Backup Prepare API (/api/backup/prepare)
         if path in ("/api/backup/prepare", "/api/backup/create"):
             fmt = body.get("format", "zip")
             b_type = body.get("type", "full")
             indexed_only = body.get("indexed_only", True)
+            if b_type == "incremental":
+                baseline_type = body.get("baseline_type", "neo4j")
+                baseline_path = body.get("baseline_path")
+                include_books = body.get("include_books", True)
+                try:
+                    res = self.backend.prepare_incremental_backup(
+                        baseline_type=baseline_type,
+                        baseline_path=baseline_path,
+                        format_type=fmt,
+                        include_books=include_books,
+                    )
+                    self._send_json(res)
+                except Exception as e:
+                    logger.error(f"Failed to prepare incremental backup: {e}", exc_info=True)
+                    self._send_json({"error": str(e)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                return
+
             try:
                 res = self.backend.prepare_full_backup(
                     format_type=fmt,

@@ -471,11 +471,20 @@ class ChunkStore:
             "created_at": time.time(),
             "chunks": [c.model_dump() for c in chunks],
         }
-        with tempfile.NamedTemporaryFile("w", dir=self.storage_dir, delete=False, encoding="utf-8") as tf:
-            json.dump(data, tf, indent=2, ensure_ascii=False)
-            tmp_name = tf.name
-        os.replace(tmp_name, p)
-        return p
+        tmp_name = None
+        try:
+            with tempfile.NamedTemporaryFile("w", dir=self.storage_dir, delete=False, encoding="utf-8") as tf:
+                tmp_name = tf.name
+                json.dump(data, tf, indent=2, ensure_ascii=False)
+            os.replace(tmp_name, p)
+            return p
+        except Exception:
+            if tmp_name and os.path.exists(tmp_name):
+                try:
+                    os.unlink(tmp_name)
+                except Exception:
+                    pass
+            raise
 
     def delete_chunks(self, book_id: int) -> bool:
         """Remove cached chunks for a book."""

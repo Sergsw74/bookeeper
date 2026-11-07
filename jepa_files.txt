@@ -1,0 +1,100 @@
+2611.08156 - La-JEPA_ Compact Robot Policies with Latent World Modeling.pdf
+2611.06901 - Motion-guided Contrastive Regularization For Latent World Models.pdf
+2611.06247 - CAPE-JEPA - Cross-modal Adversarial Probabilistic Embedding JEPA.pdf
+2611.06093 - Drift-adaptive Representation Preservation for Domain-Incremental Learning.pdf
+2611.05847 - Time-to-Goal_ Learned Temporal Metrics for Long-Horizon Planning with JEPA World Models.pdf
+2611.05577 - Readable Is Not Steerable_ Pre-Registered Tests of Physical Structure in Learned Fluid Representatio.pdf
+2611.04571 - Ground-Wing_ A Parametric 3D Wing-in-Ground-Effect Dataset for Benchmarking Neural Surrogate Models.pdf
+2611.04392 - Aero-VPA_ Few-Step Flow-Matching Control over Non-Reconstructive JEPA Latents for Agile Flight on Ed.pdf
+2611.02489 - Cross-Domain Joint-Embedding Pretraining For Heterogeneous Industrial Time Series.pdf
+2611.00427 - Spoofing the Latent State_ Imperceptible Goal-Image Attacks Derail Planning in LeWorldModel.pdf
+2611.00241 - IsoAlign_ Isoform-Aware DNA-Protein Alignment via Joint-Embedding Predictive Architectures.pdf
+2611.00044 - SparseWAM_ Driving World-Action Models are Worth 16 Register Tokens.pdf
+2610.41130 - One Verdict Is Not Enough_ Regression Testing Learned World Models and Their Test Harnesses.pdf
+2610.40662 - A small HER2 reader for routine H&E slides_ real-world deployment.pdf
+2610.40356 - JEDI_ Joint-Embedding Demonstration Compression for In-Context Imitation Learning.pdf
+2610.40280 - Latent Prediction Yields Cross-Subject Alignable Representations in Sensory-Evoked fMRI.pdf
+2610.39302 - Proving and Improving the Platonic Representation Hypothesis with JEPAs.pdf
+2610.38508 - SaiVLA-JEPA_ Evaluating Future Latent Prediction in JEPA-Conditioned VLA Control.pdf
+2610.38445 - DES-JEPA_ Learning a Shared Vocabulary for High-Dimensional Discrete Event Sequences.pdf
+2610.37963 - Self-Supervised Latent Action-Conditioned World Modeling for Time Series.pdf
+2610.37391 - JEPA-Inspired Latent Field Prediction for Sparse-Pilot MIMO-OFDM Channel Reconstruction.pdf
+2610.36877 - GUI-JEPA_ Candidate-Conditioned JEPA Latents as a Fast Action Policy for Mobile GUI Agents.pdf
+2610.36743 - Readout and Operating-Point Sensitivity in Event-Stream Candidate Selection.pdf
+2610.36662 - SWIM_ Learning What Matters from Behaviors for JEPA World Models.pdf
+2610.36493 - AC-JEPA_ Anchored Cross-Modal Joint Embedding Predictive Architecture for Visual-to-Symbolic Transla.pdf
+2610.35636 - Adapt for Planning, Not just Prediction_ Optimistic Test-Time World Model Adaptation.pdf
+2610.34033 - Fovea-JEPA_ Overcoming Geometric Blind Spots in V-JEPA for Camera Motion Recognition.pdf
+2610.33310 - Exploring Joint-Embedding Predictive Architectures for Self-Supervised Representation Learning of Po.pdf
+2610.32657 - DT-JEPA_ Learning to Predict Future Representations for Decision-Making.pdf
+2610.32562 - Shared Is Not Enough_ Predictor Width and Factor Readability Under Masked Latent Prediction.pdf
+2610.32067 - Controlled Evaluation of EEG Foundation Models_ Random Initialisation, Band-Power and Validation-Sel.pdf
+2610.31762 - See What I Need, Dream What I Want_ A Navigation Foundation Model on a Self-Constructed Representati.pdf
+2610.31194 - Inside-JEPA_ From Prediction to Relational Grounding in Latent World Models.pdf
+2610.30724 - Learning from Next-Frame Prediction_ Towards Unified and Scalable Visual World Modeling.pdf
+2610.30160 - V-JEPA 2 Meets AQA_ Phase-Based Scoring and Reference-Based Feedback for Mountain Biking.pdf
+2610.30120 - ALPS_ Visual State Encoders for World Models.pdf
+2610.29528 - Are Joint-Embedding Predictive Objectives Effective for Longitudinal EHRs.pdf
+2610.29385 - Parallelizable Probabilistic Latent Reasoning for Diverse Reasoning Trajectories.pdf
+2610.29246 - DepState-JEPA_ Learning Depth-Grounded State Representation for Visual Perception and Manipulation.pdf
+2610.29061 - OccJEPA_ Occlusion as Masking for Amodal Video Segmentation.pdf
+2610.28519 - Touch-JEPA_ Tactile Representation Learning from Hand-Object Video with Limited Tactile Supervision.pdf
+2610.28483 - Exploring Temporal Context-Aware Physical Grounding in Latent World Models.pdf
+2610.28458 - LocaLeJEPA_ Maximum Entropy Representations under Geometric Priors.pdf
+2610.28074 - Slot-JEPA_ Object-Structured Prediction Interfaces for Latent World Models.pdf
+2610.27921 - Quantum-JEPA_ Quantum Born Priors for Latent-Action JEPA World Models.pdf
+2610.27890 - EndoWorld-JEPA_ Motion-Guided Global-Local Latent World Modeling for Endoscopic Video Representation.pdf
+2610.27851 - LaLa-World_ Scaling Latent World Models with Natural Language Actions.pdf
+2610.27364 - Predictive Closure_ A Set-Level Characterization of JEPA's Feature Selection.pdf
+2610.26780 - V-JEPA Hand_ Simple, Accurate and Fast 3D Hand and Camera Trajectory Recovery from Egocentric Videos.pdf
+2610.26179 - Learning Goal-Conditioned Subgoals through Frozen Hierarchical World Models.pdf
+2610.25296 - World Model Interpretability_ From Decoding Representations to Understanding Latent Worlds.pdf
+2610.25163 - M-JEPA_ Predictive Self-Supervised Learning for Molecular Graphs with Scaffold-Shift Evaluation on T.pdf
+2610.24619 - Beyond Geometric Closure_ Measuring and Diagnosing Mechanical Consistency in Visual Dynamics.pdf
+2610.23982 - Time-JEPA_ Grounding Video World Models with Physical Time Series.pdf
+2610.23968 - IMPULSE_ Push First, Then Predict in V-JEPA 2 Feature Space.pdf
+2610.23896 - InJePA_ Intention-First Latent Planning with Coupled JEPA World Models for Visual Navigation.pdf
+2610.23615 - Beyond Action Prediction_ Learning Search-Free Planning in Latent Space.pdf
+2610.23127 - BeJEPA_ A Goal-Conditioned Humanoid Behavior World Model via Unsupervised RL.pdf
+2610.22792 - Prune the Leaky Neurons_ Mitigating Private Data Leakage in Fine-Tuned LLMs via Joint-Embedding-Guid.pdf
+2610.21985 - VeriVLA_ Adaptive Test-Time Verification for Flow-Based VLAs with Latent World Models.pdf
+2610.21922 - TS-WAM_ Temporal Latent Actions and World-Action Coupling for Vision-Language Robot Control.pdf
+2610.21915 - What Should Robot Policies Learn to Predict_ Rethinking Supervision Targets in Vision-Language-Actio.pdf
+2610.20904 - EgoJEPA_ Beyond Retargeting for Dexterous Manipulation from Egocentric Videos.pdf
+2610.19683 - MemWM_ Associative Memory-Enhanced Latent World Models for Long-Horizon Planning.pdf
+2610.19557 - TEX-MEX_ Similarity-Guided Temporal Contrastive Learning for Time Series.pdf
+2610.19411 - W-JEPA_ Wavelet Joint-Embedding Predictive Architecture for Wearable Activity Recognition.pdf
+2610.19375 - One-Step Prediction Fidelity Is a Poor Proxy for Planning Performance in JEPA World Models.pdf
+2610.17625 - 4LC_ 4D Latent Cache for Efficient Conditioning in Dynamic World Modeling.pdf
+2610.17584 - RAN-JEPA_ An Action-Conditioned World Model for Energy-efficient Mobile Network Control.pdf
+2610.15891 - Learning Multimodal Sensor Fusion with JEPA Representations for Breathing Activity and Pose Recognit.pdf
+2610.15556 - Vision-Predictor-Action_ Towards Efficient Embodied AI via Neuro-Symbolic JEPA Predictors.pdf
+2610.15429 - World Modeling through Spectral Alignment.pdf
+2610.15267 - LeHami_ Symplectic Latent Dynamics for World Models.pdf
+2610.14871 - MORE_ Learning Motion-Oriented Registers for Driving World Models and Planning.pdf
+2610.14400 - Sparse-TD-JEPA_ Improving Zero-Shot Reinforcement Learning With Sparse Latent Task Representations.pdf
+2610.14324 - EV-JEPA_ Elastic V-JEPA for Any Device and Cross-Device Inference.pdf
+2610.13956 - MDN-VJEPA_ Multimodal Probabilistic Joint-Embedding World Models.pdf
+2610.13912 - RSI-Anything_ Unlocking Recursive Self-Improvement with World Models.pdf
+2610.13315 - JEPA-kMMVAE_ CSI Prediction for Time-Varying Wireless Channels.pdf
+2610.13237 - The Predictability Bias of Joint-Embedding Predictive Learning in Medical Imaging.pdf
+2610.12818 - LeWAM_ End-to-End World and Action Modeling with JEPAs.pdf
+2610.12407 - LeWAM_ A JEPA World Action Model with Diffusion-Steering-Based MPC.pdf
+2610.12349 - SplitJEPA_ Learning Invariant and Variant Latent Worlds without Reconstruction.pdf
+2610.12185 - RESETTLE_ Robotic Recovery through Disagreement-Triggered Retrieval and Efficient Corrective Control.pdf
+2610.11704 - Intervention anchors and scientific verification in synthetic vascular predictive representations.pdf
+2610.10571 - SPERA_ Spherical Prior EEG Foundation Model with Geometry- and Frequency-Aware Latent Prediction.pdf
+2610.10515 - RoboJEPA_ Scaling Robotic Latent World Models.pdf
+2610.09940 - Juno_ Taming Predictive Latents for Vision-Language-Action Models.pdf
+2610.09457 - DSReg_ Provably Recovering Individual World Latents without Reconstruction.pdf
+2610.09194 - Patient, Place, Prior (P$^3$)_ What Counts as Personalization in Medical World Models.pdf
+2610.09048 - Towards Financial World Modeling.pdf
+2610.08400 - Atom-JEPA_ Joint-Embedding Predictive Architecture for 3D Atomistic Systems.pdf
+2610.08192 - MacJEPA_ Missingness-Robust Audio-Visual Recognition from Untrimmed Egocentric Videos.pdf
+2610.07540 - Preserving Unstable Modes Through Inverse Dynamics in JEPA World Models.pdf
+2610.07355 - Tracking Is Not Permanence_ What Video World Models Keep of a Hidden Object.pdf
+2610.07025 - WiSPER_ Pose-Supervised Predictive and Residual Flow Refinement For Multi-Person 3D Pose Estimation.pdf
+2610.07006 - STOCK-JEPA_ Prior-Anchored Latent Revision Representation Learning in Equity Markets.pdf
+2610.06965 - ACG-WAM_ World-Action Modeling via Action-Conditioned Geometric Latent Prediction.pdf
+2610.06805 - H-JEPA_ End-to-End Learning of Hierarchical World Models for Visual Planning.pdf
+2610.06008 - Ultrasound Operator Guidance Using World Modeling and Retrieval Based Action Planning.pdf

@@ -3,17 +3,19 @@ Production-quality Typer CLI interface for bookeeper with rich progress bars and
 """
 
 import datetime
+import errno
 import json
 import logging
 import queue
 import random
+import re
 import sys
 import threading
 import time
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import typer
 import numpy as np
@@ -556,6 +558,7 @@ def _get_effective_settings(
     max_batch_chunk_size: Optional[int] = None,
     state_cache_dir: Optional[str] = None,
     config_diff: Optional[str] = None,
+    file_list: Optional[str] = None,
 ) -> Settings:
     """Retrieve settings and merge explicit CLI arguments with highest precedence."""
     config_path = _resolve_opt(config_path)
@@ -581,6 +584,7 @@ def _get_effective_settings(
     skip_limbo_chunks = _resolve_opt(skip_limbo_chunks)
     max_batch_chunk_size = _resolve_opt(max_batch_chunk_size)
     state_cache_dir = _resolve_opt(state_cache_dir)
+    file_list = _resolve_opt(file_list)
 
     cfg = get_settings(config_path, config_diff=config_diff)
     overrides = {}
@@ -590,6 +594,8 @@ def _get_effective_settings(
         overrides["calibre_library_path"] = str(calibre_path)
     if books_dir:
         overrides["books_dir"] = str(books_dir)
+    if file_list:
+        overrides["file_list"] = str(file_list)
     if ollama_url:
         overrides["ollama_base_url"] = ollama_url
     if model:
@@ -770,6 +776,350 @@ def _print_ollama_server_stats(
     console.print(table)
 
 
+def parse_file_list(file_list_path: Union[str, Path]) -> List[str]:
+    """
+    Parse a text file containing article or book filenames/paths, one per line.
+    Ignores empty lines and comments (#).
+    """
+    path = Path(file_list_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"File list not found: {path}")
+
+    lines: List[str] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        lines.append(line)
+    return lines
+
+
+def is_disk_full_error(exc: Optional[BaseException]) -> bool:
+    """
+    Check if an exception is caused by ENOSPC / Errno 28 ('No space left on device').
+    Recursively inspects chained causes and contexts.
+    """
+    if exc is None:
+        return False
+    curr: Optional[BaseException] = exc
+    visited = set()
+    while curr is not None and id(curr) not in visited:
+        visited.add(id(curr))
+        if isinstance(curr, OSError) and getattr(curr, "errno", None) == errno.ENOSPC:
+            return True
+        msg = str(curr).lower()
+        if "errno 28" in msg or "no space left on device" in msg or "enospc" in msg:
+            return True
+        curr = curr.__cause__ or curr.__context__
+    return False
+
+
+def extract_book_signatures(b: Dict[str, Any]) -> Tuple[Optional[str], Set[str]]:
+    """
+    Extract arXiv ID and normalized title/filename signatures from a book dict.
+    Returns (arxiv_id, signatures_set).
+    """
+    aid = b.get("arxiv_id")
+    b_path_str = b.get("path")
+    p = Path(b_path_str) if b_path_str else None
+    b_title = str(b.get("title") or "").strip()
+
+    if not aid and p:
+        m = re.search(r"(\d{4}\.\d{4,5})", p.name)
+        if m:
+            aid = m.group(1)
+    if not aid and b_title:
+        m = re.search(r"(\d{4}\.\d{4,5})", b_title)
+        if m:
+            aid = m.group(1)
+
+    signatures = set()
+    if b_title:
+        signatures.add(b_title.lower())
+        clean_t = re.sub(r"[^a-z0-9]", "", b_title.lower())
+        if clean_t:
+            signatures.add(clean_t)
+        title_no_aid = re.sub(r"^\d{4}\.\d{4,5}\s*[-_:]\s*", "", b_title, flags=re.IGNORECASE).strip()
+        if title_no_aid and title_no_aid != b_title:
+            signatures.add(title_no_aid.lower())
+            clean_no_aid = re.sub(r"[^a-z0-9]", "", title_no_aid.lower())
+            if clean_no_aid:
+                signatures.add(clean_no_aid)
+
+    if p:
+        signatures.add(p.name.lower())
+        signatures.add(p.stem.lower())
+        clean_s = re.sub(r"[^a-z0-9]", "", p.stem.lower())
+        if clean_s:
+            signatures.add(clean_s)
+        stem_no_aid = re.sub(r"^\d{4}\.\d{4,5}\s*[-_:]\s*", "", p.stem, flags=re.IGNORECASE).strip()
+        if stem_no_aid and stem_no_aid != p.stem:
+            signatures.add(stem_no_aid.lower())
+            clean_stem_no_aid = re.sub(r"[^a-z0-9]", "", stem_no_aid.lower())
+            if clean_stem_no_aid:
+                signatures.add(clean_stem_no_aid)
+
+    aid_clean = str(aid).strip().lower() if aid else None
+    return aid_clean, signatures
+
+
+def check_book_processed_or_skipped(
+    b: Dict[str, Any],
+    graph_book_arxiv_ids: Dict[str, Any],
+    graph_book_signatures: Dict[str, Any],
+    graph_books: Dict[Any, str],
+    tracker_completed_arxiv: Dict[str, str],
+    tracker_completed_signatures: Dict[str, str],
+    tracker_skipped_arxiv: Dict[str, str],
+    tracker_skipped_signatures: Dict[str, str],
+    tracker_records: Dict[str, Any],
+) -> Tuple[bool, str, bool, str]:
+    """
+    Check if a book has already been processed or previously skipped across systems.
+    Unprocessed files without an ID are matched strictly by arXiv ID and title/filename signatures.
+    Returns (is_processed, proc_reason, is_skipped, skip_reason).
+    """
+    b_aid, b_sigs = extract_book_signatures(b)
+
+    # 1. Check if already processed
+    # 1a. arXiv ID match
+    if b_aid:
+        if b_aid in graph_book_arxiv_ids:
+            return True, f"arXiv ID {b_aid} in knowledge graph", False, ""
+        if b_aid in tracker_completed_arxiv:
+            return True, f"arXiv ID {b_aid} in completed tracker", False, ""
+
+    # 1b. Title / filename signature match in graph or tracker completed
+    for sig in b_sigs:
+        if len(sig) >= 4:
+            if sig in graph_book_signatures:
+                return True, "title match in knowledge graph", False, ""
+            if sig in tracker_completed_signatures:
+                return True, "title match in completed tracker", False, ""
+
+    # 1c. Calibre integer ID match (ONLY if b has an integer ID and its title matches!)
+    bid = b.get("id")
+    if bid is not None:
+        bid_str = str(bid)
+        if bid in graph_books:
+            g_title = graph_books[bid]
+            _, g_sigs = extract_book_signatures({"title": g_title})
+            if b_sigs & g_sigs:
+                return True, f"book #{bid} in knowledge graph", False, ""
+        if bid_str in tracker_records and tracker_records[bid_str].get("status") == "completed":
+            rec_title = tracker_records[bid_str].get("title", "")
+            _, r_sigs = extract_book_signatures({"title": rec_title})
+            if b_sigs & r_sigs:
+                return True, f"book #{bid} in tracker", False, ""
+
+    # 2. Check if previously skipped
+    # 2a. arXiv ID match
+    if b_aid and b_aid in tracker_skipped_arxiv:
+        return False, "", True, tracker_skipped_arxiv[b_aid]
+
+    # 2b. Title / filename signature match in tracker skipped
+    for sig in b_sigs:
+        if len(sig) >= 4 and sig in tracker_skipped_signatures:
+            return False, "", True, tracker_skipped_signatures[sig]
+
+    # 2c. Calibre integer ID match (ONLY if b has an integer ID and its title matches!)
+    if bid is not None:
+        bid_str = str(bid)
+        if bid_str in tracker_records and tracker_records[bid_str].get("status") == "skipped":
+            rec_title = tracker_records[bid_str].get("title", "")
+            _, r_sigs = extract_book_signatures({"title": rec_title})
+            if b_sigs & r_sigs:
+                return False, "", True, tracker_records[bid_str].get("reason", "previously skipped")
+
+    return False, "", False, ""
+
+
+def build_tracker_and_graph_indices(
+    store: Any,
+    tracker: Any,
+) -> Tuple[
+    Dict[str, Any],  # graph_book_arxiv_ids
+    Dict[str, Any],  # graph_book_signatures
+    Dict[Any, str],  # graph_books (id -> title)
+    Dict[str, str],  # tracker_completed_arxiv
+    Dict[str, str],  # tracker_completed_signatures
+    Dict[str, str],  # tracker_skipped_arxiv
+    Dict[str, str],  # tracker_skipped_signatures
+    Dict[str, Any],  # tracker_records
+]:
+    """Build fast lookup indexes across knowledge graph and tracker records."""
+    tracker_records = tracker._get_op_records("build_graph")
+
+    graph_books = {
+        attrs["book_id"]: attrs.get("title", f"Book {attrs['book_id']}")
+        for _, attrs in store.graph.nodes(data=True)
+        if attrs.get("type") == "Book" and "book_id" in attrs
+    }
+    graph_book_arxiv_ids: Dict[str, Any] = {}
+    graph_book_signatures: Dict[str, Any] = {}
+    for _, attrs in store.graph.nodes(data=True):
+        if attrs.get("type") == "Book":
+            g_bid = attrs.get("book_id")
+            g_aid = attrs.get("arxiv_id")
+            g_title = str(attrs.get("title", "")).strip()
+            if g_aid:
+                graph_book_arxiv_ids[str(g_aid).strip().lower()] = g_bid
+            if g_title:
+                m = re.search(r"(\d{4}\.\d{4,5})", g_title)
+                if m:
+                    graph_book_arxiv_ids[m.group(1).lower()] = g_bid
+                _, g_sigs = extract_book_signatures({"title": g_title})
+                for s in g_sigs:
+                    graph_book_signatures[s] = g_bid
+
+    tracker_completed_arxiv: Dict[str, str] = {}
+    tracker_completed_signatures: Dict[str, str] = {}
+    tracker_skipped_arxiv: Dict[str, str] = {}
+    tracker_skipped_signatures: Dict[str, str] = {}
+
+    for rec_id_str, rec in tracker_records.items():
+        st = rec.get("status")
+        rec_title = str(rec.get("title", "")).strip()
+        rec_meta = rec.get("metadata") if isinstance(rec.get("metadata"), dict) else {}
+        rec_aid = str(rec_meta.get("arxiv_id", "")).strip().lower()
+        if not rec_aid and rec_title:
+            m = re.search(r"(\d{4}\.\d{4,5})", rec_title)
+            if m:
+                rec_aid = m.group(1).lower()
+        rec_fname = str(rec_meta.get("filename", "")).strip()
+        rec_reason = rec.get("reason", "previously skipped")
+
+        rec_fake_book: Dict[str, Any] = {"title": rec_title}
+        if rec_fname:
+            rec_fake_book["path"] = rec_fname
+        if rec_aid:
+            rec_fake_book["arxiv_id"] = rec_aid
+
+        rec_extracted_aid, rec_sigs = extract_book_signatures(rec_fake_book)
+        final_aid = rec_aid or rec_extracted_aid
+
+        if st == "completed":
+            if final_aid:
+                tracker_completed_arxiv[final_aid] = rec_title or f"Book #{rec_id_str}"
+            for s in rec_sigs:
+                tracker_completed_signatures[s] = rec_title or f"Book #{rec_id_str}"
+        elif st == "skipped":
+            if final_aid:
+                tracker_skipped_arxiv[final_aid] = rec_reason
+            for s in rec_sigs:
+                tracker_skipped_signatures[s] = rec_reason
+
+    return (
+        graph_book_arxiv_ids,
+        graph_book_signatures,
+        graph_books,
+        tracker_completed_arxiv,
+        tracker_completed_signatures,
+        tracker_skipped_arxiv,
+        tracker_skipped_signatures,
+        tracker_records,
+    )
+
+
+def match_file_list_to_books(
+    lines: List[str],
+    all_books: List[Dict[str, Any]],
+    client: Any = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    Match lines from a file list against books in the catalog.
+    Preserves the priority order specified in the file list.
+    Returns (matched_books, unmatched_lines).
+    """
+    by_full_path: Dict[str, Dict[str, Any]] = {}
+    by_filename: Dict[str, Dict[str, Any]] = {}
+    by_stem: Dict[str, Dict[str, Any]] = {}
+    by_arxiv_id: Dict[str, Dict[str, Any]] = {}
+    by_title: Dict[str, Dict[str, Any]] = {}
+
+    for b in all_books:
+        p_str = b.get("path")
+        if p_str:
+            p = Path(p_str)
+            by_full_path[str(p.resolve())] = b
+            by_filename[p.name.lower()] = b
+            by_stem[p.stem.lower()] = b
+
+        aid = b.get("arxiv_id")
+        if aid:
+            by_arxiv_id[str(aid).strip()] = b
+
+        title = b.get("title")
+        if title:
+            by_title[title.strip().lower()] = b
+
+    matched: List[Dict[str, Any]] = []
+    unmatched: List[str] = []
+    seen_keys: set = set()
+
+    for line in lines:
+        matched_book = None
+        cand_path = Path(line.replace("\\", "/")).expanduser()
+        cand_name = cand_path.name.lower()
+        cand_stem = cand_path.stem.lower()
+
+        # Check arXiv ID pattern e.g. 2611.08156 or 2611.08156v1
+        m = re.search(r"(\d{4}\.\d{4,5})", line)
+        aid = m.group(1) if m else None
+
+        # 1. Match by full path
+        if str(cand_path.resolve()) in by_full_path:
+            matched_book = by_full_path[str(cand_path.resolve())]
+        # 2. Match by exact filename
+        elif cand_name in by_filename:
+            matched_book = by_filename[cand_name]
+        # 3. Match by arXiv ID
+        elif aid and aid in by_arxiv_id:
+            matched_book = by_arxiv_id[aid]
+        # 4. Match by stem
+        elif cand_stem in by_stem:
+            matched_book = by_stem[cand_stem]
+        # 5. Match by exact title
+        elif cand_stem in by_title:
+            matched_book = by_title[cand_stem]
+        # 6. Fallback: match by partial arXiv ID in filename
+        elif aid:
+            for fname, b in by_filename.items():
+                if aid in fname:
+                    matched_book = b
+                    break
+
+        # 7. Fallback: standalone file existing directly on filesystem (unprocessed, no integer ID)
+        if not matched_book and cand_path.is_file():
+            p_pub = BookParser.extract_publication_date(cand_path)
+            fmt = cand_path.suffix.lstrip(".").upper() or "PDF"
+            matched_book = {
+                "id": None,
+                "title": cand_path.stem,
+                "authors": ["Unknown"],
+                "author": "Unknown",
+                "path": str(cand_path.resolve()),
+                "formats": [fmt],
+                "pubdate": p_pub,
+                "publication_date": p_pub,
+                "arxiv_id": aid or "",
+            }
+
+        if matched_book:
+            book_key = (
+                str(Path(matched_book["path"]).resolve())
+                if matched_book.get("path")
+                else (matched_book.get("arxiv_id") or matched_book.get("title"))
+            )
+            if book_key not in seen_keys:
+                seen_keys.add(book_key)
+                matched.append(matched_book)
+        else:
+            unmatched.append(line)
+
+    return matched, unmatched
+
+
 @app.command()
 def config(
     config_path: Optional[str] = typer.Option(
@@ -860,6 +1210,9 @@ def list_books(
     config_diff: Optional[str] = typer.Option(
         None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."
     ),
+    file_list: Optional[str] = typer.Option(
+        None, "--file-list", "--files", "-L", help="Path to text file containing book/article filenames/paths to filter."
+    ),
 ):
     """
     List and search books in the configured Calibre library, download folder, or mounted SMB share.
@@ -883,6 +1236,13 @@ def list_books(
         except Exception as e:
             console.print(f"[bold red]Failed to read book source:[/bold red] {e}")
             raise typer.Exit(1)
+
+    if file_list:
+        fl_path = Path(file_list).expanduser().resolve()
+        if fl_path.is_file():
+            fl_lines = parse_file_list(fl_path)
+            books, unmatched = match_file_list_to_books(fl_lines, books, client)
+            console.print(f"[dim cyan]Filtered by file list: {len(books)} of {len(fl_lines)} matched from {fl_path.name}[/dim cyan]")
 
     if search:
         q = search.lower()
@@ -920,7 +1280,7 @@ def list_books(
         if len(title) > 50:
             title = title[:47] + "..."
 
-        row_vals = [str(b.get("id", ""))]
+        row_vals = ["-" if b.get("id") is None else str(b.get("id"))]
         if has_arxiv:
             row_vals.append(str(b.get("arxiv_id", "")))
         row_vals.extend([title, authors_str[:24], formats_str or "[dim]None[/dim]"])
@@ -1428,6 +1788,16 @@ def clean_metadata(
                         except Exception as e:
                             with display_lock:
                                 console.print(f"[bold red]✗ Failed to process book #{bid} ('{raw_title}'):[/bold red] {e}")
+                            if is_disk_full_error(e):
+                                with display_lock:
+                                    console.print(
+                                        f"\n[bold red]🛑 HARD STOP: No space left on device ([Errno 28] / ENOSPC). "
+                                        f"Aborting clean-metadata immediately on book #{bid} ('{raw_title}').[/bold red]\n"
+                                    )
+                                abort_event.set()
+                                for f in future_to_book:
+                                    f.cancel()
+                                break
                             with db_lock:
                                 tracker.mark_failed("clean_metadata", bid, title=raw_title, error=str(e))
                             failed_count += 1
@@ -1556,6 +1926,13 @@ def build_graph(
     ),
     file_path: Optional[str] = typer.Option(
         None, "--file", "-f", help="Process a standalone EPUB or PDF file directly."
+    ),
+    file_list: Optional[str] = typer.Option(
+        None,
+        "--file-list",
+        "--files",
+        "-L",
+        help="Path to text file containing book/article filenames, paths, or arXiv IDs to prioritize and process (one per line).",
     ),
     all_books: bool = typer.Option(
         False, "--all", "-a", help="Process all books in the Calibre library."
@@ -1809,6 +2186,7 @@ def build_graph(
     skip_limbo_chunks = _resolve_opt(skip_limbo_chunks)
     max_batch_chunk_size = _resolve_opt(max_batch_chunk_size)
     state_cache_dir = _resolve_opt(state_cache_dir)
+    file_list = _resolve_opt(file_list)
     export_graphml = _resolve_opt(export_graphml, False)
     hierarchical_cover = _resolve_opt(hierarchical_cover)
     if hierarchical_cover is None and mmr is not None:
@@ -1839,6 +2217,7 @@ def build_graph(
         max_batch_chunk_size=max_batch_chunk_size,
         state_cache_dir=state_cache_dir,
         config_diff=config_diff,
+        file_list=file_list,
     )
     output_dir = cfg.resolved_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2168,6 +2547,7 @@ def build_graph(
         console.print("[dim yellow]Reset progress checkpoint for build_graph (preserving skipped books in skip list).[/dim yellow]")
 
     books_to_process = []
+    effective_file_list = file_list or getattr(cfg, "file_list", None)
 
     # Case 1: Standalone file passed
     if file_path:
@@ -2232,6 +2612,28 @@ def build_graph(
             console.print(
                 f"[bold cyan]Retrying {len(target_list)} previously skipped book(s){sample_str}...[/bold cyan]"
             )
+        elif effective_file_list:
+            file_list_path = Path(effective_file_list).expanduser().resolve()
+            if not file_list_path.is_file():
+                console.print(f"[bold red]File list not found:[/bold red] {file_list_path}")
+                raise typer.Exit(1)
+            lines = parse_file_list(file_list_path)
+            console.print(f"[dim cyan]Parsed {len(lines)} entry(ies) from file list '{file_list_path.name}'...[/dim cyan]")
+            matched_books, unmatched_lines = match_file_list_to_books(lines, all_calibre_books, client=client)
+            if unmatched_lines:
+                sample_unmatched = unmatched_lines[:5]
+                sample_str = f" (e.g. {sample_unmatched})" if len(unmatched_lines) > 5 else f" ({unmatched_lines})"
+                console.print(f"[yellow]Warning: {len(unmatched_lines)} line(s) from file list could not be matched to catalog books{sample_str}.[/yellow]")
+            if not matched_books:
+                console.print(f"[bold yellow]No books matched from file list '{file_list_path.name}'.[/bold yellow]")
+                raise typer.Exit(0)
+            console.print(f"[bold green]Matched {len(matched_books)} book(s) from file list (prioritized).[/bold green]")
+            if all_books:
+                matched_ids = {b.get("id") for b in matched_books}
+                remaining_books = [b for b in all_calibre_books if b.get("id") not in matched_ids]
+                target_list = matched_books + remaining_books
+            else:
+                target_list = matched_books
         elif all_books or continue_run or from_scratch or (book_id is None and not file_path and not retry_failed and not retry_skipped):
             target_list = all_calibre_books
             if from_scratch:
@@ -2240,23 +2642,28 @@ def build_graph(
                 console.print("[dim cyan]Continuing build from next book (relative to knowledge graph)...[/dim cyan]")
         else:
             console.print(
-                "[bold yellow]Please specify --book-id <ID>, --file <path>, --retry-failed, --continue, --from-scratch, or --all to build graph.[/bold yellow]"
+                "[bold yellow]Please specify --book-id <ID>, --file <path>, --file-list <path>, --retry-failed, --continue, --from-scratch, or --all to build graph.[/bold yellow]"
             )
             raise typer.Exit(1)
 
         # Pre-filter by start_from_id
         if start_from_id is not None:
-            target_list = [b for b in target_list if b.get("id", 0) >= start_from_id]
+            target_list = [b for b in target_list if b.get("id") is not None and b.get("id", 0) >= start_from_id]
 
         # Pre-filter by resume checkpoint and existing knowledge_graph BEFORE touching network or exporting EPUBs
-        if resume and not retry_failed and not retry_skipped and not from_scratch:
+        if (resume or effective_file_list) and not retry_failed and not retry_skipped and not from_scratch:
             tracker_completed = tracker.get_completed_ids("build_graph")
             tracker_skipped = tracker.get_skipped_ids("build_graph")
-            graph_books = {
-                attrs["book_id"]: attrs.get("title", f"Book {attrs['book_id']}")
-                for _, attrs in store.graph.nodes(data=True)
-                if attrs.get("type") == "Book" and "book_id" in attrs
-            }
+            (
+                graph_book_arxiv_ids,
+                graph_book_signatures,
+                graph_books,
+                tracker_completed_arxiv,
+                tracker_completed_signatures,
+                tracker_skipped_arxiv,
+                tracker_skipped_signatures,
+                tracker_records,
+            ) = build_tracker_and_graph_indices(store, tracker)
             graph_book_ids = set(graph_books.keys())
 
             # Detect unprocessed / partially ingested books in knowledge graph from previous interrupted runs!
@@ -2304,11 +2711,37 @@ def build_graph(
 
             # Bypass both already indexed books AND memorized skipped books upfront!
             orig_len = len(target_list)
-            bypass_ids = completed_ids | tracker_skipped
-            target_list = [b for b in target_list if b.get("id") not in bypass_ids]
+            kept_target_list = []
+            for b in target_list:
+                is_proc, reason, is_skip, skip_reason = check_book_processed_or_skipped(
+                    b,
+                    graph_book_arxiv_ids,
+                    graph_book_signatures,
+                    graph_books,
+                    tracker_completed_arxiv,
+                    tracker_completed_signatures,
+                    tracker_skipped_arxiv,
+                    tracker_skipped_signatures,
+                    tracker_records,
+                )
+                id_prefix = f"#{b['id']} " if b.get("id") is not None else ""
+                title_display = b.get("title") or (Path(b["path"]).name if b.get("path") else "Unknown")
+                if is_proc:
+                    if effective_file_list:
+                        console.print(f"[dim]⚡ Skipped already processed article: {id_prefix}'{title_display}' ({reason})[/dim]")
+                    continue
+                if is_skip:
+                    if effective_file_list:
+                        console.print(f"[dim]⚡ Skipped previously skipped article: {id_prefix}'{title_display}' ({skip_reason})[/dim]")
+                    continue
+                kept_target_list.append(b)
+
+            target_list = kept_target_list
             bypassed = orig_len - len(target_list)
             if bypassed > 0:
-                next_bid_str = f"Next book: #{target_list[0]['id']} ('{target_list[0].get('title', '')}')" if target_list else "None (all books indexed or skipped)"
+                first_b = target_list[0] if target_list else None
+                first_bid_str = f"#{first_b['id']} " if first_b and first_b.get("id") is not None else ""
+                next_bid_str = f"Next book: {first_bid_str}'{first_b.get('title', '')}'" if first_b else "None (all books indexed or skipped)"
                 if tracker_skipped:
                     msg = (
                         f"Knowledge Graph Resume: Skipped {bypassed} book(s) "
@@ -2322,29 +2755,78 @@ def build_graph(
                     )
                 console.print(f"[dim cyan]{msg}[/dim cyan]")
         elif not retry_skipped and tracker.get_skipped_ids("build_graph"):
-            tracker_skipped = tracker.get_skipped_ids("build_graph")
+            (
+                graph_book_arxiv_ids,
+                graph_book_signatures,
+                graph_books,
+                tracker_completed_arxiv,
+                tracker_completed_signatures,
+                tracker_skipped_arxiv,
+                tracker_skipped_signatures,
+                tracker_records,
+            ) = build_tracker_and_graph_indices(store, tracker)
             orig_len = len(target_list)
-            target_list = [b for b in target_list if b.get("id") not in tracker_skipped]
+            kept_target_list = []
+            for b in target_list:
+                _, _, is_skip, _ = check_book_processed_or_skipped(
+                    b,
+                    graph_book_arxiv_ids,
+                    graph_book_signatures,
+                    graph_books,
+                    tracker_completed_arxiv,
+                    tracker_completed_signatures,
+                    tracker_skipped_arxiv,
+                    tracker_skipped_signatures,
+                    tracker_records,
+                )
+                if not is_skip:
+                    kept_target_list.append(b)
+            target_list = kept_target_list
             bypassed = orig_len - len(target_list)
             if bypassed > 0:
-                next_bid_str = f"Next book: #{target_list[0]['id']} ('{target_list[0].get('title', '')}')" if target_list else "None (all books skipped)"
+                first_b = target_list[0] if target_list else None
+                first_bid_str = f"#{first_b['id']} " if first_b and first_b.get("id") is not None else ""
+                next_bid_str = f"Next book: {first_bid_str}'{first_b.get('title', '')}'" if first_b else "None (all books skipped)"
                 msg = (
                     f"Preserved Skip List: Bypassed {bypassed} previously skipped book(s) "
                     f"(graphical or unsupported formats). {len(target_list)} remaining to process. {next_bid_str}"
                 )
                 console.print(f"[dim cyan]{msg}[/dim cyan]")
 
+        # Determine highest existing integer book ID to allocate next IDs dynamically for unprocessed files
+        max_existing_id = 0
+        int_ids = [i for i in store.graph.nodes() if isinstance(i, str) and i.startswith("book:") and i[5:].isdigit()]
+        if int_ids:
+            max_existing_id = max(max_existing_id, max(int(i[5:]) for i in int_ids))
+        all_tracker_ops = tracker._get_op_records("build_graph")
+        int_t = [int(k) for k in all_tracker_ops.keys() if k.isdigit()]
+        if int_t:
+            max_existing_id = max(max_existing_id, max(int_t))
+        next_assignable_id = max(max_existing_id + 1, 1)
+
         export_dir = output_dir / "calibre_ingest"
         for b in target_list:
             if limit is not None and limit > 0 and len(books_to_process) >= limit:
                 break
-            bid = b["id"]
+            bid = b.get("id")
+            if bid is None:
+                bid = next_assignable_id
+                next_assignable_id += 1
             formats = b.get("formats", [])
+            b_aid, _ = extract_book_signatures(b)
+            b_fname = Path(b["path"]).name if b.get("path") else None
             # Check if book only has graphical formats (CBR, CBZ, DJVU)
             if formats and BookParser.only_has_graphical_formats(formats):
                 fmts_label = ", ".join(formats)
-                console.print(f"[dim yellow]⚡ Memorized skipped book #{bid}: graphical format ({fmts_label}).[/dim yellow]")
-                tracker.mark_skipped("build_graph", bid, title=b.get("title", f"Book {bid}"), reason=f"graphical: {fmts_label}")
+                id_lbl = f"#{bid} " if b.get("id") is not None else ""
+                console.print(f"[dim yellow]⚡ Memorized skipped book {id_lbl}'{b.get('title')}': graphical format ({fmts_label}).[/dim yellow]")
+                tracker.mark_skipped(
+                    "build_graph",
+                    bid,
+                    title=b.get("title", f"Book {bid}"),
+                    reason=f"graphical: {fmts_label}",
+                    metadata={"arxiv_id": b_aid, "filename": b_fname},
+                )
                 continue
 
             b_pub = b.get("publication_date") or b.get("pubdate")
@@ -2358,33 +2840,135 @@ def build_graph(
                     {
                         "id": bid,
                         "title": b.get("title", f"Book {bid}"),
-                        "author": ", ".join(b.get("authors", [])) or "Unknown",
-                        "path": cached_files[0] if cached_files else None,
+                        "author": ", ".join(b.get("authors", [])) or b.get("author") or "Unknown",
+                        "path": cached_files[0] if cached_files else (Path(b["path"]) if b.get("path") and Path(b["path"]).is_file() else None),
                         "pubdate": b_pub,
                         "publication_date": b_pub,
+                        "arxiv_id": b_aid,
                     }
                 )
             else:
-                try:
-                    book_file = client.export_book(bid, target_dir=export_dir)
-                except Exception as e:
-                    console.print(f"[yellow]Warning: Could not export book #{bid} ({e}).[/yellow]")
-                    book_file = None
+                book_file = None
+                if b.get("path") and Path(b["path"]).is_file():
+                    book_file = Path(b["path"])
+                elif client and hasattr(client, "export_book"):
+                    try:
+                        book_file = client.export_book(bid, target_dir=export_dir)
+                    except Exception as e:
+                        console.print(f"[yellow]Warning: Could not export book #{bid} ({e}).[/yellow]")
+                        book_file = None
 
                 if book_file and book_file.is_file():
                     books_to_process.append(
                         {
                             "id": bid,
                             "title": b.get("title", f"Book {bid}"),
-                            "author": ", ".join(b.get("authors", [])) or "Unknown",
+                            "author": ", ".join(b.get("authors", [])) or b.get("author") or "Unknown",
                             "path": book_file,
                             "pubdate": b_pub,
                             "publication_date": b_pub,
+                            "arxiv_id": b_aid,
                         }
                     )
                 else:
                     console.print(f"[yellow]Skipping book #{bid}: No supported text format available (EPUB, FB2, PDF, RTF, TXT, ZIP).[/yellow]")
-                    tracker.mark_skipped("build_graph", bid, title=b.get("title", f"Book {bid}"), reason="No supported text format available")
+                    tracker.mark_skipped(
+                        "build_graph",
+                        bid,
+                        title=b.get("title", f"Book {bid}"),
+                        reason="No supported text format available",
+                        metadata={"arxiv_id": b_aid, "filename": b_fname},
+                    )
+    elif effective_file_list:
+        file_list_path = Path(effective_file_list).expanduser().resolve()
+        if not file_list_path.is_file():
+            console.print(f"[bold red]File list not found:[/bold red] {file_list_path}")
+            raise typer.Exit(1)
+        lines = parse_file_list(file_list_path)
+        console.print(f"[dim cyan]Parsed {len(lines)} entry(ies) from file list '{file_list_path.name}'...[/dim cyan]")
+        matched_books, unmatched_lines = match_file_list_to_books(lines, [], client=None)
+        if unmatched_lines:
+            sample_unmatched = unmatched_lines[:5]
+            sample_str = f" (e.g. {sample_unmatched})" if len(unmatched_lines) > 5 else f" ({unmatched_lines})"
+            console.print(f"[yellow]Warning: {len(unmatched_lines)} line(s) from file list could not be resolved to files on disk{sample_str}.[/yellow]")
+        if not matched_books:
+            console.print(f"[bold yellow]No files matched from file list '{file_list_path.name}'.[/bold yellow]")
+            raise typer.Exit(0)
+        target_list = matched_books
+
+        if start_from_id is not None:
+            target_list = [b for b in target_list if b.get("id") is not None and b.get("id", 0) >= start_from_id]
+
+        if not from_scratch:
+            (
+                graph_book_arxiv_ids,
+                graph_book_signatures,
+                graph_books,
+                tracker_completed_arxiv,
+                tracker_completed_signatures,
+                tracker_skipped_arxiv,
+                tracker_skipped_signatures,
+                tracker_records,
+            ) = build_tracker_and_graph_indices(store, tracker)
+
+            kept_target_list = []
+            for b in target_list:
+                is_proc, reason, is_skip, skip_reason = check_book_processed_or_skipped(
+                    b,
+                    graph_book_arxiv_ids,
+                    graph_book_signatures,
+                    graph_books,
+                    tracker_completed_arxiv,
+                    tracker_completed_signatures,
+                    tracker_skipped_arxiv,
+                    tracker_skipped_signatures,
+                    tracker_records,
+                )
+                id_prefix = f"#{b['id']} " if b.get("id") is not None else ""
+                title_display = b.get("title") or (Path(b["path"]).name if b.get("path") else "Unknown")
+                if is_proc:
+                    console.print(f"[dim]⚡ Skipped already processed article: {id_prefix}'{title_display}' ({reason})[/dim]")
+                    continue
+                if is_skip:
+                    console.print(f"[dim]⚡ Skipped previously skipped article: {id_prefix}'{title_display}' ({skip_reason})[/dim]")
+                    continue
+                kept_target_list.append(b)
+
+            target_list = kept_target_list
+
+        max_existing_id = 0
+        int_ids = [i for i in store.graph.nodes() if isinstance(i, str) and i.startswith("book:") and i[5:].isdigit()]
+        if int_ids:
+            max_existing_id = max(max_existing_id, max(int(i[5:]) for i in int_ids))
+        all_tracker_ops = tracker._get_op_records("build_graph")
+        int_t = [int(k) for k in all_tracker_ops.keys() if k.isdigit()]
+        if int_t:
+            max_existing_id = max(max_existing_id, max(int_t))
+        next_assignable_id = max(max_existing_id + 1, 1)
+
+        for b in target_list:
+            if limit is not None and limit > 0 and len(books_to_process) >= limit:
+                break
+            p = Path(b["path"])
+            if p.is_file():
+                if BookParser.is_graphical_format(p):
+                    console.print(f"[yellow]Skipping graphical file '{p.name}': contains image-based content ({p.suffix}).[/yellow]")
+                    continue
+                bid = b.get("id")
+                if bid is None:
+                    bid = next_assignable_id
+                    next_assignable_id += 1
+                p_pub = b.get("pubdate") or b.get("publication_date") or BookParser.extract_publication_date(p)
+                b_aid, _ = extract_book_signatures(b)
+                books_to_process.append({
+                    "id": bid,
+                    "title": b.get("title", p.stem),
+                    "author": b.get("author", "Unknown"),
+                    "path": p,
+                    "pubdate": p_pub,
+                    "publication_date": p_pub,
+                    "arxiv_id": b_aid,
+                })
     else:
         source_display = getattr(client, "display_name", "Calibre library")
         console.print(
@@ -2426,12 +3010,16 @@ def build_graph(
             console.print("[bold yellow]No books available to process.[/bold yellow]")
         raise typer.Exit(0)
 
-    if cfg.recent_ideas.enabled:
+    if cfg.recent_ideas.enabled and not effective_file_list:
         books_to_process = sort_books_chronologically(books_to_process)
         dated_count = sum(1 for b in books_to_process if b.get("publication_date") or b.get("pubdate"))
         console.print(
             f"[bold cyan]Chronological Ingestion:[/bold cyan] Sorted {len(books_to_process)} book(s) "
             f"by publication date ({dated_count} dated, {len(books_to_process) - dated_count} undated)."
+        )
+    elif effective_file_list:
+        console.print(
+            f"[dim cyan]Preserving prioritized order from file list for {len(books_to_process)} book(s).[/dim cyan]"
         )
 
     console.print(f"[bold green]Starting pipeline for {len(books_to_process)} book(s)...[/bold green]")
@@ -2451,6 +3039,7 @@ def build_graph(
     session_total_candidate_chunks = 0
     session_filter_stats: Dict[str, int] = {}
     interrupted = False
+    disk_full_error: Optional[BaseException] = None
     pipeline_start_time = time.perf_counter()
 
     stats_lock = threading.Lock()
@@ -2499,6 +3088,15 @@ def build_graph(
             bpubdate = binfo.get("publication_date") or binfo.get("pubdate")
             if not bpubdate and bpath and bpath.is_file():
                 bpubdate = BookParser.extract_publication_date(bpath)
+            barxiv_id = binfo.get("arxiv_id")
+            if not barxiv_id and bpath:
+                m = re.search(r"(\d{4}\.\d{4,5})", bpath.name)
+                if m:
+                    barxiv_id = m.group(1)
+            if not barxiv_id and btitle:
+                m = re.search(r"(\d{4}\.\d{4,5})", btitle)
+                if m:
+                    barxiv_id = m.group(1)
 
             book_state_dir = output_dir / ".book_states"
             book_state = BookProcessingState(
@@ -3139,6 +3737,15 @@ def build_graph(
                                         )
                                         chunk_filter_states[l_chk.chunk_id] = "skip"
                                         store.add_chunk(l_chk, filter_state="skip")
+                                        book_state.mark_chunk_processed(
+                                            chunk_id=l_chk.chunk_id,
+                                            chunk_idx=l_chk.chunk_idx,
+                                            section_title=l_chk.section_title,
+                                            extraction_dict={"concepts": []},
+                                            duration=0.0,
+                                            server_used="skipped_limbo",
+                                            auto_save=False,
+                                        )
                                         with stats_lock:
                                             book_skipped_chunks += 1
                                             session_skipped_chunks += 1
@@ -3636,7 +4243,7 @@ def build_graph(
 
                     # Step 2/4: Integrate sections, chunks, concepts, and grounded quotes into Knowledge Graph
                     t_step2 = time.perf_counter()
-                    store.add_book(bid, title=btitle, author=bauthor, publication_date=bpubdate)
+                    store.add_book(bid, title=btitle, author=bauthor, publication_date=bpubdate, arxiv_id=barxiv_id)
 
                     # Ensure ALL chunks from the book exist in the graph (including skipped chunks)
                     # so sequential NEXT/PREV edges and section hierarchies remain completely contiguous.
@@ -3719,7 +4326,6 @@ def build_graph(
                                     f"(neither quote nor concept name present in chunk text)"
                                 )
                             for rel_name in canonical_concept.related_concepts:
-                                batch_touched_concepts.add(rel_name)
                                 store.add_concept_relation(
                                     src_concept_name=canonical_concept.name,
                                     tgt_concept_name=rel_name,
@@ -3794,6 +4400,7 @@ def build_graph(
 
                     # Step 4/4: Finalize book state & persist graph checkpoint (without redundant full-graph chunk re-linking)
                     t_step4 = time.perf_counter()
+                    b_fname = bpath.name if bpath else None
                     if failed_poison_results:
                         book_state.finalize(has_errors=True)
                         tracker.mark_partially_indexed(
@@ -3806,6 +4413,8 @@ def build_graph(
                                 "assigned_chunks": book_assigned_chunks,
                                 "skipped_chunks": book_skipped_chunks,
                                 "publication_date": bpubdate,
+                                "arxiv_id": barxiv_id,
+                                "filename": b_fname,
                             },
                         )
                     else:
@@ -3820,6 +4429,8 @@ def build_graph(
                                 "assigned_chunks": book_assigned_chunks,
                                 "skipped_chunks": book_skipped_chunks,
                                 "publication_date": bpubdate,
+                                "arxiv_id": barxiv_id,
+                                "filename": b_fname,
                             },
                         )
 
@@ -3925,10 +4536,12 @@ def build_graph(
                 should_dual_pass = cfg.dual_pass.enabled if dual_pass is None else dual_pass
                 if is_batch_end and not interrupted and store.graph.number_of_nodes() > 0:
                     t_batch_start = time.perf_counter()
-                    # Collect any additional concepts marked dirty in store
-                    for nid in store.dirty_nodes:
+                    # Collect any additional grounded concepts marked dirty in store
+                    for nid in list(store.dirty_nodes):
                         if nid.startswith("concept:"):
-                            batch_touched_concepts.add(nid[len("concept:"):])
+                            attrs = store.graph.nodes.get(nid, {})
+                            if attrs.get("is_idea") or attrs.get("summary") or attrs.get("brief_description"):
+                                batch_touched_concepts.add(nid[len("concept:"):])
 
                     if should_dual_pass:
                         console.print(f"\n  [bold cyan]═══ Running Inter-Batch Dual-Pass Idea Consolidation (Batch size: {batch_size}, Affected concepts: {len(batch_touched_concepts)}) ═══[/bold cyan]")
@@ -3980,6 +4593,10 @@ def build_graph(
                             )
                         except Exception as e:
                             console.print(f"  [bold yellow]⚠ Batch Neo4j sync failed:[/bold yellow] {e}")
+                        finally:
+                            store.clear_dirty()
+                    else:
+                        store.clear_dirty()
 
                     # Attribute batch postprocessing & sync overhead evenly to the books of this batch
                     batch_overhead = time.perf_counter() - t_batch_start
@@ -4006,6 +4623,20 @@ def build_graph(
                 raise
             except Exception as e:
                 console.print(f"[bold red]✗ Failed to build graph for book #{bid} ('{btitle}'):[/bold red] {e}")
+                if is_disk_full_error(e):
+                    disk_full_error = e
+                    interrupted = True
+                    console.print(
+                        f"\n[bold red]🛑 HARD STOP: No space left on device ([Errno 28] / ENOSPC). "
+                        f"Aborting build-graph immediately on book #{bid} ('{btitle}') to prevent disk corruption.[/bold red]\n"
+                    )
+                    try:
+                        tracker.mark_failed("build_graph", bid, title=btitle, error=str(e))
+                    except Exception:
+                        pass
+                    store.remove_book(bid)
+                    break
+
                 tracker.mark_failed("build_graph", bid, title=btitle, error=str(e))
                 store.remove_book(bid)
 
@@ -4036,33 +4667,38 @@ def build_graph(
         if store.graph.number_of_nodes() > 0:
             should_dual_pass = cfg.dual_pass.enabled if dual_pass is None else dual_pass
             if should_dual_pass and not interrupted and not ran_batch_postproc_on_last_book:
-                for nid in store.dirty_nodes:
+                for nid in list(store.dirty_nodes):
                     if nid.startswith("concept:"):
-                        batch_touched_concepts.add(nid[len("concept:"):])
-                console.print(
-                    f"\n[bold cyan]═══ Running Dual-Pass Idea Postprocessor & Synthesis (Affected concepts: {len(batch_touched_concepts)}) ═══[/bold cyan]"
-                )
-                try:
-                    postprocessor = IdeaPostProcessor.from_settings(
-                        cfg,
-                        pool=extractor.pool,
-                        embeddings=embeddings,
-                    )
-                    pp_report = postprocessor.process_graph(
-                        store,
-                        console=console,
-                        affected_concepts=batch_touched_concepts if batch_touched_concepts else None,
-                    )
+                        attrs = store.graph.nodes.get(nid, {})
+                        if attrs.get("is_idea") or attrs.get("summary") or attrs.get("brief_description"):
+                            batch_touched_concepts.add(nid[len("concept:"):])
+
+                if batch_touched_concepts:
                     console.print(
-                        f"[bold green]✓ Idea Postprocessing Complete ({pp_report.duration_seconds:.2f}s):[/bold green] "
-                        f"{pp_report.total_clusters} clusters ({pp_report.multi_occurrence_clusters_count} synthesized, "
-                        f"{pp_report.single_occurrence_clusters_count} bypassed, {pp_report.merged_clusters_count} merged). "
-                        f"Added {pp_report.edges_added_count} provenance/relational edges."
+                        f"\n[bold cyan]═══ Running Dual-Pass Idea Postprocessor & Synthesis (Affected concepts: {len(batch_touched_concepts)}) ═══[/bold cyan]"
                     )
-                except Exception as e:
-                    console.print(f"[bold red]✗ Idea Postprocessor failed:[/bold red] {e}")
-                finally:
-                    batch_touched_concepts.clear()
+                    try:
+                        postprocessor = IdeaPostProcessor.from_settings(
+                            cfg,
+                            pool=extractor.pool,
+                            embeddings=embeddings,
+                        )
+                        pp_report = postprocessor.process_graph(
+                            store,
+                            console=console,
+                            affected_concepts=batch_touched_concepts,
+                        )
+                        console.print(
+                            f"[bold green]✓ Idea Postprocessing Complete ({pp_report.duration_seconds:.2f}s):[/bold green] "
+                            f"{pp_report.total_clusters} clusters ({pp_report.multi_occurrence_clusters_count} synthesized, "
+                            f"{pp_report.single_occurrence_clusters_count} bypassed, {pp_report.merged_clusters_count} merged). "
+                            f"Added {pp_report.edges_added_count} provenance/relational edges."
+                        )
+                    except Exception as e:
+                        console.print(f"[bold red]✗ Idea Postprocessor failed:[/bold red] {e}")
+                    finally:
+                        batch_touched_concepts.clear()
+                        store.clear_dirty()
 
             if embeddings is not None and not interrupted:
                 try:
@@ -4075,8 +4711,15 @@ def build_graph(
                 except Exception as e:
                     logger.debug(f"Could not backfill remaining idea embeddings: {e}")
 
-            store.save(graph_file, link_chunks=False)
-            if not interrupted:
+            if not disk_full_error:
+                store.save(graph_file, link_chunks=False)
+            else:
+                try:
+                    store.save(graph_file, link_chunks=False)
+                except Exception as save_err:
+                    console.print(f"[dim yellow]Could not save final knowledge graph checkpoint due to disk space constraints: {save_err}[/dim yellow]")
+
+            if not interrupted and not disk_full_error:
                 final_clean = should_clean and not has_cleaned
                 try:
                     obs = ObsidianExporter(vault_dest)
@@ -4133,6 +4776,15 @@ def build_graph(
             if hasattr(embeddings, "pool") and getattr(embeddings, "pool", None) is not extractor.pool:
                 pools_to_report.append(embeddings.pool)
             _print_ollama_server_stats(pools_to_report, console=console)
+
+        if disk_full_error is not None:
+            console.print(
+                f"\n[bold red]🛑 HARD STOP: No space left on device ([Errno 28] / ENOSPC).[/bold red]\n"
+                f"Processing stopped on book #{bid} ('{btitle}').\n"
+                f"Successfully completed in this session: [bold green]{completed_in_session}[/bold green] book(s).\n"
+                f"Downstream idea postprocessing, embeddings backfill, and exports aborted."
+            )
+            raise typer.Exit(code=28)
 
         if interrupted:
             try:
@@ -4701,6 +5353,13 @@ def export_neo4j_command(
             )
         raise typer.Exit(1)
 
+    if result.get("status") == "already_synchronized":
+        console.print(
+            f"[bold green]✓ Neo4j database is already fully synchronized with Knowledge Graph[/bold green] "
+            f"[dim]({result.get('books_evaluated', 0)} books, graph_hash: {result.get('graph_hash', '')[:12]}...)[/dim]\n"
+        )
+        return
+
     # Display results table
     table = Table(title="Neo4j Export Summary", border_style="green")
     table.add_column("Category", style="cyan")
@@ -4709,6 +5368,12 @@ def export_neo4j_command(
 
     if result.get("clean_start"):
         table.add_row("[bold red]Clean Start[/bold red]", "Purged Previous Nodes", f"[yellow]{result['cleaned_nodes']}[/yellow]")
+        table.add_section()
+    elif result.get("books_unchanged"):
+        table.add_row("[bold cyan]Incremental Sync[/bold cyan]", "Unchanged Books (Skipped)", f"[dim green]{result['books_unchanged']}[/dim green]")
+        table.add_row("[bold cyan]Incremental Sync[/bold cyan]", "Modified Books (Synced)", f"[bold green]{result.get('books_modified', 0)}[/bold green]")
+        if result.get("chunks_skipped"):
+            table.add_row("[bold cyan]Incremental Sync[/bold cyan]", "Chunks/Sections Skipped", f"[cyan]{result['chunks_skipped']:,}[/cyan]")
         table.add_section()
 
     for lbl, count in sorted(result["node_breakdown"].items()):
@@ -4722,9 +5387,14 @@ def export_neo4j_command(
     table.add_row("[bold]Total Relationships[/bold]", "", f"[bold green]{result['edges_upserted']}[/bold green]")
 
     console.print(table)
-    clean_note = f" (clean start: purged {result['cleaned_nodes']} previous nodes)" if result.get("clean_start") else ""
+    if result.get("clean_start"):
+        sync_note = f" (clean start: purged {result['cleaned_nodes']} previous nodes)"
+    elif result.get("books_unchanged"):
+        sync_note = f" (incremental sync: {result['books_unchanged']} unchanged books skipped)"
+    else:
+        sync_note = ""
     console.print(
-        f"[bold green]✓ Successfully exported Knowledge Graph to Neo4j{clean_note}[/bold green] "
+        f"[bold green]✓ Successfully exported Knowledge Graph to Neo4j{sync_note}[/bold green] "
         f"[dim]({target_uri}, db: {target_database})[/dim]\n"
     )
 
@@ -5025,6 +5695,9 @@ def build_rag(
     ),
     config_diff: Optional[str] = typer.Option(
         None, "--config-diff", help="Path to YAML config overlay applied on top of base config.yaml."
+    ),
+    file_list: Optional[str] = typer.Option(
+        None, "--file-list", "--files", "-L", help="Path to text file containing book/article filenames/paths to filter."
     ),
 ):
     """
@@ -7931,9 +8604,10 @@ def rebuild_graph_command(
     dedup = _resolve_opt(dedup, True)
     books_dir = _resolve_opt(books_dir)
     state_cache_dir = _resolve_opt(state_cache_dir)
+    file_list = _resolve_opt(file_list)
     export_graphml = _resolve_opt(export_graphml, False)
 
-    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir, config_diff=config_diff)
+    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir, config_diff=config_diff, file_list=file_list)
     output_dir = cfg.resolved_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     graph_file = output_dir / "knowledge_graph.json"
@@ -8015,7 +8689,27 @@ def rebuild_graph_command(
         except Exception as e:
             logger.warning(f"Could not read state file {sf}: {e}")
 
-    candidate_states.sort(key=lambda x: x[0])
+    effective_file_list = file_list or getattr(cfg, "file_list", None)
+    if effective_file_list:
+        fl_path = Path(effective_file_list).expanduser().resolve()
+        if fl_path.is_file():
+            fl_lines = parse_file_list(fl_path)
+            state_books = []
+            for bid, sf, s_data, ext_cnt in candidate_states:
+                meta = s_data.get("metadata", {})
+                state_books.append({
+                    "id": bid,
+                    "title": meta.get("title") or s_data.get("title") or f"Book {bid}",
+                    "arxiv_id": meta.get("arxiv_id") or s_data.get("arxiv_id"),
+                    "path": meta.get("path") or s_data.get("path") or str(sf),
+                    "candidate_tuple": (bid, sf, s_data, ext_cnt),
+                })
+            matched_state_books, _ = match_file_list_to_books(fl_lines, state_books, client=None)
+            candidate_states = [b["candidate_tuple"] for b in matched_state_books]
+            console.print(f"[dim cyan]Filtered rebuild candidate states by file list: {len(candidate_states)} matched.[/dim cyan]")
+    else:
+        candidate_states.sort(key=lambda x: x[0])
+
     if limit is not None and limit > 0:
         candidate_states = candidate_states[:limit]
 
@@ -8281,12 +8975,23 @@ def backup_command(
         None,
         "--type",
         "-t",
-        help="Backup type: 'knowledge' (default) or 'full' (includes original indexed source books).",
+        help="Backup type: 'knowledge' (default), 'full' (includes original indexed source books), or 'incremental' (diff only).",
     ),
     full: bool = typer.Option(
         False,
         "--full",
         help="Create a full backup containing knowledge artifacts and original indexed source books.",
+    ),
+    incremental: bool = typer.Option(
+        False,
+        "--incremental",
+        "-inc",
+        help="Create an incremental backup containing only new & related books diff compared to a baseline (Neo4j or backup archive).",
+    ),
+    diff_against: Optional[str] = typer.Option(
+        None,
+        "--diff-against",
+        help="Baseline to diff against for incremental backup: 'neo4j' (default) or path to a backup archive/directory/file.",
     ),
     books_dir: Optional[Path] = typer.Option(
         None,
@@ -8361,6 +9066,9 @@ def backup_command(
     no_states = _resolve_opt(no_states, False)
     no_lightrag = _resolve_opt(no_lightrag, False)
 
+    incremental = _resolve_opt(incremental, False)
+    diff_against = _resolve_opt(diff_against)
+
     target_dest = destination or output
 
     cfg = _get_effective_settings(config_path, calibre_path, config_diff=config_diff)
@@ -8370,9 +9078,9 @@ def backup_command(
         console.print(f"[bold red]Source output directory not found:[/bold red] {source_dir}")
         raise typer.Exit(1)
 
-    effective_type = "full" if (full or (backup_type and backup_type.lower() == "full")) else "knowledge"
+    effective_type = "incremental" if (incremental or (backup_type and backup_type.lower() == "incremental")) else ("full" if (full or (backup_type and backup_type.lower() == "full")) else "knowledge")
     effective_books_dir = None
-    if effective_type == "full":
+    if effective_type in ("full", "incremental"):
         if books_dir:
             effective_books_dir = Path(books_dir).expanduser().resolve()
         elif cfg.resolved_books_dir:
@@ -8381,7 +9089,7 @@ def backup_command(
             default_books = Path("archive_downloader/downloads").resolve()
             effective_books_dir = default_books
 
-        if not effective_books_dir.is_dir():
+        if effective_type == "full" and not effective_books_dir.is_dir():
             console.print(f"[bold red]Source books directory not found:[/bold red] {effective_books_dir}")
             raise typer.Exit(1)
 
@@ -8389,6 +9097,53 @@ def backup_command(
         "chunks_dir": cfg.resolved_chunks_dir,
         "state_file": cfg.resolved_state_file,
     }
+
+    if effective_type == "incremental":
+        from bookeeper.backup import create_incremental_backup
+
+        baseline_val = diff_against or ("neo4j" if cfg.neo4j.enabled else "neo4j")
+        console.print(f"[bold cyan]Creating incremental diff backup against baseline: [bold white]{baseline_val}[/bold white]...[/bold cyan]")
+        try:
+            result = create_incremental_backup(
+                source_dir=source_dir,
+                baseline=baseline_val,
+                neo4j_config=cfg.neo4j,
+                destination=Path(target_dest) if target_dest else None,
+                format_type=format_type or "zip",
+                books_dir=effective_books_dir if effective_books_dir and effective_books_dir.is_dir() else None,
+                include_books=not all_books,
+                include_chunks=not no_chunks,
+                include_obsidian=not no_obsidian,
+                include_states=not no_states,
+                custom_dirs=custom_dirs,
+            )
+        except Exception as e:
+            console.print(f"[bold red]Failed to create incremental backup:[/bold red] {e}")
+            raise typer.Exit(1)
+
+        dest_path = result["destination"]
+        table = Table(title="Incremental Diff Backup Summary", border_style="green")
+        table.add_column("Property", style="bold")
+        table.add_column("Details", style="cyan")
+        table.add_row("Backup Archive", str(dest_path))
+        table.add_row("Backup Type", "INCREMENTAL")
+        table.add_row("Baseline Type", str(result.get("baseline_type", "")).upper())
+        table.add_row("Baseline Reference", str(result.get("baseline_reference", "")))
+        table.add_row("New Books in Diff", f"{result.get('new_books_count', 0):,}")
+        table.add_row("Related Books Connected", f"{result.get('related_books_count', 0):,}")
+        table.add_row("Diff Subgraph Nodes", f"{result.get('diff_nodes', 0):,}")
+        table.add_row("Diff Subgraph Edges", f"{result.get('diff_edges', 0):,}")
+        table.add_row("Total Files Archived", f"{result.get('total_files', 0):,}")
+        table.add_row("Compressed Size", f"{result.get('compressed_bytes', 0) / (1024 * 1024):.2f} MB")
+        console.print("\n", table)
+        if result.get("new_books"):
+            nb_sample = ", ".join(f"'{b.get('title')}'" for b in result["new_books"][:5])
+            console.print(f"[dim]New books: {nb_sample}{' ...' if len(result['new_books']) > 5 else ''}[/dim]")
+        if result.get("related_books"):
+            rb_sample = ", ".join(f"'{b.get('title')}'" for b in result["related_books"][:5])
+            console.print(f"[dim]Related books: {rb_sample}{' ...' if len(result['related_books']) > 5 else ''}[/dim]")
+        console.print(f"[bold green]✓ Successfully created incremental backup at:[/bold green] [bold cyan]{dest_path}[/bold cyan]\n")
+        return
 
     t0 = time.perf_counter()
     type_desc = "full backup (knowledge + source books)" if effective_type == "full" else "knowledge backup"
@@ -8515,6 +9270,12 @@ def restore_command(
         "--clean",
         help="Wipe existing knowledge graph, Obsidian vault, chunks, and book states in destination before restoring.",
     ),
+    incremental: bool = typer.Option(
+        False,
+        "--incremental",
+        "-inc",
+        help="Force incremental update mode (merge into existing KG and Neo4j without wiping).",
+    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
@@ -8533,12 +9294,13 @@ def restore_command(
     config_diff = _resolve_opt(config_diff)
     calibre_path = _resolve_opt(calibre_path)
     clean = _resolve_opt(clean, False)
+    incremental = _resolve_opt(incremental, False)
     dry_run = _resolve_opt(dry_run, False)
 
     target_archive = archive_path or from_archive
     if not target_archive:
         console.print("[bold red]Please specify the archive file path to restore from.[/bold red]")
-        console.print("[dim]Usage: bookeeper restore <path_to_backup.zip|.7z> [--output-dir <path>] [--books-dir <path>] [--clean][/dim]")
+        console.print("[dim]Usage: bookeeper restore <path_to_backup.zip|.7z> [--output-dir <path>] [--books-dir <path>] [--clean] [--incremental][/dim]")
         raise typer.Exit(1)
 
     archive_file = Path(target_archive).expanduser().resolve()
@@ -8550,36 +9312,56 @@ def restore_command(
     target_dir = Path(output_dir).expanduser().resolve() if output_dir else cfg.resolved_output_dir
     explicit_books_dir = Path(books_dir).expanduser().resolve() if books_dir else None
 
+    info = inspect_backup(archive_file)
+    is_inc = incremental or info.get("backup_type") == "incremental"
+
     if dry_run:
         console.print(f"[bold cyan]Inspecting archive [bold white]{archive_file}[/bold white] (Dry Run)...[/bold cyan]")
-        try:
-            info = inspect_backup(archive_file)
-        except Exception as e:
-            console.print(f"[bold red]Failed to inspect archive:[/bold red] {e}")
-            raise typer.Exit(1)
-
-        is_full = info.get("backup_type") == "full" or info.get("categories", {}).get("books", 0) > 0
-        computed_books_dir = None
-        if is_full:
-            computed_books_dir = resolve_target_books_dir(
-                target_dir=target_dir,
-                metadata=info.get("metadata"),
-                explicit_books_dir=explicit_books_dir,
-            )
-
         table = Table(title=f"Archive Inspection: {archive_file.name}", border_style="cyan")
         table.add_column("Category", style="bold")
         table.add_column("Count", justify="right", style="cyan")
         table.add_row("Backup Type", info.get("backup_type", "knowledge").upper(), style="bold magenta")
         table.add_row("Target Directory (Knowledge)", str(target_dir))
-        if is_full and computed_books_dir:
-            table.add_row("Target Directory (Books)", str(computed_books_dir))
+        is_full = info.get("backup_type") == "full" or info.get("categories", {}).get("books", 0) > 0
+        if is_full and explicit_books_dir:
+            table.add_row("Target Directory (Books)", str(explicit_books_dir))
         for cat, cnt in info["categories"].items():
             table.add_row(cat.replace("_", " ").title(), str(cnt))
         table.add_row("Total Files", f"{info['total_files']:,}", style="bold green")
         table.add_row("Compressed Size", f"{info['compressed_bytes'] / (1024 * 1024):.2f} MB")
         table.add_row("Uncompressed Size", f"{info['uncompressed_bytes'] / (1024 * 1024):.2f} MB")
         console.print("\n", table)
+        return
+
+    if is_inc:
+        from bookeeper.backup import apply_incremental_update
+
+        console.print(f"[bold cyan]Applying incremental update from [bold white]{archive_file.name}[/bold white]...[/bold cyan]")
+        try:
+            res = apply_incremental_update(
+                archive_path=archive_file,
+                target_dir=target_dir,
+                books_dir=explicit_books_dir,
+                neo4j_config=cfg.neo4j,
+                export_neo4j=cfg.neo4j.enabled,
+            )
+        except Exception as e:
+            console.print(f"[bold red]Failed to apply incremental update:[/bold red] {e}")
+            raise typer.Exit(1)
+
+        m_stats = res.get("merge_stats", {})
+        table = Table(title="Incremental Update Summary", border_style="green")
+        table.add_column("Metric", style="bold")
+        table.add_column("Count", justify="right", style="cyan")
+        table.add_row("Nodes Added", f"{m_stats.get('nodes_added', 0):,}")
+        table.add_row("Nodes Updated", f"{m_stats.get('nodes_updated', 0):,}")
+        table.add_row("Edges Added", f"{m_stats.get('edges_added', 0):,}")
+        table.add_row("Edges Updated", f"{m_stats.get('edges_updated', 0):,}")
+        table.add_row("Files Restored", f"{res.get('files_restored', 0):,}")
+        neo_info = "Updated" if res.get("neo4j_export") and not res.get("neo4j_export", {}).get("error") else ("Skipped (disabled)" if not cfg.neo4j.enabled else "Error")
+        table.add_row("Neo4j Database", neo_info)
+        console.print("\n", table)
+        console.print(f"[bold green]✓ Incremental update successfully merged into Knowledge Graph and Neo4j.[/bold green]\n")
         return
 
     t0 = time.perf_counter()
@@ -8725,6 +9507,13 @@ def sync_command(
         "--timeout",
         help="HTTP request timeout in seconds for backup transmission and remote restore (default: 600).",
     ),
+    file_list: Optional[Path] = typer.Option(
+        None,
+        "--file-list",
+        "--files",
+        "-L",
+        help="Path to text file containing book/article filenames/paths to filter or prioritize.",
+    ),
 ):
     """
     Synchronize local knowledge graph and books with a remote Bookkeeper server via REST API:
@@ -8746,8 +9535,9 @@ def sync_command(
     calibre_path = _resolve_opt(calibre_path)
     format_type = _resolve_opt(format_type, "zip")
     timeout = _resolve_opt(timeout, 600)
+    file_list = _resolve_opt(file_list)
 
-    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir, config_diff=config_diff)
+    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir, config_diff=config_diff, file_list=file_list)
 
     # Normalize remote server URL
     target_server = server.strip()
@@ -8958,30 +9748,32 @@ def ui_command(
     console.print(f"\n[bold cyan]Starting Bookeeper Idea-Based Search Engine UI...[/bold cyan]")
     console.print(f"  • [bold white]Web Interface:[/bold white] [bold green]http://{host}:{actual_port}/[/bold green]")
     console.print(f"  • [bold white]Query API:[/bold white] [bold cyan]http://{host}:{actual_port}/query[/bold cyan] [dim](LightRAG compatible)[/dim]")
-    console.print(f"  • [bold white]Neo4j URI:[/bold white] {cfg.neo4j.uri} (database: '{cfg.neo4j.database}')")
-
-    # Pre-flight Database Consistency Verification
-    try:
-        consistency = backend.validate_database_consistency()
-        if consistency.get("neo4j_connected"):
-            if not consistency.get("is_consistent"):
-                discrepancy_lines = "\n".join(f"  • [yellow]{d}[/yellow]" for d in consistency.get("discrepancies", []))
-                console.print(Panel(
-                    f"[bold yellow]⚠️  DATABASE INCONSISTENCY DETECTED[/bold yellow]\n\n"
-                    f"The connected Neo4j database is outdated or out of sync with your local knowledge base:\n"
-                    f"{discrepancy_lines}\n\n"
-                    f"[bold white]Impact:[/bold white] Search results and graph exploration may return incomplete data.\n"
-                    f"[bold white]Resolution:[/bold white] Run [bold cyan]bookeeper rebuild-graph --export-neo4j[/bold cyan] or [bold cyan]bookeeper build-graph --export-neo4j[/bold cyan] to synchronize.",
-                    title="[bold yellow]Consistency Warning[/bold yellow]",
-                    border_style="yellow",
-                ))
+    if cfg.neo4j.enabled:
+        console.print(f"  • [bold white]Neo4j URI:[/bold white] {cfg.neo4j.uri} (database: '{cfg.neo4j.database}')")
+        # Pre-flight Database Consistency Verification
+        try:
+            consistency = backend.validate_database_consistency()
+            if consistency.get("neo4j_connected"):
+                if not consistency.get("is_consistent"):
+                    discrepancy_lines = "\n".join(f"  • [yellow]{d}[/yellow]" for d in consistency.get("discrepancies", []))
+                    console.print(Panel(
+                        f"[bold yellow]⚠️  DATABASE INCONSISTENCY DETECTED[/bold yellow]\n\n"
+                        f"The connected Neo4j database is outdated or out of sync with your local knowledge base:\n"
+                        f"{discrepancy_lines}\n\n"
+                        f"[bold white]Impact:[/bold white] Search results and graph exploration may return incomplete data.\n"
+                        f"[bold white]Resolution:[/bold white] Run [bold cyan]bookeeper rebuild-graph --export-neo4j[/bold cyan] or [bold cyan]bookeeper build-graph --export-neo4j[/bold cyan] to synchronize.",
+                        title="[bold yellow]Consistency Warning[/bold yellow]",
+                        border_style="yellow",
+                    ))
+                else:
+                    ls = consistency.get("local_stats", {})
+                    console.print(f"  • [bold green]Neo4j Status:[/bold green] [green]Synchronized with local KB[/green] ({ls.get('books', 0)} books, {ls.get('chunks', 0):,} chunks, {ls.get('ideas', 0):,} ideas)")
             else:
-                ls = consistency.get("local_stats", {})
-                console.print(f"  • [bold green]Neo4j Status:[/bold green] [green]Synchronized with local KB[/green] ({ls.get('books', 0)} books, {ls.get('chunks', 0):,} chunks, {ls.get('ideas', 0):,} ideas)")
-        else:
-            console.print(f"  • [bold dim]Neo4j Status:[/bold dim] [dim]Offline / Standalone mode (serving from local knowledge_graph.json)[/dim]")
-    except Exception as e:
-        console.print(f"  • [dim]Consistency check skipped: {e}[/dim]")
+                console.print(f"  • [bold dim]Neo4j Status:[/bold dim] [dim]Offline / Standalone mode (serving from local knowledge_graph.json)[/dim]")
+        except Exception as e:
+            console.print(f"  • [dim]Consistency check skipped: {e}[/dim]")
+    else:
+        console.print(f"  • [bold white]Neo4j Status:[/bold white] [dim]Disabled in config (standalone mode, serving from local knowledge_graph.json)[/dim]")
 
     console.print("[dim]Press Ctrl+C to terminate the web server.[/dim]\n")
 
@@ -9085,6 +9877,7 @@ def lightrag_index_command(
     config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to partial YAML config overlay applied on top of base config.yaml."),
     calibre_path: Optional[str] = typer.Option(None, "--calibre-path", help="Calibre library path or SMB mount."),
     books_dir: Optional[str] = typer.Option(None, "--books-dir", help="Path to folder containing books/articles."),
+    file_list: Optional[str] = typer.Option(None, "--file-list", "--files", "-L", help="Path to text file containing book/article filenames/paths to filter."),
     lightrag_dir: Optional[str] = typer.Option(None, "--lightrag-dir", help="Working directory for LightRAG database."),
     clean: bool = typer.Option(False, "--clean", help="Wipe existing LightRAG database before indexing."),
 ):
@@ -9095,7 +9888,7 @@ def lightrag_index_command(
     from bookeeper.calibre import get_book_client
     from bookeeper.rag.lightrag_service import LightRAGRawIndexer
 
-    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir, config_diff=config_diff)
+    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir, config_diff=config_diff, file_list=file_list)
     client = get_book_client(cfg, calibre_path=calibre_path, books_dir=books_dir)
     all_books = client.list_books()
 
@@ -9139,6 +9932,7 @@ def generate_questions_command(
     config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to partial YAML config overlay applied on top of base config.yaml."),
     calibre_path: Optional[str] = typer.Option(None, "--calibre-path", help="Calibre library path or SMB mount."),
     books_dir: Optional[str] = typer.Option(None, "--books-dir", help="Path to folder containing books/articles."),
+    file_list: Optional[str] = typer.Option(None, "--file-list", "--files", "-L", help="Path to text file containing book/article filenames/paths to filter."),
     timeout: int = typer.Option(180, "--timeout", "-t", help="Timeout in seconds per LLM request for question synthesis (default: 180s)."),
     hierarchical_cover: bool = typer.Option(True, "--hierarchical-cover/--no-hierarchical-cover", help="Enable or disable Section-Aware Hierarchical Semantic Cover for diverse outlining chunk selection (default: True)."),
     mmr: Optional[bool] = typer.Option(None, "--mmr/--no-mmr", hidden=True, help="Deprecated alias for --hierarchical-cover."),
@@ -9151,7 +9945,7 @@ def generate_questions_command(
     from bookeeper.calibre import get_book_client
     from bookeeper.evaluation.question_generator import QuestionGenerator
 
-    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir, config_diff=config_diff)
+    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir, config_diff=config_diff, file_list=file_list)
     client = get_book_client(cfg, calibre_path=calibre_path, books_dir=books_dir)
     all_books = client.list_books()
 
@@ -9202,6 +9996,7 @@ def ab_benchmark_command(
     config_diff: Optional[str] = typer.Option(None, "--config-diff", help="Path to partial YAML config overlay applied on top of base config.yaml."),
     calibre_path: Optional[str] = typer.Option(None, "--calibre-path", help="Calibre library path or SMB mount."),
     books_dir: Optional[str] = typer.Option(None, "--books-dir", help="Path to folder containing books/articles."),
+    file_list: Optional[str] = typer.Option(None, "--file-list", "--files", "-L", help="Path to text file containing book/article filenames/paths to filter."),
     questions_file: Optional[str] = typer.Option(None, "--questions", "-q", help="Path to existing question library JSON file (if omitted, questions are generated)."),
     questions_per_book: int = typer.Option(5, "--questions-per-book", help="Questions to generate per book if --questions is not provided."),
     output_dir: Optional[str] = typer.Option(None, "--output-dir", "-o", help="Target output session folder for benchmark artifacts and reports."),
@@ -9227,7 +10022,7 @@ def ab_benchmark_command(
     from bookeeper.evaluation.benchmark import ABBenchmarkRunner
     from bookeeper.evaluation.question_generator import QuestionLibrary
 
-    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir, config_diff=config_diff)
+    cfg = _get_effective_settings(config_path, calibre_path, books_dir=books_dir, config_diff=config_diff, file_list=file_list)
     client = get_book_client(cfg, calibre_path=calibre_path, books_dir=books_dir)
     all_books = client.list_books()
 

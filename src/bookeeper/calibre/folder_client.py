@@ -360,80 +360,28 @@ class FolderBookClient:
                 }
             )
 
-        # 3. Load or generate stable, persistent integer IDs
+        # 3. Clean up any legacy .book_ids.json file if present
         id_map_file = self.folder_path / ".book_ids.json"
-        id_map: Dict[str, int] = {}
         if id_map_file.is_file():
             try:
-                saved_map = json.loads(id_map_file.read_text(encoding="utf-8"))
-                if isinstance(saved_map, dict):
-                    entries = saved_map.get("entries", saved_map)
-                    for k, v in entries.items():
-                        try:
-                            id_map[str(k)] = int(v)
-                        except (ValueError, TypeError):
-                            pass
-            except Exception as e:
-                logger.debug(f"Could not load .book_ids.json: {e}")
+                id_map_file.unlink()
+            except Exception:
+                pass
 
-        # Assign IDs
-        needs_save = False
-        unassigned: List[Dict[str, Any]] = []
-
+        # Unprocessed download files have no primary key / ID before processing
+        discovered_items.sort(
+            key=lambda x: (
+                0 if x.get("downloaded_at") else (1 if x.get("arxiv_id") else 2),
+                x.get("downloaded_at") or "",
+                x.get("arxiv_id") or "",
+                Path(x["path"]).name.lower(),
+            )
+        )
         for item in discovered_items:
-            key = item["key"]
-            if key in id_map:
-                item["id"] = id_map[key]
-            else:
-                unassigned.append(item)
+            item["id"] = None
 
-        if unassigned:
-            if not id_map:
-                # Fresh assignment: sort deterministically by download date (oldest first), then arXiv ID, then filename
-                unassigned.sort(
-                    key=lambda x: (
-                        0 if x.get("downloaded_at") else (1 if x.get("arxiv_id") else 2),
-                        x.get("downloaded_at") or "",
-                        x.get("arxiv_id") or "",
-                        Path(x["path"]).name.lower(),
-                    )
-                )
-                for idx, item in enumerate(unassigned, start=1):
-                    item["id"] = idx
-                    id_map[item["key"]] = idx
-            else:
-                # Append to existing IDs
-                next_id = max(id_map.values(), default=0) + 1
-                for item in unassigned:
-                    item["id"] = next_id
-                    id_map[item["key"]] = next_id
-                    next_id += 1
-            needs_save = True
-
-        if needs_save:
-            try:
-                temp_file = None
-                with tempfile.NamedTemporaryFile("w", dir=self.folder_path, delete=False, encoding="utf-8") as tf:
-                    json.dump(
-                        {"next_id": max(id_map.values(), default=0) + 1, "entries": id_map},
-                        tf,
-                        indent=2,
-                        ensure_ascii=False,
-                    )
-                    temp_file = Path(tf.name)
-                temp_file.replace(id_map_file)
-            except Exception as e:
-                logger.debug(f"Could not save .book_ids.json in {self.folder_path}: {e}")
-                if temp_file and temp_file.is_file():
-                    try:
-                        temp_file.unlink()
-                    except Exception:
-                        pass
-
-        # 4. Construct sorted final catalog
-        discovered_items.sort(key=lambda x: x.get("id", 0))
         self._catalog = discovered_items
-        self._catalog_by_id = {b["id"]: b for b in self._catalog}
+        self._catalog_by_path = {b["path"]: b for b in self._catalog}
 
     def list_books(self, fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """List books from the download directory."""
@@ -460,19 +408,25 @@ class FolderBookClient:
 
     def export_book(
         self,
-        book_id: int,
+        book_id: Any,
         target_dir: Union[Path, str],
         fmt: Optional[Union[str, List[str]]] = None,
     ) -> Optional[Path]:
         """
-        Locate book file for the given book_id.
+        Locate book file for the given book_id or path.
         Since the book is already stored locally on disk, returns the local file path directly.
         """
-        book = self._catalog_by_id.get(book_id)
-        if not book:
-            return None
+        if isinstance(book_id, (str, Path)) and Path(str(book_id)).is_file():
+            return Path(str(book_id))
 
-        src_path = Path(book["path"])
+        if isinstance(book_id, str) and book_id in self._catalog_by_path:
+            return Path(self._catalog_by_path[book_id]["path"])
+
+        for b in self._catalog:
+            if b.get("id") == book_id and b.get("path") and Path(b["path"]).is_file():
+                return Path(b["path"])
+
+        return None
         if src_path.is_file():
             return src_path
 

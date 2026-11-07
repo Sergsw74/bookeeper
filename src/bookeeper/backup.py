@@ -837,6 +837,9 @@ def restore_backup(
     books_dir: Optional[Path] = None,
     clean: bool = False,
     dry_run: bool = False,
+    incremental: bool = False,
+    export_neo4j: bool = True,
+    neo4j_config: Optional[Any] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> Dict[str, Any]:
     """
@@ -852,7 +855,30 @@ def restore_backup(
 
     # 1. Inspect archive first
     inspection = inspect_backup(archive_path)
-    is_full = inspection.get("backup_type") == "full" or inspection.get("categories", {}).get("books", 0) > 0
+    b_type = inspection.get("backup_type", "knowledge")
+    is_incremental = (b_type == "incremental") or incremental
+    is_full = b_type == "full" or inspection.get("categories", {}).get("books", 0) > 0
+
+    if is_incremental:
+        if dry_run:
+            return {
+                "dry_run": True,
+                "backup_type": "incremental",
+                "target_dir": target_dir,
+                "target_books_dir": books_dir,
+                "inspection": inspection,
+                "cleaned": {},
+                "files_restored": 0,
+                "bytes_restored": 0,
+            }
+        return apply_incremental_update(
+            archive_path=archive_path,
+            target_dir=target_dir,
+            books_dir=books_dir,
+            neo4j_config=neo4j_config,
+            export_neo4j=export_neo4j,
+            progress_callback=progress_callback,
+        )
 
     target_books_dir: Optional[Path] = None
     if is_full:
@@ -1220,4 +1246,744 @@ def compare_knowledge_graphs(
             "delta": edges_b - edges_a,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Incremental Update & Backup Engine
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class IncrementalDiffResult:
+    """Detailed result of calculating incremental diff against a baseline."""
+
+    new_books: List[Dict[str, Any]]
+    related_books: List[Dict[str, Any]]
+    diff_store: Any  # ConceptGraphStore
+    diff_node_count: int
+    diff_edge_count: int
+    baseline_type: str
+    baseline_reference: str
+    baseline_book_count: int
+    current_book_count: int
+
+
+def extract_book_signatures(b: Dict[str, Any]) -> Tuple[Optional[str], Set[str]]:
+    """
+    Extract arXiv ID and normalized title/filename signatures from a book dict.
+    Returns (arxiv_id, signatures_set).
+    """
+    aid = b.get("arxiv_id")
+    b_path_str = b.get("path") or b.get("file_path")
+    p = Path(b_path_str) if b_path_str else None
+    b_title = str(b.get("title") or b.get("name") or "").strip()
+
+    if not aid and p:
+        m = re.search(r"(\d{4}\.\d{4,5})", p.name)
+        if m:
+            aid = m.group(1)
+    if not aid and b_title:
+        m = re.search(r"(\d{4}\.\d{4,5})", b_title)
+        if m:
+            aid = m.group(1)
+
+    signatures = set()
+    if b_title:
+        signatures.add(b_title.lower())
+        clean_t = re.sub(r"[^a-z0-9]", "", b_title.lower())
+        if clean_t:
+            signatures.add(clean_t)
+        title_no_aid = re.sub(r"^\d{4}\.\d{4,5}\s*[-_:]\s*", "", b_title, flags=re.IGNORECASE).strip()
+        if title_no_aid and title_no_aid != b_title:
+            signatures.add(title_no_aid.lower())
+            clean_no_aid = re.sub(r"[^a-z0-9]", "", title_no_aid.lower())
+            if clean_no_aid:
+                signatures.add(clean_no_aid)
+
+    if p:
+        signatures.add(p.name.lower())
+        signatures.add(p.stem.lower())
+        clean_s = re.sub(r"[^a-z0-9]", "", p.stem.lower())
+        if clean_s:
+            signatures.add(clean_s)
+
+    aid_clean = str(aid).strip().lower() if aid else None
+    return aid_clean, signatures
+
+
+def get_baseline_books(
+    baseline: Union[str, Path, Any] = "neo4j",
+    neo4j_config: Optional[Any] = None,
+) -> Tuple[List[Dict[str, Any]], str, str]:
+    """
+    Extract baseline books from either:
+    1. 'neo4j' or Neo4jConfig / Neo4jExporter -> queries connected Neo4j database.
+    2. Backup archive (.zip, .7z, .tar.gz) -> unpacks / reads knowledge_graph.json.
+    3. JSON file or directory -> reads knowledge_graph.json.
+    Returns (baseline_books, baseline_type, baseline_reference).
+    """
+    from bookeeper.graph.store import ConceptGraphStore
+
+    # Case 1: Neo4j baseline
+    is_neo4j = (
+        (isinstance(baseline, str) and baseline.lower() == "neo4j")
+        or hasattr(baseline, "fetch_remote_books")
+        or type(baseline).__name__ in ("Neo4jConfig", "Neo4jExporter")
+    )
+    if is_neo4j:
+        from bookeeper.graph.neo4j_exporter import Neo4jExporter
+
+        if hasattr(baseline, "fetch_remote_books"):
+            exporter = baseline
+        else:
+            if neo4j_config is None and type(baseline).__name__ == "Neo4jConfig":
+                neo4j_config = baseline
+            if neo4j_config is None:
+                from bookeeper.config import get_settings
+
+                cfg = get_settings()
+                neo4j_config = cfg.neo4j
+            exporter = Neo4jExporter.from_config(neo4j_config)
+
+        if not exporter.verify_connectivity():
+            raise ConnectionError(
+                f"Neo4j database is not reachable at {getattr(exporter, 'uri', 'localhost:7687')}. "
+                "Please ensure Neo4j is running or provide a backup archive as baseline."
+            )
+        books = exporter.fetch_remote_books()
+        return books, "neo4j", getattr(exporter, "uri", "neo4j")
+
+    # Case 2: Backup archive or directory or file
+    p = Path(baseline).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"Baseline backup target not found at: {p}")
+
+    if p.is_file() and p.suffix.lower() in (".zip", ".7z", ".tar", ".gz", ".tgz"):
+        with open_backup_target(p) as r_target:
+            b_store = ConceptGraphStore()
+            b_store.load(r_target.graph_file)
+            books = []
+            for nid, attrs in b_store.graph.nodes(data=True):
+                if attrs.get("type") == "Book":
+                    bid = attrs.get("book_id")
+                    if bid is None and str(nid).startswith("book:"):
+                        try:
+                            bid = int(str(nid).replace("book:", ""))
+                        except ValueError:
+                            pass
+                    books.append({
+                        "id": nid,
+                        "book_id": bid,
+                        "title": attrs.get("title", f"Book {bid}"),
+                        "author": attrs.get("author", "Unknown"),
+                        "arxiv_id": attrs.get("arxiv_id"),
+                        "content_hash": attrs.get("content_hash"),
+                    })
+        return books, "backup_archive", p.name
+
+    if p.is_dir():
+        kg_file = p / "knowledge_graph.json"
+        if not kg_file.is_file():
+            kg_file = p / "knowledge_graph_spine.json"
+        if not kg_file.is_file():
+            raise FileNotFoundError(f"No knowledge graph found in baseline directory: {p}")
+        b_store = ConceptGraphStore()
+        b_store.load(kg_file)
+        books = []
+        for nid, attrs in b_store.graph.nodes(data=True):
+            if attrs.get("type") == "Book":
+                bid = attrs.get("book_id")
+                if bid is None and str(nid).startswith("book:"):
+                    try:
+                        bid = int(str(nid).replace("book:", ""))
+                    except ValueError:
+                        pass
+                books.append({
+                    "id": nid,
+                    "book_id": bid,
+                    "title": attrs.get("title", f"Book {bid}"),
+                    "author": attrs.get("author", "Unknown"),
+                    "arxiv_id": attrs.get("arxiv_id"),
+                    "content_hash": attrs.get("content_hash"),
+                })
+        return books, "directory", str(p)
+
+    if p.is_file():
+        b_store = ConceptGraphStore()
+        b_store.load(p)
+        books = []
+        for nid, attrs in b_store.graph.nodes(data=True):
+            if attrs.get("type") == "Book":
+                bid = attrs.get("book_id")
+                if bid is None and str(nid).startswith("book:"):
+                    try:
+                        bid = int(str(nid).replace("book:", ""))
+                    except ValueError:
+                        pass
+                books.append({
+                    "id": nid,
+                    "book_id": bid,
+                    "title": attrs.get("title", f"Book {bid}"),
+                    "author": attrs.get("author", "Unknown"),
+                    "arxiv_id": attrs.get("arxiv_id"),
+                    "content_hash": attrs.get("content_hash"),
+                })
+        return books, "file", p.name
+
+    raise ValueError(f"Unsupported baseline target: {baseline}")
+
+
+def calculate_incremental_diff(
+    source_dir: Path,
+    baseline: Union[str, Path, Any] = "neo4j",
+    neo4j_config: Optional[Any] = None,
+    current_store: Optional[Any] = None,
+) -> IncrementalDiffResult:
+    """
+    Calculate the incremental difference between the current Knowledge Graph and a baseline
+    (either an active Neo4j database or a previous backup archive/file).
+    Identifies:
+      1. New books in the current KG not in the baseline (or with changed content hash).
+      2. Books in the current KG related to the new books via shared concepts and concept relations.
+      3. An extracted diff subgraph (ConceptGraphStore) containing exactly the new & related books,
+         their connecting sections/chunks, and the bridging concepts.
+    """
+    from bookeeper.graph.store import ConceptGraphStore
+
+    source_dir = Path(source_dir).expanduser().resolve()
+    if current_store is None:
+        current_store = ConceptGraphStore()
+        kg_path = source_dir / "knowledge_graph.json"
+        if kg_path.is_file() or (source_dir / "knowledge_graph_spine.json").is_file():
+            current_store.load(kg_path if kg_path.is_file() else source_dir)
+        else:
+            raise FileNotFoundError(f"No knowledge graph found in source directory: {source_dir}")
+
+    # 1. Extract books from current store
+    current_books: List[Dict[str, Any]] = []
+    all_book_nodes: Dict[str, Dict[str, Any]] = {}
+    for nid, attrs in current_store.graph.nodes(data=True):
+        if attrs.get("type") == "Book":
+            bid = attrs.get("book_id")
+            if bid is None and str(nid).startswith("book:"):
+                try:
+                    bid = int(str(nid).replace("book:", ""))
+                except ValueError:
+                    pass
+            b_info = {
+                "node_id": nid,
+                "book_id": bid,
+                "title": attrs.get("title", f"Book {bid}"),
+                "author": attrs.get("author", "Unknown"),
+                "arxiv_id": attrs.get("arxiv_id"),
+                "content_hash": attrs.get("content_hash"),
+            }
+            current_books.append(b_info)
+            all_book_nodes[str(nid)] = b_info
+
+    # 2. Extract books from baseline
+    baseline_books, baseline_type, baseline_ref = get_baseline_books(
+        baseline=baseline,
+        neo4j_config=neo4j_config,
+    )
+
+    # 3. Index baseline books by arXiv ID, title signatures, and ID
+    baseline_arxiv_map: Dict[str, Dict[str, Any]] = {}
+    baseline_sig_map: Dict[str, Dict[str, Any]] = {}
+    baseline_id_map: Dict[str, Dict[str, Any]] = {}
+
+    for bb in baseline_books:
+        b_aid, b_sigs = extract_book_signatures(bb)
+        if b_aid:
+            baseline_arxiv_map[b_aid] = bb
+        for s in b_sigs:
+            if len(s) >= 4:
+                baseline_sig_map[s] = bb
+        bid = bb.get("book_id") or bb.get("id")
+        if bid is not None:
+            bid_clean = str(bid).replace("book:", "").strip()
+            baseline_id_map[bid_clean] = bb
+
+    # 4. Identify New Books (present in current KG, missing or modified in baseline)
+    new_books: List[Dict[str, Any]] = []
+    for cb in current_books:
+        cb_aid, cb_sigs = extract_book_signatures(cb)
+        matched_bb = None
+        if cb_aid and cb_aid in baseline_arxiv_map:
+            matched_bb = baseline_arxiv_map[cb_aid]
+        if not matched_bb:
+            for s in cb_sigs:
+                if len(s) >= 4 and s in baseline_sig_map:
+                    matched_bb = baseline_sig_map[s]
+                    break
+        if not matched_bb and cb.get("book_id") is not None:
+            cid_str = str(cb["book_id"]).replace("book:", "").strip()
+            if cid_str in baseline_id_map:
+                cand_bb = baseline_id_map[cid_str]
+                _, cand_sigs = extract_book_signatures(cand_bb)
+                if cb_sigs & cand_sigs:
+                    matched_bb = cand_bb
+
+        if matched_bb is None:
+            new_books.append(cb)
+        else:
+            cb_hash = cb.get("content_hash")
+            bb_hash = matched_bb.get("content_hash")
+            if cb_hash and bb_hash and cb_hash != bb_hash:
+                new_books.append(cb)
+
+    new_book_nodes = {cb["node_id"] for cb in new_books}
+
+    # 5. Identify Books Related to New Books from KG via shared concepts and concept relations
+    new_connected_concepts = set()
+    for b_node in new_book_nodes:
+        if not current_store.graph.has_node(b_node):
+            continue
+        # Direct concept edges from book node
+        for neighbor in current_store.graph.neighbors(b_node):
+            if current_store.graph.nodes[neighbor].get("type") in ("Concept", "Idea"):
+                new_connected_concepts.add(neighbor)
+        for pred in current_store.graph.predecessors(b_node):
+            if current_store.graph.nodes[pred].get("type") in ("Concept", "Idea"):
+                new_connected_concepts.add(pred)
+
+        # Concept edges from sections and chunks of this book
+        bid = current_store.graph.nodes[b_node].get("book_id")
+        for n, attrs in current_store.graph.nodes(data=True):
+            if attrs.get("book_id") == bid and attrs.get("type") in ("Section", "Chunk"):
+                for neighbor in current_store.graph.neighbors(n):
+                    if current_store.graph.nodes[neighbor].get("type") in ("Concept", "Idea"):
+                        new_connected_concepts.add(neighbor)
+                for pred in current_store.graph.predecessors(n):
+                    if current_store.graph.nodes[pred].get("type") in ("Concept", "Idea"):
+                        new_connected_concepts.add(pred)
+
+    # 1-hop expansion across RELATED_TO inter-concept edges
+    expanded_concepts = set(new_connected_concepts)
+    for c_node in new_connected_concepts:
+        for neighbor in current_store.graph.neighbors(c_node):
+            if current_store.graph.nodes[neighbor].get("type") in ("Concept", "Idea"):
+                expanded_concepts.add(neighbor)
+        for pred in current_store.graph.predecessors(c_node):
+            if current_store.graph.nodes[pred].get("type") in ("Concept", "Idea"):
+                expanded_concepts.add(pred)
+
+    # Find existing/other books linked to any of these expanded concepts
+    related_books_map: Dict[str, Dict[str, Any]] = {}
+    for c_node in expanded_concepts:
+        c_name = current_store.graph.nodes[c_node].get("name", str(c_node).replace("concept:", ""))
+        connected_nodes = set(current_store.graph.neighbors(c_node)) | set(current_store.graph.predecessors(c_node))
+        for node in connected_nodes:
+            node_attrs = current_store.graph.nodes[node]
+            ntype = node_attrs.get("type")
+            b_target = None
+            if ntype == "Book" and node not in new_book_nodes:
+                b_target = node
+            elif ntype in ("Section", "Chunk") and "book_id" in node_attrs:
+                cand = f"book:{node_attrs['book_id']}"
+                if cand in all_book_nodes and cand not in new_book_nodes:
+                    b_target = cand
+
+            if b_target:
+                if b_target not in related_books_map:
+                    b_data = all_book_nodes[b_target]
+                    related_books_map[b_target] = {
+                        "node_id": b_target,
+                        "book_id": b_data.get("book_id"),
+                        "title": b_data.get("title", f"Book {b_data.get('book_id')}"),
+                        "author": b_data.get("author", "Unknown"),
+                        "arxiv_id": b_data.get("arxiv_id"),
+                        "shared_concepts": set(),
+                    }
+                related_books_map[b_target]["shared_concepts"].add(c_name)
+
+    related_books_list = []
+    for r in related_books_map.values():
+        r_copy = dict(r)
+        r_copy["shared_concepts"] = sorted(list(r["shared_concepts"]))
+        related_books_list.append(r_copy)
+
+    # 6. Extract Diff Subgraph (ConceptGraphStore)
+    diff_nodes = set()
+    # 1. New books and all their sections, chunks, formulas
+    for b_node in new_book_nodes:
+        diff_nodes.add(b_node)
+        bid = current_store.graph.nodes[b_node].get("book_id")
+        for n, attrs in current_store.graph.nodes(data=True):
+            if attrs.get("book_id") == bid:
+                diff_nodes.add(n)
+
+    # 2. Related books and their connecting chunks/sections
+    for r_node in related_books_map.keys():
+        diff_nodes.add(r_node)
+        r_bid = all_book_nodes[r_node].get("book_id")
+        for n, attrs in current_store.graph.nodes(data=True):
+            if attrs.get("book_id") == r_bid:
+                n_neighbors = set(current_store.graph.neighbors(n)) | set(current_store.graph.predecessors(n))
+                if any(c in expanded_concepts for c in n_neighbors):
+                    diff_nodes.add(n)
+
+    # 3. All expanded concepts
+    for c_node in expanded_concepts:
+        diff_nodes.add(c_node)
+
+    diff_subgraph = current_store.graph.subgraph(diff_nodes).copy()
+    diff_store = ConceptGraphStore(diff_subgraph)
+
+    return IncrementalDiffResult(
+        new_books=new_books,
+        related_books=related_books_list,
+        diff_store=diff_store,
+        diff_node_count=diff_store.graph.number_of_nodes(),
+        diff_edge_count=diff_store.graph.number_of_edges(),
+        baseline_type=baseline_type,
+        baseline_reference=baseline_ref,
+        baseline_book_count=len(baseline_books),
+        current_book_count=len(current_books),
+    )
+
+
+def create_incremental_backup(
+    source_dir: Path,
+    baseline: Union[str, Path, Any] = "neo4j",
+    neo4j_config: Optional[Any] = None,
+    destination: Optional[Path] = None,
+    format_type: str = "zip",
+    books_dir: Optional[Path] = None,
+    include_books: bool = True,
+    include_obsidian: bool = True,
+    include_states: bool = True,
+    include_chunks: bool = True,
+    current_store: Optional[Any] = None,
+    custom_dirs: Optional[Dict[str, Path]] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> Dict[str, Any]:
+    """
+    Create an incremental backup archive containing only the diff (new books, related books,
+    and their interconnecting concepts/sections/chunks) compared against a baseline (Neo4j or backup archive).
+    """
+    source_dir = Path(source_dir).expanduser().resolve()
+    diff_res = calculate_incremental_diff(
+        source_dir=source_dir,
+        baseline=baseline,
+        neo4j_config=neo4j_config,
+        current_store=current_store,
+    )
+
+    fmt = (format_type or "zip").lower().strip()
+    if fmt in {"7z", "7-zip", "sevenzip"}:
+        fmt = "7z"
+    else:
+        fmt = "zip"
+    ext = f".{fmt}"
+
+    now = datetime.datetime.now()
+    timestamp_str = now.strftime("%Y%m%d_%H%M%S")
+    default_filename = f"incremental_backup_{timestamp_str}{ext}"
+
+    if destination is None:
+        dest_archive = Path.cwd() / default_filename
+    else:
+        dest_path = Path(destination).expanduser().resolve()
+        if dest_path.is_dir():
+            dest_archive = dest_path / default_filename
+        else:
+            dest_archive = dest_path if dest_path.suffix else dest_path.with_suffix(ext)
+
+    dest_archive.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory() as td:
+        stage_dir = Path(td)
+
+        # 1. Save diff knowledge graph
+        diff_res.diff_store.save(stage_dir / "knowledge_graph.json")
+
+        # 2. Collect chunks for new books
+        if include_chunks:
+            c_dir = custom_dirs.get("chunks_dir") if custom_dirs else None
+            chunks_src = Path(c_dir).expanduser().resolve() if c_dir else (source_dir / "chunks")
+            if chunks_src.is_dir():
+                target_chunks = stage_dir / "chunks"
+                target_chunks.mkdir(parents=True, exist_ok=True)
+                for b in diff_res.new_books:
+                    bid = b.get("book_id")
+                    if bid is not None:
+                        cf = chunks_src / f"book_{bid}_chunks.json"
+                        if cf.is_file():
+                            shutil.copy2(cf, target_chunks / cf.name)
+
+        # 3. Collect state files for new books
+        if include_states:
+            s_dir = custom_dirs.get("states_dir") if custom_dirs else None
+            states_src = Path(s_dir).expanduser().resolve() if s_dir else (source_dir / ".book_states")
+            if states_src.is_dir():
+                target_states = stage_dir / ".book_states"
+                target_states.mkdir(parents=True, exist_ok=True)
+                for b in diff_res.new_books:
+                    bid = b.get("book_id")
+                    if bid is not None:
+                        sf = states_src / f"book_{bid}_state.json"
+                        if sf.is_file():
+                            shutil.copy2(sf, target_states / sf.name)
+
+        # 4. Collect Obsidian notes for new & related books and concepts
+        if include_obsidian:
+            o_dir = custom_dirs.get("obsidian_dir") if custom_dirs else None
+            obs_src = Path(o_dir).expanduser().resolve() if o_dir else (source_dir / "obsidian_vault")
+            if obs_src.is_dir():
+                target_obs = stage_dir / "obsidian_vault"
+                target_obs.mkdir(parents=True, exist_ok=True)
+                # Match titles of new and related books
+                match_titles = set()
+                for b in diff_res.new_books + diff_res.related_books:
+                    t = b.get("title")
+                    if t:
+                        match_titles.add(re.sub(r"[^a-z0-9]", "", str(t).lower()))
+
+                for root, _, files in os.walk(obs_src):
+                    for f in files:
+                        if f.endswith(".md"):
+                            f_stem_clean = re.sub(r"[^a-z0-9]", "", Path(f).stem.lower())
+                            if f_stem_clean in match_titles or f == "00_Index.md":
+                                src_f = Path(root) / f
+                                rel_f = src_f.relative_to(obs_src)
+                                dest_f = target_obs / rel_f
+                                dest_f.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.copy2(src_f, dest_f)
+
+        # 5. Collect original source book files for new books
+        if include_books and books_dir:
+            b_dir_p = Path(books_dir).expanduser().resolve()
+            if b_dir_p.is_dir():
+                target_books = stage_dir / "books"
+                target_books.mkdir(parents=True, exist_ok=True)
+                for b in diff_res.new_books:
+                    b_aid = b.get("arxiv_id")
+                    b_title_clean = re.sub(r"[^a-z0-9]", "", str(b.get("title") or "").lower())
+                    for item in b_dir_p.iterdir():
+                        if not item.is_file() or item.suffix.lower() not in BOOK_EXTENSIONS:
+                            continue
+                        matched = False
+                        if b_aid and b_aid in item.name:
+                            matched = True
+                        elif b_title_clean and b_title_clean in re.sub(r"[^a-z0-9]", "", item.stem.lower()):
+                            matched = True
+                        if matched:
+                            shutil.copy2(item, target_books / item.name)
+                            opf = item.with_suffix(".opf")
+                            if opf.is_file():
+                                shutil.copy2(opf, target_books / opf.name)
+                            break
+
+        # 6. Write backup_metadata.json
+        meta = {
+            "backup_type": "incremental",
+            "created_at": now.isoformat(),
+            "format": fmt,
+            "bookeeper_version": "0.1.0",
+            "source_directory": str(source_dir),
+            "baseline_type": diff_res.baseline_type,
+            "baseline_reference": diff_res.baseline_reference,
+            "new_books": diff_res.new_books,
+            "related_books": diff_res.related_books,
+            "stats": {
+                "new_books_count": len(diff_res.new_books),
+                "related_books_count": len(diff_res.related_books),
+                "diff_nodes": diff_res.diff_node_count,
+                "diff_edges": diff_res.diff_edge_count,
+                "baseline_book_count": diff_res.baseline_book_count,
+                "current_book_count": diff_res.current_book_count,
+            },
+        }
+        (stage_dir / "backup_metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+        # 7. Compress into target archive
+        file_list: List[Tuple[Path, str]] = []
+        for root, _, files in os.walk(stage_dir):
+            for f in files:
+                fp = Path(root) / f
+                rel = fp.relative_to(stage_dir).as_posix()
+                file_list.append((fp, rel))
+
+        total_files = len(file_list)
+        total_uncompressed = sum(fp.stat().st_size for fp, _ in file_list)
+
+        if fmt == "7z":
+            with py7zr.SevenZipFile(dest_archive, "w") as sz:
+                for idx, (fpath, arcname) in enumerate(file_list, start=1):
+                    sz.write(fpath, arcname)
+                    if progress_callback:
+                        progress_callback(idx, total_files, f"Packing {arcname}")
+        else:
+            with zipfile.ZipFile(dest_archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                for idx, (fpath, arcname) in enumerate(file_list, start=1):
+                    zf.write(fpath, arcname)
+                    if progress_callback:
+                        progress_callback(idx, total_files, f"Packing {arcname}")
+
+    compressed_size = dest_archive.stat().st_size
+    return {
+        "success": True,
+        "destination": str(dest_archive),
+        "filename": dest_archive.name,
+        "format": fmt,
+        "backup_type": "incremental",
+        "new_books_count": len(diff_res.new_books),
+        "related_books_count": len(diff_res.related_books),
+        "diff_nodes": diff_res.diff_node_count,
+        "diff_edges": diff_res.diff_edge_count,
+        "new_books": diff_res.new_books,
+        "related_books": diff_res.related_books,
+        "total_files": total_files,
+        "uncompressed_bytes": total_uncompressed,
+        "compressed_bytes": compressed_size,
+        "created_at": now.isoformat(),
+    }
+
+
+def apply_incremental_update(
+    archive_path: Path,
+    target_dir: Path,
+    books_dir: Optional[Path] = None,
+    neo4j_config: Optional[Any] = None,
+    export_neo4j: bool = True,
+    target_store: Optional[Any] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> Dict[str, Any]:
+    """
+    Apply an incremental update archive to the existing Knowledge Graph and Neo4j database (if active).
+    Merges new and related book subgraphs without wiping existing knowledge.
+    """
+    from bookeeper.graph.store import ConceptGraphStore
+
+    archive_path = Path(archive_path).expanduser().resolve()
+    if not archive_path.is_file():
+        raise FileNotFoundError(f"Incremental archive not found at: {archive_path}")
+
+    target_dir = Path(target_dir).expanduser().resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory() as td:
+        extract_dir = Path(td)
+        fmt = detect_archive_format(archive_path)
+
+        if fmt == "7z":
+            with py7zr.SevenZipFile(archive_path, "r") as sz:
+                sz.extractall(extract_dir)
+        else:
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                zf.extractall(extract_dir)
+
+        # 1. Read metadata
+        meta_file = extract_dir / "backup_metadata.json"
+        meta: Dict[str, Any] = {}
+        if meta_file.is_file():
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        new_books = meta.get("new_books", [])
+        related_books = meta.get("related_books", [])
+
+        # 2. Merge Knowledge Graph
+        diff_kg_file = extract_dir / "knowledge_graph.json"
+        merge_stats = {"nodes_added": 0, "nodes_updated": 0, "edges_added": 0, "edges_updated": 0}
+
+        if diff_kg_file.is_file():
+            diff_store = ConceptGraphStore()
+            diff_store.load(diff_kg_file)
+
+            if target_store is None:
+                target_store = ConceptGraphStore()
+                tgt_kg = target_dir / "knowledge_graph.json"
+                if tgt_kg.is_file() or (target_dir / "knowledge_graph_spine.json").is_file():
+                    target_store.load(tgt_kg if tgt_kg.is_file() else target_dir)
+
+            merge_stats = target_store.merge_store(diff_store)
+            target_store.save(target_dir / "knowledge_graph.json")
+
+        # 3. Merge auxiliary files
+        files_restored = 0
+        bytes_restored = 0
+
+        # Chunks
+        inc_chunks = extract_dir / "chunks"
+        if inc_chunks.is_dir():
+            tgt_chunks = target_dir / "chunks"
+            tgt_chunks.mkdir(parents=True, exist_ok=True)
+            for cf in inc_chunks.iterdir():
+                if cf.is_file():
+                    shutil.copy2(cf, tgt_chunks / cf.name)
+                    files_restored += 1
+                    bytes_restored += cf.stat().st_size
+
+        # States
+        inc_states = extract_dir / ".book_states"
+        if inc_states.is_dir():
+            tgt_states = target_dir / ".book_states"
+            tgt_states.mkdir(parents=True, exist_ok=True)
+            for sf in inc_states.iterdir():
+                if sf.is_file():
+                    shutil.copy2(sf, tgt_states / sf.name)
+                    files_restored += 1
+                    bytes_restored += sf.stat().st_size
+
+        # Obsidian notes
+        inc_obs = extract_dir / "obsidian_vault"
+        if inc_obs.is_dir():
+            tgt_obs = target_dir / "obsidian_vault"
+            for root, _, files in os.walk(inc_obs):
+                for f in files:
+                    src_f = Path(root) / f
+                    rel_f = src_f.relative_to(inc_obs)
+                    dest_f = tgt_obs / rel_f
+                    dest_f.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_f, dest_f)
+                    files_restored += 1
+                    bytes_restored += src_f.stat().st_size
+
+        # Source books
+        inc_books = extract_dir / "books"
+        if inc_books.is_dir() and books_dir:
+            b_dir_p = Path(books_dir).expanduser().resolve()
+            b_dir_p.mkdir(parents=True, exist_ok=True)
+            for bf in inc_books.iterdir():
+                if bf.is_file():
+                    shutil.copy2(bf, b_dir_p / bf.name)
+                    files_restored += 1
+                    bytes_restored += bf.stat().st_size
+
+        # 4. Synchronize into Neo4j if active
+        neo4j_result = None
+        if export_neo4j and diff_kg_file.is_file():
+            try:
+                from bookeeper.graph.neo4j_exporter import Neo4jExporter
+
+                if neo4j_config is None:
+                    from bookeeper.config import get_settings
+
+                    cfg = get_settings()
+                    neo4j_config = cfg.neo4j
+                exporter = Neo4jExporter.from_config(neo4j_config)
+                if exporter.verify_connectivity():
+                    neo4j_result = exporter.export(diff_store, clean=False, show_progress=False)
+            except Exception as e:
+                logger.warning(f"Could not update Neo4j during incremental restore: {e}")
+                neo4j_result = {"error": str(e)}
+
+    return {
+        "success": True,
+        "backup_type": "incremental",
+        "archive": archive_path.name,
+        "target_dir": str(target_dir),
+        "files_restored": files_restored,
+        "bytes_restored": bytes_restored,
+        "merge_stats": merge_stats,
+        "new_books": new_books,
+        "related_books": related_books,
+        "neo4j_export": neo4j_result,
+        "completed_at": datetime.datetime.now().isoformat(),
+    }
+
 

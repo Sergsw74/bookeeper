@@ -640,6 +640,269 @@ def test_cli_sync_flow_no_clean(tmp_path):
         assert b'name="clean"\r\n\r\nfalse' in req_arg.data
 
 
+def test_incremental_diff_calculation_and_backup_creation(tmp_path: Path):
+    """
+    Test calculating incremental diff against a baseline and packaging an incremental archive:
+    1. Detects new books not in baseline.
+    2. Identifies related existing books in the graph linked via shared concepts.
+    3. Builds a diff subgraph with new books, related books, and bridging concepts.
+    4. Packages an incremental archive with metadata.
+    """
+    from bookeeper.backup import (
+        calculate_incremental_diff,
+        create_incremental_backup,
+        apply_incremental_update,
+        inspect_backup,
+    )
+    from bookeeper.graph.store import ConceptGraphStore
+    from bookeeper.processing.extractor import Concept
+    from unittest.mock import MagicMock, patch
+
+    # Setup current knowledge graph in out_dir
+    out_dir = tmp_path / "current_output"
+    out_dir.mkdir(parents=True)
+    store = ConceptGraphStore()
+
+    # Book 1: "Foundation Models" (existing in baseline)
+    store.add_book(1, title="Foundation Models", author="Author A", arxiv_id="2101.00001")
+    c_transformer = Concept(name="Transformer", category="Idea", summary="Attention architecture", weight=5)
+    c_world_model = Concept(name="World Models", category="Idea", summary="Latent predictive models", weight=6)
+    store.add_concept(c_transformer)
+    store.add_concept(c_world_model)
+    store.add_book_idea_link(1, "Transformer")
+    store.add_book_idea_link(1, "World Models")
+
+    # Book 2: "JEPA Architectures" (NEW book, not in baseline)
+    store.add_book(2, title="JEPA Architectures", author="Author B", arxiv_id="2410.00002")
+    c_jepa = Concept(name="JEPA", category="Idea", summary="Joint Embedding Predictive Architecture", weight=7)
+    store.add_concept(c_jepa)
+    store.add_book_idea_link(2, "World Models")  # Shared with Book 1!
+    store.add_book_idea_link(2, "JEPA")
+    store.add_concept_relation("JEPA", "World Models")
+
+    store.save(out_dir / "knowledge_graph.json")
+
+    # Mock Neo4j baseline having only Book 1
+    mock_neo4j = MagicMock()
+    mock_neo4j.verify_connectivity.return_value = True
+    mock_neo4j.uri = "bolt://localhost:7687"
+    mock_neo4j.fetch_remote_books.return_value = [
+        {
+            "id": "book:1",
+            "book_id": 1,
+            "title": "Foundation Models",
+            "author": "Author A",
+            "arxiv_id": "2101.00001",
+            "content_hash": "hash_book_1",
+        }
+    ]
+
+    # 1. Calculate diff against Neo4j baseline
+    diff_res = calculate_incremental_diff(
+        source_dir=out_dir,
+        baseline=mock_neo4j,
+        current_store=store,
+    )
+
+    # Verify New Books
+    assert len(diff_res.new_books) == 1
+    assert diff_res.new_books[0]["book_id"] == 2
+    assert diff_res.new_books[0]["title"] == "JEPA Architectures"
+
+    # Verify Related Books (Book 1 is related because it shares "World Models")
+    assert len(diff_res.related_books) == 1
+    assert diff_res.related_books[0]["book_id"] == 1
+    assert "World Models" in diff_res.related_books[0]["shared_concepts"]
+
+    # Verify Diff Subgraph
+    diff_nodes = set(diff_res.diff_store.graph.nodes())
+    assert "book:2" in diff_nodes
+    assert "book:1" in diff_nodes
+    assert "concept:World Models" in diff_nodes
+    assert "concept:JEPA" in diff_nodes
+
+    # 2. Create Incremental Backup Archive
+    dest_dir = tmp_path / "backups"
+    backup_meta = create_incremental_backup(
+        source_dir=out_dir,
+        baseline=mock_neo4j,
+        destination=dest_dir,
+        current_store=store,
+    )
+
+    archive_file = Path(backup_meta["destination"])
+    assert archive_file.is_file()
+    assert backup_meta["backup_type"] == "incremental"
+    assert backup_meta["new_books_count"] == 1
+    assert backup_meta["related_books_count"] == 1
+
+    # Verify inspection detects incremental archive
+    insp = inspect_backup(archive_file)
+    assert insp["backup_type"] == "incremental"
+    assert insp["metadata"]["new_books"][0]["book_id"] == 2
+
+    # 3. Apply Incremental Update into a target instance that only has Book 1
+    target_out = tmp_path / "target_output"
+    target_out.mkdir(parents=True)
+    target_store = ConceptGraphStore()
+    target_store.add_book(1, title="Foundation Models", author="Author A", arxiv_id="2101.00001")
+    target_store.add_concept(c_transformer)
+    target_store.add_concept(c_world_model)
+    target_store.add_book_idea_link(1, "Transformer")
+    target_store.add_book_idea_link(1, "World Models")
+    target_store.save(target_out / "knowledge_graph.json")
+
+    mock_target_neo4j = MagicMock()
+    mock_target_neo4j.verify_connectivity.return_value = True
+    mock_target_neo4j.export.return_value = {"status": "ok", "nodes_upserted": 4, "edges_upserted": 3}
+
+    with patch("bookeeper.graph.neo4j_exporter.Neo4jExporter.from_config", return_value=mock_target_neo4j):
+        update_res = apply_incremental_update(
+            archive_path=archive_file,
+            target_dir=target_out,
+            export_neo4j=True,
+        )
+
+    assert update_res["success"] is True
+    assert update_res["backup_type"] == "incremental"
+    assert update_res["merge_stats"]["nodes_added"] >= 2  # book:2 and concept:JEPA
+
+    # Verify target store now contains both Book 1 and Book 2!
+    merged_store = ConceptGraphStore()
+    merged_store.load(target_out / "knowledge_graph.json")
+    assert merged_store.graph.has_node("book:1")
+    assert merged_store.graph.has_node("book:2")
+    assert merged_store.graph.has_node("concept:JEPA")
+    assert merged_store.graph.has_node("concept:World Models")
+    assert merged_store.graph.has_edge("book:2", "concept:JEPA")
+    assert merged_store.graph.has_edge("book:2", "concept:World Models")
+
+    # Verify Neo4j export was called with clean=False (preserving existing database!)
+    mock_target_neo4j.export.assert_called_once()
+    assert mock_target_neo4j.export.call_args[1]["clean"] is False
+
+
+def test_incremental_backup_against_archive_baseline(tmp_path: Path):
+    """
+    Test calculating incremental diff against a previous backup archive file (.zip) baseline:
+    1. Baseline archive contains only Book 1.
+    2. Current KG contains Book 1, Book 2 (shares 'World Models' with Book 1), and Book 3 ('Quantum Algorithms').
+    3. Verifies that diff detects Book 2 & Book 3 as new, Book 1 as related book via shared concept.
+    4. Packages incremental backup archive and applies update to target instance.
+    """
+    import zipfile
+    from bookeeper.backup import (
+        calculate_incremental_diff,
+        create_incremental_backup,
+        apply_incremental_update,
+        inspect_backup,
+    )
+    from bookeeper.graph.store import ConceptGraphStore
+    from bookeeper.processing.extractor import Concept
+
+    # 1. Create baseline backup archive (.zip)
+    baseline_store = ConceptGraphStore()
+    baseline_store.add_book(1, title="Foundation Models", author="Author A", arxiv_id="2101.00001")
+    c_transformer = Concept(name="Transformer", category="Idea", summary="Attention architecture", weight=5)
+    c_world_model = Concept(name="World Models", category="Idea", summary="Latent predictive models", weight=6)
+    baseline_store.add_concept(c_transformer)
+    baseline_store.add_concept(c_world_model)
+    baseline_store.add_book_idea_link(1, "Transformer")
+    baseline_store.add_book_idea_link(1, "World Models")
+
+    baseline_dir = tmp_path / "baseline_raw"
+    baseline_dir.mkdir(parents=True)
+    baseline_kg = baseline_dir / "knowledge_graph.json"
+    baseline_store.save(baseline_kg)
+
+    baseline_archive = tmp_path / "baseline_backup.zip"
+    with zipfile.ZipFile(baseline_archive, "w") as zf:
+        zf.write(baseline_kg, "knowledge_graph.json")
+        zf.writestr("backup_metadata.json", json.dumps({"backup_type": "knowledge", "created_at": "2026-01-01T00:00:00"}))
+
+    # 2. Setup current KG: Book 1 + Book 2 (related to Book 1 via World Models) + Book 3 (independent)
+    current_dir = tmp_path / "current_output"
+    current_dir.mkdir(parents=True)
+    current_store = ConceptGraphStore()
+    current_store.add_book(1, title="Foundation Models", author="Author A", arxiv_id="2101.00001")
+    current_store.add_concept(c_transformer)
+    current_store.add_concept(c_world_model)
+    current_store.add_book_idea_link(1, "Transformer")
+    current_store.add_book_idea_link(1, "World Models")
+
+    # Book 2: "JEPA Architectures"
+    current_store.add_book(2, title="JEPA Architectures", author="Author B", arxiv_id="2410.00002")
+    c_jepa = Concept(name="JEPA", category="Idea", summary="Joint Embedding Predictive Architecture", weight=7)
+    current_store.add_concept(c_jepa)
+    current_store.add_book_idea_link(2, "World Models")  # Shares World Models with Book 1!
+    current_store.add_book_idea_link(2, "JEPA")
+
+    # Book 3: "Quantum Supremacy"
+    current_store.add_book(3, title="Quantum Supremacy", author="Author C", arxiv_id="2411.00003")
+    c_quantum = Concept(name="Quantum Supremacy", category="Idea", summary="Computational advantage", weight=8)
+    current_store.add_concept(c_quantum)
+    current_store.add_book_idea_link(3, "Quantum Supremacy")
+
+    current_store.save(current_dir / "knowledge_graph.json")
+
+    # 3. Calculate diff against archive baseline file
+    diff_res = calculate_incremental_diff(
+        source_dir=current_dir,
+        baseline=baseline_archive,
+        current_store=current_store,
+    )
+
+    assert diff_res.baseline_type == "backup_archive"
+    assert diff_res.baseline_reference == baseline_archive.name
+    assert len(diff_res.new_books) == 2
+    new_bids = {b["book_id"] for b in diff_res.new_books}
+    assert new_bids == {2, 3}
+
+    # Verify Book 1 was identified as related because Book 2 shares "World Models" with it
+    assert len(diff_res.related_books) == 1
+    assert diff_res.related_books[0]["book_id"] == 1
+    assert "World Models" in diff_res.related_books[0]["shared_concepts"]
+
+    # 4. Create incremental backup archive
+    dest_dir = tmp_path / "backups"
+    backup_meta = create_incremental_backup(
+        source_dir=current_dir,
+        baseline=baseline_archive,
+        destination=dest_dir,
+        current_store=current_store,
+    )
+    inc_archive = Path(backup_meta["destination"])
+    assert inc_archive.is_file()
+    assert backup_meta["backup_type"] == "incremental"
+    assert backup_meta["new_books_count"] == 2
+    assert backup_meta["related_books_count"] == 1
+
+    # 5. Apply incremental update into a target instance with Book 1
+    target_dir = tmp_path / "target_output_2"
+    target_dir.mkdir(parents=True)
+    baseline_store.save(target_dir / "knowledge_graph.json")
+
+    update_res = apply_incremental_update(
+        archive_path=inc_archive,
+        target_dir=target_dir,
+        export_neo4j=False,
+    )
+
+    assert update_res["success"] is True
+    assert update_res["merge_stats"]["nodes_added"] >= 3  # books 2, 3 and concept JEPA, Quantum Supremacy
+
+    merged_store = ConceptGraphStore()
+    merged_store.load(target_dir / "knowledge_graph.json")
+    assert merged_store.graph.has_node("book:1")
+    assert merged_store.graph.has_node("book:2")
+    assert merged_store.graph.has_node("book:3")
+    assert merged_store.graph.has_node("concept:JEPA")
+    assert merged_store.graph.has_node("concept:Quantum Supremacy")
+    assert merged_store.graph.has_node("concept:World Models")
+
+
+
+
 
 
 

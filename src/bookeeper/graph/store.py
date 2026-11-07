@@ -86,12 +86,19 @@ class ConceptGraphStore:
         summary: str = "",
         tags: Optional[List[str]] = None,
         publication_date: Optional[str] = None,
+        arxiv_id: Optional[str] = None,
     ) -> str:
         """Add or update a Book node enriched with research literature note tags and metadata."""
         title = BookParser.repair_mojibake(title)
         author = BookParser.repair_mojibake(author) if author else "Unknown"
         summary = BookParser.repair_mojibake(summary) if summary else ""
         pub_date = BookParser.parse_publication_date(publication_date)
+
+        resolved_aid = arxiv_id
+        if not resolved_aid:
+            m = re.search(r"(\d{4}\.\d{4,5})", title)
+            if m:
+                resolved_aid = m.group(1)
 
         node_id = f"book:{book_id}"
         book_tags = ["book", "literature-note", "research-source"]
@@ -110,12 +117,16 @@ class ConceptGraphStore:
                 "author": author,
                 "summary": summary,
             }
+            if resolved_aid:
+                node_attrs["arxiv_id"] = resolved_aid
             if pub_date:
                 node_attrs["publication_date"] = pub_date
             self.graph.add_node(node_id, **node_attrs)
         else:
             nd = self.graph.nodes[node_id]
             nd["title"] = title
+            if resolved_aid:
+                nd["arxiv_id"] = resolved_aid
             if author and author != "Unknown":
                 nd["author"] = author
             if summary and len(summary) > len(nd.get("summary", "")):
@@ -1115,6 +1126,47 @@ class ConceptGraphStore:
             "edge_types": edge_types,
             "average_concept_weight": avg_weight,
             "concept_weight_count": len(concept_weights),
+        }
+
+    def merge_store(self, other: "ConceptGraphStore") -> Dict[str, int]:
+        """
+        Merge another ConceptGraphStore into this one.
+        Upserts nodes and edges, preserving existing structures while incorporating new/updated data.
+        """
+        nodes_added = 0
+        nodes_updated = 0
+        edges_added = 0
+        edges_updated = 0
+
+        # 1. Merge nodes
+        for n, d in other.graph.nodes(data=True):
+            if self.graph.has_node(n):
+                self.graph.nodes[n].update(d)
+                nodes_updated += 1
+            else:
+                self.graph.add_node(n, **d)
+                nodes_added += 1
+            self.mark_node_dirty(n)
+
+        # 2. Merge edges
+        for u, v, d in other.graph.edges(data=True):
+            if self.graph.has_edge(u, v):
+                self.graph.edges[u, v].update(d)
+                edges_updated += 1
+            else:
+                self.graph.add_edge(u, v, **d)
+                edges_added += 1
+            self.mark_edge_dirty(u, v)
+
+        logger.info(
+            f"Merged ConceptGraphStore: +{nodes_added} nodes ({nodes_updated} updated), "
+            f"+{edges_added} edges ({edges_updated} updated)."
+        )
+        return {
+            "nodes_added": nodes_added,
+            "nodes_updated": nodes_updated,
+            "edges_added": edges_added,
+            "edges_updated": edges_updated,
         }
 
     def get_embedding(

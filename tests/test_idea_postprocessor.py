@@ -1259,4 +1259,379 @@ def test_process_graph_affected_concepts_cross_merges_with_graph():
     assert not store.graph.nodes["concept:Quantum Computing"].get("postprocessed")
 
 
+def test_batch_ideas_by_context_size():
+    """Verify batch_ideas_by_context_size honors max_idea_batch and max_context_size constraints."""
+    from bookeeper.processing.idea_postprocessor import batch_ideas_by_context_size
+
+    def make_cluster(name: str, payload_len: int = 100) -> IdeaCluster:
+        c = IdeaCluster(canonical_name=name, normalized_name=name.lower())
+        c.add_observation(
+            IdeaObservation(
+                concept_name=name,
+                chunk_id="chk_1",
+                local_brief="x" * payload_len,
+            )
+        )
+        return c
+
+    def format_fn(cluster: IdeaCluster):
+        obs = cluster.observations[0]
+        return obs.local_brief, []
+
+    clusters = [make_cluster(f"Idea_{i}", payload_len=200) for i in range(10)]
+
+    # Test 1: Max 3 items per batch
+    batches_count = batch_ideas_by_context_size(
+        clusters,
+        format_payload_fn=format_fn,
+        max_context_size=100000,
+        max_idea_batch=3,
+    )
+    assert len(batches_count) == 4
+    assert [len(b) for b in batches_count] == [3, 3, 3, 1]
+
+    # Test 2: Max context size limit (each item is ~200 + 150 overhead = 350 bytes; limit 800 bytes -> 2 items/batch)
+    batches_size = batch_ideas_by_context_size(
+        clusters,
+        format_payload_fn=format_fn,
+        max_context_size=800,
+        max_idea_batch=10,
+    )
+    for b in batches_size:
+        assert len(b) <= 2
+
+    # Test 3: Oversized cluster placed in its own single-item batch
+    big_cluster = make_cluster("Big_Idea", payload_len=5000)
+    mixed_clusters = [clusters[0], big_cluster, clusters[1]]
+    batches_mixed = batch_ideas_by_context_size(
+        mixed_clusters,
+        format_payload_fn=format_fn,
+        max_context_size=1000,
+        max_idea_batch=5,
+    )
+    # big_cluster must be in its own batch
+    assert [c.canonical_name for c in batches_mixed[1]] == ["Big_Idea"]
+
+
+def test_batch_consolidated_idea_output_sanitization():
+    """Verify BatchConsolidatedIdeaOutput model validator handles various LLM output structures."""
+    from bookeeper.processing.idea_postprocessor import BatchConsolidatedIdeaOutput
+
+    # Case 1: Plain list of ideas
+    raw_list = [
+        {
+            "idea_id": "idea_1",
+            "brief_description": "Brief 1",
+            "detailed_explanation": "Detailed explanation 1",
+        },
+        {
+            "idea_id": "idea_2",
+            "brief_description": "Brief 2",
+            "detailed_explanation": "Detailed explanation 2",
+        },
+    ]
+    parsed_list = BatchConsolidatedIdeaOutput.model_validate(raw_list)
+    assert len(parsed_list.ideas) == 2
+    assert parsed_list.ideas[0].idea_id == "idea_1"
+
+    # Case 2: Dict with alternative key 'consolidated_ideas'
+    raw_alt = {
+        "consolidated_ideas": [
+            {
+                "idea_id": "idea_1",
+                "brief_description": "Brief 1",
+                "detailed_explanation": "Detailed explanation 1",
+            }
+        ]
+    }
+    parsed_alt = BatchConsolidatedIdeaOutput.model_validate(raw_alt)
+    assert len(parsed_alt.ideas) == 1
+
+    # Case 3: Dict keyed by idea_id
+    raw_keyed = {
+        "idea_1": {
+            "brief_description": "Brief 1",
+            "detailed_explanation": "Detailed explanation 1",
+        },
+        "idea_2": {
+            "brief_description": "Brief 2",
+            "detailed_explanation": "Detailed explanation 2",
+        },
+    }
+    parsed_keyed = BatchConsolidatedIdeaOutput.model_validate(raw_keyed)
+    assert len(parsed_keyed.ideas) == 2
+    ids = {item.idea_id for item in parsed_keyed.ideas}
+    assert ids == {"idea_1", "idea_2"}
+
+
+def test_synthesize_cluster_batch_execution():
+    """Verify synthesize_cluster_batch formats prompt with XML tags and unpacks batch output."""
+    from bookeeper.processing.idea_postprocessor import (
+        BatchConsolidatedIdeaOutput,
+        ConsolidatedIdeaBatchItem,
+    )
+
+    c1 = IdeaCluster(canonical_name="Speculative Decoding", normalized_name="speculative decoding")
+    c1.add_observation(IdeaObservation(concept_name="Speculative Decoding", chunk_id="chk1", local_brief="Fast drafting."))
+    c1.add_observation(IdeaObservation(concept_name="Speculative Decoding", chunk_id="chk2", local_brief="Target verification."))
+
+    c2 = IdeaCluster(canonical_name="KV Cache Quantization", normalized_name="kv cache quantization")
+    c2.add_observation(IdeaObservation(concept_name="KV Cache Quantization", chunk_id="chk3", local_brief="4-bit compression."))
+    c2.add_observation(IdeaObservation(concept_name="KV Cache Quantization", chunk_id="chk4", local_brief="Outlier preservation."))
+
+    mock_pool = MagicMock()
+    mock_pool.nodes = [OllamaServerNode(url="http://localhost:11434", priority=1)]
+    mock_pool.execute_with_failover.return_value = BatchConsolidatedIdeaOutput(
+        ideas=[
+            ConsolidatedIdeaBatchItem(
+                idea_id="idea_1",
+                brief_description="Draft-then-verify decoding acceleration.",
+                detailed_explanation="A small draft model proposes tokens verified by a large target model.",
+                category="Inference Optimization",
+                weight=8,
+            ),
+            ConsolidatedIdeaBatchItem(
+                idea_id="idea_2",
+                brief_description="Low-bit key-value cache compression.",
+                detailed_explanation="Compresses attention key-value states to 4 bits while preserving precision for outlier channels.",
+                category="Memory Optimization",
+                weight=7,
+            ),
+        ]
+    )
+
+    pp = IdeaPostProcessor(
+        pool=mock_pool,
+        max_idea_batch=3,
+        max_context_size=5120,
+    )
+
+    results = pp.synthesize_cluster_batch([c1, c2])
+    assert len(results) == 2
+    assert "Speculative Decoding" in results
+    assert "KV Cache Quantization" in results
+    assert results["Speculative Decoding"].category == "Inference Optimization"
+    assert results["KV Cache Quantization"].category == "Memory Optimization"
+    assert mock_pool.execute_with_failover.called
+
+
+def test_process_graph_with_batch_prompt_joining():
+    """Verify process_graph batches multiple multi-occurrence ideas into single LLM invocations."""
+    from bookeeper.processing.idea_postprocessor import (
+        BatchConsolidatedIdeaOutput,
+        ConsolidatedIdeaBatchItem,
+    )
+
+    store = ConceptGraphStore()
+
+    # Add 4 multi-occurrence ideas (2 chunks each)
+    for i in range(1, 5):
+        idea_name = f"Architecture Pattern {i}"
+        chk1 = HierarchicalChunk(
+            chunk_id=f"chk_{i}_1", chunk_idx=i, book_id=1, book_title="Design Book",
+            chapter_idx=1, chapter_title="Ch1", section_title="S1", breadcrumb="B>Ch1>S1",
+            text=f"First description of {idea_name}.", char_count=40, word_count=6,
+        )
+        chk2 = HierarchicalChunk(
+            chunk_id=f"chk_{i}_2", chunk_idx=i + 10, book_id=1, book_title="Design Book",
+            chapter_idx=1, chapter_title="Ch1", section_title="S1", breadcrumb="B>Ch1>S1",
+            text=f"Second description of {idea_name}.", char_count=40, word_count=6,
+        )
+        store.add_chunk(chk1)
+        store.add_chunk(chk2)
+        store.add_idea_support_link(concept_name=idea_name, chunk=chk1, quote=f"Quote 1 for {idea_name}", brief_description="Brief 1")
+        store.add_idea_support_link(concept_name=idea_name, chunk=chk2, quote=f"Quote 2 for {idea_name}", brief_description="Brief 2")
+
+    mock_pool = MagicMock()
+    mock_pool.nodes = [OllamaServerNode(url="http://localhost:11434", priority=1)]
+
+    # Mock execute_with_failover to return batch results dynamically matching whatever ideas are in the prompt
+    def mock_execute(fn, **kwargs):
+        # We can construct a BatchConsolidatedIdeaOutput with mock items
+        return BatchConsolidatedIdeaOutput(
+            ideas=[
+                ConsolidatedIdeaBatchItem(
+                    idea_id=f"idea_{k}",
+                    brief_description=f"Consolidated brief {k}",
+                    detailed_explanation=f"Consolidated detailed explanation {k}",
+                    category="Architecture",
+                    weight=8,
+                )
+                for k in range(1, 5)
+            ]
+        )
+
+    mock_pool.execute_with_failover.side_effect = mock_execute
+
+    pp = IdeaPostProcessor(
+        pool=mock_pool,
+        max_idea_batch=3,
+        max_context_size=5120,
+        min_occurrences=2,
+    )
+
+    report = pp.process_graph(store)
+    assert report.total_clusters == 4
+    assert report.synthesized_count == 4
+    # With 4 ideas and max_idea_batch=3, there should be 2 batch calls (batch 1 has 3 ideas, batch 2 has 1 idea)
+    assert mock_pool.execute_with_failover.call_count == 2
+
+
+def test_process_graph_batched_synthesis_fifteen_items():
+    """Verify that 20 multi-occurrence ideas with max_idea_batch=15 are batched into 2 LLM calls (15 and 5)."""
+    from bookeeper.processing.idea_postprocessor import BatchConsolidatedIdeaOutput, ConsolidatedIdeaBatchItem
+
+    store = ConceptGraphStore()
+    store.add_book(1, title="Fifteen Batch Test", author="Architect")
+
+    for i in range(1, 21):
+        chk_a = HierarchicalChunk(
+            chunk_id=f"c_{i}_1",
+            chunk_idx=i * 2 - 1,
+            book_id=1,
+            book_title="Fifteen Batch Test",
+            chapter_idx=1,
+            chapter_title="Chapter 1",
+            section_title=f"Sec {i}",
+            breadcrumb="Book > Ch1",
+            text=f"Short concept mention {i}.",
+            char_count=25,
+            word_count=4,
+        )
+        chk_b = HierarchicalChunk(
+            chunk_id=f"c_{i}_2",
+            chunk_idx=i * 2,
+            book_id=1,
+            book_title="Fifteen Batch Test",
+            chapter_idx=1,
+            chapter_title="Chapter 1",
+            section_title=f"Sec {i}",
+            breadcrumb="Book > Ch1",
+            text=f"Second short concept mention {i}.",
+            char_count=32,
+            word_count=5,
+        )
+        store.add_chunk(chk_a)
+        store.add_chunk(chk_b)
+        store.add_idea_support_link(
+            concept_name=f"BigIdea {i}",
+            chunk=chk_a,
+            quote=f"Quote {i}",
+            brief_description=f"Brief {i}",
+        )
+        store.add_idea_support_link(
+            concept_name=f"BigIdea {i}",
+            chunk=chk_b,
+            quote=f"Quote {i}",
+            brief_description=f"Brief {i}",
+        )
+
+    mock_pool = MagicMock()
+    mock_pool.nodes = [OllamaServerNode(url="http://localhost:11434", priority=1)]
+    mock_pool.get_last_used_server.return_value = "http://localhost:11434"
+
+    def mock_execute(fn, tried_urls=None, **kwargs):
+        return BatchConsolidatedIdeaOutput(
+            ideas=[
+                ConsolidatedIdeaBatchItem(
+                    idea_id=f"idea_{k}",
+                    brief_description=f"Consolidated brief {k}",
+                    detailed_explanation=f"Consolidated detailed explanation {k}",
+                    category="Architecture",
+                    weight=8,
+                )
+                for k in range(1, 25)
+            ]
+        )
+
+    mock_pool.execute_with_failover.side_effect = mock_execute
+
+    test_console = Console(record=True, width=120)
+    pp = IdeaPostProcessor(
+        pool=mock_pool,
+        max_idea_batch=15,
+        max_context_size=7168,
+        min_occurrences=2,
+    )
+
+    report = pp.process_graph(store, console=test_console)
+    output_text = test_console.export_text()
+
+    assert report.total_clusters == 20
+    assert report.synthesized_count == 20
+    # 20 ideas batched with max_idea_batch=15 -> exactly 2 batch calls (15 and 5)
+    assert mock_pool.execute_with_failover.call_count == 2
+    assert "Batch 1/2 (15 ideas" in output_text
+    assert "Batch 2/2 (5 ideas" in output_text
+
+
+def test_salvage_truncated_json():
+    """Verify that salvage_truncated_json recovers completed items when JSON is cut off mid-stream."""
+    from bookeeper.processing.idea_postprocessor import salvage_truncated_json
+
+    truncated = (
+        '{\n'
+        '  "ideas": [\n'
+        '    {"idea_id": "idea_1", "brief_description": "Brief 1", "detailed_explanation": "Detail 1"},\n'
+        '    {"idea_id": "idea_2", "brief_description": "Brief 2", "detailed_explanation": "Detail 2"},\n'
+        '    {"idea_id": "idea_3", "brief_description": "Brief 3", "detailed_explanation": "Truncated \\\\textstyle'
+    )
+    salvaged = salvage_truncated_json(truncated)
+    assert salvaged is not None
+    assert "ideas" in salvaged
+    assert len(salvaged["ideas"]) == 2
+    assert salvaged["ideas"][0]["idea_id"] == "idea_1"
+    assert salvaged["ideas"][1]["idea_id"] == "idea_2"
+
+
+def test_batch_synthesis_fallback_to_individual_on_error():
+    """Verify that if batch synthesis throws an exception, it falls back to individual synthesis for each idea."""
+    mock_pool = MagicMock()
+    mock_pool.nodes = [OllamaServerNode(url="http://localhost:11434", priority=1)]
+    mock_pool.get_last_used_server.return_value = "http://localhost:11434"
+
+    calls = []
+
+    def mock_execute(fn, *args, **kwargs):
+        # Inspect kwargs to ensure quarantine_server=False is set
+        assert kwargs.get("quarantine_server") is False
+        # First call is the batch call: simulate failure (e.g. JSON truncation or validation error)
+        if not calls:
+            calls.append("batch")
+            raise ValueError("1 validation error for BatchConsolidatedIdeaOutput: Invalid JSON EOF")
+        # Subsequent calls are individual calls
+        calls.append("individual")
+        return ConsolidatedIdeaOutput(
+            brief_description="Individual brief",
+            detailed_explanation="Individual detail",
+            category="Pattern",
+            weight=7,
+        )
+
+    mock_pool.execute_with_failover.side_effect = mock_execute
+
+    c1 = IdeaCluster(canonical_name="Concept A", normalized_name="concept a")
+    c1.add_observation(IdeaObservation(concept_name="Concept A", local_brief="Brief A", quote="Quote A"))
+    c2 = IdeaCluster(canonical_name="Concept B", normalized_name="concept b")
+    c2.add_observation(IdeaObservation(concept_name="Concept B", local_brief="Brief B", quote="Quote B"))
+
+    pp = IdeaPostProcessor(
+        pool=mock_pool,
+        max_idea_batch=5,
+        min_occurrences=1,
+    )
+
+    results = pp.synthesize_cluster_batch([c1, c2])
+    assert len(results) == 2
+    assert "Concept A" in results
+    assert "Concept B" in results
+    assert results["Concept A"].brief_description == "Individual brief"
+    assert results["Concept B"].brief_description == "Individual brief"
+    # 1 failed batch call + 2 individual fallback calls
+    assert calls == ["batch", "individual", "individual"]
+
+
+
+
+
 

@@ -71,7 +71,10 @@ def generate_calibre_opf(article: ArticleMetadata, output_path: Path) -> Path:
 
     # Description
     dc_desc = ET.SubElement(metadata, "dc:description")
-    dc_desc.text = f"arXiv article {article.arxiv_id}. Abstract: {article.abstract_url}"
+    if article.abstract:
+        dc_desc.text = f"{article.abstract}\n\narXiv article {article.arxiv_id}. Abstract: {article.abstract_url}"
+    else:
+        dc_desc.text = f"arXiv article {article.arxiv_id}. Abstract: {article.abstract_url}"
 
     # Pretty print XML
     raw_xml = ET.tostring(package, encoding="utf-8")

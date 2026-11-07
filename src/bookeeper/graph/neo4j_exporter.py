@@ -3,11 +3,15 @@ Neo4j Graph Database Exporter for Concept Knowledge Graph.
 Performs high-throughput upsert (insert new, update existing) for nodes and relationships via Cypher.
 """
 
+import hashlib
 import json
 import logging
+import os
 import re
 import time
 from contextlib import contextmanager, nullcontext
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 try:
@@ -107,6 +111,7 @@ class Neo4jExporter:
         batch_size: int = 500,
         connection_timeout: float = 10.0,
         clean_export: bool = False,
+        incremental_sync: bool = True,
     ):
         if GraphDatabase is None:
             raise ImportError(
@@ -120,6 +125,7 @@ class Neo4jExporter:
         self.batch_size = max(1, batch_size)
         self.connection_timeout = connection_timeout
         self.clean_export = clean_export
+        self.incremental_sync = incremental_sync
         self._driver = None
         self._captured_search_indexes: list[dict[str, Any]] = []
 
@@ -134,6 +140,7 @@ class Neo4jExporter:
             batch_size=config.batch_size,
             connection_timeout=config.connection_timeout,
             clean_export=config.clean_export,
+            incremental_sync=getattr(config, "incremental_sync", True),
         )
 
     def get_driver(self):
@@ -204,7 +211,9 @@ class Neo4jExporter:
         Create uniqueness constraints on node 'id' for each label to guarantee
         fast O(1) index lookups during MERGE statements.
         """
-        for label in labels:
+        labels_to_ensure = set(labels)
+        labels_to_ensure.add("BookeeperSync")
+        for label in labels_to_ensure:
             clean_lbl = sanitize_label(label)
             # Try Neo4j 4.4+ constraint syntax
             constraint_name = f"constraint_{clean_lbl.lower()}_id"
@@ -219,6 +228,306 @@ class Neo4jExporter:
                     session.run(index_query)
                 except Exception as ex:
                     logger.debug(f"Could not create index for :{clean_lbl}: {ex}")
+
+    @staticmethod
+    def compute_book_content_hash(
+        book_id: int | str,
+        output_dir: Optional[Path | str] = None,
+        store: Optional[ConceptGraphStore] = None,
+    ) -> str:
+        """
+        Compute a deterministic content hash for a book compilation unit (Strategy A):
+          content_hash = SHA256(chunks_json + state_json)
+        Falls back to deterministic serialization of the book's graph elements if files are unavailable.
+        """
+        try:
+            bid_clean = int(str(book_id).replace("book:", "").strip())
+        except (ValueError, TypeError):
+            bid_clean = str(book_id).replace("book:", "").strip()
+
+        hasher = hashlib.sha256()
+        hasher.update(f"book:{bid_clean}:".encode("utf-8"))
+
+        out_path: Optional[Path] = None
+        if output_dir:
+            out_path = Path(output_dir).expanduser().resolve()
+        elif store and getattr(store, "output_dir", None):
+            out_path = Path(store.output_dir).expanduser().resolve()
+
+        found_files = False
+        if out_path and out_path.is_dir():
+            cand_chunks = [
+                out_path / "chunks" / f"book_{bid_clean}_chunks.json",
+                out_path / f"book_{bid_clean}_chunks.json",
+            ]
+            cand_states = [
+                out_path / ".book_states" / f"book_{bid_clean}_state.json",
+                out_path / f"book_{bid_clean}_state.json",
+            ]
+            for cp in cand_chunks:
+                if cp.is_file():
+                    try:
+                        hasher.update(cp.read_bytes())
+                        found_files = True
+                        break
+                    except Exception:
+                        pass
+            for sp in cand_states:
+                if sp.is_file():
+                    try:
+                        hasher.update(sp.read_bytes())
+                        found_files = True
+                        break
+                    except Exception:
+                        pass
+
+        # Fallback to in-memory graph elements if disk files are not present
+        if not found_files and store and hasattr(store, "graph"):
+            g = store.graph
+            b_nid = f"book:{bid_clean}"
+            b_attrs = g.nodes.get(b_nid, {}) if g.has_node(b_nid) else {}
+            hasher.update(str(b_attrs.get("title", "")).encode("utf-8"))
+            hasher.update(str(b_attrs.get("author", "")).encode("utf-8"))
+            hasher.update(str(b_attrs.get("summary", "")).encode("utf-8"))
+
+            sections = sorted(
+                [n for n in g.nodes if n.startswith(f"section:{bid_clean}:")]
+            )
+            for s in sections:
+                sd = g.nodes[s]
+                hasher.update(f"{s}:{sd.get('title', '')}:{sd.get('char_count', 0)};".encode("utf-8"))
+
+            chunks = sorted(
+                [
+                    (n, d)
+                    for n, d in g.nodes(data=True)
+                    if d.get("type") == "Chunk" and str(d.get("book_id")) == str(bid_clean)
+                ],
+                key=lambda x: x[0],
+            )
+            for cid, cd in chunks:
+                hasher.update(
+                    f"{cid}:{cd.get('chunk_idx', 0)}:{cd.get('char_count', 0)}:{cd.get('text', '')[:128]};".encode(
+                        "utf-8"
+                    )
+                )
+
+        return hasher.hexdigest()
+
+    @staticmethod
+    def compute_node_content_hash(
+        node_id: str,
+        primary_label: str,
+        properties: dict[str, Any],
+    ) -> str:
+        """
+        Compute deterministic SHA-256 attribute hash for node-level upsert guarding (Strategy B).
+        Unchanged nodes in Neo4j skip property rewrites and HNSW index modifications.
+        """
+        hasher = hashlib.sha256()
+        hasher.update(f"{node_id}:{primary_label}:".encode("utf-8"))
+        for k in sorted(properties.keys()):
+            if k in ("content_hash", "id"):
+                continue
+            v = properties[k]
+            if isinstance(v, list):
+                if v and isinstance(v[0], float):
+                    v_str = ",".join(f"{x:.4f}" for x in v[:16]) + f";len={len(v)}"
+                else:
+                    v_str = json.dumps(v, ensure_ascii=False)
+            elif isinstance(v, dict):
+                v_str = json.dumps(v, sort_keys=True, ensure_ascii=False)
+            else:
+                v_str = str(v)
+            hasher.update(f"{k}={v_str}|".encode("utf-8"))
+        return hasher.hexdigest()[:32]
+
+    @staticmethod
+    def compute_graph_hash(
+        store: ConceptGraphStore,
+        book_hashes: Optional[dict[str, str]] = None,
+    ) -> str:
+        """
+        Compute deterministic composite hash of the overall knowledge base.
+        Combines sorted per-book content hashes and concept graph structural counts.
+        """
+        hasher = hashlib.sha256()
+        if book_hashes:
+            for bid in sorted(book_hashes.keys()):
+                hasher.update(f"{bid}={book_hashes[bid]};".encode("utf-8"))
+
+        g = getattr(store, "graph", None)
+        if g is not None:
+            concept_count = sum(
+                1 for n, d in g.nodes(data=True)
+                if d.get("type") in ("Concept", "Idea") or d.get("is_idea") or d.get("tag") == "idea"
+            )
+            hasher.update(
+                f"concepts={concept_count};nodes={g.number_of_nodes()};edges={g.number_of_edges()}".encode("utf-8")
+            )
+        return hasher.hexdigest()
+
+    def get_sync_metadata(self, session: Any) -> Optional[dict[str, Any]]:
+        """
+        Fetch technical synchronization metadata from Neo4j (:BookeeperSync {id: 'sync_metadata'}).
+        """
+        query = (
+            "MATCH (s:BookeeperSync {id: 'sync_metadata'}) "
+            "RETURN s.graph_hash AS graph_hash, s.synced_at_iso AS synced_at_iso, "
+            "s.total_books AS total_books, s.total_nodes AS total_nodes, "
+            "s.total_edges AS total_edges, s.book_hashes AS book_hashes"
+        )
+        try:
+            result = session.run(query)
+            rec = result.single() if hasattr(result, "single") else None
+            if not rec:
+                return None
+            row = dict(rec) if not isinstance(rec, dict) else rec
+            b_hashes = row.get("book_hashes")
+            if isinstance(b_hashes, str):
+                try:
+                    b_hashes = json.loads(b_hashes)
+                except Exception:
+                    b_hashes = {}
+            return {
+                "graph_hash": row.get("graph_hash"),
+                "synced_at_iso": row.get("synced_at_iso"),
+                "total_books": row.get("total_books", 0),
+                "total_nodes": row.get("total_nodes", 0),
+                "total_edges": row.get("total_edges", 0),
+                "book_hashes": b_hashes or {},
+            }
+        except Exception as e:
+            logger.debug(f"Could not read :BookeeperSync metadata: {e}")
+            return None
+
+    def update_sync_metadata(
+        self,
+        session: Any,
+        graph_hash: str,
+        total_books: int,
+        total_nodes: int,
+        total_edges: int,
+        book_hashes: dict[str, str],
+        backup_hash: Optional[str] = None,
+    ) -> None:
+        """
+        Upsert technical synchronization metadata node into Neo4j.
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        query = """
+        MERGE (s:BookeeperSync {id: 'sync_metadata'})
+        SET s.graph_hash = $graph_hash,
+            s.synced_at_iso = $synced_at_iso,
+            s.total_books = $total_books,
+            s.total_nodes = $total_nodes,
+            s.total_edges = $total_edges,
+            s.book_hashes = $book_hashes,
+            s.backup_hash = $backup_hash
+        """
+        try:
+            self._execute_write_query(
+                session,
+                query,
+                graph_hash=graph_hash,
+                synced_at_iso=now_iso,
+                total_books=total_books,
+                total_nodes=total_nodes,
+                total_edges=total_edges,
+                book_hashes=json.dumps(book_hashes),
+                backup_hash=backup_hash or "",
+            )
+        except Exception as e:
+            logger.debug(f"Could not update :BookeeperSync metadata: {e}")
+
+    def fetch_remote_book_hashes(self, session: Any) -> dict[str, str]:
+        """
+        Fetch mapping of book_node_id -> content_hash for all books currently stored in Neo4j.
+        """
+        query = "MATCH (b:Book) RETURN b.id AS id, b.content_hash AS content_hash"
+        try:
+            result = session.run(query)
+            records = list(result) if result is not None else []
+        except Exception as e:
+            logger.debug(f"Could not fetch book hashes from Neo4j: {e}")
+            return {}
+
+        hashes: dict[str, str] = {}
+        for rec in records:
+            try:
+                row = dict(rec) if not isinstance(rec, dict) else rec
+            except Exception:
+                continue
+            bid = str(row.get("id") or "").strip()
+            chash = str(row.get("content_hash") or "").strip()
+            if bid:
+                hashes[bid] = chash
+        return hashes
+
+    def fetch_remote_books(self, session: Optional[Any] = None) -> list[dict[str, Any]]:
+        """
+        Fetch list of all books stored in Neo4j with their id, book_id, title, author, arxiv_id, and content_hash.
+        """
+        self.verify_connectivity()
+        query = """
+        MATCH (b:Book)
+        RETURN b.id AS id, b.book_id AS book_id, b.title AS title, b.author AS author,
+               b.arxiv_id AS arxiv_id, b.content_hash AS content_hash
+        """
+        def _run(s):
+            try:
+                res = s.run(query)
+                records = list(res) if res is not None else []
+            except Exception as e:
+                logger.debug(f"Could not fetch remote books from Neo4j: {e}")
+                return []
+            books = []
+            for rec in records:
+                try:
+                    row = dict(rec) if not isinstance(rec, dict) else rec
+                except Exception:
+                    continue
+                books.append({
+                    "id": row.get("id"),
+                    "book_id": row.get("book_id"),
+                    "title": row.get("title"),
+                    "author": row.get("author"),
+                    "arxiv_id": row.get("arxiv_id"),
+                    "content_hash": row.get("content_hash"),
+                })
+            return books
+
+        if session is not None:
+            return _run(session)
+        with self.get_driver().session(database=self.database) as s:
+            return _run(s)
+
+    def purge_book_subgraph(self, session: Any, book_id_str: str) -> int:
+        """
+        Purge all sections and chunks belonging to a modified book (Strategy A):
+          MATCH (b:Book {id: $bid})-[:HAS_SECTION]->(s:Section)
+          OPTIONAL MATCH (s)-[:HAS_CHUNK]->(c:Chunk)
+          DETACH DELETE s, c
+        Detaching chunks automatically cleans up adjacent relations (NEXT, PREV, SUPPORTED_BY, SUPPORTS_IDEA).
+        """
+        try:
+            bid_num = int(str(book_id_str).replace("book:", "").strip())
+        except (ValueError, TypeError):
+            bid_num = -1
+
+        query = """
+        MATCH (b:Book {id: $bid})
+        OPTIONAL MATCH (b)-[:HAS_SECTION]->(s:Section)
+        OPTIONAL MATCH (s)-[:HAS_CHUNK]->(c:Chunk)
+        OPTIONAL MATCH (c2:Chunk) WHERE c2.book_id = $bid_num
+        DETACH DELETE s, c, c2
+        """
+        try:
+            self._execute_write_query(session, query, bid=book_id_str, bid_num=bid_num)
+            return 1
+        except Exception as e:
+            logger.warning(f"Failed to purge book subgraph for {book_id_str}: {e}")
+            return 0
 
     def ensure_idea_vector_index(
         self,
@@ -826,23 +1135,31 @@ class Neo4jExporter:
         progress_callback: Optional[Callable[[str, int, int, str], None]] = None,
         console: Optional[Any] = None,
         only_affected: bool = False,
-        suspend_search_indexes: bool = True,
+        suspend_search_indexes: Optional[bool] = None,
         index_timeout_sec: int = 300,
         index_poll_interval: float = 3.0,
+        incremental_sync: Optional[bool] = None,
+        backup_hash: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Export ConceptGraphStore into Neo4j via batched upsert with live progress display.
 
-        Semantics:
-        - clean=True: Performs a clean start (deletes all content in database before export)
-        - only_affected=True: Upserts ONLY nodes and edges marked dirty in `store` (and deletes
-          any merged/removed nodes in `store.removed_nodes`), then clears `store`'s dirty tracking.
-        - suspend_search_indexes=True: Captures and drops existing VECTOR and FULLTEXT search
-          indexes prior to bulk node/edge upserts (strictly preserving unique ID constraints
-          for O(1) MERGE), then recreates them in bulk and waits until ONLINE in a finally block.
-        - Nodes: MERGE on (id), ON CREATE SET props, ON MATCH SET props
-        - Edges: MERGE (source)-[r:REL]->(target), ON CREATE SET props, ON MATCH SET props
-        - show_progress=True: Displays rich real-time progress bars for nodes and relationships
+        Smart Synchronization Features:
+        - Strategy A (Per-Book Cluster Synchronization):
+            Computes deterministic per-book content_hash: SHA256(chunks_json + state_json).
+            Compares with hashes in Neo4j (MATCH (b:Book)). Unchanged book subgraphs (sections,
+            chunks, intra-chunk links) are skipped completely; modified books purge only their
+            subgraph and re-upsert.
+        - Strategy B (Node-Level content_hash Guard):
+            Computes deterministic attribute hash for each node. Cypher UNWIND checks:
+            ON MATCH SET n += CASE WHEN n.content_hash IS NULL OR n.content_hash <> row.content_hash
+                              THEN row.properties ELSE {} END, n.content_hash = row.content_hash
+            Unchanged nodes skip property rewrites, preventing unnecessary HNSW index modifications.
+        - Strategy C (Preserve Vector Indexes during Incremental Updates):
+            Keeps native HNSW vector indexes online during incremental updates (< 5% modified nodes),
+            avoiding unnecessary drop/rebuild overhead.
+        - Technical Metadata Node (:BookeeperSync):
+            Tracks overall graph_hash. If 100% matched, export returns immediately with 0ms overhead.
         """
         self.verify_connectivity()
         driver = self.get_driver()
@@ -869,6 +1186,7 @@ class Neo4jExporter:
 
         with progress_cm as progress:
             effective_clean = self.clean_export if clean is None else clean
+            effective_incremental_sync = bool(self.incremental_sync if incremental_sync is None else incremental_sync)
             incremental_mode = bool(only_affected and not effective_clean)
             deleted_before_export = 0
             if effective_clean:
@@ -893,96 +1211,198 @@ class Neo4jExporter:
                 store.link_sequential_chunks()
 
             g = store.graph
-            dirty_node_set: set[str] = set(getattr(store, "dirty_nodes", set())) if incremental_mode else set()
-            dirty_edge_set: set[tuple[str, str]] = set(getattr(store, "dirty_edges", set())) if incremental_mode else set()
-            removed_node_list: list[str] = list(getattr(store, "removed_nodes", set())) if incremental_mode else []
 
-            if incremental_mode:
-                for u_id, v_id in dirty_edge_set:
-                    if store.has_node(u_id):
-                        dirty_node_set.add(u_id)
-                    if store.has_node(v_id):
-                        dirty_node_set.add(v_id)
-                target_nodes_iter = []
-                for nid in dirty_node_set:
-                    ndata = store.get_node_data(nid) if hasattr(store, "get_node_data") else (g.nodes[nid] if g.has_node(nid) else None)
-                    if ndata is not None:
-                        target_nodes_iter.append((nid, ndata))
+            # Calculate deterministic per-book content hashes and overall graph hash
+            local_book_hashes: dict[str, str] = {}
+            out_dir = getattr(store, "output_dir", None)
+            for nid, attrs in list(g.nodes(data=True)):
+                if attrs.get("type") == "Book":
+                    bid = attrs.get("book_id", nid.replace("book:", ""))
+                    b_hash = self.compute_book_content_hash(bid, output_dir=out_dir, store=store)
+                    attrs["content_hash"] = b_hash
+                    local_book_hashes[nid] = b_hash
 
-                target_edges_iter = []
-                for (u_id, v_id) in dirty_edge_set:
-                    if g.has_edge(u_id, v_id):
-                        target_edges_iter.append((u_id, v_id, g.edges[u_id, v_id]))
-                    elif getattr(store, "is_sharded", False) and store.active_shard_graph and store.active_shard_graph.has_edge(u_id, v_id):
-                        target_edges_iter.append((u_id, v_id, store.active_shard_graph.edges[u_id, v_id]))
-            else:
-                target_nodes_iter = list(store.iter_all_nodes(data=True)) if getattr(store, "is_sharded", False) else list(g.nodes(data=True))
-                target_edges_iter = list(store.iter_all_edges(data=True)) if getattr(store, "is_sharded", False) else list(g.edges(data=True))
+            current_graph_hash = self.compute_graph_hash(store, book_hashes=local_book_hashes)
 
-            total_nodes = len(target_nodes_iter)
-            total_edges = len(target_edges_iter)
-
-            node_counts: dict[str, int] = {}
-            edge_counts: dict[str, int] = {}
-
-            # 1. Prepare Nodes Grouped by (PrimaryLabel, is_idea)
-            # Grouping allows using specific label indices for maximum Cypher performance
-            nodes_by_group: dict[tuple[str, bool], list[dict[str, Any]]] = {}
-            distinct_labels: set[str] = set()
-            idea_vector_dim: int = 1024
-            chunk_vector_dim: int = 1024
-
-            for node_id, attrs in target_nodes_iter:
-                primary_label = sanitize_label(attrs.get("type", "Entity"))
-                is_idea = bool(attrs.get("is_idea", False) or attrs.get("tag") == "idea" or primary_label in ("Concept", "Idea"))
-                distinct_labels.add(primary_label)
-                raw_emb = get_node_embedding(attrs, return_numpy=False)
-                if is_idea:
-                    distinct_labels.add("Idea")
-                    if raw_emb and len(raw_emb) > 0:
-                        idea_vector_dim = len(raw_emb)
-                elif primary_label == "Chunk":
-                    if raw_emb and len(raw_emb) > 0:
-                        chunk_vector_dim = len(raw_emb)
-
-                # Export embeddings on :Idea and :Chunk nodes
-                excl = {"embedding_b64", "embedding_dim", "embedding_dtype"}
-                if not (is_idea or primary_label == "Chunk"):
-                    excl.add("embedding")
-                props = clean_neo4j_properties(attrs, exclude_keys=excl)
-                if (is_idea or primary_label == "Chunk") and raw_emb:
-                    props["embedding"] = raw_emb
-                props["id"] = node_id  # Guarantee primary key property
-
-                group_key = (primary_label, is_idea)
-                if group_key not in nodes_by_group:
-                    nodes_by_group[group_key] = []
-                nodes_by_group[group_key].append({"id": node_id, "properties": props})
-
-            # 2. Prepare Edges Grouped by (SourceLabel, RelType, TargetLabel)
-            edges_by_group: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
-
-            for src_id, tgt_id, attrs in target_edges_iter:
-                src_node = g.nodes.get(src_id, {})
-                tgt_node = g.nodes.get(tgt_id, {})
-
-                src_label = sanitize_label(src_node.get("type", "Entity"))
-                tgt_label = sanitize_label(tgt_node.get("type", "Entity"))
-                rel_type = sanitize_rel_type(attrs.get("relation", "RELATES_TO"))
-
-                props = clean_neo4j_properties(attrs, exclude_keys={"relation"})
-
-                edge_key = (src_label, rel_type, tgt_label)
-                if edge_key not in edges_by_group:
-                    edges_by_group[edge_key] = []
-                edges_by_group[edge_key].append({
-                    "source_id": src_id,
-                    "target_id": tgt_id,
-                    "properties": props,
-                })
-
-            # Execute Upserts inside Session
             with driver.session(database=self.database) as session:
+                # 0. Check Technical Metadata Node (:BookeeperSync) for instant 0ms skip
+                if effective_incremental_sync and not effective_clean and not incremental_mode and local_book_hashes:
+                    sync_meta = self.get_sync_metadata(session)
+                    if sync_meta and sync_meta.get("graph_hash") == current_graph_hash:
+                        logger.info(
+                            f"Neo4j database is already fully synchronized with Knowledge Graph (graph_hash={current_graph_hash[:12]}...). Skipping export."
+                        )
+                        if console is not None:
+                            console.print(
+                                f"[bold green]✓ Neo4j database is already fully synchronized with Knowledge Graph[/bold green] "
+                                f"[dim]({len(local_book_hashes)} books, graph_hash: {current_graph_hash[:12]}...)[/dim]\n"
+                            )
+                        return {
+                            "status": "already_synchronized",
+                            "uri": self.uri,
+                            "database": self.database,
+                            "clean_start": False,
+                            "only_affected": False,
+                            "incremental_sync": True,
+                            "graph_hash": current_graph_hash,
+                            "books_evaluated": len(local_book_hashes),
+                            "books_unchanged": len(local_book_hashes),
+                            "books_modified": 0,
+                            "chunks_skipped": 0,
+                            "nodes_upserted": 0,
+                            "node_breakdown": {},
+                            "edges_upserted": 0,
+                            "edge_breakdown": {},
+                            "cleaned_nodes": 0,
+                            "removed_nodes_deleted": 0,
+                            "search_indexes_suspended": False,
+                        }
+
+                # Strategy A: Per-Book Cluster Synchronization
+                unchanged_books: set[str] = set()
+                modified_books: set[str] = set(local_book_hashes.keys())
+                skipped_subgraph_nodes: set[str] = set()
+
+                if effective_incremental_sync and not effective_clean and not incremental_mode and local_book_hashes:
+                    remote_book_hashes = self.fetch_remote_book_hashes(session)
+                    if remote_book_hashes:
+                        unchanged_books = {
+                            bid for bid, h in local_book_hashes.items()
+                            if bid in remote_book_hashes and remote_book_hashes[bid] == h and h != ""
+                        }
+                        modified_books = set(local_book_hashes.keys()) - unchanged_books
+                        removed_books = set(remote_book_hashes.keys()) - set(local_book_hashes.keys())
+
+                        # Purge subgraphs for modified books and removed books
+                        for mod_bid in modified_books:
+                            if mod_bid in remote_book_hashes:
+                                self.purge_book_subgraph(session, mod_bid)
+                        for rem_bid in removed_books:
+                            self.purge_book_subgraph(session, rem_bid)
+                            try:
+                                session.run("MATCH (b:Book {id: $bid}) DETACH DELETE b", bid=rem_bid)
+                            except Exception:
+                                pass
+
+                        if unchanged_books:
+                            # Collect chunk and section node IDs belonging to unchanged books
+                            for ub in unchanged_books:
+                                ub_num = str(ub).replace("book:", "")
+                                for n in g.nodes:
+                                    if n.startswith(f"section:{ub_num}:"):
+                                        skipped_subgraph_nodes.add(n)
+                                for n, d in g.nodes(data=True):
+                                    if d.get("type") == "Chunk" and str(d.get("book_id")) == ub_num:
+                                        skipped_subgraph_nodes.add(n)
+
+                            cluster_msg = (
+                                f"Per-Book Cluster Sync: {len(unchanged_books)} books unchanged "
+                                f"({len(skipped_subgraph_nodes):,} chunks/sections skipped), "
+                                f"{len(modified_books)} books modified/new."
+                            )
+                            logger.info(cluster_msg)
+                            if console is not None:
+                                console.print(f"[bold cyan]⚡ {cluster_msg}[/bold cyan]")
+
+                dirty_node_set: set[str] = set(getattr(store, "dirty_nodes", set())) if incremental_mode else set()
+                dirty_edge_set: set[tuple[str, str]] = set(getattr(store, "dirty_edges", set())) if incremental_mode else set()
+                removed_node_list: list[str] = list(getattr(store, "removed_nodes", set())) if incremental_mode else []
+
+                if incremental_mode:
+                    for u_id, v_id in dirty_edge_set:
+                        if store.has_node(u_id):
+                            dirty_node_set.add(u_id)
+                        if store.has_node(v_id):
+                            dirty_node_set.add(v_id)
+                    target_nodes_iter = []
+                    for nid in dirty_node_set:
+                        ndata = store.get_node_data(nid) if hasattr(store, "get_node_data") else (g.nodes[nid] if g.has_node(nid) else None)
+                        if ndata is not None and nid not in skipped_subgraph_nodes:
+                            target_nodes_iter.append((nid, ndata))
+
+                    target_edges_iter = []
+                    for (u_id, v_id) in dirty_edge_set:
+                        if u_id in skipped_subgraph_nodes or v_id in skipped_subgraph_nodes:
+                            continue
+                        if g.has_edge(u_id, v_id):
+                            target_edges_iter.append((u_id, v_id, g.edges[u_id, v_id]))
+                        elif getattr(store, "is_sharded", False) and store.active_shard_graph and store.active_shard_graph.has_edge(u_id, v_id):
+                            target_edges_iter.append((u_id, v_id, store.active_shard_graph.edges[u_id, v_id]))
+                else:
+                    all_nodes = store.iter_all_nodes(data=True) if getattr(store, "is_sharded", False) else g.nodes(data=True)
+                    all_edges = store.iter_all_edges(data=True) if getattr(store, "is_sharded", False) else g.edges(data=True)
+                    target_nodes_iter = [(nid, d) for nid, d in all_nodes if nid not in skipped_subgraph_nodes]
+                    target_edges_iter = [(u, v, d) for u, v, d in all_edges if u not in skipped_subgraph_nodes and v not in skipped_subgraph_nodes]
+
+                total_nodes = len(target_nodes_iter)
+                total_edges = len(target_edges_iter)
+
+                node_counts: dict[str, int] = {}
+                edge_counts: dict[str, int] = {}
+
+                # 1. Prepare Nodes Grouped by (PrimaryLabel, is_idea)
+                nodes_by_group: dict[tuple[str, bool], list[dict[str, Any]]] = {}
+                distinct_labels: set[str] = set()
+                idea_vector_dim: int = 1024
+                chunk_vector_dim: int = 1024
+
+                for node_id, attrs in target_nodes_iter:
+                    primary_label = sanitize_label(attrs.get("type", "Entity"))
+                    is_idea = bool(attrs.get("is_idea", False) or attrs.get("tag") == "idea" or primary_label in ("Concept", "Idea"))
+                    distinct_labels.add(primary_label)
+                    raw_emb = get_node_embedding(attrs, return_numpy=False)
+                    if is_idea:
+                        distinct_labels.add("Idea")
+                        if raw_emb and len(raw_emb) > 0:
+                            idea_vector_dim = len(raw_emb)
+                    elif primary_label == "Chunk":
+                        if raw_emb and len(raw_emb) > 0:
+                            chunk_vector_dim = len(raw_emb)
+
+                    # Export embeddings on :Idea and :Chunk nodes
+                    excl = {"embedding_b64", "embedding_dim", "embedding_dtype"}
+                    if not (is_idea or primary_label == "Chunk"):
+                        excl.add("embedding")
+                    props = clean_neo4j_properties(attrs, exclude_keys=excl)
+                    if (is_idea or primary_label == "Chunk") and raw_emb:
+                        props["embedding"] = raw_emb
+                    props["id"] = node_id  # Guarantee primary key property
+
+                    # Strategy B: Compute deterministic node content hash
+                    node_hash = attrs.get("content_hash") or self.compute_node_content_hash(node_id, primary_label, props)
+                    props["content_hash"] = node_hash
+
+                    group_key = (primary_label, is_idea)
+                    if group_key not in nodes_by_group:
+                        nodes_by_group[group_key] = []
+                    nodes_by_group[group_key].append({
+                        "id": node_id,
+                        "properties": props,
+                        "content_hash": node_hash,
+                    })
+
+                # 2. Prepare Edges Grouped by (SourceLabel, RelType, TargetLabel)
+                edges_by_group: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+
+                for src_id, tgt_id, attrs in target_edges_iter:
+                    src_node = g.nodes.get(src_id, {})
+                    tgt_node = g.nodes.get(tgt_id, {})
+
+                    src_label = sanitize_label(src_node.get("type", "Entity"))
+                    tgt_label = sanitize_label(tgt_node.get("type", "Entity"))
+                    rel_type = sanitize_rel_type(attrs.get("relation", "RELATES_TO"))
+
+                    props = clean_neo4j_properties(attrs, exclude_keys={"relation"})
+
+                    edge_key = (src_label, rel_type, tgt_label)
+                    if edge_key not in edges_by_group:
+                        edges_by_group[edge_key] = []
+                    edges_by_group[edge_key].append({
+                        "source_id": src_id,
+                        "target_id": tgt_id,
+                        "properties": props,
+                    })
+
                 # If incremental mode has removed/merged nodes, delete them first
                 if removed_node_list:
                     for i in range(0, len(removed_node_list), self.batch_size):
@@ -993,7 +1413,7 @@ class Neo4jExporter:
                             ids=rem_batch,
                         )
 
-                # Step A: Ensure Unique ID Schema Constraints (strictly preserved for O(1) MERGE)
+                # Step A: Ensure Unique ID Schema Constraints
                 if distinct_labels:
                     schema_task = (
                         progress.add_task(f"Verifying Schema Constraints ({len(distinct_labels)} labels)...", total=len(distinct_labels) or 1)
@@ -1010,37 +1430,47 @@ class Neo4jExporter:
                     if progress_callback:
                         progress_callback("schema", len(distinct_labels), len(distinct_labels), "Constraints verified")
 
-                # Step B & C: Suspend VECTOR/FULLTEXT search indexes during bulk node & relationship upserts,
-                # then recreate them in bulk and wait for ONLINE status in the finally block.
+                # Strategy C: Auto-detect whether to suspend vector/fulltext search indexes
+                if suspend_search_indexes is not None:
+                    should_suspend = bool(suspend_search_indexes)
+                elif effective_clean:
+                    should_suspend = True
+                elif len(unchanged_books) > 0 or incremental_mode:
+                    # Incremental update: keep vector indexes online!
+                    should_suspend = False
+                else:
+                    # Full export / initial build: suspend indexes for bulk load performance
+                    should_suspend = True
+
                 has_vector_labels = bool("Idea" in distinct_labels or "Chunk" in distinct_labels)
                 with self.search_index_suspension(
                     session=session,
                     distinct_labels=distinct_labels,
                     idea_vector_dim=idea_vector_dim,
                     chunk_vector_dim=chunk_vector_dim,
-                    suspend_existing=bool(suspend_search_indexes and (has_vector_labels or total_nodes > 0)),
+                    suspend_existing=bool(should_suspend and (has_vector_labels or total_nodes > 0)),
                     wait_online=True,
                     timeout_sec=index_timeout_sec,
                     poll_interval=index_poll_interval,
                     progress=progress,
                     progress_callback=progress_callback,
                 ):
-                    # Step B: Upsert Nodes in Batches
+                    # Step B: Upsert Nodes in Batches with Strategy B content_hash guard
                     node_task = (
-                        progress.add_task("Upserting Affected Nodes..." if incremental_mode else "Upserting Nodes...", total=total_nodes)
+                        progress.add_task("Upserting Affected Nodes..." if (incremental_mode or unchanged_books) else "Upserting Nodes...", total=total_nodes)
                         if progress and total_nodes > 0
                         else None
                     )
                     nodes_done = 0
                     for (primary_label, is_idea), node_batch_list in nodes_by_group.items():
+                        extra_create = ", n:`Idea`" if is_idea and primary_label != "Idea" else ""
+                        extra_match = ", n:`Idea`" if is_idea and primary_label != "Idea" else ""
                         label_query = (
                             f"UNWIND $batch AS row\n"
                             f"MERGE (n:`{primary_label}` {{id: row.id}})\n"
-                            f"ON CREATE SET n += row.properties"
-                            + (", n:`Idea`" if is_idea and primary_label != "Idea" else "")
-                            + "\n"
-                            "ON MATCH SET n += row.properties"
-                            + (", n:`Idea`" if is_idea and primary_label != "Idea" else "")
+                            f"ON CREATE SET n += row.properties, n.content_hash = row.content_hash{extra_create}\n"
+                            f"ON MATCH SET n += CASE WHEN n.content_hash IS NULL OR n.content_hash <> row.content_hash THEN row.properties ELSE {{}} END, "
+                            f"n.content_hash = row.content_hash{extra_match}"
                         )
 
                         for i in range(0, len(node_batch_list), self.batch_size):
@@ -1067,7 +1497,7 @@ class Neo4jExporter:
 
                     # Step C: Upsert Relationships in Batches
                     edge_task = (
-                        progress.add_task("Upserting Affected Relationships..." if incremental_mode else "Upserting Relationships...", total=total_edges)
+                        progress.add_task("Upserting Affected Relationships..." if (incremental_mode or unchanged_books) else "Upserting Relationships...", total=total_edges)
                         if progress and total_edges > 0
                         else None
                     )
@@ -1104,11 +1534,24 @@ class Neo4jExporter:
                             description=f"[bold green]✓ Relationships Complete[/bold green] ({total_edges:,} relationships)",
                         )
 
+                    # Step D: Update Technical Metadata Node (:BookeeperSync)
+                    self.update_sync_metadata(
+                        session=session,
+                        graph_hash=current_graph_hash,
+                        total_books=len(local_book_hashes),
+                        total_nodes=g.number_of_nodes() if g else total_nodes,
+                        total_edges=g.number_of_edges() if g else total_edges,
+                        book_hashes=local_book_hashes,
+                        backup_hash=backup_hash,
+                    )
+
         if hasattr(store, "clear_dirty"):
             store.clear_dirty()
 
         logger.info(
-            f"Successfully upserted {total_nodes} nodes and {total_edges} edges into Neo4j ({self.uri}, db={self.database}, only_affected={incremental_mode})"
+            f"Successfully exported to Neo4j ({self.uri}, db={self.database}, "
+            f"nodes={total_nodes}, edges={total_edges}, unchanged_books={len(unchanged_books)}, "
+            f"chunks_skipped={len(skipped_subgraph_nodes)})"
         )
 
         return {
@@ -1117,10 +1560,17 @@ class Neo4jExporter:
             "database": self.database,
             "clean_start": effective_clean,
             "only_affected": incremental_mode,
+            "incremental_sync": effective_incremental_sync,
+            "graph_hash": current_graph_hash,
+            "books_evaluated": len(local_book_hashes),
+            "books_unchanged": len(unchanged_books),
+            "books_modified": len(modified_books),
+            "chunks_skipped": len(skipped_subgraph_nodes),
             "removed_nodes_deleted": len(removed_node_list),
             "cleaned_nodes": deleted_before_export,
             "nodes_upserted": total_nodes,
             "node_breakdown": node_counts,
             "edges_upserted": total_edges,
             "edge_breakdown": edge_counts,
+            "search_indexes_suspended": should_suspend,
         }

@@ -37,7 +37,7 @@ import numpy as np
 from langchain_core.embeddings import Embeddings
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -281,6 +281,143 @@ class ConsolidatedIdeaOutput(BaseModel):
         le=10,
         description="Significance and depth weight from 0 to 10.",
     )
+
+
+class ConsolidatedIdeaBatchItem(BaseModel):
+    """Structured LLM synthesis for an individual idea inside a batched prompt."""
+
+    idea_id: Optional[str] = Field(
+        default=None,
+        description="Exact idea ID matching the <idea id=\"...\"> tag in the prompt.",
+    )
+    canonical_name: Optional[str] = Field(
+        default=None,
+        description="Canonical name of the target idea / concept.",
+    )
+    brief_description: str = Field(
+        description="Cohesive 1-2 sentence description capturing the macro-identity."
+    )
+    detailed_explanation: str = Field(
+        description="Synthesized comprehensive explanation integrating distinct events, cause-and-effect chains, mechanisms, and conditions across all chunks without dropping earlier facts."
+    )
+    related_entities: List[str] = Field(
+        default_factory=list,
+        description="Explicit related entities or concepts mentioned across the pooled observations.",
+    )
+    category: Optional[str] = Field(
+        default=None,
+        description="Domain category classification (e.g. Architectural Pattern, Principle, Mechanism).",
+    )
+    weight: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=10,
+        description="Significance and depth weight from 0 to 10.",
+    )
+
+
+class BatchConsolidatedIdeaOutput(BaseModel):
+    """Synthesis output containing consolidated ideas for multiple combined idea clusters."""
+
+    ideas: List[ConsolidatedIdeaBatchItem] = Field(
+        default_factory=list,
+        description="List of consolidated ideas matching each provided idea tag.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def sanitize_batch(cls, data: Any) -> Any:
+        if isinstance(data, list):
+            return {"ideas": data}
+        if isinstance(data, dict):
+            if "ideas" in data and isinstance(data["ideas"], list):
+                return data
+            for alt_key in ("consolidated_ideas", "items", "results", "concepts", "clusters", "chunks"):
+                if alt_key in data and isinstance(data[alt_key], list):
+                    data["ideas"] = data[alt_key]
+                    return data
+            # Check if dict keys are idea IDs (e.g. {"idea_1": {...}, "idea_2": {...}})
+            items = []
+            for k, val in data.items():
+                if isinstance(val, dict):
+                    val_copy = dict(val)
+                    val_copy.setdefault("idea_id", str(k))
+                    items.append(val_copy)
+            if items:
+                return {"ideas": items}
+        return data
+
+
+def salvage_truncated_json(raw: str) -> Optional[Dict[str, Any]]:
+    """
+    Attempt to recover completed idea items from a JSON payload that was truncated mid-stream (e.g. at token limit).
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    last_brace = raw.rfind('}')
+    while last_brace > 0:
+        candidate = raw[:last_brace + 1].strip()
+        for suffix in (']}', '}', ']}'):
+            try:
+                data = json.loads(candidate + suffix)
+                if isinstance(data, dict):
+                    for k in ("ideas", "consolidated_ideas", "items", "results"):
+                        if k in data and isinstance(data[k], list) and len(data[k]) > 0:
+                            return data
+            except Exception:
+                pass
+        last_brace = raw.rfind('}', 0, last_brace)
+    return None
+
+
+def batch_ideas_by_context_size(
+    clusters: Sequence[IdeaCluster],
+    format_payload_fn: Callable[[IdeaCluster], Tuple[str, List[str]]],
+    max_context_size: int = 7168,
+    max_idea_batch: Optional[int] = 15,
+    tag_overhead: int = 150,
+) -> List[List[IdeaCluster]]:
+    """
+    Combine idea clusters into batches up to max_context_size bytes (default: 7168 bytes / 7KB)
+    and up to max_idea_batch items (default: 15).
+    Each idea's formatted payload and XML tag overhead are accounted for.
+    If a single idea cluster exceeds max_context_size, it is placed in its own single-item batch.
+    """
+    if max_context_size <= 0:
+        return [[c] for c in clusters]
+
+    batches: List[List[IdeaCluster]] = []
+    current_batch: List[IdeaCluster] = []
+    current_size = 0
+
+    for cluster in clusters:
+        payload, _ = format_payload_fn(cluster)
+        payload_size = len(payload.encode("utf-8")) + tag_overhead
+        can_fit_size = (current_size + payload_size <= max_context_size)
+        can_fit_count = (max_idea_batch is None or max_idea_batch <= 0 or len(current_batch) < max_idea_batch)
+
+        if not current_batch:
+            current_batch.append(cluster)
+            current_size = payload_size
+        elif can_fit_size and can_fit_count:
+            current_batch.append(cluster)
+            current_size += payload_size
+        else:
+            batches.append(current_batch)
+            current_batch = [cluster]
+            current_size = payload_size
+
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
 
 
 class IdeaPostProcessorReport(BaseModel):
@@ -595,6 +732,8 @@ class IdeaPostProcessor:
         checkpoint_interval: int = 100,
         resume: bool = True,
         async_save: bool = True,
+        max_idea_batch: int = 15,
+        max_context_size: int = 7168,
     ):
         self.pool = pool
         self.embeddings = embeddings
@@ -609,6 +748,8 @@ class IdeaPostProcessor:
         self.checkpoint_interval = checkpoint_interval
         self.resume = resume
         self.async_save = async_save
+        self.max_idea_batch = max_idea_batch
+        self.max_context_size = max_context_size
 
     @classmethod
     def from_settings(
@@ -647,6 +788,16 @@ class IdeaPostProcessor:
             if async_save is not None
             else getattr(settings.dual_pass, "async_save", True)
         )
+        eff_max_idea_batch = (
+            settings.dual_pass.max_idea_batch
+            if getattr(settings.dual_pass, "max_idea_batch", None) is not None
+            else min(getattr(settings, "max_chunk_batch", 15), 15)
+        )
+        eff_max_context_size = (
+            settings.dual_pass.max_context_size
+            if getattr(settings.dual_pass, "max_context_size", None) is not None
+            else getattr(settings, "max_context_size", 7168)
+        )
 
         # Initialize pool if not provided
         if pool is None:
@@ -680,6 +831,8 @@ class IdeaPostProcessor:
             checkpoint_interval=eff_interval,
             resume=eff_resume,
             async_save=eff_async_save,
+            max_idea_batch=eff_max_idea_batch,
+            max_context_size=eff_max_context_size,
         )
 
     # --------------------------------------------------------------------------
@@ -1336,37 +1489,73 @@ class IdeaPostProcessor:
     # --------------------------------------------------------------------------
 
     def format_consolidation_payload(
-        self, cluster: IdeaCluster
+        self,
+        cluster: IdeaCluster,
+        max_obs: int = 3,
+        max_desc_chars: int = 150,
+        max_quotes: Optional[int] = None,
     ) -> Tuple[str, List[str]]:
         """
         Format chronologically linearized observations and top representative quotes
-        into structured bullet points for the LLM.
+        into compact structured bullet points for the LLM.
         """
-        quotes = cluster.get_representative_quotes(max_quotes=self.max_quotes)
+        eff_max_quotes = max_quotes if max_quotes is not None else min(self.max_quotes, 2)
+        quotes = cluster.get_representative_quotes(max_quotes=eff_max_quotes)
         ordered_obs = cluster.get_linearized_observations()
+        selected_obs = ordered_obs[:max_obs] if len(ordered_obs) > max_obs else ordered_obs
 
         bullet_points = []
-        for idx, obs in enumerate(ordered_obs, 1):
+        for idx, obs in enumerate(selected_obs, 1):
             pos_label = obs.position_str or f"Chunk {obs.chunk_id or idx}"
-            desc = obs.local_detailed or obs.local_brief or "Mentioned concept."
-            quote_part = f' | Supporting Quote: "{obs.quote}"' if obs.quote else ""
-            bullet_points.append(f"- [Obs #{idx} | Pos: {pos_label}]{quote_part}\n  Context: {desc}")
+            desc = (obs.local_detailed or obs.local_brief or "Mentioned concept.").strip()
+            if len(desc) > max_desc_chars:
+                desc = desc[:max_desc_chars].rsplit(" ", 1)[0] + "..."
+            quote_part = ""
+            if obs.quote:
+                q_clean = obs.quote.strip()
+                if len(q_clean) > 100:
+                    q_clean = q_clean[:100].rsplit(" ", 1)[0] + "..."
+                quote_part = f' | Quote: "{q_clean}"'
+            bullet_points.append(f"- [Pos: {pos_label}]{quote_part} Context: {desc}")
+
+        compact_quotes = []
+        for q in quotes:
+            q_clean = q.strip()
+            if len(q_clean) > 120:
+                q_clean = q_clean[:120].rsplit(" ", 1)[0] + "..."
+            compact_quotes.append(f'* "{q_clean}"')
 
         payload = (
-            f"Target Idea / Concept: {cluster.canonical_name}\n"
-            f"Known Aliases: {', '.join(sorted(cluster.aliases)) if cluster.aliases else 'None'}\n"
-            f"Total Occurrences across Corpus: {cluster.total_occurrences}\n\n"
-            f"Chronological Observations:\n"
+            f"Concept: {cluster.canonical_name}\n"
+            f"Occurrences: {cluster.total_occurrences}\n"
+            f"Observations:\n"
             + ("\n".join(bullet_points) if bullet_points else "- Single mention.")
-            + "\n\n"
-            f"Top Source Quotes:\n"
-            + ("\n".join(f'* "{q}"' for q in quotes) if quotes else "* None.")
+            + (("\nTop Quotes:\n" + "\n".join(compact_quotes)) if compact_quotes else "")
         )
         return payload, quotes
 
     # --------------------------------------------------------------------------
     # Step 3: LLM Consolidation & Synthesis (Second Pass)
     # --------------------------------------------------------------------------
+
+    def batch_ideas(
+        self,
+        clusters: Sequence[IdeaCluster],
+        max_context_size: Optional[int] = None,
+        max_idea_batch: Optional[int] = None,
+    ) -> List[List[IdeaCluster]]:
+        """
+        Combine idea clusters into batches up to maximum context size (default: self.max_context_size / 5KB)
+        and maximum idea count (default: self.max_idea_batch / 3).
+        """
+        size_limit = self.max_context_size if max_context_size is None else max_context_size
+        count_limit = self.max_idea_batch if max_idea_batch is None else max_idea_batch
+        return batch_ideas_by_context_size(
+            clusters,
+            format_payload_fn=self.format_consolidation_payload,
+            max_context_size=size_limit,
+            max_idea_batch=count_limit,
+        )
 
     def synthesize_cluster(self, cluster: IdeaCluster) -> ConsolidatedIdeaOutput:
         """
@@ -1420,6 +1609,16 @@ class IdeaPostProcessor:
                     res = structured_llm.invoke(messages)
                     if isinstance(res, ConsolidatedIdeaOutput):
                         return res
+                    if isinstance(res, BatchConsolidatedIdeaOutput):
+                        if res.ideas:
+                            item = res.ideas[0]
+                            return ConsolidatedIdeaOutput(
+                                brief_description=item.brief_description,
+                                detailed_explanation=item.detailed_explanation,
+                                related_entities=item.related_entities,
+                                category=item.category or cluster.category,
+                                weight=item.weight if item.weight is not None else cluster.max_weight,
+                            )
                     if isinstance(res, dict):
                         return ConsolidatedIdeaOutput.model_validate(res)
                 except Exception as exc:
@@ -1482,7 +1681,18 @@ class IdeaPostProcessor:
                     capability="llm",
                     input_chars=input_chars,
                     task_type="llm",
+                    quarantine_server=False,
                 )
+                if isinstance(result, BatchConsolidatedIdeaOutput):
+                    if result.ideas:
+                        item = result.ideas[0]
+                        return ConsolidatedIdeaOutput(
+                            brief_description=item.brief_description,
+                            detailed_explanation=item.detailed_explanation,
+                            related_entities=item.related_entities,
+                            category=item.category or cluster.category,
+                            weight=item.weight if item.weight is not None else cluster.max_weight,
+                        )
                 return result
             except Exception as e:
                 logger.warning(
@@ -1492,6 +1702,223 @@ class IdeaPostProcessor:
 
         # Deterministic fallback when LLM is unavailable / failed
         return self._deterministic_consolidation(cluster, quotes)
+
+    def synthesize_cluster_batch(
+        self, clusters: List[IdeaCluster]
+    ) -> Dict[str, ConsolidatedIdeaOutput]:
+        """
+        Submit multiple idea clusters simultaneously to consolidation model
+        in a single LLM prompt with XML tags, returning a mapping of canonical_name -> ConsolidatedIdeaOutput.
+        If a cluster is missing from batch output or if the call fails, gracefully falls back to individual synthesis.
+        """
+        if not clusters:
+            return {}
+        if len(clusters) == 1:
+            res_single = self.synthesize_cluster(clusters[0])
+            if isinstance(res_single, BatchConsolidatedIdeaOutput):
+                if res_single.ideas:
+                    item = res_single.ideas[0]
+                    res_single = ConsolidatedIdeaOutput(
+                        brief_description=item.brief_description,
+                        detailed_explanation=item.detailed_explanation,
+                        related_entities=item.related_entities,
+                        category=item.category or clusters[0].category,
+                        weight=item.weight if item.weight is not None else clusters[0].max_weight,
+                    )
+            return {clusters[0].canonical_name: res_single}
+
+        idea_blocks: List[str] = []
+        cluster_by_id: Dict[str, IdeaCluster] = {}
+        cluster_quotes: Dict[str, List[str]] = {}
+
+        for idx, cluster in enumerate(clusters, start=1):
+            idea_id = f"idea_{idx}"
+            cluster_by_id[idea_id] = cluster
+            payload, quotes = self.format_consolidation_payload(cluster)
+            cluster_quotes[cluster.canonical_name] = quotes
+            block = (
+                f'<idea id="{idea_id}" name="{cluster.canonical_name}">\n'
+                f"{payload}\n"
+                f"</idea>"
+            )
+            idea_blocks.append(block)
+
+        system_prompt = (
+            "You are a Principal Knowledge Graph Architect and Domain Ontologist.\n"
+            "Your task is Second-Pass Idea Consolidation: synthesize a unified, definitive definition "
+            "for multiple distinct ideas based strictly on their chronologically ordered observations "
+            "and supporting quotes collected across the source material.\n"
+            'Multiple ideas are provided simultaneously, each enclosed within <idea id="..." name="..."> ... </idea> tags.\n\n'
+            "Requirements for each idea:\n"
+            "1. Process each idea independently and return a separate consolidated result matching its idea_id.\n"
+            "2. brief_description: A cohesive 1-2 sentence definition capturing the macro-identity and core essence of the idea.\n"
+            "3. detailed_explanation: A focused, cohesive explanation (100-200 words) integrating distinct events, "
+            "cause-and-effect chains, mechanisms, and conditions across all chunks without dropping earlier facts.\n"
+            "4. related_entities: List 2-5 explicit related entities, concepts, or architectural patterns "
+            "discussed across the pooled observations for that specific idea.\n"
+            "5. category: Domain classification (e.g. Architectural Pattern, Principle, Mechanism, Theory, Data Structure).\n"
+            "6. weight: Significance and depth weight from 0 to 10 (higher for novel/specialized architectural concepts).\n"
+            "7. Return strictly valid JSON conforming to the BatchConsolidatedIdeaOutput schema."
+        )
+
+        user_prompt = (
+            "Consolidate and synthesize the following ideas into unified canonical concepts:\n\n"
+            + "\n\n".join(idea_blocks)
+            + "\n\nRespond with valid JSON conforming to the BatchConsolidatedIdeaOutput schema."
+        )
+
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ]
+
+        results: Dict[str, ConsolidatedIdeaOutput] = {}
+
+        if self.pool and self.pool.nodes:
+            def _invoke_fn(url: str) -> BatchConsolidatedIdeaOutput:
+                # 1. Structured ChatOllama invoke
+                try:
+                    llm = ChatOllama(
+                        model=self.model_name,
+                        base_url=url,
+                        temperature=self.temperature,
+                        top_p=0.9,
+                        model_kwargs={"num_predict": 8192},
+                        sync_client_kwargs={"timeout": float(self.timeout)},
+                        client_kwargs={"timeout": float(self.timeout)},
+                    )
+                    structured_llm = llm.with_structured_output(BatchConsolidatedIdeaOutput)
+                    res = structured_llm.invoke(messages)
+                    if isinstance(res, BatchConsolidatedIdeaOutput):
+                        return res
+                    if isinstance(res, dict):
+                        return BatchConsolidatedIdeaOutput.model_validate(res)
+                except Exception as exc:
+                    logger.debug(f"Structured batch invoke failed on {url}, falling back to curl JSON: {exc}")
+
+                # 2. Curl fallback with format="json"
+                if shutil.which("curl"):
+                    msgs_payload = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ]
+                    body = {
+                        "model": self.model_name,
+                        "messages": msgs_payload,
+                        "format": "json",
+                        "options": {"temperature": self.temperature, "top_p": 0.9, "num_predict": 8192},
+                        "stream": False,
+                    }
+                    import subprocess
+
+                    cmd = [
+                        "curl",
+                        "-s",
+                        "--connect-timeout",
+                        "5",
+                        "--max-time",
+                        str(self.timeout),
+                        "-X",
+                        "POST",
+                        f"{url.rstrip('/')}/api/chat",
+                        "-H",
+                        "Content-Type: application/json",
+                        "-d",
+                        json.dumps(body),
+                    ]
+                    p = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                    if p.returncode == 0 and p.stdout.strip():
+                        resp_json = json.loads(p.stdout)
+                        content = resp_json.get("message", {}).get("content", "")
+                        try:
+                            from bookeeper.processing.token_tracker import TokenTracker
+                            TokenTracker.get_instance().record_response_data(
+                                resp_json,
+                                prompt_text=f"{system_prompt}\n{user_prompt}",
+                                completion_text=content,
+                                task_type="llm",
+                            )
+                        except Exception as track_err:
+                            logger.debug(f"Failed to record token usage in postprocessor batch: {track_err}")
+                        try:
+                            return BatchConsolidatedIdeaOutput.model_validate_json(content)
+                        except Exception as parse_err:
+                            salvaged = salvage_truncated_json(content)
+                            if salvaged:
+                                logger.info(
+                                    f"Salvaged {len(salvaged.get('ideas', []))} ideas from partially truncated batch JSON on {url}"
+                                )
+                                return BatchConsolidatedIdeaOutput.model_validate(salvaged)
+                            raise parse_err
+
+                raise RuntimeError(f"Could not synthesize idea batch on {url}")
+
+            try:
+                input_chars = len(system_prompt) + len(user_prompt)
+                batch_res = self.pool.execute_with_failover(
+                    _invoke_fn,
+                    retries=self.retries,
+                    model_name=self.model_name,
+                    capability="llm",
+                    input_chars=input_chars,
+                    task_type="llm",
+                    quarantine_server=False,
+                )
+                if isinstance(batch_res, BatchConsolidatedIdeaOutput):
+                    model_ideas: Dict[str, ConsolidatedIdeaBatchItem] = {}
+                    for item in batch_res.ideas:
+                        if item.idea_id:
+                            model_ideas[str(item.idea_id).strip()] = item
+
+                    for idx_pos, (idea_id, cluster) in enumerate(cluster_by_id.items(), start=1):
+                        matching_item = model_ideas.get(idea_id)
+                        if not matching_item:
+                            # Try fuzzy match by idea_id, integer index, or cluster canonical_name
+                            for m_id, m_val in model_ideas.items():
+                                if m_id in (idea_id, idea_id.replace("idea_", ""), str(idx_pos), cluster.canonical_name):
+                                    matching_item = m_val
+                                    break
+                                if m_val.canonical_name and m_val.canonical_name.lower() == cluster.canonical_name.lower():
+                                    matching_item = m_val
+                                    break
+                        if not matching_item and idx_pos <= len(batch_res.ideas):
+                            matching_item = batch_res.ideas[idx_pos - 1]
+                        if matching_item:
+                            results[cluster.canonical_name] = ConsolidatedIdeaOutput(
+                                brief_description=matching_item.brief_description,
+                                detailed_explanation=matching_item.detailed_explanation,
+                                related_entities=matching_item.related_entities,
+                                category=matching_item.category or cluster.category,
+                                weight=matching_item.weight if matching_item.weight is not None else cluster.max_weight,
+                            )
+                elif isinstance(batch_res, ConsolidatedIdeaOutput):
+                    results[clusters[0].canonical_name] = batch_res
+            except Exception as e:
+                logger.warning(f"Batch idea synthesis LLM call failed across pool: {e}. Falling back to individual synthesis.")
+
+        # For any cluster missing from batch results, fall back to individual synthesis
+        for cluster in clusters:
+            if cluster.canonical_name not in results:
+                try:
+                    res_indiv = self.synthesize_cluster(cluster)
+                    if isinstance(res_indiv, BatchConsolidatedIdeaOutput):
+                        if res_indiv.ideas:
+                            item = res_indiv.ideas[0]
+                            res_indiv = ConsolidatedIdeaOutput(
+                                brief_description=item.brief_description,
+                                detailed_explanation=item.detailed_explanation,
+                                related_entities=item.related_entities,
+                                category=item.category or cluster.category,
+                                weight=item.weight if item.weight is not None else cluster.max_weight,
+                            )
+                    results[cluster.canonical_name] = res_indiv
+                except Exception as fallback_err:
+                    logger.warning(f"Fallback synthesis failed for '{cluster.canonical_name}': {fallback_err}")
+                    results[cluster.canonical_name] = self._deterministic_consolidation(
+                        cluster, cluster_quotes.get(cluster.canonical_name, [])
+                    )
+
+        return results
 
     def _deterministic_consolidation(
         self, cluster: IdeaCluster, quotes: List[str]
@@ -2065,164 +2492,240 @@ class IdeaPostProcessor:
 
         num_affected = len(affected_clusters)
 
+        # Partition affected clusters into:
+        # 1. Single-occurrence (bypassed, 0 LLM calls needed)
+        # 2. Already refined / cached (resumed, 0 LLM calls needed)
+        # 3. Needing synthesis (multi-occurrence >= min_occurrences, batched LLM calls)
+        bypassed_clusters: List[IdeaCluster] = []
+        cached_clusters: List[IdeaCluster] = []
+        clusters_needing_synthesis: List[IdeaCluster] = []
+
+        for c in affected_clusters:
+            if c.total_occurrences < self.min_occurrences and not self._is_cluster_already_refined(c, state_manager):
+                bypassed_clusters.append(c)
+            elif self._is_cluster_already_refined(c, state_manager):
+                cached_clusters.append(c)
+            else:
+                clusters_needing_synthesis.append(c)
+
+        completed = 0
+
         try:
-            # 3 & 4. Process and apply ONLY affected clusters to the graph
-            if console is not None and num_affected > 0:
-                progress = Progress(
-                    SpinnerColumn(),
-                    TextColumn("[bold cyan]Consolidation Progress:[/bold cyan]"),
-                    BarColumn(bar_width=25),
-                    TaskProgressColumn(),
-                    MofNCompleteColumn(),
-                    TextColumn("{task.fields[stats_line]}"),
-                    console=console,
-                )
-                tot_task = progress.add_task("total", total=num_affected, completed=0, stats_line="")
-                first_c = affected_clusters[0]
-                first_is_cached = self._is_cluster_already_refined(first_c, state_manager) or bool(
-                    not (first_c.total_occurrences >= self.min_occurrences)
-                    and state_manager
-                    and state_manager.is_processed(first_c.canonical_name)
-                )
-                if first_c.total_occurrences >= self.min_occurrences:
-                    if first_is_cached:
-                        first_init_text = f"[bold blue]Current Idea:[/bold blue] '{first_c.canonical_name}' | [bold green]✓ Synthesized (resumed)[/bold green]"
-                    else:
-                        first_init_text = (
-                            f"[bold blue]Current Idea:[/bold blue] '{first_c.canonical_name}' "
-                            f"({first_c.total_occurrences} mentions) | [bold yellow]Consolidating with {self.model_name}...[/bold yellow]"
+            # Phase 1: Fast in-memory resolution of single-occurrence & cached clusters
+            for c in bypassed_clusters:
+                output, eff_is_multi, was_resumed = self._process_single_cluster(c, state_manager)
+                edges_added = self.apply_consolidation_to_graph(store, c, output)
+                total_edges_added += edges_added
+                single_occ_count += 1
+                bypassed_names.append(c.canonical_name)
+                if was_resumed:
+                    actual_resumed_count += 1
+                completed += 1
+                if completed % 10 == 0 or completed == num_affected:
+                    pct = (completed / num_affected * 100) if num_affected > 0 else 100.0
+                    if console is not None:
+                        console.print(
+                            f"[bold cyan][Idea Postprocessor][/bold cyan] {completed}/{num_affected} ideas ({pct:.1f}%)"
+                            f" | [dim]{single_occ_count} bypassed[/dim] | +{total_edges_added} edges"
                         )
+                if on_progress:
+                    on_progress(completed, num_affected, c.canonical_name, {
+                        "synthesized": synthesized_count,
+                        "bypassed": single_occ_count,
+                        "resumed": actual_resumed_count,
+                        "edges_added": total_edges_added,
+                    })
+
+            for c in cached_clusters:
+                output, eff_is_multi, was_resumed = self._process_single_cluster(c, state_manager)
+                edges_added = self.apply_consolidation_to_graph(store, c, output)
+                total_edges_added += edges_added
+                actual_resumed_count += 1
+                if eff_is_multi:
+                    synthesized_count += 1
+                    multi_occ_count += 1
+                    synthesized_names.append(c.canonical_name)
                 else:
-                    first_init_text = (
-                        f"[bold blue]Current Idea:[/bold blue] '{first_c.canonical_name}' | [dim]Bypassing (single-occurrence)[/dim]"
+                    single_occ_count += 1
+                    bypassed_names.append(c.canonical_name)
+                completed += 1
+                if completed % 10 == 0 or completed == num_affected:
+                    pct = (completed / num_affected * 100) if num_affected > 0 else 100.0
+                    if console is not None:
+                        console.print(
+                            f"[bold cyan][Idea Postprocessor][/bold cyan] {completed}/{num_affected} ideas ({pct:.1f}%)"
+                            f" | [bold green]✓ {synthesized_count} synthesized[/bold green]"
+                            f" | [dim]{single_occ_count} bypassed[/dim] | +{total_edges_added} edges"
+                        )
+                if on_progress:
+                    on_progress(completed, num_affected, c.canonical_name, {
+                        "synthesized": synthesized_count,
+                        "bypassed": single_occ_count,
+                        "resumed": actual_resumed_count,
+                        "edges_added": total_edges_added,
+                    })
+
+            if console is not None and (bypassed_clusters or cached_clusters):
+                console.print(
+                    f"  [dim green]⚡ Instant resolution: {len(bypassed_clusters)} single-occurrence ideas bypassed, "
+                    f"{len(cached_clusters)} cached ideas reused (+{total_edges_added} edges).[/dim green]"
+                )
+
+            # Phase 2: Batch Consolidation for multi-occurrence clusters needing synthesis
+            synthesis_batches = self.batch_ideas(clusters_needing_synthesis)
+            total_batches = len(synthesis_batches)
+            total_needing_synthesis = len(clusters_needing_synthesis)
+
+            if total_needing_synthesis > 0:
+                t_synth_start = time.perf_counter()
+                synth_completed = 0
+
+                if console is not None:
+                    progress = Progress(
+                        SpinnerColumn(),
+                        TextColumn("[bold cyan]Consolidation Progress:[/bold cyan]"),
+                        BarColumn(bar_width=25),
+                        TaskProgressColumn(),
+                        MofNCompleteColumn(),
+                        TextColumn("{task.fields[stats_line]}"),
+                        console=console,
                     )
-                cur_line = Text.from_markup(first_init_text)
+                    synth_task = progress.add_task(
+                        "synthesize",
+                        total=total_needing_synthesis,
+                        completed=0,
+                        stats_line="",
+                    )
+                    first_b = synthesis_batches[0]
+                    first_b_names = ", ".join(f"'{b_item.canonical_name}'" for b_item in first_b[:3])
+                    first_more = f" (+{len(first_b)-3} more)" if len(first_b) > 3 else ""
+                    init_text = (
+                        f"[bold blue]Batch 1/{total_batches} ({len(first_b)} ideas):[/bold blue] {first_b_names}{first_more} | "
+                        f"[bold yellow]Consolidating with {self.model_name}...[/bold yellow]"
+                    )
+                    cur_line = Text.from_markup(init_text)
 
-                with Live(Group(cur_line, progress), console=console, refresh_per_second=10) as live:
-                    for idx, cluster in enumerate(affected_clusters, start=1):
-                        is_multi = cluster.total_occurrences >= self.min_occurrences
-                        is_already_refined = self._is_cluster_already_refined(cluster, state_manager)
+                    with Live(Group(cur_line, progress), console=console, refresh_per_second=10) as live:
+                        for b_idx, batch in enumerate(synthesis_batches, 1):
+                            batch_names = ", ".join(f"'{b_item.canonical_name}'" for b_item in batch[:3])
+                            more_str = f" (+{len(batch)-3} more)" if len(batch) > 3 else ""
+                            total_bytes = sum(len(self.format_consolidation_payload(c)[0].encode("utf-8")) + 150 for c in batch)
+                            batch_kb = total_bytes / 1024.0
 
-                        if is_multi and not is_already_refined:
                             cur_text = (
-                                f"[bold blue]Current Idea:[/bold blue] '{cluster.canonical_name}' "
-                                f"({cluster.total_occurrences} mentions) | [bold yellow]Consolidating with {self.model_name}...[/bold yellow]"
+                                f"[bold blue]Batch {b_idx}/{total_batches} ({len(batch)} ideas, {batch_kb:.1f}KB):[/bold blue] {batch_names}{more_str} | "
+                                f"[bold yellow]Consolidating with {self.model_name}...[/bold yellow]"
                             )
                             live.update(Group(Text.from_markup(cur_text), progress))
 
-                        output, eff_is_multi, was_resumed = self._process_single_cluster(cluster, state_manager)
-                        edges_added = self.apply_consolidation_to_graph(store, cluster, output)
-                        total_edges_added += edges_added
+                            t_b_start = time.perf_counter()
+                            batch_results = self.synthesize_cluster_batch(batch)
+                            b_dur = time.perf_counter() - t_b_start
 
-                        if was_resumed:
-                            actual_resumed_count += 1
+                            for c in batch:
+                                output = batch_results.get(c.canonical_name) or self.synthesize_cluster(c)
+                                c.already_refined = True
+                                if state_manager:
+                                    state_manager.record_processed(c, output, status="synthesized")
+                                edges_added = self.apply_consolidation_to_graph(store, c, output)
+                                total_edges_added += edges_added
+                                synthesized_count += 1
+                                multi_occ_count += 1
+                                synthesized_names.append(c.canonical_name)
+                                completed += 1
 
-                        if eff_is_multi:
+                                if completed % 10 == 0 or completed == num_affected:
+                                    pct = (completed / num_affected * 100) if num_affected > 0 else 100.0
+                                    console.print(
+                                        f"[bold cyan][Idea Postprocessor][/bold cyan] {completed}/{num_affected} ideas ({pct:.1f}%)"
+                                        f" | [bold green]✓ {synthesized_count} synthesized[/bold green]"
+                                        f" | [dim]{single_occ_count} bypassed[/dim] | +{total_edges_added} edges"
+                                    )
+
+                                if on_progress:
+                                    on_progress(completed, num_affected, c.canonical_name, {
+                                        "synthesized": synthesized_count,
+                                        "bypassed": single_occ_count,
+                                        "resumed": actual_resumed_count,
+                                        "edges_added": total_edges_added,
+                                    })
+
+                            synth_completed += len(batch)
+                            elapsed_synth = time.perf_counter() - t_synth_start
+                            rate = (synth_completed / elapsed_synth) if elapsed_synth > 0 else 0.0
+                            rem_sec = ((total_needing_synthesis - synth_completed) / rate) if rate > 0 and total_needing_synthesis > synth_completed else 0.0
+                            eta_str = _format_eta(rem_sec) if synth_completed < total_needing_synthesis else "0m 00s"
+                            rate_str = f"{rate:.1f} ideas/s" if rate > 0 else "-- ideas/s"
+                            stats_str = (
+                                f" | [bold yellow]{rate_str}[/bold yellow] | ETA: {eta_str} | "
+                                f"[bold green]✓ {synth_completed}/{total_needing_synthesis} synthesized[/bold green] (Batch {b_idx}/{total_batches})"
+                            )
+                            progress.update(synth_task, completed=synth_completed, total=total_needing_synthesis, stats_line=stats_str)
+
+                            srv = self.pool.get_last_used_server() or "ollama" if self.pool else "ollama"
+                            b_rate = (len(batch) / b_dur) if b_dur > 0 else 0.0
+                            finish_text = (
+                                f"  [dim green]✓ [Batch {b_idx}/{total_batches} ({len(batch)} ideas, {batch_kb:.1f}KB)][/dim green] "
+                                f"Synthesized [bold cyan]{len(batch)} ideas[/bold cyan] [dim]({b_dur:.1f}s, {b_rate:.1f} ideas/s via [bold green]{srv}[/bold green])[/dim]"
+                            )
+                            live.update(Group(Text.from_markup(finish_text), progress))
+                            console.print(finish_text)
+
+                            # Checkpoint save
+                            if state_manager and (synth_completed % self.checkpoint_interval == 0 or synth_completed == total_needing_synthesis):
+                                if synth_completed == total_needing_synthesis:
+                                    state_manager.flush()
+                                else:
+                                    state_manager.save_async()
+                else:
+                    for b_idx, batch in enumerate(synthesis_batches, 1):
+                        t_b_start = time.perf_counter()
+                        batch_results = self.synthesize_cluster_batch(batch)
+                        b_dur = time.perf_counter() - t_b_start
+
+                        for c in batch:
+                            output = batch_results.get(c.canonical_name) or self.synthesize_cluster(c)
+                            c.already_refined = True
+                            if state_manager:
+                                state_manager.record_processed(c, output, status="synthesized")
+                            edges_added = self.apply_consolidation_to_graph(store, c, output)
+                            total_edges_added += edges_added
                             synthesized_count += 1
                             multi_occ_count += 1
-                            synthesized_names.append(cluster.canonical_name)
-                            status_badge = "[bold green]✓ Synthesized (resumed)[/bold green]" if was_resumed else "[bold green]✓ Synthesized[/bold green]"
-                        else:
-                            single_occ_count += 1
-                            bypassed_names.append(cluster.canonical_name)
-                            status_badge = "[dim]Bypassed (resumed)[/dim]" if was_resumed else "[dim]Bypassed (single-occurrence)[/dim]"
+                            synthesized_names.append(c.canonical_name)
+                            completed += 1
 
-                        completed = idx
-                        cur_text = f"[bold blue]Current Idea:[/bold blue] '{cluster.canonical_name}' | {status_badge}"
+                            if completed % 10 == 0 or completed == num_affected:
+                                pct = (completed / num_affected * 100) if num_affected > 0 else 100.0
+                                logger.info(
+                                    f"[Idea Postprocessor] {completed}/{num_affected} affected ideas ({pct:.1f}%)"
+                                    f" | Synthesized: {synthesized_count} | Bypassed: {single_occ_count} | Resumed: {actual_resumed_count} | Edges: +{total_edges_added}"
+                                )
 
-                        elapsed = time.perf_counter() - t_start
-                        rate = (completed / elapsed) if elapsed > 0 else 0.0
-                        if completed > 0 and num_affected > completed and rate > 0:
-                            rem_sec = (num_affected - completed) / rate
-                            eta_str = _format_eta(rem_sec)
-                        elif completed >= num_affected:
-                            eta_str = "0m 00s"
-                        else:
-                            eta_str = "--m --s"
+                            if on_progress:
+                                on_progress(completed, num_affected, c.canonical_name, {
+                                    "synthesized": synthesized_count,
+                                    "bypassed": single_occ_count,
+                                    "resumed": actual_resumed_count,
+                                    "edges_added": total_edges_added,
+                                })
 
-                        rate_str = f"{rate:.2f} idea/s" if rate > 0 else "-- idea/s"
-                        resumed_stats = f" | [cyan]{actual_resumed_count} resumed[/cyan]" if actual_resumed_count > 0 else ""
-                        stats_str = (
-                            f" | [bold yellow]{rate_str}[/bold yellow] | ETA: {eta_str} | "
-                            f"[bold green]✓ {synthesized_count} synthesized[/bold green] | "
-                            f"[dim]{single_occ_count} bypassed[/dim]{resumed_stats}"
-                        )
-
-                        progress.update(tot_task, completed=completed, total=num_affected, stats_line=stats_str)
-                        live.update(Group(Text.from_markup(cur_text), progress))
-
-                        # Save checkpoint every checkpoint_interval (default: 100) asynchronously
-                        if state_manager and (completed % self.checkpoint_interval == 0 or completed == num_affected):
-                            if completed == num_affected:
+                        synth_completed += len(batch)
+                        if state_manager and (synth_completed % self.checkpoint_interval == 0 or synth_completed == total_needing_synthesis):
+                            if synth_completed == total_needing_synthesis:
                                 state_manager.flush()
                             else:
                                 state_manager.save_async()
-                            if completed % self.checkpoint_interval == 0 and completed < num_affected:
-                                console.print(
-                                    f"[bold cyan][Idea Postprocessor][/bold cyan] [dim]💾 Checkpoint saved (async) at {completed}/{num_affected} ideas -> {state_manager.state_path.name}[/dim]"
-                                )
-                                sys.stdout.flush()
 
-                        # Periodic statistical line info every 10 ideas (or on final completion)
-                        if completed % 10 == 0 or completed == num_affected:
-                            pct = (completed / num_affected * 100) if num_affected > 0 else 100.0
-                            console.print(
-                                f"[bold cyan][Idea Postprocessor][/bold cyan] {completed}/{num_affected} ideas ({pct:.1f}%)"
-                                f" | {rate_str} | ETA: {eta_str} | [bold green]✓ {synthesized_count} synthesized[/bold green]"
-                                f" | [dim]{single_occ_count} bypassed[/dim]{resumed_stats} | +{total_edges_added} edges"
-                            )
-                            sys.stdout.flush()
-
-                        if on_progress:
-                            on_progress(completed, num_affected, cluster.canonical_name, {
-                                "synthesized": synthesized_count,
-                                "bypassed": single_occ_count,
-                                "resumed": actual_resumed_count,
-                                "edges_added": total_edges_added,
-                            })
-            elif console is not None and total_clusters > 0 and num_affected == 0:
+                        logger.info(
+                            f"[Idea Postprocessor] Batch {b_idx}/{total_batches} ({len(batch)} ideas) in {b_dur:.1f}s: "
+                            f"{synth_completed}/{total_needing_synthesis} synthesized | +{total_edges_added} edges"
+                        )
+            elif console is not None and num_affected == 0:
                 console.print(
                     f"[bold cyan][Idea Postprocessor][/bold cyan] All {total_clusters} ideas already post-processed and up-to-date "
                     f"([cyan]{actual_resumed_count} resumed[/cyan], 0 affected ideas to re-ingest, +0 edges)."
                 )
-            else:
-                for idx, cluster in enumerate(affected_clusters, start=1):
-                    output, eff_is_multi, was_resumed = self._process_single_cluster(cluster, state_manager)
-                    edges_added = self.apply_consolidation_to_graph(store, cluster, output)
-                    total_edges_added += edges_added
-
-                    if was_resumed:
-                        actual_resumed_count += 1
-
-                    if eff_is_multi:
-                        synthesized_count += 1
-                        multi_occ_count += 1
-                        synthesized_names.append(cluster.canonical_name)
-                    else:
-                        single_occ_count += 1
-                        bypassed_names.append(cluster.canonical_name)
-
-                    completed = idx
-                    if state_manager and (completed % self.checkpoint_interval == 0 or completed == num_affected):
-                        if completed == num_affected:
-                            state_manager.flush()
-                        else:
-                            state_manager.save_async()
-
-                    if completed % 10 == 0 or completed == num_affected:
-                        pct = (completed / num_affected * 100) if num_affected > 0 else 100.0
-                        logger.info(
-                            f"[Idea Postprocessor] {completed}/{num_affected} affected ideas ({pct:.1f}%)"
-                            f" | Synthesized: {synthesized_count} | Bypassed: {single_occ_count} | Resumed: {actual_resumed_count} | Edges: +{total_edges_added}"
-                        )
-
-                    if on_progress:
-                        on_progress(completed, num_affected, cluster.canonical_name, {
-                            "synthesized": synthesized_count,
-                            "bypassed": single_occ_count,
-                            "resumed": actual_resumed_count,
-                            "edges_added": total_edges_added,
-                        })
         finally:
             if state_manager:
                 state_manager.close()

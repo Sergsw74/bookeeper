@@ -516,3 +516,4 @@ def test_deduplicator_formula_and_category_guards():
     assert is_same_cat is False
     assert method_cat == "distinct_category_guard"
 
+

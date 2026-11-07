@@ -58,7 +58,33 @@ python archive_downloader/run.py download --limit 100
 PYTHONPATH=archive_downloader/src python -m archive_downloader download --limit 100
 ```
 
-### 2. High-Throughput Batch URLs (`show=500`)
+### 2. Search Requests & Exact Match Querying
+
+You can search arXiv by query keyword or phrase, enforce exact match, or pass full arXiv search URLs directly:
+
+```bash
+# Search arXiv for query 'jepa' and download up to 100 articles:
+python archive_downloader/run.py download --query "jepa" --limit 100
+
+# Enforce exact match query:
+python archive_downloader/run.py download --query "jepa" --exact --limit 100
+
+# Or pass the direct arXiv search URL:
+python archive_downloader/run.py download \
+  --url "https://arxiv.org/search/?searchtype=all&query=jepa&abstracts=show&size=100&order=-announced_date_first" \
+  --limit 100
+
+# Save a text manifest of all processed files (both newly downloaded and skipped):
+python archive_downloader/run.py download --query "jepa" --limit 100 --file-list "jepa_articles.txt"
+
+# Save full absolute paths instead of filenames:
+python archive_downloader/run.py download --query "jepa" --limit 100 --file-list "jepa_articles.txt" --full-path
+
+# Inspect search results without downloading:
+python archive_downloader/run.py inspect --query "jepa" --exact --limit 10
+```
+
+### 3. High-Throughput Batch URLs (`show=500`)
 
 arXiv supports fetching up to 500 (or up to 2000) articles per listing page using `?skip=0&show=500`, drastically minimizing HTML scraping round-trips:
 

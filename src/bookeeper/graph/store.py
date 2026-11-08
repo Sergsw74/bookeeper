@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Set, Tuple, Union
 
 import networkx as nx
+import numpy as np
 from networkx.readwrite import json_graph
 
 from bookeeper.calibre.parser import BookParser, format_idea_month
@@ -1450,6 +1451,15 @@ class ConceptGraphStore:
 
         logger.debug(f"Sanitized graph with {len(self.graph)} nodes.")
 
+    @staticmethod
+    def _set_node_embedding_vector(node_data: Dict[str, Any], vec: Union[List[float], np.ndarray]) -> None:
+        from bookeeper.graph.embedding_codec import encode_embedding
+        if "embedding_b64" in node_data:
+            node_data.update(encode_embedding(vec, dtype="float16"))
+            node_data.pop("embedding", None)
+        else:
+            node_data["embedding"] = [round(float(x), 6) for x in (vec.tolist() if isinstance(vec, np.ndarray) else vec)]
+
     def backfill_missing_embeddings(
         self,
         embeddings: Any,
@@ -1471,6 +1481,8 @@ class ConceptGraphStore:
             partition_texts_for_embedding,
         )
 
+        target_dim = getattr(embeddings, "dimension", None) if embeddings is not None else None
+
         # First, if chunks_dir is provided, reuse any chunk embeddings already stored in book_{id}_chunks.json / book_{id}.json
         chunks_reused_from_disk = 0
         if include_chunks and chunks_dir is not None:
@@ -1479,7 +1491,8 @@ class ConceptGraphStore:
                 books_needing_chunks: Set[int] = set()
                 node_source = self.iter_all_nodes(data=True) if hasattr(self, "iter_all_nodes") else self.graph.nodes(data=True)
                 for _, attrs in node_source:
-                    if attrs.get("type") == "Chunk" and get_node_embedding(attrs, return_numpy=True) is None:
+                    existing = get_node_embedding(attrs, return_numpy=True)
+                    if attrs.get("type") == "Chunk" and (existing is None or (target_dim and len(existing) != target_dim)):
                         bid = attrs.get("book_id")
                         if bid is not None:
                             books_needing_chunks.add(int(bid))
@@ -1494,8 +1507,18 @@ class ConceptGraphStore:
                                 cemb = get_node_embedding(citem, return_numpy=True)
                                 cnid = f"chunk:{cid}"
                                 if cid and cemb is not None and len(cemb) > 1:
+                                    if target_dim and len(cemb) != target_dim:
+                                        if hasattr(embeddings, "project_vectors") and len(cemb) == 1024 and target_dim == 768:
+                                            cemb = embeddings.project_vectors(cemb)[0]
+                                        else:
+                                            continue
                                     if self.graph.has_node(cnid):
-                                        self.graph.nodes[cnid]["embedding"] = [round(float(x), 6) for x in cemb]
+                                        node_data = self.graph.nodes[cnid]
+                                        if "embedding_b64" in node_data:
+                                            node_data.update(encode_embedding(cemb, dtype="float16"))
+                                            node_data.pop("embedding", None)
+                                        else:
+                                            node_data["embedding"] = [round(float(x), 6) for x in cemb]
                                         self.mark_node_dirty(cnid)
                                         chunks_reused_from_disk += 1
                                     elif self.is_sharded and self.sharded_store:
@@ -1510,15 +1533,24 @@ class ConceptGraphStore:
 
         missing_idea_nodes: List[tuple[str, str]] = []
         missing_chunk_nodes: List[tuple[str, str]] = []
+        nodes_to_project: List[Tuple[str, np.ndarray, str]] = []
 
         node_source = self.iter_all_nodes(data=True) if hasattr(self, "iter_all_nodes") else self.graph.nodes(data=True)
         for node_id, attrs in node_source:
             existing_emb = get_node_embedding(attrs, return_numpy=True)
-            if existing_emb is not None and len(existing_emb) > 1:
-                continue
-
             ntype = attrs.get("type", "")
             is_idea = bool(attrs.get("is_idea") or attrs.get("tag") == "idea" or ntype in ("Concept", "Idea"))
+
+            if existing_emb is not None and len(existing_emb) > 1:
+                if target_dim and len(existing_emb) != target_dim:
+                    if hasattr(embeddings, "project_vectors") and len(existing_emb) == 1024 and target_dim == 768:
+                        if (is_idea and include_ideas) or (ntype == "Chunk" and include_chunks):
+                            nodes_to_project.append((node_id, existing_emb, ntype))
+                        continue
+                    # Else mismatched and not projectable -> fall through to re-embed
+                else:
+                    continue
+
             if is_idea and include_ideas:
                 raw_name = attrs.get("name") or str(node_id).replace("concept:", "")
                 clean_name = BookParser.repair_mojibake(raw_name).strip()
@@ -1544,6 +1576,28 @@ class ConceptGraphStore:
 
         ideas_embedded = 0
         chunks_embedded = chunks_reused_from_disk
+
+        if nodes_to_project and hasattr(embeddings, "project_vectors"):
+            if console:
+                console.print(f"[bold cyan]Projecting {len(nodes_to_project):,} legacy 1024-d embeddings to 768-d JEPA space on GPU...[/bold cyan]")
+            else:
+                logger.info(f"Projecting {len(nodes_to_project):,} legacy 1024-d embeddings to 768-d JEPA space on GPU...")
+            proj_arr = np.asarray([emb for _, emb, _ in nodes_to_project], dtype=np.float32)
+            projected = embeddings.project_vectors(proj_arr)
+            for (nid, _, ntype), pvec in zip(nodes_to_project, projected):
+                if self.graph.has_node(nid):
+                    self._set_node_embedding_vector(self.graph.nodes[nid], pvec)
+                    self.mark_node_dirty(nid)
+                elif self.is_sharded and self.sharded_store:
+                    float_vec = [round(float(x), 6) for x in pvec]
+                    if ntype == "Chunk":
+                        self.add_chunk({"chunk_id": nid.replace("chunk:", ""), "embedding": float_vec})
+                    else:
+                        self.add_concept({"name": nid.replace("concept:", ""), "embedding": float_vec})
+                if ntype == "Chunk":
+                    chunks_embedded += 1
+                else:
+                    ideas_embedded += 1
 
         if missing_idea_nodes:
             idea_texts = [t for _, t in missing_idea_nodes]
@@ -1601,7 +1655,7 @@ class ConceptGraphStore:
                                     arr = np.array(v, dtype=np.float32)
                                     norm = float(np.linalg.norm(arr))
                                     unit = (arr / norm) if norm > 0.0 else arr
-                                    self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
+                                    self._set_node_embedding_vector(self.graph.nodes[nid], unit)
                                     self.mark_node_dirty(nid)
                                     ideas_embedded += 1
                             pooled_done = True
@@ -1621,7 +1675,7 @@ class ConceptGraphStore:
                                         arr = np.array(v, dtype=np.float32)
                                         norm = float(np.linalg.norm(arr))
                                         unit = (arr / norm) if norm > 0.0 else arr
-                                        self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
+                                        self._set_node_embedding_vector(self.graph.nodes[nid], unit)
                                         self.mark_node_dirty(nid)
                                         ideas_embedded += 1
                             except Exception as e:
@@ -1666,7 +1720,7 @@ class ConceptGraphStore:
                                     arr = np.array(v, dtype=np.float32)
                                     norm = float(np.linalg.norm(arr))
                                     unit = (arr / norm) if norm > 0.0 else arr
-                                    self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
+                                    self._set_node_embedding_vector(self.graph.nodes[nid], unit)
                                     self.mark_node_dirty(nid)
                                     ideas_embedded += 1
                         except Exception as e:
@@ -1729,7 +1783,7 @@ class ConceptGraphStore:
                                     arr = np.array(v, dtype=np.float32)
                                     norm = float(np.linalg.norm(arr))
                                     unit = (arr / norm) if norm > 0.0 else arr
-                                    self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
+                                    self._set_node_embedding_vector(self.graph.nodes[nid], unit)
                                     self.mark_node_dirty(nid)
                                     chunks_embedded += 1
                             pooled_done = True
@@ -1749,7 +1803,7 @@ class ConceptGraphStore:
                                         arr = np.array(v, dtype=np.float32)
                                         norm = float(np.linalg.norm(arr))
                                         unit = (arr / norm) if norm > 0.0 else arr
-                                        self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
+                                        self._set_node_embedding_vector(self.graph.nodes[nid], unit)
                                         self.mark_node_dirty(nid)
                                         chunks_embedded += 1
                             except Exception as e:
@@ -1794,7 +1848,7 @@ class ConceptGraphStore:
                                     arr = np.array(v, dtype=np.float32)
                                     norm = float(np.linalg.norm(arr))
                                     unit = (arr / norm) if norm > 0.0 else arr
-                                    self.graph.nodes[nid]["embedding"] = [round(float(x), 6) for x in unit.tolist()]
+                                    self._set_node_embedding_vector(self.graph.nodes[nid], unit)
                                     self.mark_node_dirty(nid)
                                     chunks_embedded += 1
                         except Exception as e:

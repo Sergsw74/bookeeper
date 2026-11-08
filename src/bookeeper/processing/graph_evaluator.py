@@ -916,11 +916,83 @@ def get_parent_chunk_ids(store: ConceptGraphStore) -> Set[str]:
     return parent_cids
 
 
+def _harmonize_vectors(
+    names_or_ids: List[str],
+    vec_arrays: List[np.ndarray],
+    weights: Optional[List[float]] = None,
+    target_dim: Optional[int] = None,
+    embeddings: Optional[Any] = None,
+) -> Tuple[List[str], np.ndarray, Optional[np.ndarray]]:
+    """
+    Ensure all extracted vectors have strictly identical dimensionalities before vstacking.
+    If legacy 1024-d vectors are present in a 768-d JEPA space, automatically projects them
+    to 768-d via JEPA GPU projection. Filters any irreconcilable vectors to prevent vstack crashes.
+    """
+    if not vec_arrays:
+        w_ret = np.empty(0, dtype=np.float64) if weights is not None else None
+        return names_or_ids, np.empty((0, 0), dtype=np.float32), w_ret
+
+    dims = [len(v) for v in vec_arrays]
+    unique_dims = set(dims)
+    from collections import Counter
+    most_common_dim = Counter(dims).most_common(1)[0][0]
+
+    eff_dim = target_dim or getattr(embeddings, "dimension", None)
+    if eff_dim:
+        if most_common_dim in (eff_dim, eff_dim + 128):
+            eff_dim = most_common_dim
+    else:
+        eff_dim = most_common_dim
+
+    # If any vectors have dimension 1024 and target is 768, project via JEPA
+    if eff_dim == 768 and 1024 in unique_dims:
+        idx_1024 = [i for i, v in enumerate(vec_arrays) if len(v) == 1024]
+        if idx_1024:
+            projector = getattr(embeddings, "project_vectors", None)
+            if projector is None and Path("output/jepa_768_weights.npz").is_file():
+                try:
+                    from bookeeper.evaluation.jepa_encoder import LightweightJEPAEncoder
+                    enc = LightweightJEPAEncoder.load("output/jepa_768_weights.npz", device="gpu")
+                    projector = enc.project
+                except Exception:
+                    pass
+            if projector is not None:
+                sub_arr = np.asarray([vec_arrays[i] for i in idx_1024], dtype=np.float32)
+                try:
+                    projected = projector(sub_arr)
+                    for l_idx, orig_idx in enumerate(idx_1024):
+                        vec_arrays[orig_idx] = projected[l_idx]
+                except Exception as e:
+                    logger.debug(f"Failed to project 1024-d vectors to 768-d: {e}")
+
+    # Re-check dims after projection and harmonize to eff_dim
+    final_names = []
+    final_vecs = []
+    final_weights = [] if weights is not None else None
+
+    for i, v in enumerate(vec_arrays):
+        if len(v) == eff_dim:
+            final_names.append(names_or_ids[i])
+            final_vecs.append(v)
+            if weights is not None and final_weights is not None:
+                final_weights.append(weights[i])
+
+    if not final_vecs:
+        w_ret = np.empty(0, dtype=np.float64) if weights is not None else None
+        return [], np.empty((0, 0), dtype=np.float32), w_ret
+
+    mat = np.vstack(final_vecs)
+    w_ret = np.asarray(final_weights, dtype=np.float64) if final_weights is not None else None
+    return final_names, mat, w_ret
+
+
 def extract_concept_embeddings(
     store: ConceptGraphStore,
     hybrid_math: bool = False,
     alpha: float = 0.35,
     formula_dim: int = 128,
+    target_dim: Optional[int] = None,
+    embeddings: Optional[Any] = None,
 ) -> Tuple[List[str], np.ndarray]:
     """
     Extracts all Idea/Concept node IDs and their stored vector embeddings.
@@ -934,6 +1006,15 @@ def extract_concept_embeddings(
     names: List[str] = []
     vec_arrays: List[np.ndarray] = []
 
+    projector = getattr(embeddings, "project_vectors", None)
+    if projector is None and Path("output/jepa_768_weights.npz").is_file():
+        try:
+            from bookeeper.evaluation.jepa_encoder import LightweightJEPAEncoder
+            enc = LightweightJEPAEncoder.load("output/jepa_768_weights.npz", device="gpu")
+            projector = enc.project
+        except Exception:
+            pass
+
     node_source = store.iter_all_nodes(data=True) if hasattr(store, "iter_all_nodes") else store.graph.nodes(data=True)
     for node_id, attrs in node_source:
         ntype = attrs.get("type", "")
@@ -941,6 +1022,11 @@ def extract_concept_embeddings(
         if is_idea:
             emb = get_node_embedding(attrs, return_numpy=True)
             if emb is not None and len(emb) > 1:
+                if len(emb) == 1024 and (target_dim == 768 or getattr(embeddings, "dimension", None) == 768) and projector is not None:
+                    try:
+                        emb = projector(emb)
+                    except Exception:
+                        pass
                 clean_name = attrs.get("name") or str(node_id).replace("concept:", "").replace("formula:", "")
                 names.append(str(clean_name))
 
@@ -976,10 +1062,13 @@ def extract_concept_embeddings(
                 else:
                     vec_arrays.append(emb)
 
-    if not vec_arrays:
-        return names, np.empty((0, 0), dtype=np.float32)
-
-    return names, np.vstack(vec_arrays)
+    names, mat, _ = _harmonize_vectors(
+        names_or_ids=names,
+        vec_arrays=vec_arrays,
+        target_dim=target_dim,
+        embeddings=embeddings,
+    )
+    return names, mat
 
 
 def extract_chunk_embeddings_and_weights(
@@ -988,12 +1077,15 @@ def extract_chunk_embeddings_and_weights(
     hybrid_math: bool = False,
     alpha: float = 0.35,
     formula_dim: int = 128,
+    target_dim: Optional[int] = None,
+    embeddings: Optional[Any] = None,
 ) -> Tuple[List[str], np.ndarray, np.ndarray]:
     """
     Extracts all Chunk node IDs, their stored vector embeddings, and chunk character weights.
     If hybrid_math is True, constructs block-normalized composite unit vectors (text + formulas).
     Seamlessly streams chunk nodes across Spine and Shards (or falls back to persistent chunks_dir
     when chunks are not embedded in graph nodes).
+    Harmonizes dimensionalities across mixed runs (e.g. 1024-d BGE-M3 and 768-d JEPA) using GPU projection.
     """
     from bookeeper.graph.embedding_codec import get_node_embedding
     from bookeeper.processing.formula_embedding import build_composite_embedding, build_formula_feature_vector
@@ -1003,11 +1095,25 @@ def extract_chunk_embeddings_and_weights(
     vec_arrays: List[np.ndarray] = []
     weights: List[float] = []
 
+    projector = getattr(embeddings, "project_vectors", None)
+    if projector is None and Path("output/jepa_768_weights.npz").is_file():
+        try:
+            from bookeeper.evaluation.jepa_encoder import LightweightJEPAEncoder
+            enc = LightweightJEPAEncoder.load("output/jepa_768_weights.npz", device="gpu")
+            projector = enc.project
+        except Exception:
+            pass
+
     node_source = store.iter_all_nodes(data=True) if hasattr(store, "iter_all_nodes") else store.graph.nodes(data=True)
     for node_id, attrs in node_source:
         if attrs.get("type") == "Chunk":
             emb = get_node_embedding(attrs, return_numpy=True)
             if emb is not None and len(emb) > 1:
+                if len(emb) == 1024 and (target_dim == 768 or getattr(embeddings, "dimension", None) == 768) and projector is not None:
+                    try:
+                        emb = projector(emb)
+                    except Exception:
+                        pass
                 cid = attrs.get("chunk_id") or str(node_id).replace("chunk:", "")
                 chunk_ids.append(str(cid))
                 c_len = attrs.get("char_count")
@@ -1081,10 +1187,14 @@ def extract_chunk_embeddings_and_weights(
                 except Exception as e:
                     logger.debug(f"Could not load chunks from {cfile}: {e}")
 
-    if not vec_arrays:
-        return chunk_ids, np.empty((0, 0), dtype=np.float32), np.empty(0, dtype=np.float64)
-
-    return chunk_ids, np.vstack(vec_arrays), np.asarray(weights, dtype=np.float64)
+    chunk_ids, mat, w_ret = _harmonize_vectors(
+        names_or_ids=chunk_ids,
+        vec_arrays=vec_arrays,
+        weights=weights,
+        target_dim=target_dim,
+        embeddings=embeddings,
+    )
+    return chunk_ids, mat, (w_ret if w_ret is not None else np.empty(0, dtype=np.float64))
 
 
 def extract_chunk_embeddings(
@@ -1093,6 +1203,8 @@ def extract_chunk_embeddings(
     hybrid_math: bool = False,
     alpha: float = 0.35,
     formula_dim: int = 128,
+    target_dim: Optional[int] = None,
+    embeddings: Optional[Any] = None,
 ) -> Tuple[List[str], np.ndarray]:
     """
     Extracts all Chunk node IDs and their stored vector embeddings.
@@ -1103,6 +1215,8 @@ def extract_chunk_embeddings(
         hybrid_math=hybrid_math,
         alpha=alpha,
         formula_dim=formula_dim,
+        target_dim=target_dim,
+        embeddings=embeddings,
     )
     return cids, mat
 
@@ -1401,37 +1515,52 @@ def ensure_graph_embeddings(
 ) -> None:
     """
     Ensures that concept ideas and chunk nodes in store have vector embeddings,
-    backfilling from chunks_dir or embedding model if necessary.
+    backfilling from chunks_dir or embedding model if necessary, and upgrading legacy
+    1024-d embeddings to 768-d JEPA space via GPU projection.
     """
-    _, g_mat = extract_concept_embeddings(store)
-    _, u_mat = extract_chunk_embeddings(store, chunks_dir=chunks_dir)
+    from bookeeper.graph.embedding_codec import get_node_embedding
+
+    target_dim = getattr(embeddings, "dimension", None) or 768
 
     node_source = store.iter_all_nodes(data=True) if hasattr(store, "iter_all_nodes") else store.graph.nodes(data=True)
     total_idea_nodes = 0
+    total_chunk_nodes = 0
+    mismatched_nodes = 0
+    missing_nodes = 0
+
     for _, attrs in node_source:
         ntype = attrs.get("type", "")
-        if bool(attrs.get("is_idea") or attrs.get("tag") == "idea" or ntype in ("Concept", "Idea")):
+        is_idea = bool(attrs.get("is_idea") or attrs.get("tag") == "idea" or ntype in ("Concept", "Idea"))
+        is_chunk = (ntype == "Chunk")
+        if is_idea:
             total_idea_nodes += 1
+        elif is_chunk:
+            total_chunk_nodes += 1
 
-    needs_ideas = len(g_mat) < total_idea_nodes
-    needs_chunks = len(u_mat) == 0
+        emb = get_node_embedding(attrs, return_numpy=True)
+        if emb is None:
+            if is_idea or is_chunk:
+                missing_nodes += 1
+        elif target_dim and len(emb) != target_dim:
+            mismatched_nodes += 1
 
-    if (needs_ideas or needs_chunks) and (embeddings is not None or chunks_dir is not None):
-        missing_ideas_count = max(0, total_idea_nodes - len(g_mat))
+    needs_backfill = (missing_nodes > 0 or mismatched_nodes > 0)
+    if needs_backfill and (embeddings is not None or chunks_dir is not None):
         msg_parts = []
-        if needs_ideas:
-            msg_parts.append(f"{missing_ideas_count:,} concept idea(s)")
-        if needs_chunks:
-            msg_parts.append("chunk(s)")
-        msg = f"[bold cyan]Populating missing embeddings for {', '.join(msg_parts)} for graph space evaluation...[/bold cyan]"
+        if mismatched_nodes > 0:
+            msg_parts.append(f"{mismatched_nodes:,} legacy vector(s)")
+        if missing_nodes > 0:
+            msg_parts.append(f"{missing_nodes:,} missing vector(s)")
+        msg = f"[bold cyan]Upgrading & backfilling {', '.join(msg_parts)} for graph space evaluation...[/bold cyan]"
         if console:
             console.print(msg)
         else:
             logger.info(msg)
+
         bf_res = store.backfill_missing_embeddings(
             embeddings=embeddings,
-            include_ideas=needs_ideas,
-            include_chunks=needs_chunks,
+            include_ideas=True,
+            include_chunks=True,
             chunks_dir=chunks_dir,
             console=console,
         )
@@ -1447,6 +1576,10 @@ def ensure_graph_embeddings(
                     store.save(target_save)
                 except Exception as e:
                     logger.debug(f"Could not auto-save graph after backfilling: {e}")
+
+    # Verify embeddings are extracted with target_dim
+    _, _ = extract_concept_embeddings(store, target_dim=target_dim, embeddings=embeddings)
+    _, _ = extract_chunk_embeddings(store, chunks_dir=chunks_dir, target_dim=target_dim, embeddings=embeddings)
 
 
 def run_graph_space_evaluation(
@@ -1474,12 +1607,15 @@ def run_graph_space_evaluation(
     If states_dir is provided or book states are found, also calculates post-processing idea drift metrics.
     If generate_low_p10_prompt is True, generates a ~1M context verification benchmark prompt for frontier models.
     """
+    t_dim = getattr(embeddings, "dimension", None) or 768
     ensure_graph_embeddings(store, embeddings=embeddings, chunks_dir=chunks_dir, console=console)
     _, g_mat = extract_concept_embeddings(
         store,
         hybrid_math=hybrid_math,
         alpha=formula_alpha,
         formula_dim=formula_dim,
+        target_dim=t_dim,
+        embeddings=embeddings,
     )
 
     u_target = universe_store if universe_store is not None else store
@@ -1491,6 +1627,8 @@ def run_graph_space_evaluation(
         hybrid_math=hybrid_math,
         alpha=formula_alpha,
         formula_dim=formula_dim,
+        target_dim=t_dim,
+        embeddings=embeddings,
     )
 
     if len(u_mat) == 0:
@@ -1592,6 +1730,7 @@ def run_graph_space_comparison(
     Runs end-to-end Graph Space Comparison between Store A and Store B over their combined Universe.
     If states_dir_a / states_dir_b are provided, also calculates and compares post-processing idea drift.
     """
+    t_dim = getattr(embeddings, "dimension", None) or 768
     ensure_graph_embeddings(store_a, embeddings=embeddings, chunks_dir=chunks_dir, console=console)
     ensure_graph_embeddings(store_b, embeddings=embeddings, chunks_dir=chunks_dir, console=console)
 
@@ -1600,12 +1739,16 @@ def run_graph_space_comparison(
         hybrid_math=hybrid_math,
         alpha=formula_alpha,
         formula_dim=formula_dim,
+        target_dim=t_dim,
+        embeddings=embeddings,
     )
     _, g2_mat = extract_concept_embeddings(
         store_b,
         hybrid_math=hybrid_math,
         alpha=formula_alpha,
         formula_dim=formula_dim,
+        target_dim=t_dim,
+        embeddings=embeddings,
     )
 
     cids_a, u1_mat, w_a = extract_chunk_embeddings_and_weights(
@@ -1614,6 +1757,8 @@ def run_graph_space_comparison(
         hybrid_math=hybrid_math,
         alpha=formula_alpha,
         formula_dim=formula_dim,
+        target_dim=t_dim,
+        embeddings=embeddings,
     )
     cids_b, u2_mat, w_b = extract_chunk_embeddings_and_weights(
         store_b,
@@ -1621,6 +1766,8 @@ def run_graph_space_comparison(
         hybrid_math=hybrid_math,
         alpha=formula_alpha,
         formula_dim=formula_dim,
+        target_dim=t_dim,
+        embeddings=embeddings,
     )
 
     if len(u1_mat) == 0 and len(u2_mat) > 0:

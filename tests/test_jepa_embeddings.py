@@ -27,6 +27,7 @@ def test_jepa_config_defaults():
     assert cfg.embedding_dim == 768
     assert cfg.jepa.enabled is True
     assert cfg.jepa.dimension == 768
+    assert cfg.jepa.device == "gpu"
     assert cfg.similarity_threshold == 0.45
     assert cfg.high_similarity_threshold == 0.70
 
@@ -60,6 +61,7 @@ def test_jepa_embeddings_direct_network():
     stats = jepa_emb.embedding_stats
     assert stats["total_texts"] == 3
     assert stats["dimension"] == 768
+    assert "device" in stats
 
 
 def test_jepa_embeddings_projector(tmp_path):

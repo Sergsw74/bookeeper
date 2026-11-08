@@ -52,6 +52,8 @@ dependencies = [
     "python-multipart>=0.0.32",
     "aiofiles>=25.1.0",
     "usearch>=2.26.5",
+    "torch>=2.0.0",
+    "sentence-transformers>=3.0.0",
 ]
 
 [project.optional-dependencies]

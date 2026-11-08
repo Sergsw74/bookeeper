@@ -28,7 +28,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from bookeeper.evaluation.jepa_encoder import LightweightJEPAEncoder
+from bookeeper.evaluation.jepa_encoder import LightweightJEPAEncoder, resolve_torch_device
 from bookeeper.graph.embedding_codec import decode_embedding, get_node_embedding
 
 logger = logging.getLogger(__name__)
@@ -446,7 +446,11 @@ class JEPAComparatorEngine:
             if test_pos_a and test_neg_a:
                 for model_id, param_m, v_dim, arch_desc in candidates:
                     try:
-                        m = SentenceTransformer(model_id, device="cpu", model_kwargs={"torch_dtype": torch.float32})
+                        m = SentenceTransformer(
+                            model_id,
+                            device=str(resolve_torch_device("gpu")),
+                            model_kwargs={"torch_dtype": torch.float32},
+                        )
                         t_enc0 = time.perf_counter()
                         ea = m.encode(test_pos_a, normalize_embeddings=True)
                         eb = m.encode(test_pos_b, normalize_embeddings=True)

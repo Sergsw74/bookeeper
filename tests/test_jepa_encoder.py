@@ -7,7 +7,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from bookeeper.evaluation.jepa_encoder import LightweightJEPAEncoder
+from bookeeper.evaluation.jepa_encoder import LightweightJEPAEncoder, resolve_torch_device
+import torch
 
 
 def test_jepa_encoder_initialization():
@@ -110,3 +111,31 @@ def test_jepa_encoder_cosine_similarity():
 
     assert pytest.approx(float(LightweightJEPAEncoder.cosine_similarity(a, b)), abs=1e-6) == 0.0
     assert pytest.approx(float(LightweightJEPAEncoder.cosine_similarity(a, c)), abs=1e-6) == 1.0
+
+
+def test_jepa_device_resolution():
+    cpu_dev = resolve_torch_device("cpu")
+    assert cpu_dev.type == "cpu"
+
+    gpu_dev = resolve_torch_device("gpu")
+    if torch.cuda.is_available():
+        assert gpu_dev.type == "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        assert gpu_dev.type == "mps"
+    else:
+        assert gpu_dev.type == "cpu"
+
+
+def test_jepa_encoder_gpu_execution():
+    encoder = LightweightJEPAEncoder(latent_dim=64, device="gpu")
+    # Verify encoder neural net device matches resolved GPU
+    expected_dev = resolve_torch_device("gpu")
+    assert encoder.device.type == expected_dev.type
+    assert encoder.neural_net.device.type == expected_dev.type
+
+    texts = ["Sample idea " + str(i) for i in range(20)]
+    encoded = encoder.encode_text(texts)
+    assert encoded.shape == (20, 64)
+    norms = np.linalg.norm(encoded, axis=1)
+    np.testing.assert_allclose(norms, 1.0, atol=1e-5)
+

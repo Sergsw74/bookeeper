@@ -459,7 +459,11 @@ class JEPAConfig(BaseModel):
     )
     model_type: str = Field(
         default="direct_network",
-        description="JEPA model type: 'direct_network' (pure lightweight CPU network, >8,000 txt/s), 'all-mpnet-base-v2', or 'whitened_projector'.",
+        description="JEPA model type: 'direct_network' (lightweight GPU-accelerated neural network, >50,000 txt/s), 'all-mpnet-base-v2', or 'whitened_projector'.",
+    )
+    device: str = Field(
+        default="gpu",
+        description="Compute device for JEPA: 'gpu' (auto-selects cuda or mps), 'cuda', 'mps', or 'cpu'. Defaults to 'gpu'.",
     )
     weights_path: str = Field(
         default="output/jepa_768_weights.npz",

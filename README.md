@@ -21,6 +21,7 @@ The documentation is split into specialized subchapters stored in the [`docs/`](
 | 🔄 **[Two-Pass Idea Post-Processing](docs/post-processing.md)** | Concept clustering ($\ge 0.92$), alias resolution, concise macro-definition synthesis, and state checkpointing. |
 | 🔬 **[A/B Testing & Benchmarking](docs/ab-tests.md)** | Automated test harness, same-branch vs branch-vs-branch testing, configuration overlays, delta reporting, and live cross-check status monitor. |
 | 🛡️ **[Factual Verification & Auditing](docs/verification.md)** | Multi-mode verification suite: Ideas Grounding, Chunk Coherence, Dual-KG Cross-Checking, Oracle QA probes, and Graph Embedding Space & Skipping Leverage (`--mode graph` / `kg`). |
+| 📬 **[Telegram Notifications](docs/notifications.md)** | Real-time event notifications for graph build start, milestone progress (every N%), book errors, completion stats, and verification audit scorecards. |
 
 ---
 
@@ -198,6 +199,27 @@ Every extracted idea and concept is assigned a significance weight on a scale fr
 - **Automatic Merging**: Deduplicated concepts retain the maximum observed weight (`max(canonical.weight, incoming.weight)`).
 - **Obsidian Frontmatter**: Notes include `weight: <W>` and the master index `00_Index.md` is sorted by weight descending.
 - **Neo4j Property**: Stored directly on `:Concept` nodes as `n.weight` for easy Cypher queries.
+
+---
+
+## 📬 Real-Time Telegram Notifications
+
+Bookkeeper includes a built-in Telegram notification subsystem for monitoring long-running indexing pipelines and factual verification audits.
+
+- **Knowledge Graph Build**: Dispatches alerts for job start, milestone progress updates (e.g. every 10% or 20%), book processing errors, and completion summaries with final graph metrics.
+- **Verification Audits**: Dispatches audit initiation and completion scorecards reporting Mean Calibrated Fidelity ($R_{calibrated}$), Factual Recall, Net Semantic Integrity ($S_{net}$), and discrepancies.
+- **Fault-Tolerant & Non-Blocking**: Runs with strict timeouts and silent no-op fallbacks if credentials are omitted.
+
+Configure via `config.yaml` / `my-config.yaml` or environment variables:
+```yaml
+telegram:
+  enabled: true
+  bot_token: "123456789:ABCDef..."
+  chat_id: "987654321"
+  progress_step_percent: 10
+```
+
+For full details, see the [Telegram Notifications Guide](docs/notifications.md).
 
 ---
 

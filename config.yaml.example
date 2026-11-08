@@ -285,3 +285,20 @@ pricing:
   #   input: 2.50
   #   output: 10.00
   #   cache: 1.25
+
+# ==============================================================================
+# Telegram Notifications Configuration
+# ==============================================================================
+# Dispatches real-time job execution alerts and progress milestones to Telegram.
+# Enabled by default; if credentials (bot_token/chat_id) are omitted, notifications
+# gracefully skip without interrupting execution.
+telegram:
+  enabled: true                       # Master toggle to enable/disable Telegram notifications
+  bot_token: ""                       # Telegram Bot API token from @BotFather (or set TELEGRAM_BOT_TOKEN)
+  chat_id: ""                         # Telegram Chat ID, group ID, or @channelname (or set TELEGRAM_CHAT_ID)
+  message_thread_id: null             # Optional forum supergroup topic / thread ID
+  notify_build_graph: true            # Notify for knowledge graph build start, progress, and completion
+  notify_verification: true           # Notify for verification audits (start, completion, and statistics)
+  progress_step_percent: 10           # Notify every N percent during graph build (e.g. 10 for every 10%, 20 for 20%)
+  timeout_seconds: 10.0               # Telegram API HTTP timeout in seconds
+

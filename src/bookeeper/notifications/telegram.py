@@ -303,13 +303,45 @@ class TelegramNotifier:
         if hallucination is not None:
             lines.append(f"  • <b>Hallucination Rate:</b> {float(hallucination) * 100:.2f}%")
 
-        # 5. Graph Space Coverage / Vendi score (KG mode)
-        cov = data.get("mean_coverage_ratio") or data.get("coverage_ratio")
+        # 5. Graph Space Coverage / Chamfer / Vendi score (KG mode)
+        cov = (
+            data.get("coverage_at_tau_pct")
+            or data.get("threshold_coverage_pct")
+            or data.get("coverage_tau")
+            or data.get("mean_coverage_ratio")
+            or data.get("coverage_ratio")
+        )
         if cov is not None:
-            lines.append(f"  • <b>Graph Coverage (τ):</b> {float(cov) * 100:.2f}%")
-        vendi = data.get("vendi_score") or data.get("vendi_diversity")
+            c_val = float(cov)
+            if c_val <= 1.0:
+                c_val *= 100.0
+            tau_val = data.get("tau", 0.75)
+            lines.append(f"  • <b>Corpus Coverage (τ={tau_val}):</b> {c_val:.2f}%")
+
+        chamfer = data.get("chamfer_mean") or data.get("chamfer_mean_coverage") or data.get("mean_chamfer_coverage")
+        if chamfer is not None:
+            lines.append(f"  • <b>Chamfer Proximity (μ):</b> {float(chamfer):.4f}")
+
+        vendi = data.get("vendi_diversity_score") or data.get("vendi_score") or data.get("vendi_diversity")
         if vendi is not None:
-            lines.append(f"  • <b>Vendi Diversity:</b> {float(vendi):.3f}")
+            lines.append(f"  • <b>Vendi Diversity:</b> {float(vendi):.2f}")
+
+        nodes_cnt = data.get("nodes_count") or data.get("idea_nodes_count")
+        chunks_cnt = data.get("universe_chunks_count")
+        if nodes_cnt is not None and chunks_cnt is not None:
+            lines.append(f"  • <b>Graph Scope:</b> {nodes_cnt:,} concepts / {chunks_cnt:,} chunks")
+
+        drift = data.get("postprocessing_drift")
+        if isinstance(drift, dict):
+            f_ret = drift.get("forward_retention")
+            b_fid = drift.get("backward_fidelity")
+            if f_ret is not None:
+                lines.append(f"  • <b>Forward Retention:</b> {float(f_ret):.4f}")
+            if b_fid is not None:
+                lines.append(f"  • <b>Backward Fidelity:</b> {float(b_fid):.4f}")
+            c_align = drift.get("centroid_cosine_alignment")
+            if c_align is not None:
+                lines.append(f"  • <b>Centroid Alignment:</b> {float(c_align):.4f}")
 
         # 6. Sampled Chunks / Ideas count
         sampled = (

@@ -112,17 +112,56 @@ def vicreg_loss(
     return total_loss, float(sim_loss.item()), float(std_loss.item()), float(cov_loss.item())
 
 
+def _parse_single_pdf_worker(pdf_path_str: str) -> List[Tuple[str, str]]:
+    """Worker function for parallel PDF discourse pair extraction."""
+    try:
+        import pypdf
+        import logging
+        logging.getLogger("pypdf").setLevel(logging.ERROR)
+        reader = pypdf.PdfReader(pdf_path_str)
+        doc_chunks = []
+        for page in reader.pages[:25]:
+            txt = page.extract_text() or ""
+            for para in txt.split("\n\n"):
+                p_clean = para.strip()
+                if len(p_clean) >= 60:
+                    doc_chunks.append(p_clean)
+        pdf_pairs = []
+        for i in range(len(doc_chunks) - 1):
+            pdf_pairs.append((doc_chunks[i], doc_chunks[i + 1]))
+        return pdf_pairs
+    except Exception:
+        return []
+
+
 def load_chunk_pairs_from_states(
     state_dirs: Sequence[Union[str, Path]],
     books_dir: Optional[Union[str, Path]] = None,
     max_books: Optional[int] = None,
     max_pairs: Optional[int] = None,
+    cache_path: Optional[Union[str, Path]] = "output/.jepa_chunk_pairs.json.gz",
     console: Optional[Console] = None,
 ) -> List[Tuple[str, str]]:
     """
     Load discourse continuity pairs (chunk_i, chunk_{i+1}) from pre-parsed book states
-    and/or raw PDF books in books_dir.
+    and/or raw PDF books in books_dir. Caches parsed pairs to disk for fast reload.
     """
+    if cache_path and not max_books and not max_pairs:
+        c_path = Path(cache_path)
+        if c_path.is_file():
+            try:
+                import gzip
+                if console:
+                    console.print(f"[bold green]Loading cached pairs from {c_path}...[/bold green]")
+                with gzip.open(c_path, "rt", encoding="utf-8") as f:
+                    data = json.load(f)
+                pairs = [tuple(p) for p in data]
+                if console:
+                    console.print(f"✓ Loaded {len(pairs):,} discourse pairs from cache.")
+                return pairs
+            except Exception as e:
+                logger.debug(f"Cache read error: {e}")
+
     state_files: List[Path] = []
     for s_dir in state_dirs:
         p = Path(s_dir)
@@ -155,38 +194,45 @@ def load_chunk_pairs_from_states(
         except Exception as e:
             logger.debug(f"Error reading {fpath}: {e}")
 
-    # If books_dir is provided, extract additional pairs from unparsed PDFs
+    # If books_dir is provided, extract additional pairs from unparsed PDFs in parallel
     if books_dir:
         b_dir = Path(books_dir)
         if b_dir.is_dir():
+            from concurrent.futures import ThreadPoolExecutor
             import pypdf
 
+            logging.getLogger("pypdf").setLevel(logging.ERROR)
             pdf_files = sorted(list(b_dir.glob("*.pdf")))
+            
+            # Filter PDFs not already covered by state titles
+            to_parse = [
+                p for p in pdf_files
+                if not any(t in p.stem.lower() for t in seen_titles if len(t) > 5)
+            ]
+
             if console:
-                console.print(f"[dim]Scanning {len(pdf_files)} PDF books in {b_dir.name}...[/dim]")
-            for pdf_path in pdf_files:
+                console.print(f"[dim]Scanning {len(to_parse):,} new PDF books in thread pool...[/dim]")
+
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                results = list(executor.map(lambda p: _parse_single_pdf_worker(str(p)), to_parse))
+
+            for r in results:
+                pairs.extend(r)
                 if max_pairs and len(pairs) >= max_pairs:
-                    break
-                fname = pdf_path.stem.lower()
-                # Skip if already loaded from state
-                if any(t in fname for t in seen_titles if len(t) > 5):
-                    continue
-                try:
-                    reader = pypdf.PdfReader(str(pdf_path))
-                    doc_chunks = []
-                    # Read up to 25 pages for discourse continuity
-                    for page in reader.pages[:25]:
-                        txt = page.extract_text() or ""
-                        for para in txt.split("\n\n"):
-                            p_clean = para.strip()
-                            if len(p_clean) >= 60:
-                                doc_chunks.append(p_clean)
-                    for i in range(len(doc_chunks) - 1):
-                        pairs.append((doc_chunks[i], doc_chunks[i + 1]))
-                        if max_pairs and len(pairs) >= max_pairs:
-                            return pairs
-                except Exception as e:
-                    logger.debug(f"Error parsing PDF {pdf_path}: {e}")
+                    return pairs[:max_pairs]
+
+    if cache_path and not max_books and not max_pairs and pairs:
+        try:
+            import gzip
+            c_path = Path(cache_path)
+            c_path.parent.mkdir(parents=True, exist_ok=True)
+            with gzip.open(c_path, "wt", encoding="utf-8") as f:
+                json.dump(pairs, f)
+            if console:
+                console.print(f"[dim]Cached {len(pairs):,} discourse pairs to {c_path}[/dim]")
+        except Exception as e:
+            logger.debug(f"Could not cache pairs: {e}")
 
     return pairs
 

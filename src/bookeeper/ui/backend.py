@@ -686,9 +686,14 @@ class SearchEngineBackend:
         if not ollama_url or ollama_url == "pool":
             ollama_url = getattr(self.config, "ollama_base_url", "http://192.168.50.15:11434")
 
-        model_name = getattr(self.config, "embedding_model", "bge-m3:latest")
+        model_name = getattr(self.config, "embedding_model", "jepa-768")
 
-        index = ConceptEmbeddingIndex(cache_path=cache_path, ollama_url=ollama_url, model_name=model_name)
+        index = ConceptEmbeddingIndex(
+            cache_path=cache_path,
+            ollama_url=ollama_url,
+            model_name=model_name,
+            settings=self.config,
+        )
         if not index.load():
             logger.info("Concept embeddings cache not found on disk yet.")
         self._concept_embedding_index = index

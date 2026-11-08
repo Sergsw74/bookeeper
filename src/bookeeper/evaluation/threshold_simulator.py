@@ -693,26 +693,38 @@ def preload_simulation_data(
     loaded_books: List[PreloadedBookData] = []
     concept_map: Dict[str, List[float]] = {}
 
-    # 1. Preload concept embeddings from existing knowledge_graph.json if available
+    from bookeeper.graph.embedding_codec import get_node_embedding
+
+    # 1. Preload concept and chunk embeddings from existing knowledge_graph.json if available
     g_path = Path(graph_path).expanduser().resolve() if graph_path else (s_dir.parent / "knowledge_graph.json")
     if not g_path.is_file() and (s_dir / "knowledge_graph.json").is_file():
         g_path = s_dir / "knowledge_graph.json"
 
+    kg_chunks_map: Dict[str, List[float]] = {}
     if g_path.is_file():
         try:
             with open(g_path, "r", encoding="utf-8") as gf:
                 g_data = json.load(gf)
             nodes = g_data.get("nodes", [])
             for n in nodes:
-                name = str(n.get("name") or "").strip().lower()
-                emb = n.get("embedding")
-                if name and isinstance(emb, list) and len(emb) > 1:
-                    concept_map[name] = [float(x) for x in emb]
-            logger.info(f"Loaded {len(concept_map):,} precomputed concept embeddings from {g_path}")
+                emb = get_node_embedding(n, return_numpy=True)
+                if emb is None or len(emb) <= 1:
+                    continue
+                ntype = n.get("type", "")
+                nid = str(n.get("id") or "")
+                if ntype == "Chunk" or nid.startswith("chunk:"):
+                    cid = str(n.get("chunk_id") or nid).replace("chunk:", "")
+                    kg_chunks_map[cid] = emb.tolist()
+                else:
+                    name = str(n.get("name") or nid).replace("concept:", "").strip().lower()
+                    if name:
+                        concept_map[name] = emb.tolist()
+            logger.info(f"Loaded {len(concept_map):,} concept and {len(kg_chunks_map):,} chunk embeddings from {g_path}")
         except Exception as e:
-            logger.warning(f"Could not load precomputed concept embeddings from {g_path}: {e}")
+            logger.warning(f"Could not load precomputed embeddings from {g_path}: {e}")
 
     # 2. Iterate and preload state files
+    target_dim = getattr(embeddings_client, "dimension", None)
     for bid, sf_path in state_files.items():
         if max_books and len(loaded_books) >= max_books:
             break
@@ -756,23 +768,48 @@ def preload_simulation_data(
 
         # Filter chunks that have valid embeddings and character counts
         valid_chunks: List[Dict[str, Any]] = []
+        chunks_to_embed: List[Tuple[Dict[str, Any], str]] = []
+
         for c in raw_chunks:
-            emb = c.get("embedding")
-            if isinstance(emb, (list, np.ndarray)) and len(emb) > 1:
-                # Normalize embedding to unit length
+            cid = str(c.get("chunk_id") or "")
+            emb = None
+            if cid in kg_chunks_map:
+                emb = kg_chunks_map[cid]
+            else:
+                raw_emb = get_node_embedding(c, return_numpy=True)
+                if raw_emb is not None and (target_dim is None or len(raw_emb) == target_dim):
+                    emb = raw_emb
+
+            c_dict = {
+                "chunk_id": cid,
+                "chunk_idx": int(c.get("chunk_idx") or 0),
+                "section_title": str(c.get("section_title") or ""),
+                "char_count": int(c.get("char_count") or len(str(c.get("text") or ""))),
+                "text": str(c.get("text") or ""),
+            }
+
+            if emb is not None and len(emb) > 1:
                 arr = np.asarray(emb, dtype=np.float32)
                 norm = float(np.linalg.norm(arr))
-                unit_emb = (arr / norm).tolist() if norm > 0 else arr.tolist()
-
-                c_dict = {
-                    "chunk_id": str(c.get("chunk_id") or ""),
-                    "chunk_idx": int(c.get("chunk_idx") or 0),
-                    "section_title": str(c.get("section_title") or ""),
-                    "char_count": int(c.get("char_count") or len(str(c.get("text") or ""))),
-                    "text": str(c.get("text") or ""),
-                    "embedding": unit_emb,
-                }
+                c_dict["embedding"] = (arr / norm).tolist() if norm > 0 else arr.tolist()
                 valid_chunks.append(c_dict)
+            else:
+                txt = c_dict["text"].strip()
+                if txt and embeddings_client is not None:
+                    chunks_to_embed.append((c_dict, txt))
+
+        if chunks_to_embed:
+            to_embed_texts = [txt for _, txt in chunks_to_embed]
+            try:
+                computed_vecs = embeddings_client.embed_documents(to_embed_texts)
+                for (cd, _), v in zip(chunks_to_embed, computed_vecs):
+                    if v and len(v) > 1:
+                        arr = np.asarray(v, dtype=np.float32)
+                        norm = float(np.linalg.norm(arr))
+                        cd["embedding"] = (arr / norm).tolist() if norm > 0 else arr.tolist()
+                        valid_chunks.append(cd)
+            except Exception as e:
+                logger.warning(f"Failed to compute chunk embeddings: {e}")
 
         if valid_chunks:
             # Sort chunks by chunk_idx
@@ -855,7 +892,7 @@ def simulate_variation(
     embeddings_client: Optional[Any] = None,
     pool: Optional[Any] = None,
     postprocess: bool = True,
-    postprocess_threshold: float = 0.92,
+    postprocess_threshold: float = 0.84,
     tau_loss: float = 0.70,
     corpus_raw_embeddings: Optional[np.ndarray] = None,
     corpus_raw_weights: Optional[List[int]] = None,
@@ -1183,7 +1220,7 @@ def run_threshold_simulation_suite(
     pool: Optional[Any] = None,
     console: Optional[Console] = None,
     postprocess: bool = True,
-    postprocess_threshold: float = 0.92,
+    postprocess_threshold: float = 0.84,
     tau_loss: float = 0.70,
     batch_size: int = 10,
     model_name: Optional[str] = None,

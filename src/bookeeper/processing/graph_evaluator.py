@@ -948,7 +948,11 @@ def _harmonize_vectors(
     if eff_dim == 768 and 1024 in unique_dims:
         idx_1024 = [i for i, v in enumerate(vec_arrays) if len(v) == 1024]
         if idx_1024:
-            projector = getattr(embeddings, "project_vectors", None)
+            can_proj = getattr(embeddings, "can_project", None)
+            if callable(can_proj) and not can_proj(1024):
+                projector = None
+            else:
+                projector = getattr(embeddings, "project_vectors", None)
             if projector is None and Path("output/jepa_768_weights.npz").is_file():
                 try:
                     from bookeeper.evaluation.jepa_encoder import LightweightJEPAEncoder
@@ -1006,7 +1010,11 @@ def extract_concept_embeddings(
     names: List[str] = []
     vec_arrays: List[np.ndarray] = []
 
-    projector = getattr(embeddings, "project_vectors", None)
+    can_proj = getattr(embeddings, "can_project", None)
+    if callable(can_proj) and not can_proj(1024):
+        projector = None
+    else:
+        projector = getattr(embeddings, "project_vectors", None)
     if projector is None and Path("output/jepa_768_weights.npz").is_file():
         try:
             from bookeeper.evaluation.jepa_encoder import LightweightJEPAEncoder
@@ -1095,7 +1103,11 @@ def extract_chunk_embeddings_and_weights(
     vec_arrays: List[np.ndarray] = []
     weights: List[float] = []
 
-    projector = getattr(embeddings, "project_vectors", None)
+    can_proj = getattr(embeddings, "can_project", None)
+    if callable(can_proj) and not can_proj(1024):
+        projector = None
+    else:
+        projector = getattr(embeddings, "project_vectors", None)
     if projector is None and Path("output/jepa_768_weights.npz").is_file():
         try:
             from bookeeper.evaluation.jepa_encoder import LightweightJEPAEncoder

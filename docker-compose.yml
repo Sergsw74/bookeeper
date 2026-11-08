@@ -1,6 +1,6 @@
 services:
   bookeeper:
-    image: 192.168.50.20:5000/bookeeper:latest
+    image: 192.168.50.20:5000/bookeeper:${BOOKEEPER_IMAGE_TAG:-latest-jepa}
     build:
       context: .
       dockerfile: Dockerfile

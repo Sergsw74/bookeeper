@@ -10340,10 +10340,10 @@ def simulate_thresholds_command(
         "--postprocess/--no-postprocess",
         help="Whether to run post-processing deduplication and calculate idea drift metrics (default: True).",
     ),
-    postprocess_threshold: float = typer.Option(
-        0.92,
+    postprocess_threshold: Optional[float] = typer.Option(
+        None,
         "--postprocess-threshold",
-        help="Cosine similarity threshold for postprocessing concept deduplication (default: 0.92).",
+        help="Cosine similarity threshold for postprocessing concept deduplication (default: from config dual_pass.similarity_threshold).",
     ),
     tau_loss: float = typer.Option(
         0.70,
@@ -10461,6 +10461,11 @@ def simulate_thresholds_command(
             logger.warning(f"Could not initialize OllamaPool for simulation: {e}")
 
     eff_model = model or getattr(cfg, "resolved_dual_pass_model", "qwen2.5:7b-instruct-q4_K_M")
+    eff_postprocess_threshold = (
+        postprocess_threshold
+        if postprocess_threshold is not None
+        else getattr(cfg.dual_pass, "similarity_threshold", 0.84)
+    )
 
     try:
         suite_report = run_threshold_simulation_suite(
@@ -10475,7 +10480,7 @@ def simulate_thresholds_command(
             pool=pool,
             console=console,
             postprocess=postprocess,
-            postprocess_threshold=postprocess_threshold,
+            postprocess_threshold=eff_postprocess_threshold,
             tau_loss=tau_loss,
             batch_size=batch_size,
             model_name=eff_model,
@@ -10723,8 +10728,8 @@ def train_jepa_command(
         search_dirs.append(out_dir / "cached_states")
         search_dirs.append(out_dir)
 
-    # Resolve books directory
-    resolved_books_dir = Path(books_dir) if books_dir else (Path(cfg.books_dir) if cfg.books_dir else None)
+    # Resolve books directory (only scan raw PDFs if explicitly passed via --books-dir)
+    resolved_books_dir = Path(books_dir) if books_dir else None
 
     console.print(
         Panel.fit(

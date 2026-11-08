@@ -2101,6 +2101,53 @@ def test_ui_backend_sync_neo4j_from_knowledge_graph_flow(mock_backend, tmp_path)
     assert mock_exporter.export.called
 
 
+def test_ui_concept_embedding_index_jepa(tmp_path):
+    """Verify ConceptEmbeddingIndex loads JEPA-768 embeddings and queries successfully."""
+    from bookeeper.ui.embeddings import ConceptEmbeddingIndex
+    import numpy as np
+
+    kg_path = tmp_path / "knowledge_graph.json"
+    cache_path = tmp_path / "concept_embeddings.npz"
+
+    # Create dummy 768-d concept embeddings
+    vec1 = [0.1] * 768
+    vec2 = [0.2] * 768
+    dummy_kg = {
+        "nodes": [
+            {"id": "concept:SpatialReasoning", "name": "Spatial Reasoning", "weight": 8, "embedding": vec1},
+            {"id": "concept:ActiveInference", "name": "Active Inference", "weight": 6, "embedding": vec2},
+            {"id": "chunk:1", "type": "Chunk", "embedding": vec1},  # Should be skipped
+        ]
+    }
+    with open(kg_path, "w", encoding="utf-8") as f:
+        json.dump(dummy_kg, f)
+
+    mock_client = MagicMock()
+    mock_client.embed_query.return_value = vec1
+
+    idx = ConceptEmbeddingIndex(
+        cache_path=cache_path,
+        model_name="jepa-768",
+        embeddings_client=mock_client,
+    )
+
+    # 1. Test dynamic extraction from knowledge_graph.json
+    assert idx.load(graph_path=kg_path) is True
+    assert len(idx.concept_ids) == 2
+    assert idx.dim == 768
+    assert idx._norm_matrix.shape == (2, 768)
+    assert cache_path.is_file()
+
+    # 2. Test query with mock JEPA client
+    results, telemetry = idx.query_core_ideas_with_telemetry("What is spatial reasoning?", similarity_threshold=0.55)
+    assert len(results) >= 1
+    assert results[0]["name"] == "Spatial Reasoning"
+    assert results[0]["cosine_similarity"] > 0.99
+    assert telemetry["dimensions"] == 768
+    assert telemetry["total_indexed_concepts"] == 2
+
+
+
 
 
 

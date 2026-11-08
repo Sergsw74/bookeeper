@@ -15,6 +15,8 @@ The documentation is split into specialized subchapters stored in the [`docs/`](
 | 🔄 **[Recommended Workflow](docs/workflow.md)** | **Start here**: Calibration via small A/B tests, building knowledge graph, export, and optional post-processing. |
 | 🚀 **[Getting Started](docs/get-started.md)** | Prerequisites, installation (`uv`/`pip`), configuration walkthrough, and basic commands. |
 | 🏗️ **[Building the Knowledge Graph](docs/building-graph.md)** | Graph extraction pipeline, chronological ingestion, 3-tier semantic routing, offline rebuilds, pruning, incremental Neo4j sync, and index suspension. |
+| 🎓 **[Mandatory JEPA Pre-Training](docs/jepa-pretraining.md)** | **Mandatory step**: Why untrained base models fail with random values, two-tier architecture, VICReg loss, pair extraction, and GPU benchmark (~27s on M4 GPU). |
+| 🧠 **[JEPA 2-Axis Semantic Filtering](docs/jepa_filters.md)** | Calibrated 768-d JEPA joint embedding space, 2-axis filtering (idea routing × chunk redundancy), and Honey Spot A benchmark. |
 | 🧹 **[Chunk Filtering & Semantic Pruning](docs/filters.md)** | 4-tier conveyor filtering (math shield, regex boilerplate, semantic routing, hierarchical semantic cover), benchmark trade-offs, and optimal settings ($\tau = 0.95$). |
 | 🌐 **[Interactive Web UI & Search](docs/ui.md)** | **Idea Search & Explorer**: Interactive Cytoscape Neo4j graph, dedicated **💡 Ideas Page** (exact, embedded vector search, modernity range filter), Obsidian note panel, and embedded LightRAG WebUI. |
 | 🔍 **[Decoupled Hybrid RAG](docs/rag.md)** | LightRAG vector/graph indexing from cached chunks and multi-mode querying (`hybrid`, `local`, `global`). |
@@ -38,6 +40,8 @@ Bookkeeper provides a rich set of CLI commands. Below is a high-level overview o
 | **`query`** | `bookeeper query "Explain Paxos"` | Queries the library using LightRAG hybrid retrieval (local entity graphs + global summaries). | [Hybrid RAG](docs/rag.md) |
 | **`build-rag`** | `bookeeper build-rag` | Indexes pre-computed SSD chunks into LightRAG independently from book ingestion. | [Hybrid RAG](docs/rag.md) |
 | **`postprocess-ideas`** | `bookeeper postprocess-ideas` | At-most-once LLM synthesis of multi-occurrence ideas with untouched cluster skipping, BLAS vector clustering, and state checkpointing. | [Post-Processing](docs/post-processing.md) |
+| **`train-jepa`** | `bookeeper train-jepa --epochs 10 --device gpu` | Trains a domain-adapted two-tier Text-JEPA representation model with VICReg loss on local literature discourse pairs (~27s on M4 GPU). | [JEPA Pre-training](docs/jepa-pretraining.md) |
+| **`sweep-thresholds`** | `bookeeper sweep-thresholds -p "0.65:0.85,0.75:0.86"` | Replays chunk routing over the book chunk & state cache, computing full graph space metrics and idea drift across threshold variations with Mermaid plots. | [JEPA Filters](docs/jepa_filters.md) |
 | **`verify`** | `bookeeper verify --mode graph --tau 0.75` | Audits factual grounding of ideas, chunk boundary coherence, cross-KG NLI entailment, graph embedding space (`--mode graph`), or post-processing idea drift (`--mode drift`) under 10 GB memory guard. | [Verification](docs/verification.md) |
 | **`verifiers`** | `bookeeper verifiers` | Runs all configured verification suites from `config.yaml` concurrently. | [Verification](docs/verification.md) |
 | **`simulate-thresholds`** | `bookeeper simulate-thresholds -p "0.60:0.90,0.65:0.90"` | Fast offline simulation of chunk routing, graph space metrics, and post-processing drift across threshold pairs (<0.2s/run) with Mermaid charts. | [Threshold Simulator](docs/threshold-simulator.md) |
@@ -117,11 +121,13 @@ Bookkeeper includes an intelligent multi-server routing engine designed for dist
 To handle massive knowledge bases efficiently without ingestion lag or GPU bottlenecks, Bookkeeper incorporates specialized architectural patterns:
 
 - **Chronological Book Ingestion & Idea Modernity Tracking**: Books are ingested chronologically by publication/file date. Ideas track `first_occurrence_month` and `month` (`YYYY-MM`), with earlier dates winning to reflect idea provenance.
-- **3-Tier Semantic Chunk Routing (`--skip-limbo-chunks`, `--max-batch-chunk-size`)**:
-  - **Priority 1 (Unassigned / Brand New)**: Similarity $< 0.65$ triggers full LLM extraction.
-  - **Priority 2 (High-Confidence Fast-Path)**: Similarity $\ge 0.90$ directly assigns chunks to existing ideas, bypassing LLM calls entirely.
-  - **Priority 3 (Limbo Chunks)**: $0.65 \le \text{sim} < 0.90$. Skipping these via `--skip-limbo-chunks` provides massive speedups for large libraries.
-  - **Forced Chunk Size Recovery (`--max-batch-chunk-size`)**: If a limbo chunk is this character size or bigger, it is forcibly recovered from limbo and restored to the Priority 1 unprocessed queue, even if embeddings suggested limbo or skipping. Resuming with this threshold also recovers previously skipped limbo chunks.
+- **JEPA 2-Axis Calibrated Filtering (Honey Spot A - Balanced Pareto)**:
+  - **Axis 1 (Global Idea Similarity Routing)**:
+    - **Unassigned / Novel Frontier (`< 0.65`)**: Triggers LLM concept extraction.
+    - **High-Confidence Direct Reuse (`>= 0.85`)**: Directly attributes chunks to canonical ideas at zero LLM cost, adding supporting quotes and `:MENTIONED_IN` edges.
+    - **Limbo Chunks (`0.65 <= sim < 0.85`)**: Bypassed via `--skip-limbo-chunks` unless character length $\ge 1024$ (`--max-batch-chunk-size`).
+  - **Axis 2 (Local Chunk Redundancy Pruning)**: Prunes intra-section narrative repetition with cosine similarity $\ge 0.85$, safely eliminating **52.6% of corpus chunks** while maintaining **53.22% coverage** and **0.7487 Chamfer proximity** (matching unpruned baselines).
+  - **Priority 1 Math Shield Guarantee**: All mathematical equations, LaTeX formulas, and theorem declarations unconditionally trigger `FilterDecision.RETAIN` and are 100% safeguarded from all downstream filters.
 - **Neo4j Search Index Suspension**: During bulk node and edge exports, Bookkeeper discovers and temporarily suspends `VECTOR` (`idea_idx`, `chunk_idx`) and `FULLTEXT` indexes while preserving unique ID constraints for $O(1)$ `MERGE`. Indexes are recreated in parallel post-ingestion and polled until reaching `ONLINE` state.
 - **Incremental Batch Sync**: Automatically exports only affected (dirty) nodes and edges after each configured book batch (default: 10 books).
 - **Incremental Diff Backup & Graph Merging**: Calculates diffs against active Neo4j or previous archives (`--incremental`, `--diff-against`), identifying newly indexed books along with conceptually related literature connected via shared knowledge graph nodes. Restoring with `--incremental` performs a non-destructive merge into existing KG artifacts and Neo4j.
@@ -176,10 +182,13 @@ cp config.yaml.example config.yaml
 # 3. Test connectivity and list books:
 bookeeper list-books --limit 10
 
-# 4. Ingest 3 books from scratch into Knowledge Graph:
+# 4. Optional: Teach / fine-tune domain-adapted JEPA model on literature (~27s on M4 GPU):
+bookeeper train-jepa --epochs 10 --device gpu
+
+# 5. Ingest 3 books from scratch into Knowledge Graph:
 bookeeper build-graph --limit 3 --from-scratch --no-lightrag
 
-# 5. Audit factual grounding:
+# 6. Audit factual grounding:
 bookeeper verify --mode ideas --percent 2.0
 ```
 

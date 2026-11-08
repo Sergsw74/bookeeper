@@ -184,19 +184,44 @@ class JEPAEmbeddings(Embeddings):
             in_dim = 384
             out_dim = self.dimension
 
+            use_fp16 = self.device.type in ("mps", "cuda")
             head = TextJEPAHead(in_dim=in_dim, hidden_dim=512, out_dim=out_dim).to(self.device)
             if self.pt_weights_path.is_file():
                 try:
                     ckpt = torch.load(self.pt_weights_path, map_location=self.device)
                     head.load_state_dict(ckpt["state_dict"])
                     self._jepa_mean = ckpt.get("mean_z", None)
+                    if self._jepa_mean is not None and use_fp16:
+                        self._jepa_mean = self._jepa_mean.half()
                     backbone_name = ckpt.get("backbone_name", backbone_name)
                     logger.info(f"Loaded trained JEPA head weights from {self.pt_weights_path}")
                 except Exception as e:
                     logger.warning(f"Could not load JEPA head weights from {self.pt_weights_path}: {e}")
+            else:
+                logger.warning(
+                    f"JEPA head weights not found at {self.pt_weights_path}! The projection head is using uncalibrated random weights. "
+                    "Pre-training is mandatory for accurate cosine similarity: please run 'bookeeper train-jepa' first."
+                )
+
+            if use_fp16:
+                head = head.half()
             head.eval()
 
-            self._jepa_backbone = SentenceTransformer(backbone_name, device=str(self.device))
+            model_kwargs = {"torch_dtype": torch.float16} if use_fp16 else {}
+            try:
+                self._jepa_backbone = SentenceTransformer(
+                    backbone_name,
+                    device=str(self.device),
+                    model_kwargs=model_kwargs,
+                    local_files_only=True,
+                )
+            except Exception:
+                self._jepa_backbone = SentenceTransformer(
+                    backbone_name,
+                    device=str(self.device),
+                    model_kwargs=model_kwargs,
+                )
+            self._jepa_backbone.max_seq_length = 128
             self._jepa_head = head
 
         return self._jepa_backbone, self._jepa_head
@@ -240,13 +265,15 @@ class JEPAEmbeddings(Embeddings):
             for i in range(0, len(texts), bs):
                 sub = texts[i : i + bs]
                 base_vecs = backbone.encode(sub, batch_size=bs, show_progress_bar=False, normalize_embeddings=True)
-                with torch.no_grad():
+                with torch.inference_mode():
                     t_in = torch.from_numpy(base_vecs).to(self.device)
+                    if next(head.parameters()).dtype == torch.float16:
+                        t_in = t_in.half()
                     z = head(t_in)
                     if self._jepa_mean is not None:
                         z = z - self._jepa_mean.to(self.device)
                     z_norm = torch.nn.functional.normalize(z, p=2, dim=-1)
-                    embeddings.extend([v.tolist() for v in z_norm.cpu().numpy()])
+                    embeddings.extend(z_norm.cpu().numpy().tolist())
                 if on_progress:
                     try:
                         on_progress(len(sub))
@@ -303,6 +330,22 @@ class JEPAEmbeddings(Embeddings):
         res = self.embed_documents([text])
         return res[0] if res else [0.0] * self.dimension
 
+    @property
+    def input_dimension(self) -> int:
+        """Expected input dimension for projector."""
+        if hasattr(self, "encoder") and self.encoder is not None:
+            return getattr(self.encoder, "in_dim", self.dimension)
+        return self.dimension
+
+    def can_project(self, dim: int) -> bool:
+        """Check if pre-existing vectors of dimension `dim` can be projected."""
+        if not self.encoder.is_fitted and self.weights_path.is_file():
+            try:
+                self.encoder = LightweightJEPAEncoder.load(self.weights_path)
+            except Exception:
+                pass
+        return bool(self.encoder.is_fitted and self.input_dimension == dim)
+
     def project_vectors(self, vectors: Union[np.ndarray, List[List[float]]]) -> np.ndarray:
         """
         Fast batch projection of pre-existing embeddings (e.g. from book state files)
@@ -311,4 +354,9 @@ class JEPAEmbeddings(Embeddings):
         arr = np.asarray(vectors, dtype=np.float32)
         if not self.encoder.is_fitted and self.weights_path.is_file():
             self.encoder = LightweightJEPAEncoder.load(self.weights_path)
+        if arr.ndim > 0 and arr.shape[-1] != self.input_dimension:
+            raise ValueError(
+                f"Cannot project vectors of dimension {arr.shape[-1]} to JEPA space: "
+                f"fitted projector expects dimension {self.input_dimension}."
+            )
         return self.encoder.project(arr)

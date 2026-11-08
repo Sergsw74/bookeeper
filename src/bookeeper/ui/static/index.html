@@ -2022,11 +2022,11 @@
 
         <div class="toolbar-group">
           <label for="similarity-threshold" class="toolbar-label">Threshold:</label>
-          <select id="similarity-threshold" class="toolbar-select" title="Minimum embedding cosine similarity required for seed ideas">
-            <option value="0.80">≥ 0.80 (Strict)</option>
-            <option value="0.70" selected>≥ 0.70 (Standard)</option>
-            <option value="0.60">≥ 0.60 (Relaxed)</option>
-            <option value="0.50">≥ 0.50 (Broad)</option>
+          <select id="similarity-threshold" class="toolbar-select" title="Minimum embedding cosine similarity required for seed ideas (calibrated for JEPA-768)">
+            <option value="0.75">≥ 0.75 (Strict)</option>
+            <option value="0.65" selected>≥ 0.65 (Standard - JEPA)</option>
+            <option value="0.55">≥ 0.55 (Relaxed)</option>
+            <option value="0.45">≥ 0.45 (Broad)</option>
           </select>
         </div>
 
@@ -2222,20 +2222,20 @@
                   class="seg-btn"
                   data-idea-mode="embedded"
                   onclick="setIdeasSearchMode('embedded')"
-                  title="Neural embedding vector search (bge-m3 cosine similarity)"
+                  title="Neural embedding vector search (JEPA-768 cosine similarity)"
                 >🧠 Embedded Search</button>
               </div>
               <input type="hidden" id="ideas-search-mode" value="exact" />
             </div>
 
             <div class="toolbar-group" id="ideas-sim-threshold-group" style="display:none; gap:6px;">
-              <label for="ideas-sim-threshold" class="toolbar-label" title="Minimum cosine similarity for embedded search">Min Similarity:</label>
+              <label for="ideas-sim-threshold" class="toolbar-label" title="Minimum cosine similarity for embedded search (JEPA-calibrated)">Min Similarity:</label>
               <select id="ideas-sim-threshold" class="toolbar-select" onchange="executeIdeasSearch()">
                 <option value="0.30">≥ 0.30 (Broad)</option>
-                <option value="0.45" selected>≥ 0.45 (Standard)</option>
-                <option value="0.60">≥ 0.60 (Confident)</option>
-                <option value="0.70">≥ 0.70 (Strict)</option>
-                <option value="0.80">≥ 0.80 (Exact Semantic)</option>
+                <option value="0.45">≥ 0.45 (Balanced)</option>
+                <option value="0.55" selected>≥ 0.55 (Standard - JEPA)</option>
+                <option value="0.65">≥ 0.65 (Confident)</option>
+                <option value="0.75">≥ 0.75 (Strict Semantic)</option>
               </select>
             </div>
 

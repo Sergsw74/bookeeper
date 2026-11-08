@@ -1497,7 +1497,7 @@ class ConceptGraphStore:
                         if bid is not None:
                             books_needing_chunks.add(int(bid))
                 for bid in books_needing_chunks:
-                    cfile = next((f for f in [cdir / f"book_{bid}_chunks.json", cdir / f"book_{bid}.json"] if f.is_file()), None)
+                    cfile = next((f for f in [cdir / f"book_{bid}_chunks.json", cdir / f"book_{bid}.json", cdir / f"book_{bid}_state.json"] if f.is_file()), None)
                     if cfile and cfile.is_file():
                         try:
                             with open(cfile, "r", encoding="utf-8") as f:
@@ -1508,8 +1508,15 @@ class ConceptGraphStore:
                                 cnid = f"chunk:{cid}"
                                 if cid and cemb is not None and len(cemb) > 1:
                                     if target_dim and len(cemb) != target_dim:
-                                        if hasattr(embeddings, "project_vectors") and len(cemb) == 1024 and target_dim == 768:
-                                            cemb = embeddings.project_vectors(cemb)[0]
+                                        can_proj = getattr(embeddings, "can_project", None)
+                                        is_proj = can_proj(len(cemb)) if callable(can_proj) else (
+                                            hasattr(embeddings, "project_vectors") and getattr(embeddings, "input_dimension", target_dim) == len(cemb)
+                                        )
+                                        if is_proj:
+                                            try:
+                                                cemb = embeddings.project_vectors([cemb])[0]
+                                            except Exception:
+                                                continue
                                         else:
                                             continue
                                     if self.graph.has_node(cnid):
@@ -1543,7 +1550,11 @@ class ConceptGraphStore:
 
             if existing_emb is not None and len(existing_emb) > 1:
                 if target_dim and len(existing_emb) != target_dim:
-                    if hasattr(embeddings, "project_vectors") and len(existing_emb) == 1024 and target_dim == 768:
+                    can_proj = getattr(embeddings, "can_project", None)
+                    is_proj = can_proj(len(existing_emb)) if callable(can_proj) else (
+                        hasattr(embeddings, "project_vectors") and getattr(embeddings, "input_dimension", target_dim) == len(existing_emb)
+                    )
+                    if is_proj:
                         if (is_idea and include_ideas) or (ntype == "Chunk" and include_chunks):
                             nodes_to_project.append((node_id, existing_emb, ntype))
                         continue
@@ -1578,26 +1589,61 @@ class ConceptGraphStore:
         chunks_embedded = chunks_reused_from_disk
 
         if nodes_to_project and hasattr(embeddings, "project_vectors"):
-            if console:
-                console.print(f"[bold cyan]Projecting {len(nodes_to_project):,} legacy 1024-d embeddings to 768-d JEPA space on GPU...[/bold cyan]")
-            else:
-                logger.info(f"Projecting {len(nodes_to_project):,} legacy 1024-d embeddings to 768-d JEPA space on GPU...")
-            proj_arr = np.asarray([emb for _, emb, _ in nodes_to_project], dtype=np.float32)
-            projected = embeddings.project_vectors(proj_arr)
-            for (nid, _, ntype), pvec in zip(nodes_to_project, projected):
-                if self.graph.has_node(nid):
-                    self._set_node_embedding_vector(self.graph.nodes[nid], pvec)
-                    self.mark_node_dirty(nid)
-                elif self.is_sharded and self.sharded_store:
-                    float_vec = [round(float(x), 6) for x in pvec]
-                    if ntype == "Chunk":
-                        self.add_chunk({"chunk_id": nid.replace("chunk:", ""), "embedding": float_vec})
-                    else:
-                        self.add_concept({"name": nid.replace("concept:", ""), "embedding": float_vec})
-                if ntype == "Chunk":
-                    chunks_embedded += 1
+            sample_dim = len(nodes_to_project[0][1])
+            can_proj = getattr(embeddings, "can_project", None)
+            is_proj = can_proj(sample_dim) if callable(can_proj) else (
+                getattr(embeddings, "input_dimension", target_dim) == sample_dim
+            )
+            if is_proj:
+                if console:
+                    console.print(f"[bold cyan]Projecting {len(nodes_to_project):,} legacy {sample_dim}-d embeddings to {target_dim}-d JEPA space on GPU...[/bold cyan]")
                 else:
-                    ideas_embedded += 1
+                    logger.info(f"Projecting {len(nodes_to_project):,} legacy {sample_dim}-d embeddings to {target_dim}-d JEPA space on GPU...")
+                try:
+                    proj_arr = np.asarray([emb for _, emb, _ in nodes_to_project], dtype=np.float32)
+                    projected = embeddings.project_vectors(proj_arr)
+                    for (nid, _, ntype), pvec in zip(nodes_to_project, projected):
+                        if self.graph.has_node(nid):
+                            self._set_node_embedding_vector(self.graph.nodes[nid], pvec)
+                            self.mark_node_dirty(nid)
+                        elif self.is_sharded and self.sharded_store:
+                            float_vec = [round(float(x), 6) for x in pvec]
+                            if ntype == "Chunk":
+                                self.add_chunk({"chunk_id": nid.replace("chunk:", ""), "embedding": float_vec})
+                            else:
+                                self.add_concept({"name": nid.replace("concept:", ""), "embedding": float_vec})
+                        if ntype == "Chunk":
+                            chunks_embedded += 1
+                        else:
+                            ideas_embedded += 1
+                except Exception as e:
+                    logger.warning(f"Failed to project legacy embeddings: {e}, falling back to re-embed")
+                    is_proj = False
+
+            if not is_proj:
+                for nid, _, ntype in nodes_to_project:
+                    attrs = self.graph.nodes[nid]
+                    if ntype == "Chunk" and include_chunks:
+                        chunk_text = (attrs.get("text") or "").strip()
+                        if chunk_text:
+                            missing_chunk_nodes.append((nid, chunk_text))
+                    elif include_ideas:
+                        raw_name = attrs.get("name") or str(nid).replace("concept:", "")
+                        clean_name = BookParser.repair_mojibake(raw_name).strip()
+                        if clean_name:
+                            brief = attrs.get("brief_description") or attrs.get("short_description") or attrs.get("summary") or ""
+                            detailed = attrs.get("detailed_explanation") or ""
+                            desc = attrs.get("description") or ""
+                            summary = attrs.get("summary") or ""
+                            text = format_idea_for_embedding(
+                                clean_name,
+                                brief_description=brief,
+                                detailed_explanation=detailed,
+                                summary=summary,
+                                description=desc,
+                                short_description=attrs.get("short_description", "") or brief,
+                            )
+                            missing_idea_nodes.append((nid, text))
 
         if missing_idea_nodes:
             idea_texts = [t for _, t in missing_idea_nodes]

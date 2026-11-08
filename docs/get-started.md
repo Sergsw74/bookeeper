@@ -196,6 +196,15 @@ bookeeper restore ./backups/my_knowledge.7z --output-dir ./restored_output --cle
 
 ## 5. Your First Knowledge Graph Run
 
+### Step 1: Pre-train / Teach Domain JEPA Model (Optional but Recommended)
+Train a domain-adapted 768-d JEPA representation model with VICReg loss on your literature pairs (~27s on Apple Silicon M4 GPU):
+
+```bash
+# Teach JEPA directly from download directory or existing book states:
+bookeeper train-jepa --epochs 10 --device gpu
+```
+
+### Step 2: Ingest Initial Batch of Books
 Once configured, index a small batch of books to verify your pipeline end-to-end:
 
 ```bash
@@ -215,6 +224,8 @@ You can monitor real-time extraction progress in the terminal:
 Dive deeper into specific subsystems:
 
 - 🔄 **[Recommended Workflow](workflow.md)** — Start here: Calibration via small A/B tests, full graph build, exports, and optional post-processing.
+- 🎓 **[Mandatory JEPA Pre-Training](jepa-pretraining.md)** — **Mandatory prerequisite**: Why untrained base models fail with random values, VICReg loss, pair harvesting, and GPU pre-training (~27s on M4 GPU).
+- 🧠 **[JEPA 2-Axis Semantic Filtering](jepa_filters.md)** — Calibrated 768-d JEPA joint embedding space, 2-axis filtering (idea routing × chunk redundancy), and Honey Spot A benchmark.
 - 💾 **[Backup & Restore Subsystem](backup-restore.md)** — Standalone backup engine, full vs knowledge scopes, integrity audits, and A/B evaluations against archives.
 - ⚡ **[Threshold Simulation & Sweep Engine](threshold-simulator.md)** — Offline replay of chunk routing across threshold pairs with graph space metrics and idea drift in milliseconds.
 - 🏗️ **[Building the Knowledge Graph](building-graph.md)** — Comprehensive options for `build-graph`, instant offline rebuilds via `rebuild-graph`, concept significance weighting, and Neo4j exports.

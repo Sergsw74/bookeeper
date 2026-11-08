@@ -1754,6 +1754,8 @@ class Settings(BaseSettings):
                         flat_data[f"lightrag_{sub_key}"] = sub_val
             elif key == "jepa" and isinstance(val, dict):
                 flat_data["jepa"] = val
+            elif key == "telegram" and isinstance(val, dict):
+                flat_data["telegram"] = val
             elif isinstance(val, dict):
                 for sub_key, sub_val in val.items():
                     flat_data[f"{key}_{sub_key}"] = sub_val

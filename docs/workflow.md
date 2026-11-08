@@ -34,6 +34,19 @@ flowchart TD
 
 ---
 
+## Mandatory Prerequisite: Domain JEPA Model Pre-Training (`bookeeper train-jepa`)
+
+> [!IMPORTANT]
+> **PRE-TRAINING IS MANDATORY FOR THE JEPA REPRESENTATION PIPELINE**:  
+> In `jepa-768` mode, `bookeeper` uses a two-tier model (`bge-small-en-v1.5` backbone + trainable `TextJEPAHead`). If you start extraction without running `bookeeper train-jepa`, the projection head uses **uncalibrated random PyTorch weights**, generating chaotic vectors and destroying filtering accuracy.  
+> **Always run pre-training first** on your literature pairs (~27 seconds on Apple Silicon M4 GPU):
+> ```bash
+> bookeeper train-jepa --epochs 10 --device gpu
+> ```
+> See the **[Mandatory JEPA Pre-Training Guide](jepa-pretraining.md)** for architecture details, VICReg loss mechanics, and validation metrics.
+
+---
+
 ## Step 1: Run Small A/B Tests to Find Your Balance
 
 Before launching a full extraction run across hundreds of books, **always run an A/B test on a small sample (1–3 books, small chunk/block counts)** to verify your extraction hypothesis, evaluate model tradeoffs, and calibrate settings for your specific domain and book formats.

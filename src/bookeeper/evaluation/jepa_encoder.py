@@ -267,6 +267,15 @@ class LightweightJEPAEncoder:
         self.is_fitted = True
         return self
 
+    @property
+    def in_dim(self) -> int:
+        """Expected input dimension for projections."""
+        if self.W_proj_ is not None:
+            return int(self.W_proj_.shape[0])
+        if self.mean_ is not None:
+            return int(self.mean_.shape[-1])
+        return self.latent_dim
+
     def project(self, embeddings: Union[np.ndarray, List[List[float]], torch.Tensor]) -> np.ndarray:
         """
         Project embeddings into decorrelated unit-hypersphere JEPA latent space.
@@ -287,6 +296,11 @@ class LightweightJEPAEncoder:
         is_1d = (X.ndim == 1)
         if is_1d:
             X = X.unsqueeze(0)
+
+        if X.shape[-1] != self.in_dim:
+            raise ValueError(
+                f"Input tensor dimension {X.shape[-1]} does not match fitted projector dimension {self.in_dim}."
+            )
 
         with torch.no_grad():
             X_centered = X - self._mean_tensor

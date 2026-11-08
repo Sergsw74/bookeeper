@@ -89,7 +89,9 @@ BUILD_CMD+=(--platform "${PLATFORMS}")
 BUILD_CMD+=(--build-arg "APP_VERSION=${VERSION}")
 BUILD_CMD+=(--build-arg "RELEASE_DATE=${RELEASE_DATE}")
 BUILD_CMD+=(-t "${REGISTRY}:latest")
+BUILD_CMD+=(-t "${REGISTRY}:latest-jepa")
 BUILD_CMD+=(-t "${REGISTRY}:${VERSION}")
+BUILD_CMD+=(-t "${REGISTRY}:${VERSION}-jepa")
 
 if [ "$PUSH" = true ]; then
     BUILD_CMD+=(--push)

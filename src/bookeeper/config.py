@@ -178,6 +178,43 @@ class Neo4jConfig(BaseModel):
     )
 
 
+class TelegramConfig(BaseModel):
+    """Configuration for Telegram notifications on job events (graph build, verification, errors)."""
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable or disable Telegram notifications.",
+    )
+    bot_token: Optional[str] = Field(
+        default=None,
+        description="Telegram Bot API token (from @BotFather). Can also be set via TELEGRAM_BOT_TOKEN.",
+    )
+    chat_id: Optional[str] = Field(
+        default=None,
+        description="Target Telegram chat ID, group ID, or channel (@channelname). Can also be set via TELEGRAM_CHAT_ID.",
+    )
+    message_thread_id: Optional[int] = Field(
+        default=None,
+        description="Optional forum supergroup topic / thread ID to send messages to.",
+    )
+    notify_build_graph: bool = Field(
+        default=True,
+        description="Send notifications for graph build start, milestone progress, completion, and failures.",
+    )
+    notify_verification: bool = Field(
+        default=True,
+        description="Send notifications for verification start and completion with summary statistics.",
+    )
+    progress_step_percent: int = Field(
+        default=10,
+        description="For graph building, notify progress every N percent (e.g. 10 for every 10%, 20 for every 20%).",
+    )
+    timeout_seconds: float = Field(
+        default=10.0,
+        description="HTTP request timeout in seconds for Telegram API calls.",
+    )
+
+
 class SingleVerifierConfig(BaseModel):
     """Configuration for an individual verifier in multi-verification."""
 
@@ -1119,11 +1156,6 @@ class Settings(BaseSettings):
             return False
         return True
 
-    @property
-    def embedding_dim(self) -> int:
-        """Alias for lightrag_embedding_dim for vector embeddings."""
-        return self.lightrag_embedding_dim
-
 
 
     def calculate_pool_concurrency(self, num_servers: int) -> int:
@@ -1399,6 +1431,59 @@ class Settings(BaseSettings):
             cfg_dict["enabled"] = True
 
         return Neo4jConfig(**cfg_dict)
+
+    # Telegram Notifications
+    telegram: TelegramConfig = Field(
+        default_factory=TelegramConfig,
+        description="Telegram notification configuration.",
+    )
+
+    @field_validator("telegram", mode="before")
+    @classmethod
+    def parse_telegram_config(cls, v: Any) -> Any:
+        cfg_dict: Dict[str, Any] = {}
+        if isinstance(v, TelegramConfig):
+            cfg_dict = v.model_dump()
+        elif isinstance(v, dict):
+            cfg_dict = dict(v)
+
+        # Check environment variable overrides (BOOKEEPER_TELEGRAM_* and TELEGRAM_*)
+        env_token = (
+            os.environ.get("BOOKEEPER_TELEGRAM_BOT_TOKEN")
+            or os.environ.get("TELEGRAM_BOT_TOKEN")
+            or ""
+        ).strip()
+        env_chat = (
+            os.environ.get("BOOKEEPER_TELEGRAM_CHAT_ID")
+            or os.environ.get("TELEGRAM_CHAT_ID")
+            or ""
+        ).strip()
+        env_thread = os.environ.get("BOOKEEPER_TELEGRAM_MESSAGE_THREAD_ID") or os.environ.get("TELEGRAM_MESSAGE_THREAD_ID")
+        env_enabled_str = os.environ.get("BOOKEEPER_TELEGRAM_ENABLED") or os.environ.get("TELEGRAM_ENABLED")
+        env_step_str = (
+            os.environ.get("BOOKEEPER_TELEGRAM_PROGRESS_STEP")
+            or os.environ.get("TELEGRAM_PROGRESS_STEP")
+            or os.environ.get("TELEGRAM_PROGRESS_STEP_PERCENT")
+        )
+
+        if env_token:
+            cfg_dict["bot_token"] = env_token
+        if env_chat:
+            cfg_dict["chat_id"] = env_chat
+        if env_thread is not None:
+            try:
+                cfg_dict["message_thread_id"] = int(env_thread)
+            except ValueError:
+                pass
+        if env_enabled_str is not None:
+            cfg_dict["enabled"] = env_enabled_str.strip().lower() in ("1", "true", "yes", "on")
+        if env_step_str is not None:
+            try:
+                cfg_dict["progress_step_percent"] = int(env_step_str)
+            except ValueError:
+                pass
+
+        return TelegramConfig(**cfg_dict)
 
     # Knowledge Graph Factual Verification
     verification: VerificationConfig = Field(

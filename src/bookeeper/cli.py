@@ -50,6 +50,7 @@ from bookeeper.calibre import (
     get_book_client,
 )
 from bookeeper.config import Settings, get_active_config_diff, get_settings, set_active_config_diff
+from bookeeper.notifications import TelegramNotifier
 from bookeeper.graph.exporters import GraphMLExporter, Neo4jExporter, ObsidianExporter
 from bookeeper.graph.sharding import GraphMigrator, ShardedGraphStore
 from bookeeper.graph.store import ConceptGraphStore
@@ -3050,6 +3051,18 @@ def build_graph(
         f"across {num_servers} Ollama server(s) (low: {num_servers}, max default: {min(cfg.max_active_tasks_cap, 3 * num_servers)})."
     )
 
+    notifier = TelegramNotifier(cfg.telegram)
+    try:
+        notifier.notify_build_start(
+            total_books=len(books_to_process),
+            llm_model=cfg.llm_model,
+            embedding_model=cfg.embedding_model,
+            pool_concurrency=pool_concurrency,
+            target_info=f"{len(books_to_process)} book(s)",
+        )
+    except Exception as n_err:
+        logger.debug(f"Telegram build start notification failed: {n_err}")
+
     completed_in_session = 0
     session_assigned_chunks = 0
     session_skipped_chunks = 0
@@ -4548,6 +4561,31 @@ def build_graph(
                 })
                 console.print(f"  [dim green]✓ Book #{bid} concepts integrated and graph checkpoint saved ({book_total_dur:.1f}s).[/dim green]")
 
+                # Telegram progress milestone notification (e.g. every 10% or 20%)
+                if notifier.should_notify_progress(completed=completed_in_session, total=len(books_to_process)):
+                    try:
+                        elapsed_so_far = time.perf_counter() - pipeline_start_time
+                        _, _, overall_eta_str, _ = compute_overall_library_eta(
+                            total_books=len(books_to_process),
+                            current_book_idx=book_idx,
+                            current_book_rem_sec=0.0,
+                            durations=durations,
+                            pool_concurrency=pool_concurrency,
+                            completed_book_records=completed_book_records,
+                        )
+                        notifier.notify_build_progress(
+                            completed_books=completed_in_session,
+                            total_books=len(books_to_process),
+                            current_book_title=btitle,
+                            elapsed_seconds=elapsed_so_far,
+                            eta_str=overall_eta_str,
+                            active_tasks=active_tasks_count,
+                            assigned_chunks=session_assigned_chunks,
+                            skipped_chunks=session_skipped_chunks,
+                        )
+                    except Exception as n_err:
+                        logger.debug(f"Telegram progress notification failed: {n_err}")
+
                 # Inter-batch post-processing & incremental Neo4j export of affected nodes
                 batch_size = batch_size_books
                 is_batch_end = (completed_in_session % batch_size == 0) or (book_idx == len(books_to_process))
@@ -4641,6 +4679,10 @@ def build_graph(
                 raise
             except Exception as e:
                 console.print(f"[bold red]✗ Failed to build graph for book #{bid} ('{btitle}'):[/bold red] {e}")
+                try:
+                    notifier.notify_build_failure(book_id=bid, title=btitle, error=str(e))
+                except Exception as n_err:
+                    logger.debug(f"Telegram build failure notification failed: {n_err}")
                 if is_disk_full_error(e):
                     disk_full_error = e
                     interrupted = True
@@ -4862,6 +4904,24 @@ def build_graph(
             title="Knowledge Graph Build Complete",
         )
     )
+
+    # Telegram build completion notification
+    try:
+        total_pipeline_dur = time.perf_counter() - pipeline_start_time
+        failed_count = len(books_to_process) - completed_in_session if not interrupted else 0
+        notifier.notify_build_complete(
+            total_books=len(books_to_process),
+            completed_books=completed_in_session,
+            failed_books=failed_count if failed_count > 0 else 0,
+            total_nodes=st.get("total_nodes", 0),
+            total_edges=st.get("total_edges", 0),
+            duration_seconds=total_pipeline_dur,
+            assigned_chunks=session_assigned_chunks,
+            skipped_chunks=session_skipped_chunks,
+            graph_file=str(store.sharded_dir if store.is_sharded else graph_file),
+        )
+    except Exception as n_err:
+        logger.debug(f"Telegram build complete notification failed: {n_err}")
 
 
 @app.command("status")
@@ -5831,6 +5891,7 @@ def _save_verification_artifacts(
     cfg: Settings,
     pool: Optional[OllamaPool] = None,
     mode_label: str = "verification",
+    v_duration: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Save primary verification report, standalone statistics summary file, and debug trace JSON.
@@ -5880,6 +5941,18 @@ def _save_verification_artifacts(
 
     if pool is not None:
         _print_ollama_server_stats([pool], console=console, title=f"Ollama Server {mode_label.title()} Effort Statistics")
+
+    # 4. Telegram Notification
+    try:
+        v_notifier = TelegramNotifier(cfg.telegram)
+        v_notifier.notify_verification_complete(
+            mode=effective_mode,
+            model=effective_model,
+            duration_seconds=v_duration or 0.0,
+            summary=report_dict,
+        )
+    except Exception as n_err:
+        logger.debug(f"Telegram verification notification failed: {n_err}")
 
     return report_dict
 
@@ -5957,6 +6030,21 @@ def _execute_single_verification(
     effective_debug = debug if debug is not None else getattr(cfg.verification, "debug", False)
     effective_cooldown = cooldown if cooldown is not None else cfg.resolved_verification_cooldown_seconds
     effective_mode = (mode or cfg.verification.mode).strip().lower()
+
+    t_verification_start = time.perf_counter()
+    effective_v_model = model or getattr(cfg.verification, "model", None) or cfg.llm_model
+    verifier_notifier = TelegramNotifier(cfg.telegram)
+    target_desc = str(compare_graph or graph_file or cfg.resolved_output_dir / "knowledge_graph.json")
+    sample_desc = f"{percent or getattr(cfg.verification, 'percent', 1.0)}% sample" if (percent is not None or getattr(cfg.verification, "percent", None)) else ""
+    try:
+        verifier_notifier.notify_verification_start(
+            mode=effective_mode,
+            model=effective_v_model,
+            target_info=target_desc,
+            sample_info=sample_desc,
+        )
+    except Exception as n_err:
+        logger.debug(f"Telegram verification start notification failed: {n_err}")
 
     if effective_mode in ("chunking", "chunks"):
         target_chunks_dir = Path(chunks_dir).expanduser().resolve() if chunks_dir else cfg.resolved_chunks_dir
@@ -6176,6 +6264,7 @@ def _execute_single_verification(
             cfg=cfg,
             pool=pool,
             mode_label="chunking verification",
+            v_duration=time.perf_counter() - t_verification_start,
         )
 
     # Mode: 'chunk' (Oracle Idea Extraction & Alignment)
@@ -6467,6 +6556,7 @@ def _execute_single_verification(
             cfg=cfg,
             pool=pool,
             mode_label="chunk verification",
+            v_duration=time.perf_counter() - t_verification_start,
         )
 
     # Mode: 'cross-check' (Dual Knowledge Base Seam & Recall Comparative Audit)
@@ -6836,6 +6926,7 @@ def _execute_single_verification(
                 cfg=cfg,
                 pool=pool,
                 mode_label="cross-check verification",
+                v_duration=time.perf_counter() - t_verification_start,
             )
         finally:
             if temp_backup_targets:
@@ -7065,6 +7156,17 @@ def _execute_single_verification(
             with open(out_dest, "w", encoding="utf-8") as f:
                 json.dump(report_dict, f, indent=2, ensure_ascii=False)
             console.print(f"[bold green]✓ Report saved to:[/bold green] [bold cyan]{out_dest}[/bold cyan]")
+
+            try:
+                verifier_notifier.notify_verification_complete(
+                    mode=effective_mode,
+                    model=effective_v_model,
+                    duration_seconds=time.perf_counter() - t_verification_start,
+                    summary=report_dict,
+                )
+            except Exception as n_err:
+                logger.debug(f"Telegram verification notification failed: {n_err}")
+
             return report_dict
         finally:
             for bt in temp_backup_targets:
@@ -7148,6 +7250,17 @@ def _execute_single_verification(
             with open(out_dest, "w", encoding="utf-8") as f:
                 json.dump(drift_dict, f, indent=2, ensure_ascii=False)
             console.print(f"[bold green]✓ Report saved to:[/bold green] [bold cyan]{out_dest}[/bold cyan]")
+
+            try:
+                verifier_notifier.notify_verification_complete(
+                    mode=effective_mode,
+                    model=effective_v_model,
+                    duration_seconds=time.perf_counter() - t_verification_start,
+                    summary=drift_dict,
+                )
+            except Exception as n_err:
+                logger.debug(f"Telegram verification notification failed: {n_err}")
+
             return drift_dict
         finally:
             if temp_drift_target:
@@ -7354,6 +7467,7 @@ def _execute_single_verification(
             cfg=cfg,
             pool=pool,
             mode_label="ideas verification",
+            v_duration=time.perf_counter() - t_verification_start,
         )
     finally:
         if temp_ideas_target:

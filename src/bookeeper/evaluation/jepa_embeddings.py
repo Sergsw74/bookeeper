@@ -48,6 +48,7 @@ class JEPAEmbeddings(Embeddings):
         model_type: str = "direct_network",
         device: Optional[Union[str, Any]] = "gpu",
         weights_path: Optional[Union[str, Path]] = None,
+        pt_weights_path: Optional[Union[str, Path]] = None,
         base_embeddings: Optional[Embeddings] = None,
         encoder: Optional[LightweightJEPAEncoder] = None,
         neural_net: Optional[LightweightJEPANetwork] = None,
@@ -59,6 +60,7 @@ class JEPAEmbeddings(Embeddings):
         self.model_type = model_type.lower()
         self.device = resolve_torch_device(device)
         self.weights_path = Path(weights_path) if weights_path else Path("output/jepa_768_weights.npz")
+        self.pt_weights_path = Path(pt_weights_path) if pt_weights_path else Path("output/jepa_head_weights.pt")
         self.base_embeddings = base_embeddings
         self.hf_model_id = hf_model_id
 
@@ -91,6 +93,10 @@ class JEPAEmbeddings(Embeddings):
             )
 
         self._hf_model = None
+        self._jepa_head = None
+        self._jepa_backbone = None
+        self._jepa_mean = None
+        self.pt_weights_path = Path("output/jepa_head_weights.pt")
 
     @classmethod
     def from_settings(
@@ -106,7 +112,8 @@ class JEPAEmbeddings(Embeddings):
         model_type = getattr(jepa_cfg, "model_type", "direct_network")
         device = getattr(jepa_cfg, "device", "gpu")
         weights_path = getattr(jepa_cfg, "weights_path", "output/jepa_768_weights.npz")
-        base_model_name = getattr(jepa_cfg, "base_embedding_model", "bge-m3:latest")
+        pt_weights_path = getattr(jepa_cfg, "pt_weights_path", "output/jepa_head_weights.pt")
+        base_model_name = getattr(jepa_cfg, "base_embedding_model", "BAAI/bge-small-en-v1.5")
 
         base_embeddings = None
         if model_type == "whitened_projector":
@@ -125,6 +132,7 @@ class JEPAEmbeddings(Embeddings):
             model_type=model_type,
             device=device,
             weights_path=weights_path,
+            pt_weights_path=pt_weights_path,
             base_embeddings=base_embeddings,
         )
 
@@ -166,6 +174,33 @@ class JEPAEmbeddings(Embeddings):
             )
         return self._hf_model
 
+    def _get_jepa_pipeline(self):
+        if self._jepa_head is None:
+            import torch
+            from sentence_transformers import SentenceTransformer
+            from bookeeper.evaluation.train_jepa import TextJEPAHead
+
+            backbone_name = "BAAI/bge-small-en-v1.5"
+            in_dim = 384
+            out_dim = self.dimension
+
+            head = TextJEPAHead(in_dim=in_dim, hidden_dim=512, out_dim=out_dim).to(self.device)
+            if self.pt_weights_path.is_file():
+                try:
+                    ckpt = torch.load(self.pt_weights_path, map_location=self.device)
+                    head.load_state_dict(ckpt["state_dict"])
+                    self._jepa_mean = ckpt.get("mean_z", None)
+                    backbone_name = ckpt.get("backbone_name", backbone_name)
+                    logger.info(f"Loaded trained JEPA head weights from {self.pt_weights_path}")
+                except Exception as e:
+                    logger.warning(f"Could not load JEPA head weights from {self.pt_weights_path}: {e}")
+            head.eval()
+
+            self._jepa_backbone = SentenceTransformer(backbone_name, device=str(self.device))
+            self._jepa_head = head
+
+        return self._jepa_backbone, self._jepa_head
+
     def embed_documents(
         self,
         texts: List[str],
@@ -191,6 +226,27 @@ class JEPAEmbeddings(Embeddings):
                 sub = texts[i : i + batch_sz]
                 vecs = self.neural_net.forward_batch(sub)
                 embeddings.extend([v.tolist() for v in vecs])
+                if on_progress:
+                    try:
+                        on_progress(len(sub))
+                    except Exception:
+                        pass
+
+        elif self.model_type in ("two_tier_jepa", "jepa_head"):
+            import torch
+            backbone, head = self._get_jepa_pipeline()
+            bs = batch_size or 256
+            embeddings = []
+            for i in range(0, len(texts), bs):
+                sub = texts[i : i + bs]
+                base_vecs = backbone.encode(sub, batch_size=bs, show_progress_bar=False, normalize_embeddings=True)
+                with torch.no_grad():
+                    t_in = torch.from_numpy(base_vecs).to(self.device)
+                    z = head(t_in)
+                    if self._jepa_mean is not None:
+                        z = z - self._jepa_mean.to(self.device)
+                    z_norm = torch.nn.functional.normalize(z, p=2, dim=-1)
+                    embeddings.extend([v.tolist() for v in z_norm.cpu().numpy()])
                 if on_progress:
                     try:
                         on_progress(len(sub))

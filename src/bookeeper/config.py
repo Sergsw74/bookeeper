@@ -469,6 +469,10 @@ class JEPAConfig(BaseModel):
         default="output/jepa_768_weights.npz",
         description="File path to persist/load fitted JEPA covariance whitening weights.",
     )
+    pt_weights_path: str = Field(
+        default="output/jepa_head_weights.pt",
+        description="File path to persist/load PyTorch weights for two-tier JEPA head.",
+    )
     base_embedding_model: str = Field(
         default="bge-m3:latest",
         description="Base embedding model to whiten if model_type is 'whitened_projector'.",
@@ -1748,6 +1752,8 @@ class Settings(BaseSettings):
                         flat_data["enable_lightrag"] = sub_val
                     else:
                         flat_data[f"lightrag_{sub_key}"] = sub_val
+            elif key == "jepa" and isinstance(val, dict):
+                flat_data["jepa"] = val
             elif isinstance(val, dict):
                 for sub_key, sub_val in val.items():
                     flat_data[f"{key}_{sub_key}"] = sub_val

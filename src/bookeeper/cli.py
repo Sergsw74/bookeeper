@@ -10628,6 +10628,128 @@ def compare_jepa_command(
     )
 
 
+@app.command("train-jepa")
+def train_jepa_command(
+    state_dir: Optional[str] = typer.Option(
+        None,
+        "--state-dir",
+        "-s",
+        help="Path to directory containing book_*_state.json files (default: output/.book_states, output/cached_states).",
+    ),
+    max_books: Optional[int] = typer.Option(
+        None,
+        "--max-books",
+        "-b",
+        help="Maximum books to load from states (default: all available books).",
+    ),
+    max_pairs: Optional[int] = typer.Option(
+        None,
+        "--max-pairs",
+        "-p",
+        help="Maximum chunk pairs to use for training (default: all available).",
+    ),
+    epochs: int = typer.Option(
+        10,
+        "--epochs",
+        "-e",
+        help="Number of training epochs (default: 10).",
+    ),
+    batch_size: int = typer.Option(
+        256,
+        "--batch-size",
+        help="Training batch size (default: 256).",
+    ),
+    lr: float = typer.Option(
+        1e-3,
+        "--lr",
+        help="Learning rate for AdamW optimizer (default: 0.001).",
+    ),
+    latent_dim: int = typer.Option(
+        768,
+        "--latent-dim",
+        "-d",
+        help="Target latent dimension for JEPA space (default: 768).",
+    ),
+    device: str = typer.Option(
+        "gpu",
+        "--device",
+        help="Execution device: gpu (MPS/CUDA), mps, cuda, or cpu.",
+    ),
+    output_weights: str = typer.Option(
+        "output/jepa_head_weights.pt",
+        "--output-weights",
+        help="Path to save PyTorch JEPA checkpoint.",
+    ),
+    output_npz: str = typer.Option(
+        "output/jepa_768_weights.npz",
+        "--output-npz",
+        help="Path to save closed-form whitening NPZ matrix.",
+    ),
+    config_path: Optional[str] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to config.yaml file.",
+    ),
+):
+    """
+    Train a Domain-Adapted Two-Tier Text-JEPA Head (Strategy A) on your Book Corpus.
+    Uses frozen BAAI/bge-small-en-v1.5 + multi-layer JEPA projection head with VICReg loss.
+    """
+    from bookeeper.config import get_settings
+    from bookeeper.evaluation.train_jepa import load_chunk_pairs_from_states, train_jepa_head
+
+    console = Console()
+    cfg = get_settings(config_path)
+
+    # Resolve search directories
+    out_dir = Path(cfg.output_dir)
+    search_dirs = []
+    if state_dir:
+        search_dirs.append(Path(state_dir))
+    else:
+        search_dirs.append(out_dir / ".book_states")
+        search_dirs.append(out_dir / "cached_states")
+        search_dirs.append(out_dir)
+
+    console.print(
+        Panel.fit(
+            f"[bold cyan]Domain-Adapted Text-JEPA Training (Strategy A)[/bold cyan]\n"
+            f"• Source State Dirs: {', '.join(str(d) for d in search_dirs if d.is_dir())}\n"
+            f"• Target Dimension: {latent_dim}\n"
+            f"• Training Epochs: {epochs} | Batch Size: {batch_size}\n"
+            f"• Device: {device}",
+            title="JEPA Pre-training Setup",
+            border_style="cyan",
+        )
+    )
+
+    with console.status("[bold green]Loading discourse chunk pairs from book states...[/bold green]"):
+        pairs = load_chunk_pairs_from_states(
+            state_dirs=search_dirs,
+            max_books=max_books,
+            max_pairs=max_pairs,
+        )
+
+    if not pairs:
+        console.print("[bold red]Error: No chunk pairs found in state directories.[/bold red]")
+        raise typer.Exit(code=1)
+
+    train_jepa_head(
+        pairs=pairs,
+        backbone_name="BAAI/bge-small-en-v1.5",
+        target_dim=latent_dim,
+        hidden_dim=512,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        device=device,
+        output_weights_path=output_weights,
+        output_npz_path=output_npz,
+        console=console,
+    )
+
+
 if __name__ == "__main__":
     app()
 

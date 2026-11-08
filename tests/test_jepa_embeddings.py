@@ -110,3 +110,23 @@ def test_decode_embedding_with_list_and_array():
     decoded_arr = decode_embedding(raw_arr)
     assert isinstance(decoded_arr, np.ndarray)
     assert np.allclose(decoded_arr, raw_arr)
+
+
+def test_jepa_embeddings_two_tier():
+    cfg = Settings(
+        embedding_provider="jepa",
+        embedding_model="jepa-768",
+        embedding_dim=768,
+        jepa=JEPAConfig(enabled=True, dimension=768, model_type="two_tier_jepa"),
+    )
+    emb = JEPAEmbeddings.from_settings(cfg)
+    assert emb.model_type == "two_tier_jepa"
+    assert emb.dimension == 768
+
+    texts = ["Two-tier JEPA test text.", "Second chunk representation."]
+    vecs = emb.embed_documents(texts)
+    assert len(vecs) == 2
+    assert len(vecs[0]) == 768
+    assert len(vecs[1]) == 768
+    norm0 = np.linalg.norm(np.array(vecs[0]))
+    assert np.isclose(norm0, 1.0, atol=1e-3)

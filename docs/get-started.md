@@ -210,6 +210,9 @@ Once configured, index a small batch of books to verify your pipeline end-to-end
 ```bash
 # Ingest 3 books from scratch and export to Obsidian:
 bookeeper build-graph --limit 3 --from-scratch --no-lightrag
+
+# Continue or ingest specific books/papers from a file list (auto-skips already indexed books):
+bookeeper build-graph -L file_list.txt
 ```
 
 You can monitor real-time extraction progress in the terminal:

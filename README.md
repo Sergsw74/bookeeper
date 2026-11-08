@@ -35,7 +35,7 @@ Bookkeeper provides a rich set of CLI commands. Below is a high-level overview o
 | :--- | :--- | :--- | :--- |
 | **`ui`** | `bookeeper ui --lightrag-server` | Launches interactive Web UI with Cytoscape Neo4j graph, dedicated **💡 Ideas Page** (exact/vector search & modernity filtering), Obsidian panel, and LightRAG WebUI. | [Web UI Guide](docs/ui.md) |
 | **`lightrag-ui`** | `bookeeper lightrag-ui --port 9621` | Starts the official embedded LightRAG FastAPI server with document manager and workspace query UI. | [Web UI Guide](docs/ui.md) |
-| **`build-graph`** | `bookeeper build-graph --limit 5 --skip-limbo-chunks` | Ingests books chronologically, runs 3-tier semantic chunk routing, and extracts concepts into `knowledge_graph.json` with real-time ETA tracking and instant Ctrl+C cancellation. | [Building Graph](docs/building-graph.md) |
+| **`build-graph`** | `bookeeper build-graph --limit 5 -L file_list.txt` | Ingests books chronologically or from a file list (`-L`), runs 3-tier semantic chunk routing, and extracts concepts into `knowledge_graph.json` with real-time ETA tracking and automatic resumption. | [Building Graph](docs/building-graph.md) |
 | **`rebuild-graph`** | `bookeeper rebuild-graph` | Fast offline rebuild of the graph from `.book_states/` in seconds without LLM inference, with sub-step progress and safe cancellation. | [Building Graph](docs/building-graph.md) |
 | **`query`** | `bookeeper query "Explain Paxos"` | Queries the library using LightRAG hybrid retrieval (local entity graphs + global summaries). | [Hybrid RAG](docs/rag.md) |
 | **`build-rag`** | `bookeeper build-rag` | Indexes pre-computed SSD chunks into LightRAG independently from book ingestion. | [Hybrid RAG](docs/rag.md) |

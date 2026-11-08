@@ -193,19 +193,28 @@ bookeeper build-graph --book-id 42
 # 7. Ingest a standalone EPUB or PDF directly:
 bookeeper build-graph --file "/path/to/my_book.epub"
 
-# 8. Retry failed books recorded in the checkpoint state:
+# 8. Continue building graph from a prioritized file list (automatically skips already indexed books):
+bookeeper build-graph --file-list "path/to/file_list.txt"
+
+# 9. Shorthand with direct downloads directory (arXiv papers / PDFs):
+bookeeper build-graph -L "path/to/file_list.txt" --books-dir archive_downloader/downloads
+
+# 10. Prioritize file list first, then continue through all remaining library books:
+bookeeper build-graph -L "path/to/file_list.txt" --all
+
+# 11. Retry failed books recorded in the checkpoint state:
 bookeeper build-graph --retry-failed
 
-# 9. Wipe checkpoint state, delete existing graph, and rebuild from scratch:
+# 12. Wipe checkpoint state, delete existing graph, and rebuild from scratch:
 bookeeper build-graph --from-scratch
 
-# 10. Rebuild graph from scratch while retaining extracted book states and cached chunks:
+# 13. Rebuild graph from scratch while retaining extracted book states and cached chunks:
 bookeeper build-graph --from-scratch --keep-book-cache
 
-# 11. Accelerate extraction by skipping ambiguous limbo chunks:
+# 14. Accelerate extraction by skipping ambiguous limbo chunks:
 bookeeper build-graph --skip-limbo-chunks
 
-# 12. Automatically export to Neo4j with clean start:
+# 15. Automatically export to Neo4j with clean start:
 bookeeper build-graph --export-neo4j --clean-export
 ```
 
@@ -220,6 +229,7 @@ bookeeper build-graph --export-neo4j --clean-export
 | `--keep-book-cache`, `--keep-cache` | Retain existing per-book state checkpoints (`.book_states`) and cached chunks even when starting `--from-scratch`. | False |
 | `--book-id`, `-b` | Process a single specific Calibre book ID. | None |
 | `--file`, `-f` | Direct path to a standalone EPUB/PDF file to ingest. | None |
+| `--file-list`, `--files`, `-L` | Path to text file containing book filenames, paths, or arXiv IDs to prioritize and ingest (one per line). Automatically skips already-indexed books to resume. | None |
 | `--books-dir` | Path to folder of books/papers to use as source instead of Calibre. | From config |
 | `--model`, `-m` | Primary Ollama LLM model for concept extraction. | From config |
 | `--model-fallback` | Fallback Ollama LLM model used after chunk retry threshold. | From config |
@@ -229,6 +239,47 @@ bookeeper build-graph --export-neo4j --clean-export
 | `--export-neo4j` | Automatically upsert the updated graph into Neo4j upon completion. | False |
 | `--clean-export` | Purge existing Neo4j graph before upserting. | False |
 | `--dual-pass` | Run second-pass idea clustering and concise macro-definition synthesis. | False |
+
+### Continuing & Prioritizing Ingestion with a File List (`--file-list` / `-L`)
+
+When working with large document libraries or downloading papers in batches (e.g. arXiv downloads), you can supply a plain-text list of files to ingest or resume:
+
+```bash
+# Continue graph construction using a file list:
+bookeeper build-graph --file-list path/to/file_list.txt
+
+# Shorthand alias with a custom books/downloads directory:
+bookeeper build-graph -L path/to/file_list.txt --books-dir archive_downloader/downloads
+
+# Process the file list first, then continue through all remaining library books:
+bookeeper build-graph -L path/to/file_list.txt --all
+```
+
+#### File List Format (`file_list.txt`)
+The file list is a standard UTF-8 text file with one target per line. Empty lines and lines starting with `#` are ignored:
+```text
+# arXiv paper identifiers
+2301.00234
+2403.05530v1
+
+# Relative or absolute file paths
+archive_downloader/downloads/attention_is_all_you_need.pdf
+/Volumes/Data/Library/deep_learning.epub
+
+# Filenames or document titles
+clean_architecture.epub
+Designing Data-Intensive Applications
+```
+
+#### Automatic Resumption & Deduplication
+- **Auto-Skip Already Processed**: Bookkeeper has checkpoint resumption enabled by default (`--resume`). When reading the file list, Bookkeeper checks each matching document against `output/knowledge_graph.json` and `output/.book_states/`. Any book or paper that was already completed in a prior run is skipped automatically:
+  ```text
+  ⚡ Skipped already processed article: #42 'Attention Is All You Need'
+  ```
+- **Automatic Interrupted Book Cleanup**: If a run was interrupted (e.g. via `Ctrl+C` or system shutdown), Bookkeeper detects the incomplete book state, safely purges partial nodes/edges from the graph, and re-processes that book cleanly from its cached chunks.
+- **Ordered Execution**: Items in the file list are processed in the exact order specified, allowing you to prioritize critical papers or foundational textbooks before building downstream cross-document connections.
+- **Combined with `--all`**: When combined with `--all`, Bookkeeper ingests all items from `--file-list` first, and then continues indexing the remaining un-indexed books in your library.
+
 
 ### Graceful Immediate Cancellation (Ctrl+C / SIGINT)
 

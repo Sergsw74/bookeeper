@@ -114,11 +114,14 @@ def vicreg_loss(
 
 def load_chunk_pairs_from_states(
     state_dirs: Sequence[Union[str, Path]],
+    books_dir: Optional[Union[str, Path]] = None,
     max_books: Optional[int] = None,
     max_pairs: Optional[int] = None,
+    console: Optional[Console] = None,
 ) -> List[Tuple[str, str]]:
     """
-    Load discourse continuity pairs (chunk_i, chunk_{i+1}) from pre-parsed book states.
+    Load discourse continuity pairs (chunk_i, chunk_{i+1}) from pre-parsed book states
+    and/or raw PDF books in books_dir.
     """
     state_files: List[Path] = []
     for s_dir in state_dirs:
@@ -132,10 +135,15 @@ def load_chunk_pairs_from_states(
         unique_files = unique_files[:max_books]
 
     pairs: List[Tuple[str, str]] = []
+    seen_titles = set()
+
     for fpath in unique_files:
         try:
             with open(fpath, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            title = data.get("book_title") or data.get("title")
+            if title:
+                seen_titles.add(title.strip().lower())
             chunks = data.get("chunks", [])
             for i in range(len(chunks) - 1):
                 t1 = chunks[i].get("text", "").strip()
@@ -146,6 +154,39 @@ def load_chunk_pairs_from_states(
                         return pairs
         except Exception as e:
             logger.debug(f"Error reading {fpath}: {e}")
+
+    # If books_dir is provided, extract additional pairs from unparsed PDFs
+    if books_dir:
+        b_dir = Path(books_dir)
+        if b_dir.is_dir():
+            import pypdf
+
+            pdf_files = sorted(list(b_dir.glob("*.pdf")))
+            if console:
+                console.print(f"[dim]Scanning {len(pdf_files)} PDF books in {b_dir.name}...[/dim]")
+            for pdf_path in pdf_files:
+                if max_pairs and len(pairs) >= max_pairs:
+                    break
+                fname = pdf_path.stem.lower()
+                # Skip if already loaded from state
+                if any(t in fname for t in seen_titles if len(t) > 5):
+                    continue
+                try:
+                    reader = pypdf.PdfReader(str(pdf_path))
+                    doc_chunks = []
+                    # Read up to 25 pages for discourse continuity
+                    for page in reader.pages[:25]:
+                        txt = page.extract_text() or ""
+                        for para in txt.split("\n\n"):
+                            p_clean = para.strip()
+                            if len(p_clean) >= 60:
+                                doc_chunks.append(p_clean)
+                    for i in range(len(doc_chunks) - 1):
+                        pairs.append((doc_chunks[i], doc_chunks[i + 1]))
+                        if max_pairs and len(pairs) >= max_pairs:
+                            return pairs
+                except Exception as e:
+                    logger.debug(f"Error parsing PDF {pdf_path}: {e}")
 
     return pairs
 
@@ -162,6 +203,7 @@ def train_jepa_head(
     device: Optional[Union[str, torch.device]] = "gpu",
     output_weights_path: Union[str, Path] = "output/jepa_head_weights.pt",
     output_npz_path: Union[str, Path] = "output/jepa_768_weights.npz",
+    resume: bool = True,
     console: Optional[Console] = None,
 ) -> Dict[str, Any]:
     """
@@ -223,6 +265,15 @@ def train_jepa_head(
     # 2. Setup JEPA Head and Optimizer
     console.print("\n[bold]Step 2/3: Training Two-Tier JEPA Head via VICReg Loss...[/bold]")
     model = TextJEPAHead(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=target_dim).to(dev)
+    if resume and Path(output_weights_path).is_file():
+        try:
+            ckpt = torch.load(output_weights_path, map_location=dev)
+            if "state_dict" in ckpt:
+                model.load_state_dict(ckpt["state_dict"])
+                console.print(f"[bold green]✓ Loaded and resuming from existing checkpoint:[/bold green] {output_weights_path}")
+        except Exception as e:
+            console.print(f"[dim yellow]Notice: Could not load existing checkpoint ({e}). Starting fresh weights.[/dim yellow]")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 

@@ -10636,11 +10636,22 @@ def train_jepa_command(
         "-s",
         help="Path to directory containing book_*_state.json files (default: output/.book_states, output/cached_states).",
     ),
+    books_dir: Optional[str] = typer.Option(
+        None,
+        "--books-dir",
+        "--download-dir",
+        help="Path to directory containing PDF books to teach from (e.g. archive_downloader/downloads).",
+    ),
+    resume: bool = typer.Option(
+        True,
+        "--resume/--no-resume",
+        help="Resume from existing checkpoint weights if present (default: True).",
+    ),
     max_books: Optional[int] = typer.Option(
         None,
         "--max-books",
         "-b",
-        help="Maximum books to load from states (default: all available books).",
+        help="Maximum books to load (default: all available books).",
     ),
     max_pairs: Optional[int] = typer.Option(
         None,
@@ -10712,23 +10723,29 @@ def train_jepa_command(
         search_dirs.append(out_dir / "cached_states")
         search_dirs.append(out_dir)
 
+    # Resolve books directory
+    resolved_books_dir = Path(books_dir) if books_dir else (Path(cfg.books_dir) if cfg.books_dir else None)
+
     console.print(
         Panel.fit(
             f"[bold cyan]Domain-Adapted Text-JEPA Training (Strategy A)[/bold cyan]\n"
             f"• Source State Dirs: {', '.join(str(d) for d in search_dirs if d.is_dir())}\n"
-            f"• Target Dimension: {latent_dim}\n"
+            + (f"• Source Books Dir: {resolved_books_dir}\n" if resolved_books_dir else "")
+            + f"• Target Dimension: {latent_dim}\n"
             f"• Training Epochs: {epochs} | Batch Size: {batch_size}\n"
-            f"• Device: {device}",
+            f"• Device: {device} | Resume Checkpoint: {resume}",
             title="JEPA Pre-training Setup",
             border_style="cyan",
         )
     )
 
-    with console.status("[bold green]Loading discourse chunk pairs from book states...[/bold green]"):
+    with console.status("[bold green]Loading discourse chunk pairs from book states and corpus...[/bold green]"):
         pairs = load_chunk_pairs_from_states(
             state_dirs=search_dirs,
+            books_dir=resolved_books_dir,
             max_books=max_books,
             max_pairs=max_pairs,
+            console=console,
         )
 
     if not pairs:
@@ -10746,6 +10763,7 @@ def train_jepa_command(
         device=device,
         output_weights_path=output_weights,
         output_npz_path=output_npz,
+        resume=resume,
         console=console,
     )
 

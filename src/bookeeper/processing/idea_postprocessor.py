@@ -1079,7 +1079,11 @@ class IdeaPostProcessor:
                 )
                 for idx in missing_indices
             ]
-            emb_model = getattr(self.embeddings, "model", "embeddings")
+            emb_model = (
+                getattr(self.embeddings, "model", None)
+                or getattr(self.embeddings, "model_type", None)
+                or "embeddings"
+            )
             text_batches = partition_texts_for_embedding(
                 texts,
                 max_batch_chars=12000,
@@ -1110,6 +1114,19 @@ class IdeaPostProcessor:
                                 max_batch_chars=12000,
                                 on_progress=lambda n: emb_progress.update(task, advance=n),
                             )
+                        elif hasattr(self.embeddings, "embed_documents"):
+                            import inspect
+                            sig = inspect.signature(self.embeddings.embed_documents)
+                            if "on_progress" in sig.parameters:
+                                vectors_raw = self.embeddings.embed_documents(
+                                    texts,
+                                    on_progress=lambda n: emb_progress.update(task, advance=n),
+                                )
+                            else:
+                                for batch in text_batches:
+                                    vecs = self.embeddings.embed_documents(batch)
+                                    vectors_raw.extend(vecs)
+                                    emb_progress.update(task, advance=len(batch))
                         else:
                             for batch in text_batches:
                                 vecs = self.embeddings.embed_documents(batch)
@@ -1122,6 +1139,8 @@ class IdeaPostProcessor:
                             batch_size=32,
                             max_batch_chars=12000,
                         )
+                    elif hasattr(self.embeddings, "embed_documents"):
+                        vectors_raw = self.embeddings.embed_documents(texts)
                     else:
                         for batch in text_batches:
                             vecs = self.embeddings.embed_documents(batch)

@@ -172,7 +172,7 @@ class JEPAEmbeddings(Embeddings):
 
         if self.model_type == "direct_network":
             # Direct lightweight residual MLP network (>8,000 texts/sec on CPU)
-            batch_sz = batch_size or 128
+            batch_sz = batch_size or 256
             embeddings = []
             for i in range(0, len(texts), batch_sz):
                 sub = texts[i : i + batch_sz]

@@ -1576,14 +1576,26 @@ class ConceptGraphStore:
                 ) as prog:
                     t_id = prog.add_task("ideas", total=len(missing_idea_nodes))
                     pooled_done = False
-                    if isinstance(embeddings, FailoverOllamaEmbeddings):
+                    if hasattr(embeddings, "embed_documents"):
                         try:
-                            vecs = embeddings.embed_documents(
-                                idea_texts,
-                                batch_size=batch_size,
-                                max_batch_chars=12000,
-                                on_progress=lambda n: prog.update(t_id, advance=n),
-                            )
+                            import inspect
+                            sig = inspect.signature(embeddings.embed_documents)
+                            if "on_progress" in sig.parameters:
+                                vecs = embeddings.embed_documents(
+                                    idea_texts,
+                                    on_progress=lambda n: prog.update(t_id, advance=n),
+                                )
+                            elif isinstance(embeddings, FailoverOllamaEmbeddings):
+                                vecs = embeddings.embed_documents(
+                                    idea_texts,
+                                    batch_size=batch_size,
+                                    max_batch_chars=12000,
+                                    on_progress=lambda n: prog.update(t_id, advance=n),
+                                )
+                            else:
+                                vecs = embeddings.embed_documents(idea_texts)
+                                prog.update(t_id, advance=len(idea_texts))
+
                             for (nid, _), v in zip(missing_idea_nodes, vecs):
                                 if v and len(v) > 1:
                                     arr = np.array(v, dtype=np.float32)
@@ -1618,13 +1630,17 @@ class ConceptGraphStore:
                             prog.update(t_id, advance=len(sub))
             else:
                 pooled_done = False
-                if isinstance(embeddings, FailoverOllamaEmbeddings):
+                if hasattr(embeddings, "embed_documents"):
                     try:
-                        vecs = embeddings.embed_documents(
-                            idea_texts,
-                            batch_size=batch_size,
-                            max_batch_chars=12000,
-                        )
+                        if isinstance(embeddings, FailoverOllamaEmbeddings):
+                            vecs = embeddings.embed_documents(
+                                idea_texts,
+                                batch_size=batch_size,
+                                max_batch_chars=12000,
+                            )
+                        else:
+                            vecs = embeddings.embed_documents(idea_texts)
+
                         for (nid, _), v in zip(missing_idea_nodes, vecs):
                             if v and len(v) > 1:
                                 arr = np.array(v, dtype=np.float32)
@@ -1688,14 +1704,26 @@ class ConceptGraphStore:
                 ) as prog:
                     t_id = prog.add_task("chunks", total=len(missing_chunk_nodes))
                     pooled_done = False
-                    if isinstance(embeddings, FailoverOllamaEmbeddings):
+                    if hasattr(embeddings, "embed_documents"):
                         try:
-                            vecs = embeddings.embed_documents(
-                                chunk_texts,
-                                batch_size=min(batch_size, 16),
-                                max_batch_chars=12000,
-                                on_progress=lambda n: prog.update(t_id, advance=n),
-                            )
+                            import inspect
+                            sig = inspect.signature(embeddings.embed_documents)
+                            if "on_progress" in sig.parameters:
+                                vecs = embeddings.embed_documents(
+                                    chunk_texts,
+                                    on_progress=lambda n: prog.update(t_id, advance=n),
+                                )
+                            elif isinstance(embeddings, FailoverOllamaEmbeddings):
+                                vecs = embeddings.embed_documents(
+                                    chunk_texts,
+                                    batch_size=min(batch_size, 16),
+                                    max_batch_chars=12000,
+                                    on_progress=lambda n: prog.update(t_id, advance=n),
+                                )
+                            else:
+                                vecs = embeddings.embed_documents(chunk_texts)
+                                prog.update(t_id, advance=len(chunk_texts))
+
                             for (nid, _), v in zip(missing_chunk_nodes, vecs):
                                 if v and len(v) > 1:
                                     arr = np.array(v, dtype=np.float32)
@@ -1730,13 +1758,17 @@ class ConceptGraphStore:
                             prog.update(t_id, advance=len(sub))
             else:
                 pooled_done = False
-                if isinstance(embeddings, FailoverOllamaEmbeddings):
+                if hasattr(embeddings, "embed_documents"):
                     try:
-                        vecs = embeddings.embed_documents(
-                            chunk_texts,
-                            batch_size=min(batch_size, 16),
-                            max_batch_chars=12000,
-                        )
+                        if isinstance(embeddings, FailoverOllamaEmbeddings):
+                            vecs = embeddings.embed_documents(
+                                chunk_texts,
+                                batch_size=min(batch_size, 16),
+                                max_batch_chars=12000,
+                            )
+                        else:
+                            vecs = embeddings.embed_documents(chunk_texts)
+
                         for (nid, _), v in zip(missing_chunk_nodes, vecs):
                             if v and len(v) > 1:
                                 arr = np.array(v, dtype=np.float32)

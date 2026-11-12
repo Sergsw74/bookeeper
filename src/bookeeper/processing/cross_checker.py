@@ -1113,6 +1113,12 @@ def run_cross_check(
         raw_ideas_old = get_ideas_for_chunks(store_a, old_chunk_ids)
         raw_ideas_new = get_ideas_for_chunks(store_b, new_chunk_ids)
 
+        if not raw_ideas_old and not raw_ideas_new:
+            # Neither system extracted concepts for this window (e.g. title page, author affiliations, preface).
+            # Skip uninformative window to ensure audit measures actual conceptual retention passages.
+            logger.debug(f"Skipping uninformative window with 0 concepts in both graphs: {b_title}")
+            continue
+
         dedup_ideas_old = tiered_deduplicate_ideas(raw_ideas_old, deduplicator)
         dedup_ideas_new = tiered_deduplicate_ideas(raw_ideas_new, deduplicator)
 

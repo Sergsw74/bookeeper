@@ -1,0 +1,15 @@
+# syntax=docker/dockerfile:1
+FROM alpine:latest
+
+LABEL maintainer="Bookeeper Contributors" \
+      description="Bookeeper JEPA Model Weights: calibrated TextJEPA projection head and whitened weights"
+
+WORKDIR /models
+
+# Pack JEPA model weights (total ~6.5 MB)
+COPY models/jepa_head_weights.pt models/jepa_768_weights.npz ./
+
+VOLUME ["/models"]
+
+# When run as a container, copies weights to target volume /output
+CMD ["cp", "-rn", "/models/.", "/output/"]

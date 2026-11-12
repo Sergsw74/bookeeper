@@ -7226,7 +7226,9 @@ def _execute_single_verification(
         # Initialize embeddings provider if needed
         embeddings = None
         try:
-            embedding_model_name = getattr(cfg, "embedding_model", "nomic-embed-text")
+            embedding_model_name = embedding_model or getattr(cfg, "embedding_model", "nomic-embed-text")
+            if embedding_model_name.startswith("jepa") or getattr(cfg, "embedding_provider", "") != "ollama":
+                embedding_model_name = "bge-m3:latest"
             embeddings = FailoverOllamaEmbeddings.from_settings(cfg, model=embedding_model_name)
         except Exception as e:
             logger.debug(f"Could not initialize FailoverOllamaEmbeddings: {e}")
@@ -7611,6 +7613,7 @@ def verify_command(
     states_dir: Optional[str] = typer.Option(
         None,
         "--states-dir",
+        "--state-cache-dir",
         help="Directory containing book state files (book_*_state.json) for post-processing drift verification.",
     ),
     tau_loss: Optional[float] = typer.Option(
@@ -7975,6 +7978,11 @@ def ab_compare_command(
         "--model",
         help="Dedicated verifier LLM model (default: from config.yaml).",
     ),
+    embedding_model: Optional[str] = typer.Option(
+        None,
+        "--embedding-model",
+        help="Embedding model name for entity deduplication (default: nomic-embed-text or bge-m3).",
+    ),
     config_path: Optional[str] = typer.Option(
         None,
         "--config",
@@ -8111,7 +8119,9 @@ def ab_compare_command(
         # 3. Mode execution
         if mode.lower() in ("cross-check", "cross_check"):
             effective_model = model or cfg.resolved_verifier_model
-            effective_embedding_model = getattr(cfg, "embedding_model", "nomic-embed-text")
+            effective_embedding_model = embedding_model or getattr(cfg, "embedding_model", "nomic-embed-text")
+            if effective_embedding_model.startswith("jepa") or getattr(cfg, "embedding_provider", "") != "ollama":
+                effective_embedding_model = "bge-m3:latest"
             verifier_servers = cfg.resolved_verification_servers
             pool = OllamaPool(
                 servers=verifier_servers,
@@ -10707,6 +10717,12 @@ def train_jepa_command(
         "-c",
         help="Path to config.yaml file.",
     ),
+    rebuild_cache: bool = typer.Option(
+        False,
+        "--rebuild-cache",
+        "--no-cache",
+        help="Force re-parsing state files and PDFs, invalidating the cached pairs archive.",
+    ),
 ):
     """
     Train a Domain-Adapted Two-Tier Text-JEPA Head (Strategy A) on your Book Corpus.
@@ -10750,6 +10766,7 @@ def train_jepa_command(
             books_dir=resolved_books_dir,
             max_books=max_books,
             max_pairs=max_pairs,
+            rebuild_cache=rebuild_cache,
             console=console,
         )
 
@@ -10771,6 +10788,71 @@ def train_jepa_command(
         resume=resume,
         console=console,
     )
+
+
+@app.command("pull-jepa-weights")
+def pull_jepa_weights_cmd(
+    image: Optional[str] = typer.Option(
+        None,
+        "--image",
+        "-i",
+        help="OCI / Docker weights image reference (e.g. 192.168.50.20:5000/bk-jepa-ai:latest).",
+    ),
+    output_dir: Optional[str] = typer.Option(
+        None,
+        "--output-dir",
+        "-o",
+        help="Target directory to place extracted JEPA weights (default: configured output_dir).",
+    ),
+    config_path: Optional[str] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to config.yaml file.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        "-f",
+        help="Force re-download even if weights already exist in output directory.",
+    ),
+):
+    """
+    Download JEPA model weights from an OCI/Docker image (e.g., 192.168.50.20:5000/bk-jepa-ai:latest)
+    or restore them from existing backup archives into output directory.
+    """
+    from bookeeper.config import get_settings
+    from bookeeper.evaluation.jepa_downloader import ensure_jepa_weights
+
+    console = Console()
+    cfg = get_settings(config_path)
+
+    eff_out = output_dir or cfg.output_dir or "output"
+    eff_image = image or getattr(cfg.jepa, "weights_image", None) or "192.168.50.20:5000/bk-jepa-ai:latest"
+
+    console.print(f"[bold cyan]Resolving JEPA weights for target dir:[/bold cyan] [bold white]{eff_out}[/bold white]")
+    console.print(f"[bold cyan]Source weights image:[/bold cyan] [bold white]{eff_image}[/bold white]")
+
+    pt_file, npz_file = ensure_jepa_weights(
+        output_dir=eff_out,
+        weights_image=eff_image,
+        auto_download=True,
+        force=force,
+    )
+
+    if pt_file and pt_file.is_file():
+        console.print(f"[bold green]✓ PyTorch Checkpoint:[/bold green] [cyan]{pt_file}[/cyan] ({pt_file.stat().st_size:,} bytes)")
+    else:
+        console.print("[bold red]✗ PyTorch Checkpoint was not found or downloaded.[/bold red]")
+
+    if npz_file and npz_file.is_file():
+        console.print(f"[bold green]✓ Whitening NPZ Matrix:[/bold green] [cyan]{npz_file}[/cyan] ({npz_file.stat().st_size:,} bytes)")
+    else:
+        console.print("[dim]Whitening NPZ matrix not present.[/dim]")
+
+    if not pt_file:
+        raise typer.Exit(code=1)
+    console.print("\n[bold green]✓ JEPA weights are ready for production ingestion and inference.[/bold green]")
 
 
 if __name__ == "__main__":

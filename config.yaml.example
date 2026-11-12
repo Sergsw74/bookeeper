@@ -67,6 +67,8 @@ jepa:
   base_embedding_model: "bge-m3:latest"
   epsilon: 0.001
   align_alpha: 0.5
+  weights_image: "192.168.50.20:5000/bk-jepa-ai:latest" # OCI/Docker image containing calibrated JEPA model weights
+  auto_download_weights: true       # Automatically restore/download weights if missing from output directory and backups
   llm_disambiguation: false         # Disambiguate concepts directly via JEPA zero-isotropic similarity (>100,000 matches/s) without slow LLM calls
 
 # Multi-server failover pool (N servers with priority ordering and capabilities)

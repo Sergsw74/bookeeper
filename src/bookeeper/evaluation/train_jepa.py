@@ -112,6 +112,13 @@ def vicreg_loss(
     return total_loss, float(sim_loss.item()), float(std_loss.item()), float(cov_loss.item())
 
 
+def _sanitize_text(s: str) -> str:
+    """Sanitize text by stripping null bytes and invalid UTF-16 surrogates from PDF extractors."""
+    if not isinstance(s, str):
+        return ""
+    return s.encode("utf-8", errors="ignore").decode("utf-8").replace("\x00", "").strip()
+
+
 def _parse_single_pdf_worker(pdf_path_str: str) -> List[Tuple[str, str]]:
     """Worker function for parallel PDF discourse pair extraction."""
     try:
@@ -120,10 +127,10 @@ def _parse_single_pdf_worker(pdf_path_str: str) -> List[Tuple[str, str]]:
         logging.getLogger("pypdf").setLevel(logging.ERROR)
         reader = pypdf.PdfReader(pdf_path_str)
         doc_chunks = []
-        for page in reader.pages[:25]:
+        for page in reader.pages[:60]:
             txt = page.extract_text() or ""
             for para in txt.split("\n\n"):
-                p_clean = para.strip()
+                p_clean = _sanitize_text(para)
                 if len(p_clean) >= 60:
                     doc_chunks.append(p_clean)
         pdf_pairs = []
@@ -140,13 +147,14 @@ def load_chunk_pairs_from_states(
     max_books: Optional[int] = None,
     max_pairs: Optional[int] = None,
     cache_path: Optional[Union[str, Path]] = "output/.jepa_chunk_pairs.json.gz",
+    rebuild_cache: bool = False,
     console: Optional[Console] = None,
 ) -> List[Tuple[str, str]]:
     """
     Load discourse continuity pairs (chunk_i, chunk_{i+1}) from pre-parsed book states
     and/or raw PDF books in books_dir. Caches parsed pairs to disk for fast reload.
     """
-    if cache_path and not max_books and not max_pairs:
+    if cache_path and not max_books and not max_pairs and not rebuild_cache:
         c_path = Path(cache_path)
         if c_path.is_file():
             try:
@@ -155,7 +163,11 @@ def load_chunk_pairs_from_states(
                     console.print(f"[bold green]Loading cached pairs from {c_path}...[/bold green]")
                 with gzip.open(c_path, "rt", encoding="utf-8") as f:
                     data = json.load(f)
-                pairs = [tuple(p) for p in data]
+                pairs = [
+                    (_sanitize_text(p[0]), _sanitize_text(p[1]))
+                    for p in data
+                    if len(_sanitize_text(p[0])) >= 40 and len(_sanitize_text(p[1])) >= 40
+                ]
                 if console:
                     console.print(f"✓ Loaded {len(pairs):,} discourse pairs from cache.")
                 return pairs
@@ -185,8 +197,8 @@ def load_chunk_pairs_from_states(
                 seen_titles.add(title.strip().lower())
             chunks = data.get("chunks", [])
             for i in range(len(chunks) - 1):
-                t1 = chunks[i].get("text", "").strip()
-                t2 = chunks[i + 1].get("text", "").strip()
+                t1 = _sanitize_text(chunks[i].get("text", ""))
+                t2 = _sanitize_text(chunks[i + 1].get("text", ""))
                 if len(t1) >= 40 and len(t2) >= 40:
                     pairs.append((t1, t2))
                     if max_pairs and len(pairs) >= max_pairs:
@@ -203,24 +215,31 @@ def load_chunk_pairs_from_states(
 
             logging.getLogger("pypdf").setLevel(logging.ERROR)
             pdf_files = sorted(list(b_dir.glob("*.pdf")))
-            
-            # Filter PDFs not already covered by state titles
-            to_parse = [
-                p for p in pdf_files
-                if not any(t in p.stem.lower() for t in seen_titles if len(t) > 5)
-            ]
 
             if console:
-                console.print(f"[dim]Scanning {len(to_parse):,} new PDF books in thread pool...[/dim]")
+                console.print(f"[dim]Scanning all {len(pdf_files):,} PDF articles in thread pool...[/dim]")
 
-            from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=8) as executor:
-                results = list(executor.map(lambda p: _parse_single_pdf_worker(str(p)), to_parse))
+                results = list(executor.map(lambda p: _parse_single_pdf_worker(str(p)), pdf_files))
 
+            added_pdf_pairs = 0
             for r in results:
                 pairs.extend(r)
+                added_pdf_pairs += len(r)
                 if max_pairs and len(pairs) >= max_pairs:
-                    return pairs[:max_pairs]
+                    break
+
+            if console:
+                console.print(f"✓ Parsed {added_pdf_pairs:,} raw discourse pairs from {len(pdf_files):,} PDFs.")
+
+    # Deduplicate pairs while preserving order
+    original_pair_count = len(pairs)
+    pairs = list(dict.fromkeys(pairs))
+    if max_pairs and len(pairs) > max_pairs:
+        pairs = pairs[:max_pairs]
+
+    if console and original_pair_count != len(pairs):
+        console.print(f"[dim]Deduplicated discourse pairs: {original_pair_count:,} -> {len(pairs):,} unique pairs.[/dim]")
 
     if cache_path and not max_books and not max_pairs and pairs:
         try:
@@ -273,11 +292,17 @@ def train_jepa_head(
     in_dim = getattr(backbone, "get_embedding_dimension", backbone.get_sentence_embedding_dimension)() or 384
 
     # Collect texts and map unique strings to indices to avoid duplicate encoding
-    texts_a = [p[0] for p in pairs]
-    texts_b = [p[1] for p in pairs]
+    texts_a = [_sanitize_text(p[0]) for p in pairs]
+    texts_b = [_sanitize_text(p[1]) for p in pairs]
 
     unique_texts = list(dict.fromkeys(texts_a + texts_b))
+    unique_texts = [t for t in unique_texts if len(t) >= 40]
     text_to_idx = {t: idx for idx, t in enumerate(unique_texts)}
+
+    # Filter pairs to those where both chunks are valid
+    valid_mask = [a in text_to_idx and b in text_to_idx for a, b in zip(texts_a, texts_b)]
+    clean_texts_a = [a for a, m in zip(texts_a, valid_mask) if m]
+    clean_texts_b = [b for b, m in zip(texts_b, valid_mask) if m]
 
     t0 = time.time()
     with Progress(
@@ -303,8 +328,8 @@ def train_jepa_head(
     console.print(f"✓ Encoded {len(unique_texts):,} unique representations in {dt_feat:.1f}s ({len(unique_texts)/dt_feat:.1f} texts/sec)")
 
     # Map back to pairs
-    idx_a = np.array([text_to_idx[t] for t in texts_a], dtype=np.int64)
-    idx_b = np.array([text_to_idx[t] for t in texts_b], dtype=np.int64)
+    idx_a = np.array([text_to_idx[t] for t in clean_texts_a], dtype=np.int64)
+    idx_b = np.array([text_to_idx[t] for t in clean_texts_b], dtype=np.int64)
     feat_a = all_encoded[idx_a]
     feat_b = all_encoded[idx_b]
 
@@ -323,7 +348,7 @@ def train_jepa_head(
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
-    n_samples = len(pairs)
+    n_samples = len(clean_texts_a)
     indices = np.arange(n_samples)
 
     history = []

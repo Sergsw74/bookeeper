@@ -47,15 +47,21 @@ RUN python3 scripts/stamp_version.py --version "${APP_VERSION}" --date "${RELEAS
 
 # Set runtime default environment variables
 ENV BOOKEEPER_VERSION="${APP_VERSION}" \
-    BOOKEEPER_RELEASE_DATE="${RELEASE_DATE}"
+    BOOKEEPER_RELEASE_DATE="${RELEASE_DATE}" \
+    HF_HOME="/app/.cache/huggingface" \
+    TRANSFORMERS_CACHE="/app/.cache/huggingface/hub" \
+    TORCH_HOME="/app/.cache/torch"
 
 # Install the workspace packages into the virtual environment
 RUN uv sync --frozen --no-dev
 
+# Pre-cache frozen sentence transformer backbone into image cache for offline execution
+RUN python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-en-v1.5')"
+
 # Create data directories and setup non-root user
-RUN mkdir -p /app/output /app/archive_downloader/downloads && \
-    useradd -u 1000 -U -d /app -s /bin/bash appuser && \
-    chown -R appuser:appuser /app
+RUN useradd -u 1000 -U -d /app -s /bin/bash appuser && \
+    mkdir -p /app/output /app/archive_downloader/downloads /app/.cache && \
+    chown -R appuser:appuser /app/output /app/archive_downloader /app/.cache
 
 USER appuser
 

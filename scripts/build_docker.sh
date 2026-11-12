@@ -81,27 +81,44 @@ python3 "${SCRIPT_DIR}/stamp_version.py" "${STAMP_ARGS[@]}"
 VERSION=$(python3 "${SCRIPT_DIR}/stamp_version.py" --get)
 RELEASE_DATE="$CUSTOM_DATE"
 
-echo "Building Docker Image: ${REGISTRY}:${VERSION} (release_date: ${RELEASE_DATE})"
-
-# Build Docker command
-BUILD_CMD=(docker buildx build)
-BUILD_CMD+=(--platform "${PLATFORMS}")
-BUILD_CMD+=(--build-arg "APP_VERSION=${VERSION}")
-BUILD_CMD+=(--build-arg "RELEASE_DATE=${RELEASE_DATE}")
-BUILD_CMD+=(-t "${REGISTRY}:latest")
-BUILD_CMD+=(-t "${REGISTRY}:latest-jepa")
-BUILD_CMD+=(-t "${REGISTRY}:${VERSION}")
-BUILD_CMD+=(-t "${REGISTRY}:${VERSION}-jepa")
+echo "=== 1/2: Building Bookeeper Application Image: ${REGISTRY}:${VERSION} ==="
+APP_BUILD_CMD=(docker buildx build)
+APP_BUILD_CMD+=(--platform "${PLATFORMS}")
+APP_BUILD_CMD+=(--build-arg "APP_VERSION=${VERSION}")
+APP_BUILD_CMD+=(--build-arg "RELEASE_DATE=${RELEASE_DATE}")
+APP_BUILD_CMD+=(-t "${REGISTRY}:latest")
+APP_BUILD_CMD+=(-t "${REGISTRY}:${VERSION}")
 
 if [ "$PUSH" = true ]; then
-    BUILD_CMD+=(--push)
+    APP_BUILD_CMD+=(--push)
 else
-    BUILD_CMD+=(--load)
+    APP_BUILD_CMD+=(--load)
 fi
+APP_BUILD_CMD+=(-f Dockerfile .)
 
-BUILD_CMD+=(.)
+echo "Executing: ${APP_BUILD_CMD[*]}"
+"${APP_BUILD_CMD[@]}"
 
-echo "Executing: ${BUILD_CMD[*]}"
-"${BUILD_CMD[@]}"
+echo "=== 2/2: Building JEPA Weights Model Image: bk-jepa-ai ==="
+JEPA_BUILD_CMD=(docker buildx build)
+JEPA_BUILD_CMD+=(--platform "${PLATFORMS}")
 
-echo "✓ Successfully built and published ${REGISTRY}:${VERSION} (${RELEASE_DATE})"
+REGISTRY_HOST="${REGISTRY%/*}"
+if [ -n "${REGISTRY_HOST}" ] && [ "${REGISTRY_HOST}" != "${REGISTRY}" ]; then
+    JEPA_BUILD_CMD+=(-t "${REGISTRY_HOST}/bk-jepa-ai:latest")
+    JEPA_BUILD_CMD+=(-t "${REGISTRY_HOST}/bk-jepa-ai:${VERSION}")
+fi
+JEPA_BUILD_CMD+=(-t "bk-jepa-ai:latest")
+JEPA_BUILD_CMD+=(-t "bk-jepa-ai:${VERSION}")
+
+if [ "$PUSH" = true ]; then
+    JEPA_BUILD_CMD+=(--push)
+else
+    JEPA_BUILD_CMD+=(--load)
+fi
+JEPA_BUILD_CMD+=(-f Dockerfile.jepa .)
+
+echo "Executing: ${JEPA_BUILD_CMD[*]}"
+"${JEPA_BUILD_CMD[@]}"
+
+echo "✓ Successfully built and published ${REGISTRY}:${VERSION} and bk-jepa-ai (${RELEASE_DATE})"

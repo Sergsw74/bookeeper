@@ -1961,7 +1961,7 @@
         <span class="version-badge" id="app-version-badge" title="Bookeeper Release Version and Build Date">
           <span style="color:#38bdf8;">v0.1.2</span>
           <span style="color:#64748b;">•</span>
-          <span>2026-11-07</span>
+          <span>2026-11-09</span>
         </span>
       </div>
       <div class="nav-tabs">
@@ -2024,9 +2024,10 @@
           <label for="similarity-threshold" class="toolbar-label">Threshold:</label>
           <select id="similarity-threshold" class="toolbar-select" title="Minimum embedding cosine similarity required for seed ideas (calibrated for JEPA-768)">
             <option value="0.75">≥ 0.75 (Strict)</option>
-            <option value="0.65" selected>≥ 0.65 (Standard - JEPA)</option>
-            <option value="0.55">≥ 0.55 (Relaxed)</option>
-            <option value="0.45">≥ 0.45 (Broad)</option>
+            <option value="0.65">≥ 0.65 (High Confidence)</option>
+            <option value="0.50" selected>≥ 0.50 (Standard - JEPA)</option>
+            <option value="0.45">≥ 0.45 (Relaxed)</option>
+            <option value="0.35">≥ 0.35 (Broad)</option>
           </select>
         </div>
 
@@ -2687,7 +2688,7 @@
           </div>
           <div style="display:flex; gap:24px; flex-wrap:wrap; font-size:0.88rem; color:var(--text-muted); line-height:1.6; background:rgba(15,23,42,0.6); padding:10px 14px; border-radius:6px;">
             <div><strong style="color:#94a3b8;">Release Version:</strong> <span id="debug-sys-version" style="color:#38bdf8; font-weight:600; font-family:monospace;">0.1.2</span></div>
-            <div><strong style="color:#94a3b8;">Release Date:</strong> <span id="debug-sys-date" style="color:#e2e8f0; font-family:monospace;">2026-11-07</span></div>
+            <div><strong style="color:#94a3b8;">Release Date:</strong> <span id="debug-sys-date" style="color:#e2e8f0; font-family:monospace;">2026-11-09</span></div>
             <div><strong style="color:#94a3b8;">Service:</strong> <span style="color:#e2e8f0;">Bookeeper Knowledge Engine</span></div>
             <div><strong style="color:#94a3b8;">UI Status:</strong> <span style="color:#34d399;">● Online</span></div>
           </div>
@@ -4914,7 +4915,7 @@
       if (!query) return;
 
       const mode = document.getElementById('search-mode').value;
-      const similarity_threshold = parseFloat(document.getElementById('similarity-threshold') ? document.getElementById('similarity-threshold').value : 0.70);
+      const similarity_threshold = parseFloat(document.getElementById('similarity-threshold') ? document.getElementById('similarity-threshold').value : 0.50);
       const top_k_seeds = parseInt(document.getElementById('top-k-seeds') ? document.getElementById('top-k-seeds').value : 6);
       const denoise_level = document.getElementById('search-denoise') ? document.getElementById('search-denoise').value : 'standard';
       const overlay = document.getElementById('loading-overlay');
@@ -5741,8 +5742,8 @@
               <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:6px;">
                 <h4 style="font-size:0.85rem; color:#818cf8; margin:0;">1. Core Ideas via Embeddings (Priority Rate = Cosine × Node Weight):</h4>
                 <div style="display:flex; gap:6px; font-family:monospace; font-size:0.75rem;">
-                  <span class="debug-tag info">Model: ${emb.model_name || 'bge-m3:latest'} (${emb.dimensions || 1024}d)</span>
-                  <span class="debug-tag info">Threshold: ≥ ${t.similarity_threshold !== undefined ? t.similarity_threshold : 0.7}</span>
+                  <span class="debug-tag info">Model: ${emb.model_name || 'jepa-768'} (${emb.dimensions || 768}d)</span>
+                  <span class="debug-tag info">Threshold: ≥ ${t.similarity_threshold !== undefined ? t.similarity_threshold : 0.5}</span>
                   <span class="debug-tag success">Candidates Met: ${emb.candidates_above_threshold_count !== undefined ? emb.candidates_above_threshold_count : coreIdeas.length}</span>
                   <span class="debug-tag info">Retrieved: ${coreIdeas.length} / ${emb.top_k_requested || t.top_k_seeds || 6}</span>
                 </div>

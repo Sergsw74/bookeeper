@@ -65,10 +65,28 @@ class ConceptEmbeddingIndex:
         """Check if embedding index is loaded in memory."""
         return len(self.ids) > 0 and self.vectors.size > 0
 
-    def load(self, graph_path: Optional[Path] = None) -> bool:
-        """Load precomputed embedding index from .npz file or extract from knowledge_graph.json."""
-        # 1. Try loading from .npz cache
-        if self.cache_path.is_file():
+    def load(
+        self,
+        graph_path: Optional[Path] = None,
+        neo4j_driver: Optional[Any] = None,
+        neo4j_database: Optional[str] = None,
+        force_refresh: bool = False,
+    ) -> bool:
+        """Load precomputed embedding index from .npz file, Neo4j, or knowledge_graph.json."""
+        neo4j_count = None
+        if neo4j_driver is not None:
+            try:
+                db = neo4j_database or "neo4j"
+                with neo4j_driver.session(database=db) as session:
+                    cnt_res = session.run("MATCH (n:Idea) WHERE n.embedding IS NOT NULL RETURN count(n) AS cnt").single()
+                    if cnt_res:
+                        neo4j_count = cnt_res["cnt"]
+            except Exception as e:
+                logger.debug(f"Could not check Neo4j concept count: {e}")
+
+        # 1. Try loading from .npz cache if not forcing refresh
+        cache_loaded = False
+        if self.cache_path.is_file() and not force_refresh:
             try:
                 data = np.load(self.cache_path, allow_pickle=True)
                 self.ids = list(data["ids"])
@@ -76,12 +94,71 @@ class ConceptEmbeddingIndex:
                 self.weights = data["weights"].astype(np.float32)
                 self.vectors = data["vectors"].astype(np.float32)
                 self.dim = self.vectors.shape[1] if len(self.vectors.shape) > 1 else 768
+                cache_loaded = True
                 logger.info(f"Loaded {len(self.ids)} concept embeddings from {self.cache_path} (dim={self.dim})")
-                return True
             except Exception as e:
                 logger.warning(f"Failed to load embedding cache {self.cache_path}: {e}")
 
-        # 2. Fallback: extract embeddings directly from knowledge_graph.json / spine
+        # If cache was loaded and Neo4j does not have more concepts, we are done
+        if cache_loaded:
+            if neo4j_count is None or neo4j_count <= len(self.ids):
+                return True
+            logger.info(
+                f"Embedding cache has {len(self.ids)} concepts, but Neo4j has {neo4j_count}. Refreshing from Neo4j..."
+            )
+
+        # 2. Extract directly from Neo4j (:Idea nodes) if driver is available
+        if neo4j_driver is not None:
+            try:
+                db = neo4j_database or "neo4j"
+                logger.info(f"Extracting concept embeddings directly from Neo4j (database={db})...")
+                with neo4j_driver.session(database=db) as session:
+                    res = session.run(
+                        """
+                        MATCH (n:Idea)
+                        WHERE n.embedding IS NOT NULL
+                        RETURN n.id AS id, n.name AS name, coalesce(n.weight, 1.0) AS weight, n.embedding AS embedding
+                        """
+                    ).data()
+
+                if res:
+                    loaded_ids = []
+                    loaded_names = []
+                    loaded_weights = []
+                    loaded_vectors = []
+                    for row in res:
+                        nid = str(row.get("id") or "")
+                        emb = row.get("embedding")
+                        if not emb or len(emb) <= 1:
+                            continue
+                        name = str(row.get("name") or nid.replace("concept:", ""))
+                        w = float(row.get("weight") or 1.0)
+                        arr = np.asarray(emb, dtype=np.float32)
+                        norm = float(np.linalg.norm(arr))
+                        if norm > 0:
+                            arr = arr / norm
+                        loaded_ids.append(nid)
+                        loaded_names.append(name)
+                        loaded_weights.append(w)
+                        loaded_vectors.append(arr)
+
+                    if loaded_vectors:
+                        self.ids = loaded_ids
+                        self.names = loaded_names
+                        self.weights = np.array(loaded_weights, dtype=np.float32)
+                        self.vectors = np.array(loaded_vectors, dtype=np.float32)
+                        self.dim = self.vectors.shape[1]
+                        logger.info(f"Extracted {len(self.ids)} concept embeddings from Neo4j (dim={self.dim})")
+                        self.save()
+                        return True
+            except Exception as e:
+                logger.warning(f"Could not extract embeddings from Neo4j: {e}")
+
+        # If Neo4j extraction was not possible but cache was loaded, keep cache
+        if cache_loaded:
+            return True
+
+        # 3. Fallback: extract embeddings directly from knowledge_graph.json / spine
         target_graph = graph_path or (self.cache_path.parent / "knowledge_graph.json")
         if not target_graph.is_file() and (self.cache_path.parent / "knowledge_graph_spine.json").is_file():
             target_graph = self.cache_path.parent / "knowledge_graph_spine.json"
@@ -119,7 +196,7 @@ class ConceptEmbeddingIndex:
                     self.ids = loaded_ids
                     self.names = loaded_names
                     self.weights = np.array(loaded_weights, dtype=np.float32)
-                    self.vectors = np.vstack(loaded_vectors)
+                    self.vectors = np.array(loaded_vectors, dtype=np.float32)
                     self.dim = self.vectors.shape[1]
                     logger.info(f"Extracted {len(self.ids)} concept embeddings from {target_graph} (dim={self.dim})")
                     self.save()
@@ -154,6 +231,18 @@ class ConceptEmbeddingIndex:
                 return self.embeddings_client
             except Exception as e:
                 logger.debug(f"Could not initialize FailoverOllamaEmbeddings in UI: {e}")
+        # Direct JEPA fallback if model is JEPA or dim is 768
+        if self.model_name == "jepa-768" or "jepa" in str(self.model_name).lower() or self.dim == 768:
+            try:
+                from bookeeper.evaluation.jepa_embeddings import JEPAEmbeddings
+                self.embeddings_client = JEPAEmbeddings(
+                    model_type="two_tier_jepa",
+                    dimension=self.dim,
+                    device="gpu",
+                )
+                return self.embeddings_client
+            except Exception as e:
+                logger.debug(f"Direct JEPAEmbeddings fallback init failed: {e}")
         return None
 
     def embed_text(self, text: str) -> Optional[np.ndarray]:
@@ -244,12 +333,18 @@ class ConceptEmbeddingIndex:
         if not self.is_loaded():
             self.load()
 
+        # Calibrate threshold for zero-isotropic JEPA 768-d space (where noise is ~0.00 and positives start ~0.45-0.50)
+        is_jepa_space = (self.dim == 768 or "jepa" in str(self.model_name).lower())
+        effective_threshold = float(similarity_threshold)
+        if is_jepa_space and effective_threshold >= 0.70:
+            effective_threshold = 0.50
+
         debug_meta: Dict[str, Any] = {
             "model_name": self.model_name,
-            "dimensions": int(self.vectors.shape[1]) if self.vectors is not None else 0,
+            "dimensions": int(self.vectors.shape[1]) if (self.vectors is not None and self.vectors.ndim > 1) else self.dim,
             "total_indexed_concepts": len(self.ids) if self.ids is not None else 0,
             "endpoint": self.ollama_url,
-            "similarity_threshold": similarity_threshold,
+            "similarity_threshold": effective_threshold,
             "top_k_requested": top_k,
             "candidates_above_threshold_count": 0,
             "candidates_above_relaxed_count": 0,
@@ -275,13 +370,13 @@ class ConceptEmbeddingIndex:
         # Priority calculation: product of cosine similarity and node weight
         priorities = cosines * self.weights
 
-        # Candidate pool: include candidates above relaxed similarity threshold (min 0.50)
-        # so high-weight concepts (e.g. weight 8+ with cosine 0.68) aren't prematurely eliminated
-        candidate_pool = np.where(cosines >= min(0.50, similarity_threshold * 0.80))[0]
+        # Candidate pool: include candidates above relaxed similarity threshold (0.40 for JEPA, 0.50 for others)
+        min_candidate_thresh = 0.40 if is_jepa_space else 0.50
+        candidate_pool = np.where(cosines >= min(min_candidate_thresh, effective_threshold * 0.80))[0]
         if len(candidate_pool) == 0:
             candidate_pool = np.argsort(-cosines)[:top_k]
 
-        debug_meta["candidates_above_threshold_count"] = int(np.sum(cosines >= similarity_threshold))
+        debug_meta["candidates_above_threshold_count"] = int(np.sum(cosines >= effective_threshold))
         debug_meta["candidates_above_relaxed_count"] = int(len(candidate_pool))
 
         # Sort candidate pool by priority score (cosine * weight) descending
@@ -311,7 +406,7 @@ class ConceptEmbeddingIndex:
                 "weight": w,
                 "cosine_similarity": round(cos, 4),
                 "priority_score": round(prio, 4),
-                "threshold_met": bool(cos >= similarity_threshold or (cos >= 0.65 and w >= 7.0)),
+                "threshold_met": bool(cos >= effective_threshold or (cos >= (0.45 if is_jepa_space else 0.65) and w >= 7.0)),
             })
             if len(results) >= top_k:
                 break

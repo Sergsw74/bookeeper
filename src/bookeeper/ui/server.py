@@ -754,7 +754,7 @@ class BookeeperUIRequestHandler(BaseHTTPRequestHandler):
 
         # 2. Web UI Search API (/api/search)
         if path == "/api/search":
-            similarity_threshold = float(body.get("similarity_threshold", 0.70))
+            similarity_threshold = float(body.get("similarity_threshold", 0.50))
             top_k_seeds = int(body.get("top_k_seeds", 6))
             try:
                 result = self.backend.query_ideas(

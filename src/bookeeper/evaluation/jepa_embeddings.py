@@ -61,6 +61,35 @@ class JEPAEmbeddings(Embeddings):
         self.device = resolve_torch_device(device)
         self.weights_path = Path(weights_path) if weights_path else Path("output/jepa_768_weights.npz")
         self.pt_weights_path = Path(pt_weights_path) if pt_weights_path else Path("output/jepa_head_weights.pt")
+
+        # Resolve weights cascade if missing (output -> backups -> models fallback -> OCI image)
+        if not self.pt_weights_path.is_file() or not self.weights_path.is_file():
+            try:
+                from bookeeper.evaluation.jepa_downloader import ensure_jepa_weights
+                ensured_pt, ensured_npz = ensure_jepa_weights(
+                    output_dir=self.pt_weights_path.parent if self.pt_weights_path else "output",
+                    pt_weights_path=self.pt_weights_path,
+                    weights_path=self.weights_path,
+                )
+                if ensured_pt and ensured_pt.is_file():
+                    self.pt_weights_path = ensured_pt
+                if ensured_npz and ensured_npz.is_file():
+                    self.weights_path = ensured_npz
+            except Exception as dl_err:
+                logger.debug(f"Could not automatically ensure JEPA weights: {dl_err}")
+
+        if not self.weights_path.is_file():
+            for fallback in (Path("models/jepa_768_weights.npz"), Path("/app/models/jepa_768_weights.npz")):
+                if fallback.is_file():
+                    self.weights_path = fallback
+                    break
+
+        if not self.pt_weights_path.is_file():
+            for fallback in (Path("models/jepa_head_weights.pt"), Path("/app/models/jepa_head_weights.pt")):
+                if fallback.is_file():
+                    self.pt_weights_path = fallback
+                    break
+
         self.base_embeddings = base_embeddings
         self.hf_model_id = hf_model_id
 
@@ -96,7 +125,6 @@ class JEPAEmbeddings(Embeddings):
         self._jepa_head = None
         self._jepa_backbone = None
         self._jepa_mean = None
-        self.pt_weights_path = Path("output/jepa_head_weights.pt")
 
     @classmethod
     def from_settings(
@@ -109,11 +137,35 @@ class JEPAEmbeddings(Embeddings):
         """
         jepa_cfg = getattr(settings, "jepa", None)
         dimension = getattr(jepa_cfg, "dimension", None) or getattr(settings, "embedding_dim", 768)
-        model_type = getattr(jepa_cfg, "model_type", "direct_network")
+        model_type = getattr(jepa_cfg, "model_type", None) or "two_tier_jepa"
         device = getattr(jepa_cfg, "device", "gpu")
         weights_path = getattr(jepa_cfg, "weights_path", "output/jepa_768_weights.npz")
         pt_weights_path = getattr(jepa_cfg, "pt_weights_path", "output/jepa_head_weights.pt")
+        weights_image = getattr(jepa_cfg, "weights_image", None)
+        auto_download = getattr(jepa_cfg, "auto_download_weights", True)
+        out_dir = getattr(settings, "output_dir", "output")
         base_model_name = getattr(jepa_cfg, "base_embedding_model", "BAAI/bge-small-en-v1.5")
+
+        if auto_download:
+            try:
+                from bookeeper.evaluation.jepa_downloader import ensure_jepa_weights
+                ensured_pt, ensured_npz = ensure_jepa_weights(
+                    output_dir=out_dir,
+                    pt_weights_path=pt_weights_path,
+                    weights_path=weights_path,
+                    weights_image=weights_image,
+                    auto_download=auto_download,
+                )
+                if ensured_pt and ensured_pt.is_file():
+                    pt_weights_path = str(ensured_pt)
+                if ensured_npz and ensured_npz.is_file():
+                    weights_path = str(ensured_npz)
+            except Exception as dl_err:
+                logger.debug(f"Failed to auto-resolve JEPA weights in from_settings: {dl_err}")
+
+        # If model_type was explicitly set to direct_network but calibrated pt weights exist, upgrade to two_tier_jepa
+        if model_type == "direct_network" and Path(pt_weights_path).is_file():
+            model_type = "two_tier_jepa"
 
         base_embeddings = None
         if model_type == "whitened_projector":

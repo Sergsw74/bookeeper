@@ -303,6 +303,14 @@ def load_reference_data(
 
             ref.chunk_to_ideas[cid] = list(set(chunk_idea_list))
 
+    if ref.chunks:
+        from collections import Counter
+        dim_counts = Counter(len(c.embedding) for c in ref.chunks)
+        if len(dim_counts) > 1:
+            common_dim = dim_counts.most_common(1)[0][0]
+            ref.chunks = [c for c in ref.chunks if len(c.embedding) == common_dim]
+            ref.ideas = {k: v for k, v in ref.ideas.items() if len(v.embedding) == common_dim}
+
     logger.info(
         f"Loaded ReferenceDataset: {len(ref.chunks)} chunks, {len(ref.ideas)} ideas, "
         f"{len(ref.idea_relations)} idea relations across {len(ref.book_ids)} books."

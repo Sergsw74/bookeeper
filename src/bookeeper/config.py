@@ -458,8 +458,8 @@ class JEPAConfig(BaseModel):
         description="Expected cosine similarity for completely unrelated concepts (default: 0.00).",
     )
     model_type: str = Field(
-        default="direct_network",
-        description="JEPA model type: 'direct_network' (lightweight GPU-accelerated neural network, >50,000 txt/s), 'all-mpnet-base-v2', or 'whitened_projector'.",
+        default="two_tier_jepa",
+        description="JEPA model type: 'two_tier_jepa' (Two-Tier Text-JEPA with bge-small backbone + TextJEPAHead), 'direct_network' (lightweight GPU-accelerated neural network), 'all-mpnet-base-v2', or 'whitened_projector'.",
     )
     device: str = Field(
         default="gpu",
@@ -488,6 +488,14 @@ class JEPAConfig(BaseModel):
     llm_disambiguation: bool = Field(
         default=False,
         description="Whether to invoke LLM for concept disambiguation in the probable zone (default: False under JEPA, letting JEPA zero-isotropic similarity resolve matches directly).",
+    )
+    weights_image: Optional[str] = Field(
+        default="192.168.50.20:5000/bk-jepa-ai:latest",
+        description="OCI/Docker image reference (e.g. '192.168.50.20:5000/bk-jepa-ai:latest') containing JEPA model weights.",
+    )
+    auto_download_weights: bool = Field(
+        default=True,
+        description="Whether to automatically download missing JEPA weights from weights_image if absent from output and backups.",
     )
 
 

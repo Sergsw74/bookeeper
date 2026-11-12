@@ -694,8 +694,17 @@ class SearchEngineBackend:
             model_name=model_name,
             settings=self.config,
         )
-        if not index.load():
-            logger.info("Concept embeddings cache not found on disk yet.")
+        driver = None
+        db_name = None
+        try:
+            if self.is_neo4j_enabled:
+                driver = self.get_neo4j_driver()
+                db_name = self.neo4j_cfg.database
+        except Exception as e:
+            logger.debug(f"Could not connect to Neo4j for embedding index load: {e}")
+
+        if not index.load(neo4j_driver=driver, neo4j_database=db_name):
+            logger.info("Concept embeddings cache not found on disk or Neo4j yet.")
         self._concept_embedding_index = index
         return self._concept_embedding_index
 
@@ -1711,18 +1720,35 @@ class SearchEngineBackend:
                 )
             except Exception as e:
                 logger.warning(f"Neural embedding query failed: {e}")
+        else:
+            embedding_telemetry = {
+                "model_name": getattr(emb_index, "model_name", "jepa-768"),
+                "dimensions": getattr(emb_index, "dim", 768),
+                "total_indexed_concepts": len(getattr(emb_index, "ids", [])),
+                "endpoint": getattr(emb_index, "ollama_url", ""),
+                "similarity_threshold": similarity_threshold,
+                "top_k_requested": top_k_seeds,
+                "candidates_above_threshold_count": 0,
+                "candidates_above_relaxed_count": 0,
+                "top_k_retrieved": 0,
+                "status": "index_not_loaded",
+            }
 
-        # Check direct Neo4j exact/prefix name and ID matches for Idea / Concept nodes
+        # Check direct Neo4j exact/prefix/substring name and ID matches for Idea / Concept nodes
         try:
             if not self.is_neo4j_enabled:
                 raise RuntimeError("Neo4j is disabled in configuration")
             driver = self.get_neo4j_driver()
+            q_clean = query.strip()
+            q_lower = q_clean.lower()
             with driver.session(database=self.neo4j_cfg.database) as session:
                 exact_res = session.run(
                     """
                     MATCH (n)
                     WHERE (n:Idea OR n:Concept) AND (
-                        toLower(n.name) = toLower($query)
+                        toLower(n.name) = $q_lower
+                        OR toLower(n.name) STARTS WITH $q_lower
+                        OR toLower(n.name) CONTAINS $q_lower
                         OR n.id = $query
                         OR toString(id(n)) = $query
                         OR elementId(n) ENDS WITH (':' + $query)
@@ -1730,27 +1756,50 @@ class SearchEngineBackend:
                     OPTIONAL MATCH (better:Idea)
                     WHERE toLower(better.name) = toLower(n.name)
                     WITH coalesce(better, n) AS best
-                    ORDER BY (CASE WHEN best:Idea THEN 1 ELSE 2 END) ASC, coalesce(best.weight, 5) DESC
-                    LIMIT 3
-                    RETURN best.id AS id, best.name AS name, coalesce(best.weight, 8.0) AS weight
+                    ORDER BY 
+                        (CASE 
+                            WHEN toLower(best.name) = $q_lower OR best.id = $query THEN 1
+                            WHEN toLower(best.name) STARTS WITH $q_lower THEN 2
+                            ELSE 3 
+                        END) ASC,
+                        (CASE WHEN best:Idea THEN 1 ELSE 2 END) ASC, 
+                        coalesce(best.weight, 5) DESC
+                    LIMIT $limit
+                    RETURN DISTINCT best.id AS id, best.name AS name, coalesce(best.weight, 8.0) AS weight,
+                        (CASE 
+                            WHEN toLower(best.name) = $q_lower OR best.id = $query THEN 1.0
+                            WHEN toLower(best.name) STARTS WITH $q_lower THEN 0.95
+                            ELSE 0.90 
+                        END) AS match_cos
                     """,
-                    {"query": query.strip()},
+                    {"query": q_clean, "q_lower": q_lower, "limit": max(top_k_seeds, 6)},
                 )
                 for r in exact_res:
                     xid = r.get("id")
                     if xid:
                         xw = float(r.get("weight") or 8.0)
-                        exact_idea = {
-                            "id": xid,
-                            "name": r.get("name") or xid,
-                            "weight": xw,
-                            "cosine_similarity": 1.0,
-                            "priority_score": round(1.0 * xw, 4),
-                            "threshold_met": True,
-                        }
-                        core_ideas = [exact_idea] + [i for i in core_ideas if i["id"] != xid]
+                        xcos = float(r.get("match_cos") or 0.90)
+                        existing = next((i for i in core_ideas if i["id"] == xid), None)
+                        if existing:
+                            existing["cosine_similarity"] = max(existing.get("cosine_similarity", 0.0), xcos)
+                            existing["priority_score"] = round(existing["cosine_similarity"] * existing["weight"], 4)
+                            existing["threshold_met"] = True
+                        else:
+                            exact_idea = {
+                                "id": xid,
+                                "name": r.get("name") or xid,
+                                "weight": xw,
+                                "cosine_similarity": xcos,
+                                "priority_score": round(xcos * xw, 4),
+                                "threshold_met": True,
+                            }
+                            core_ideas.append(exact_idea)
+
+                # Re-sort core_ideas by priority score descending and limit to top_k_seeds
+                core_ideas.sort(key=lambda x: x.get("priority_score", 0.0), reverse=True)
+                core_ideas = core_ideas[:top_k_seeds]
         except Exception as e:
-            logger.debug(f"Direct Neo4j exact idea query failed: {e}")
+            logger.debug(f"Direct Neo4j exact/prefix idea query failed: {e}")
 
         # Fallback to fast vectorizer if neural embeddings produced no matches
         if not core_ideas:

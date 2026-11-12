@@ -108,12 +108,12 @@ if [ -n "${REGISTRY_HOST}" ] && [ "${REGISTRY_HOST}" != "${REGISTRY}" ]; then
     JEPA_BUILD_CMD+=(-t "${REGISTRY_HOST}/bk-jepa-ai:latest")
     JEPA_BUILD_CMD+=(-t "${REGISTRY_HOST}/bk-jepa-ai:${VERSION}")
 fi
-JEPA_BUILD_CMD+=(-t "bk-jepa-ai:latest")
-JEPA_BUILD_CMD+=(-t "bk-jepa-ai:${VERSION}")
 
 if [ "$PUSH" = true ]; then
     JEPA_BUILD_CMD+=(--push)
 else
+    JEPA_BUILD_CMD+=(-t "bk-jepa-ai:latest")
+    JEPA_BUILD_CMD+=(-t "bk-jepa-ai:${VERSION}")
     JEPA_BUILD_CMD+=(--load)
 fi
 JEPA_BUILD_CMD+=(-f Dockerfile.jepa .)

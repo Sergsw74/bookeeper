@@ -13,6 +13,7 @@ REGISTRY="192.168.50.20:5000/bookeeper"
 PLATFORMS="linux/amd64,linux/arm64"
 PUSH=true
 BUMP=false
+BUILD_JEPA=false
 CUSTOM_VERSION=""
 CUSTOM_DATE="$(date +%Y-%m-%d)"
 
@@ -25,6 +26,7 @@ usage() {
     echo "  --date <YYYY-MM-DD> Explicit release date (default: today: ${CUSTOM_DATE})"
     echo "  --registry <URL>    Docker registry repository (default: ${REGISTRY})"
     echo "  --platform <list>   Target platforms (default: ${PLATFORMS})"
+    echo "  --with-jepa         Also build and publish bk-jepa-ai weights image (default: disabled)"
     echo "  --no-push           Do not push image to registry"
     echo "  -h, --help          Show this help message"
     exit 0
@@ -51,6 +53,10 @@ while [[ $# -gt 0 ]]; do
         --platform)
             PLATFORMS="$2"
             shift 2
+            ;;
+        --with-jepa|--build-jepa)
+            BUILD_JEPA=true
+            shift
             ;;
         --no-push)
             PUSH=false
@@ -81,7 +87,7 @@ python3 "${SCRIPT_DIR}/stamp_version.py" "${STAMP_ARGS[@]}"
 VERSION=$(python3 "${SCRIPT_DIR}/stamp_version.py" --get)
 RELEASE_DATE="$CUSTOM_DATE"
 
-echo "=== 1/2: Building Bookeeper Application Image: ${REGISTRY}:${VERSION} ==="
+echo "=== Building Bookeeper Application Image: ${REGISTRY}:${VERSION} ==="
 APP_BUILD_CMD=(docker buildx build)
 APP_BUILD_CMD+=(--platform "${PLATFORMS}")
 APP_BUILD_CMD+=(--build-arg "APP_VERSION=${VERSION}")
@@ -99,26 +105,31 @@ APP_BUILD_CMD+=(-f Dockerfile .)
 echo "Executing: ${APP_BUILD_CMD[*]}"
 "${APP_BUILD_CMD[@]}"
 
-echo "=== 2/2: Building JEPA Weights Model Image: bk-jepa-ai ==="
-JEPA_BUILD_CMD=(docker buildx build)
-JEPA_BUILD_CMD+=(--platform "${PLATFORMS}")
+if [ "$BUILD_JEPA" = true ]; then
+    echo "=== Building JEPA Weights Model Image: bk-jepa-ai ==="
+    JEPA_BUILD_CMD=(docker buildx build)
+    JEPA_BUILD_CMD+=(--platform "${PLATFORMS}")
 
-REGISTRY_HOST="${REGISTRY%/*}"
-if [ -n "${REGISTRY_HOST}" ] && [ "${REGISTRY_HOST}" != "${REGISTRY}" ]; then
-    JEPA_BUILD_CMD+=(-t "${REGISTRY_HOST}/bk-jepa-ai:latest")
-    JEPA_BUILD_CMD+=(-t "${REGISTRY_HOST}/bk-jepa-ai:${VERSION}")
-fi
+    REGISTRY_HOST="${REGISTRY%/*}"
+    if [ -n "${REGISTRY_HOST}" ] && [ "${REGISTRY_HOST}" != "${REGISTRY}" ]; then
+        JEPA_BUILD_CMD+=(-t "${REGISTRY_HOST}/bk-jepa-ai:latest")
+        JEPA_BUILD_CMD+=(-t "${REGISTRY_HOST}/bk-jepa-ai:${VERSION}")
+    fi
 
-if [ "$PUSH" = true ]; then
-    JEPA_BUILD_CMD+=(--push)
+    if [ "$PUSH" = true ]; then
+        JEPA_BUILD_CMD+=(--push)
+    else
+        JEPA_BUILD_CMD+=(-t "bk-jepa-ai:latest")
+        JEPA_BUILD_CMD+=(-t "bk-jepa-ai:${VERSION}")
+        JEPA_BUILD_CMD+=(--load)
+    fi
+    JEPA_BUILD_CMD+=(-f Dockerfile.jepa .)
+
+    echo "Executing: ${JEPA_BUILD_CMD[*]}"
+    "${JEPA_BUILD_CMD[@]}"
+    echo "✓ Successfully built and published bk-jepa-ai weights image (${VERSION})"
 else
-    JEPA_BUILD_CMD+=(-t "bk-jepa-ai:latest")
-    JEPA_BUILD_CMD+=(-t "bk-jepa-ai:${VERSION}")
-    JEPA_BUILD_CMD+=(--load)
+    echo "ℹ Skipping bk-jepa-ai weights image (pass --with-jepa to build and publish)"
 fi
-JEPA_BUILD_CMD+=(-f Dockerfile.jepa .)
 
-echo "Executing: ${JEPA_BUILD_CMD[*]}"
-"${JEPA_BUILD_CMD[@]}"
-
-echo "✓ Successfully built and published ${REGISTRY}:${VERSION} and bk-jepa-ai (${RELEASE_DATE})"
+echo "✓ Successfully built and published ${REGISTRY}:${VERSION} (${RELEASE_DATE})"

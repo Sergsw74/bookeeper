@@ -1015,12 +1015,25 @@ class OllamaPool:
     ) -> Tuple[str, Dict[str, Any]]:
         """Convenience method to generate text with failover across servers."""
         def _invoke(url: str) -> Tuple[str, Dict[str, Any]]:
-            body = {
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "options": {"temperature": temperature},
-                "stream": False,
-            }
+            is_openai_compat = "/v1" in url.lower() or "chat/completions" in url.lower()
+            if is_openai_compat:
+                endpoint_url = url.rstrip("/")
+                if not endpoint_url.endswith("/chat/completions"):
+                    endpoint_url = f"{endpoint_url}/chat/completions"
+                body = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": temperature,
+                    "stream": False,
+                }
+            else:
+                endpoint_url = f"{url.rstrip('/')}/api/chat"
+                body = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "options": {"temperature": temperature},
+                    "stream": False,
+                }
             cmd = [
                 "curl",
                 "-s",
@@ -1034,14 +1047,17 @@ class OllamaPool:
                 "Content-Type: application/json",
                 "-d",
                 json.dumps(body),
-                f"{url.rstrip('/')}/api/chat",
+                endpoint_url,
             ]
             res = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if res.returncode == 0 and res.stdout.strip():
                 data = json.loads(res.stdout)
                 if "error" in data:
-                    raise RuntimeError(f"Ollama server {url} error: {data['error']}")
-                content = data.get("message", {}).get("content", "")
+                    raise RuntimeError(f"Server {url} error: {data['error']}")
+                if "choices" in data and len(data["choices"]) > 0:
+                    content = data["choices"][0].get("message", {}).get("content", "")
+                else:
+                    content = data.get("message", {}).get("content", "")
                 try:
                     from bookeeper.processing.token_tracker import TokenTracker
                     TokenTracker.get_instance().record_response_data(
@@ -1053,7 +1069,7 @@ class OllamaPool:
                 except Exception:
                     pass
                 return content, data
-            raise RuntimeError(f"Ollama curl failed with code {res.returncode}: {res.stderr}")
+            raise RuntimeError(f"LLM curl failed with code {res.returncode}: {res.stderr}")
 
         return self.execute_with_failover(
             _invoke,

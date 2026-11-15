@@ -442,7 +442,7 @@ class IdeaVerifier:
         """Ping Ollama server pool nodes supporting verification to preload model into VRAM."""
         target_nodes = [n for n in self.pool.nodes if n.has_capability("verification")] or self.pool.nodes
         for node in target_nodes:
-            if shutil.which("curl"):
+            if shutil.which("curl") and "/v1" not in node.url.lower():
                 try:
                     cmd = [
                         "curl",
@@ -484,59 +484,75 @@ class IdeaVerifier:
                     input_chars += len(content)
 
         def _invoke(url: str) -> VerificationResult:
-            try:
-                # Clean sampling parameters: pass only valid parameters (no mirostat, mirostat_eta, mirostat_tau, or tfs_z)
-                llm = ChatOllama(
-                    model=self.model_name,
-                    base_url=url,
-                    temperature=self.temperature,
-                    top_p=0.9,
-                    sync_client_kwargs={"timeout": float(self.timeout)},
-                    client_kwargs={"timeout": float(self.timeout)},
-                )
-                structured_llm = llm.with_structured_output(VerificationResult)
-                res = structured_llm.invoke(messages)
-                if isinstance(res, VerificationResult):
-                    return res
-                if isinstance(res, dict):
-                    return VerificationResult.model_validate(res)
-                parsed = _parse_verification_text(str(res))
-                if parsed:
-                    return parsed
-                cleaned = _clean_json_str(str(res))
-                return VerificationResult.model_validate_json(cleaned)
-            except Exception as exc:
-                # 1. Recover if exception contains raw model output (e.g. Pydantic ValidationError)
-                if hasattr(exc, "errors"):
-                    try:
-                        for err in exc.errors():
-                            inp = err.get("input")
-                            if inp and isinstance(inp, str):
-                                parsed = _parse_verification_text(inp)
-                                if parsed:
-                                    return parsed
-                    except Exception:
-                        pass
+            is_openai_compat = "/v1" in url.lower() or "chat/completions" in url.lower()
+            if not is_openai_compat:
+                try:
+                    # Clean sampling parameters: pass only valid parameters (no mirostat, mirostat_eta, mirostat_tau, or tfs_z)
+                    llm = ChatOllama(
+                        model=self.model_name,
+                        base_url=url,
+                        temperature=self.temperature,
+                        top_p=0.9,
+                        sync_client_kwargs={"timeout": float(self.timeout)},
+                        client_kwargs={"timeout": float(self.timeout)},
+                    )
+                    structured_llm = llm.with_structured_output(VerificationResult)
+                    res = structured_llm.invoke(messages)
+                    if isinstance(res, VerificationResult):
+                        return res
+                    if isinstance(res, dict):
+                        return VerificationResult.model_validate(res)
+                    parsed = _parse_verification_text(str(res))
+                    if parsed:
+                        return parsed
+                    cleaned = _clean_json_str(str(res))
+                    return VerificationResult.model_validate_json(cleaned)
+                except Exception as exc:
+                    # 1. Recover if exception contains raw model output (e.g. Pydantic ValidationError)
+                    if hasattr(exc, "errors"):
+                        try:
+                            for err in exc.errors():
+                                inp = err.get("input")
+                                if inp and isinstance(inp, str):
+                                    parsed = _parse_verification_text(inp)
+                                    if parsed:
+                                        return parsed
+                        except Exception:
+                            pass
 
-                err_str = str(exc)
-                if "input_value=" in err_str:
-                    match = re.search(r"input_value=['\"]([\s\S]*?)['\"], input_type=", err_str)
-                    if match:
-                        raw_input = match.group(1).replace(r"\n", "\n").replace(r"\'", "'").replace(r'\"', '"')
-                        parsed = _parse_verification_text(raw_input)
-                        if parsed:
-                            return parsed
+                    err_str = str(exc)
+                    if "input_value=" in err_str:
+                        match = re.search(r"input_value=['\"]([\s\S]*?)['\"], input_type=", err_str)
+                        if match:
+                            raw_input = match.group(1).replace(r"\n", "\n").replace(r"\'", "'").replace(r'\"', '"')
+                            parsed = _parse_verification_text(raw_input)
+                            if parsed:
+                                return parsed
 
-                # 2. Resilient fallback via curl with standard "format": "json"
-                if shutil.which("curl"):
-                    msgs_payload = []
-                    for m in messages:
-                        role = "user"
-                        if hasattr(m, "type"):
-                            role = "system" if m.type == "system" else "user"
-                        content = getattr(m, "content", str(m))
-                        msgs_payload.append({"role": role, "content": content})
+            # Direct / resilient invocation via curl with format: json
+            if shutil.which("curl"):
+                msgs_payload = []
+                for m in messages:
+                    role = "user"
+                    if hasattr(m, "type"):
+                        role = "system" if m.type == "system" else "user"
+                    content = getattr(m, "content", str(m))
+                    msgs_payload.append({"role": role, "content": content})
 
+                prompt_text = "\n".join(str(m.content) if hasattr(m, "content") else str(m) for m in messages)
+                if is_openai_compat:
+                    endpoint_url = url.rstrip("/")
+                    if not endpoint_url.endswith("/chat/completions"):
+                        endpoint_url = f"{endpoint_url}/chat/completions"
+                    body = {
+                        "model": self.model_name,
+                        "messages": msgs_payload,
+                        "response_format": {"type": "json_object"},
+                        "temperature": self.temperature,
+                        "stream": False,
+                    }
+                else:
+                    endpoint_url = f"{url.rstrip('/')}/api/chat"
                     body = {
                         "model": self.model_name,
                         "messages": msgs_payload,
@@ -547,46 +563,51 @@ class IdeaVerifier:
                         },
                         "stream": False,
                     }
-                    cmd = [
-                        "curl",
-                        "-s",
-                        "--connect-timeout",
-                        "3",
-                        "--max-time",
-                        str(self.timeout),
-                        "-X",
-                        "POST",
-                        "-H",
-                        "Content-Type: application/json",
-                        "-d",
-                        json.dumps(body),
-                        f"{url.rstrip('/')}/api/chat",
-                    ]
-                    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
-                    if res.returncode == 0 and res.stdout.strip():
-                        try:
-                            data = json.loads(res.stdout)
-                            if "error" in data:
-                                raise RuntimeError(f"Ollama server {url} error: {data['error']}")
+                cmd = [
+                    "curl",
+                    "-s",
+                    "--connect-timeout",
+                    "3",
+                    "--max-time",
+                    str(self.timeout),
+                    "-X",
+                    "POST",
+                    "-H",
+                    "Content-Type: application/json",
+                    "-d",
+                    json.dumps(body),
+                    endpoint_url,
+                ]
+                res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                if res.returncode == 0 and res.stdout.strip():
+                    try:
+                        data = json.loads(res.stdout)
+                        if "error" in data:
+                            raise RuntimeError(f"Server {url} error: {data['error']}")
+                        if "choices" in data and len(data["choices"]) > 0:
+                            content = data["choices"][0].get("message", {}).get("content", "")
+                        else:
                             content = data.get("message", {}).get("content", "")
-                            if not content and "thinking" in data.get("message", {}):
-                                content = data["message"]["thinking"]
-                            try:
-                                from bookeeper.processing.token_tracker import TokenTracker
-                                TokenTracker.get_instance().record_response_data(
-                                    data,
-                                    prompt_text=prompt,
-                                    completion_text=content,
-                                    task_type="llm",
-                                )
-                            except Exception:
-                                pass
-                            parsed = _parse_verification_text(content)
-                            if parsed:
-                                return parsed
+                        if not content and "thinking" in data.get("message", {}):
+                            content = data["message"]["thinking"]
+                        try:
+                            from bookeeper.processing.token_tracker import TokenTracker
+                            TokenTracker.get_instance().record_response_data(
+                                data,
+                                prompt_text=prompt_text,
+                                completion_text=content,
+                                task_type="llm",
+                            )
                         except Exception:
                             pass
+                        parsed = _parse_verification_text(content)
+                        if parsed:
+                            return parsed
+                    except Exception:
+                        pass
+            if not is_openai_compat:
                 raise exc
+            raise RuntimeError(f"Failed to verify idea chunk via endpoint {url}")
 
         return self.pool.execute_with_failover(
             _invoke,

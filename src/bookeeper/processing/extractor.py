@@ -1042,16 +1042,30 @@ class KnowledgeExtractor:
                         content = getattr(m, "content", str(m))
                         msgs_payload.append({"role": role, "content": content})
 
-                    body = {
-                        "model": effective_model,
-                        "messages": msgs_payload,
-                        "format": "json",
-                        "options": {
+                    is_openai_compat = "/v1" in url.lower() or "chat/completions" in url.lower()
+                    if is_openai_compat:
+                        endpoint_url = url.rstrip("/")
+                        if not endpoint_url.endswith("/chat/completions"):
+                            endpoint_url = f"{endpoint_url}/chat/completions"
+                        body = {
+                            "model": effective_model,
+                            "messages": msgs_payload,
+                            "response_format": {"type": "json_object"},
                             "temperature": self.temperature,
-                            "top_p": 0.9,
-                        },
-                        "stream": False,
-                    }
+                            "stream": False,
+                        }
+                    else:
+                        endpoint_url = f"{url.rstrip('/')}/api/chat"
+                        body = {
+                            "model": effective_model,
+                            "messages": msgs_payload,
+                            "format": "json",
+                            "options": {
+                                "temperature": self.temperature,
+                                "top_p": 0.9,
+                            },
+                            "stream": False,
+                        }
                     cmd = [
                         "curl",
                         "-s",
@@ -1065,12 +1079,15 @@ class KnowledgeExtractor:
                         "Content-Type: application/json",
                         "-d",
                         json.dumps(body),
-                        f"{url.rstrip('/')}/api/chat",
+                        endpoint_url,
                     ]
                     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
                     if res.returncode == 0 and res.stdout.strip():
                         data = json.loads(res.stdout)
-                        content = data.get("message", {}).get("content", "")
+                        if "choices" in data and len(data["choices"]) > 0:
+                            content = data["choices"][0].get("message", {}).get("content", "")
+                        else:
+                            content = data.get("message", {}).get("content", "")
                         try:
                             from bookeeper.processing.token_tracker import TokenTracker
                             TokenTracker.get_instance().record_response_data(
@@ -1106,8 +1123,42 @@ class KnowledgeExtractor:
                 except Exception as curl_err:
                     logger.debug(f"Direct curl format=json invoke failed: {curl_err}")
 
-            # 2. Fallback to ChatOllama structured output chain with strict timeout
+            # 2. Fallback to HTTPX (for OpenAI /v1) or ChatOllama structured output chain with strict timeout
             try:
+                if is_openai_compat:
+                    with httpx.Client(timeout=timeout_float) as h_client:
+                        h_res = h_client.post(endpoint_url, json=body)
+                        h_res.raise_for_status()
+                        h_data = h_res.json()
+                        h_content = ""
+                        if "choices" in h_data and len(h_data["choices"]) > 0:
+                            h_content = h_data["choices"][0].get("message", {}).get("content", "")
+                        else:
+                            h_content = h_data.get("message", {}).get("content", "")
+                        if "<think>" in h_content and "</think>" in h_content:
+                            h_content = h_content.split("</think>")[-1].strip()
+                        if h_content:
+                            h_content = h_content.strip()
+                            if h_content.startswith("```json"):
+                                h_content = h_content[7:]
+                            elif h_content.startswith("```"):
+                                h_content = h_content[3:]
+                            if h_content.endswith("```"):
+                                h_content = h_content[:-3]
+                            h_content = h_content.strip()
+                            try:
+                                from bookeeper.processing.token_tracker import TokenTracker
+                                TokenTracker.get_instance().record_response_data(
+                                    h_data,
+                                    prompt_text=full_prompt_text,
+                                    completion_text=h_content,
+                                    task_type="llm",
+                                )
+                            except Exception:
+                                pass
+                            if hasattr(schema_cls, "model_validate_json"):
+                                return schema_cls.model_validate_json(h_content)
+                            return json.loads(h_content)
                 # Clean sampling parameters: pass only valid parameters (no mirostat, mirostat_eta, mirostat_tau, or tfs_z)
                 llm = ChatOllama(
                     base_url=url,
@@ -1794,6 +1845,44 @@ class KnowledgeExtractor:
 
         def _inspect_node(node) -> Dict[str, Any]:
             target_endpoint = getattr(node, "target_url", node.url)
+            if "/v1" in target_endpoint.lower():
+                try:
+                    try:
+                        _fetch_server_json(target_endpoint, "/models" if target_endpoint.endswith("/v1") else "/v1/models")
+                    except Exception:
+                        pass
+                    node.mark_success()
+                    return {
+                        "url": node.url,
+                        "priority": node.priority,
+                        "name": node.label,
+                        "status": "ok",
+                        "is_gpu": True,
+                        "device": "Remote OpenAPI Engine (Strata)",
+                        "size": 0,
+                        "size_vram": 0,
+                        "vram_pct": 100.0,
+                        "runner": "strata",
+                        "model": self.model_name,
+                        "warning": None,
+                    }
+                except Exception as e:
+                    node.mark_failure(str(e))
+                    return {
+                        "url": node.url,
+                        "priority": node.priority,
+                        "name": node.label,
+                        "status": "unreachable",
+                        "is_gpu": False,
+                        "device": "Unreachable",
+                        "size": 0,
+                        "size_vram": 0,
+                        "vram_pct": 0.0,
+                        "runner": "unknown",
+                        "model": self.model_name,
+                        "warning": f"Unreachable: {e}",
+                        "error": str(e),
+                    }
             # 1. Warmup ping
             try:
                 _fetch_server_json(

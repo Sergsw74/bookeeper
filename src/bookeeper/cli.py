@@ -8720,6 +8720,12 @@ def rebuild_graph_command(
         "--state-cache-dir",
         help="Directory containing existing book state files (book_*_state.json) to use as source state directory.",
     ),
+    file_list: Optional[str] = typer.Option(
+        None,
+        "--file-list",
+        "-L",
+        help="Path to a text file containing book paths, titles, or IDs to rebuild.",
+    ),
     export_graphml: bool = typer.Option(
         False,
         "--export-graphml",

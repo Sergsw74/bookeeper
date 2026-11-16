@@ -22,6 +22,7 @@ The documentation is split into specialized subchapters stored in the [`docs/`](
 | 🔍 **[Decoupled Hybrid RAG](docs/rag.md)** | LightRAG vector/graph indexing from cached chunks and multi-mode querying (`hybrid`, `local`, `global`). |
 | 🔄 **[Two-Pass Idea Post-Processing](docs/post-processing.md)** | Concept clustering ($\ge 0.92$), alias resolution, concise macro-definition synthesis, and state checkpointing. |
 | 🔬 **[A/B Testing & Benchmarking](docs/ab-tests.md)** | Automated test harness, same-branch vs branch-vs-branch testing, configuration overlays, delta reporting, and live cross-check status monitor. |
+| 📊 **[Strata vs. Baseline Benchmark](docs/benchmark_strata_vs_baseline.md)** | 10-book benchmark report: Antigravity Oracle cross-check evaluation, quality (+15% recall) vs. compute tradeoff (3.86x slowdown), and scaling projections. |
 | 🛡️ **[Factual Verification & Auditing](docs/verification.md)** | Multi-mode verification suite: Ideas Grounding, Chunk Coherence, Dual-KG Cross-Checking, Oracle QA probes, and Graph Embedding Space & Skipping Leverage (`--mode graph` / `kg`). |
 | 📬 **[Telegram Notifications](docs/notifications.md)** | Real-time event notifications for graph build start, milestone progress (every N%), book errors, completion stats, and verification audit scorecards. |
 

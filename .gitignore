@@ -70,6 +70,7 @@ my-config.yaml
 my-config*.yaml
 data/
 output/
+output_*/
 reports/
 ab_test_runs/
 obsidian_vault/

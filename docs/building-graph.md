@@ -105,9 +105,9 @@ Extracting concepts from every individual chunk using local LLMs is compute-inte
 ```mermaid
 flowchart TD
     Chunk["New Chunk Embedding\n(nomic-embed-text)"] --> SimCheck{"Compare against Idea Vector Index\nCosine Similarity (S)"}
-    SimCheck -->|S < 0.65| P1["Tier 1: Unassigned / New Idea\n(Priority 1 LLM Extraction Queue)"]
-    SimCheck -->|S >= 0.90| P2["Tier 2: High Confidence Fast-Path\n(Direct Assignment to Idea - Skips LLM)"]
-    SimCheck -->|0.65 <= S < 0.90| SizeCheck{"Chunk Size >= Threshold?\n(--max-batch-chunk-size)"}
+    SimCheck -->|"S < 0.65"| P1["Tier 1: Unassigned / New Idea\n(Priority 1 LLM Extraction Queue)"]
+    SimCheck -->|"S >= 0.90"| P2["Tier 2: High Confidence Fast-Path\n(Direct Assignment to Idea - Skips LLM)"]
+    SimCheck -->|"0.65 <= S < 0.90"| SizeCheck{"Chunk Size >= Threshold?\n(--max-batch-chunk-size)"}
     SizeCheck -->|Yes| P1Recov["Recovered from Limbo\n(Forced into Priority 1 Queue)"]
     SizeCheck -->|No| P3{"Tier 3: Limbo Chunk\n(--skip-limbo-chunks?)"}
     P3 -->|Yes| P3Skip["Skipped completely\n(Zero LLM Compute)"]

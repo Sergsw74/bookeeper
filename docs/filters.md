@@ -19,14 +19,14 @@ flowchart TD
     P2 -->|Matched Regex| Skip["SKIP\n(Dropped immediately)"]
     P2 -->|Passed| P3{"Priority 3: Idea Routing\nSemantic similarity to KG ideas"}
     
-    P3 -->|Similarity >= 0.87| HighConf["RETAIN (High Confidence)\nDirectly mapped to existing idea"]
-    P3 -->|0.72 <= Sim < 0.87| Limbo{"Limbo Chunk\nLength >= 1024 chars?"}
+    P3 -->|"Similarity >= 0.87"| HighConf["RETAIN (High Confidence)\nDirectly mapped to existing idea"]
+    P3 -->|"0.72 <= Sim < 0.87"| Limbo{"Limbo Chunk\nLength >= 1024 chars?"}
     Limbo -->|Yes| Recover["CONTINUE\n(Recovered from limbo)"]
     Limbo -->|No| Skip
-    P3 -->|Similarity < 0.72| P4{"Priority 4: Chunk Redundancy\nIntra-section Hierarchical Cover"}
+    P3 -->|"Similarity < 0.72"| P4{"Priority 4: Chunk Redundancy\nIntra-section Hierarchical Cover"}
     
     Recover --> P4
-    P4 -->|Cosine >= Tau within window| Skip
+    P4 -->|"Cosine >= Tau within window"| Skip
     P4 -->|Distinct / Anchor Chunk| Extract["EXTRACT\n(Forwarded to LLM Knowledge Extractor)"]
 ```
 

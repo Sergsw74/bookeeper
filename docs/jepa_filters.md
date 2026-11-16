@@ -16,20 +16,20 @@ Unlike classical unwhitened embedding spaces (such as standard BGE-small) where 
 ```mermaid
 flowchart TD
     Chunk["Candidate Literature Chunk"] --> P1{"Priority 1: Math Shield\nLaTeX / Equations / Theorems?"}
-    P1 -->|Yes: has_formula=True| Retain["RETAIN\n(100% Shielded from Downstream Drops)"]
-    P1 -->|No: has_formula=False| P2{"Priority 2: Boilerplate\nReferences / Bib / Licenses / OCR?"}
+    P1 -->|"Yes: has_formula=True"| Retain["RETAIN\n(100% Shielded from Downstream Drops)"]
+    P1 -->|"No: has_formula=False"| P2{"Priority 2: Boilerplate\nReferences / Bib / Licenses / OCR?"}
     
-    P2 -->|Matched Regex Noise| Skip["SKIP\n(Dropped Immediately)"]
-    P2 -->|Passed Clean| Axis2{"AXIS 2: Chunk Similarity (Cover)\nLocal Intra-Section Cosine >= Tau_chunk?"}
+    P2 -->|"Matched Regex Noise"| Skip["SKIP\n(Dropped Immediately)"]
+    P2 -->|"Passed Clean"| Axis2{"AXIS 2: Chunk Similarity (Cover)\nLocal Intra-Section Cosine >= Tau_chunk?"}
     
-    Axis2 -->|Yes: Redundant Narrative| Skip
-    Axis2 -->|No: Distinct Chunk| Axis1{"AXIS 1: Idea Similarity Routing\nCosine vs Global KG Ideas Index"}
+    Axis2 -->|"Yes: Redundant Narrative"| Skip
+    Axis2 -->|"No: Distinct Chunk"| Axis1{"AXIS 1: Idea Similarity Routing\nCosine vs Global KG Ideas Index"}
     
-    Axis1 -->|Sim >= High (e.g. 0.85)| Associate["DIRECT ASSOCIATION (Na)\nAttach Quotes & Mentions (0 LLM Cost)"]
-    Axis1 -->|Low <= Sim < High| Limbo{"Limbo Chunk\nLength >= 1024 chars?"}
+    Axis1 -->|"Sim >= High (e.g. 0.85)"| Associate["DIRECT ASSOCIATION (Na)\nAttach Quotes & Mentions (0 LLM Cost)"]
+    Axis1 -->|"Low <= Sim < High"| Limbo{"Limbo Chunk\nLength >= 1024 chars?"}
     Limbo -->|Yes| Extract["EXTRACT (Np)\nForward to LLM Extractor"]
     Limbo -->|No| Skip
-    Axis1 -->|Sim < Low (e.g. 0.65)| Extract
+    Axis1 -->|"Sim < Low (e.g. 0.65)"| Extract
 ```
 
 ### Three Discrete Conveyor Actions:

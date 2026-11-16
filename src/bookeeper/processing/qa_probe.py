@@ -586,10 +586,21 @@ def verify_assertion_entailment(
             return "NOT_MENTIONED", "Target assertion and question are empty.", ""
         return "NOT_MENTIONED", "Target assertion and question are empty."
 
+    # Guard against repetitive bibliography / author citation strings that cause infinite loops
+    if re.search(r"^[A-Z][a-zA-Z\-]+,\s*[A-Z]\.,\s*[A-Z][a-zA-Z\-]+,\s*[A-Z]\.", assertion.strip()):
+        if return_raw:
+            return "NOT_MENTIONED", "Raw bibliography citation author string bypassed.", ""
+        return "NOT_MENTIONED", "Raw bibliography citation author string bypassed."
+
     prompt = build_nli_verifier_prompt(claims_context, assertion, question=question)
 
     try:
-        raw_text, _ = pool.generate(model_name, prompt, temperature=0.0)
+        raw_text, _ = pool.generate(
+            model_name,
+            prompt,
+            temperature=0.0,
+            options={"num_predict": 300, "repeat_penalty": 1.15},
+        )
         clean = clean_llm_json_response(raw_text)
         data = {}
         try:

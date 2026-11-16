@@ -864,6 +864,18 @@ class OllamaPool:
                             )
                         last_exception = e
                         conn_err = is_connection_error(e)
+                        is_prompt_error = any(
+                            phrase in str(e).lower()
+                            for phrase in ["token repeat limit", "repeat limit reached", "prediction aborted"]
+                        )
+                        if is_prompt_error:
+                            logger.warning(
+                                f"Ollama model trapped in repetitive generation loop on prompt: {e}. "
+                                f"Bypassing prompt-level retry without penalizing server."
+                            )
+                            with self._condition:
+                                selected_node.release_without_cooldown(str(e))
+                            raise e
 
                         # If connection error (refused/offline), ensure at least 3 retry attempts on this server
                         if conn_err and max_attempts < 3:
@@ -1012,6 +1024,7 @@ class OllamaPool:
         prompt: str,
         temperature: float = 0.0,
         timeout: int = 60,
+        options: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Convenience method to generate text with failover across servers."""
         def _invoke(url: str) -> Tuple[str, Dict[str, Any]]:
@@ -1026,12 +1039,17 @@ class OllamaPool:
                     "temperature": temperature,
                     "stream": False,
                 }
+                if options and "num_predict" in options:
+                    body["max_tokens"] = options["num_predict"]
             else:
                 endpoint_url = f"{url.rstrip('/')}/api/chat"
+                opts = {"temperature": temperature, "repeat_penalty": 1.1}
+                if options:
+                    opts.update(options)
                 body = {
                     "model": model,
                     "messages": [{"role": "user", "content": prompt}],
-                    "options": {"temperature": temperature},
+                    "options": opts,
                     "stream": False,
                 }
             cmd = [

@@ -53,7 +53,7 @@ def test_daily_arxiv_sync_download_phase(tmp_path: Path):
     (downloads_dir / "2401.00001v1.Old_Paper.pdf").write_bytes(b"dummy old pdf")
 
     # Mock ArxivDownloader.run to simulate downloading 1 new paper
-    def mock_run(self):
+    def mock_run(self, progress_callback=None):
         # Update index with new paper
         idx_data = json.loads(idx_file.read_text(encoding="utf-8"))
         idx_data["2402.00002"] = {
@@ -64,7 +64,7 @@ def test_daily_arxiv_sync_download_phase(tmp_path: Path):
             "downloaded_at": "2026-10-02T00:00:00Z",
         }
         idx_file.write_text(json.dumps(idx_data), encoding="utf-8")
-        (downloads_dir / "2402.00002v1.New_Paper.pdf").write_bytes(b"dummy new pdf")
+        (downloads_dir / "2402.00002v1.New_Paper.pdf").write_bytes(b"%PDF-1.5 dummy new pdf")
         stats = MagicMock()
         stats.total_inspected = 5
         stats.already_existing = 4
@@ -182,3 +182,72 @@ def test_daily_arxiv_sync_clean_exit_when_no_new_articles(tmp_path: Path):
             "--limit", "5",
         ])
         assert code == 0
+
+
+def test_daily_arxiv_sync_download_validation_and_ordering(tmp_path: Path):
+    """
+    Verify Phase 1 download engine:
+    1. Captures files via live download callback in order.
+    2. Excludes non-PDF or empty corrupt payloads.
+    3. Guarantees only verified new PDFs are passed to Phase 2.
+    """
+    downloads_dir = tmp_path / "downloads"
+    downloads_dir.mkdir()
+
+    # Create dummy files
+    valid_pdf = downloads_dir / "2405.00001 - Paper One.pdf"
+    valid_pdf.write_bytes(b"%PDF-1.5 \x00\x01\x02 Valid Content")
+
+    corrupt_html = downloads_dir / "2405.00002 - Error 503.pdf"
+    corrupt_html.write_bytes(b"<html><head><title>503 Service Unavailable</title></head></html>")
+
+    empty_pdf = downloads_dir / "2405.00003 - Empty.pdf"
+    empty_pdf.write_bytes(b"")
+
+    def mock_run(self, progress_callback=None):
+        # Simulate ArxivDownloader triggering progress_callback for all 3
+        if progress_callback:
+            # Item 1: Valid
+            art1 = MagicMock()
+            art1.arxiv_id = "2405.00001"
+            self.indexer.add(daily_arxiv_sync.DownloadIndex(downloads_dir).entries.get("dummy") or MagicMock(
+                arxiv_id="2405.00001",
+                file_path=valid_pdf.name,
+            ))
+            progress_callback("download", 1, 3, art1, True)
+
+            # Item 2: Corrupted HTML
+            art2 = MagicMock()
+            art2.arxiv_id = "2405.00002"
+            self.indexer.add(MagicMock(
+                arxiv_id="2405.00002",
+                file_path=corrupt_html.name,
+            ))
+            progress_callback("download", 2, 3, art2, True)
+
+            # Item 3: Empty file
+            art3 = MagicMock()
+            art3.arxiv_id = "2405.00003"
+            self.indexer.add(MagicMock(
+                arxiv_id="2405.00003",
+                file_path=empty_pdf.name,
+            ))
+            progress_callback("download", 3, 3, art3, True)
+
+        stats = MagicMock()
+        stats.total_inspected = 3
+        stats.already_existing = 0
+        stats.failed = 0
+        return stats
+
+    with patch.object(daily_arxiv_sync.ArxivDownloader, "run", mock_run):
+        new_files, stats = daily_arxiv_sync.run_download_phase(
+            downloads_dir=downloads_dir,
+            limit=3,
+        )
+
+        # Only the valid PDF must be accepted
+        assert len(new_files) == 1
+        assert new_files[0].name == "2405.00001 - Paper One.pdf"
+        assert stats["new_downloaded"] == 1
+

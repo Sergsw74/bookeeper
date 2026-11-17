@@ -116,6 +116,8 @@ def run_download_phase(
 ) -> Tuple[List[Path], Dict[str, Any]]:
     """
     Crawl arXiv and download recent articles.
+    Ensures that strictly the verified, uncorrupted, newly downloaded files
+    from this run are captured in exact sequential download order.
     Returns (list of newly downloaded PDF file paths, stats_dict).
     """
     downloads_dir.mkdir(parents=True, exist_ok=True)
@@ -139,29 +141,57 @@ def run_download_phase(
         write_opf=True,
     )
 
+    just_downloaded_paths: List[Path] = []
+    seen_paths = set()
+
+    def _on_download_event(action: str, current: int, total: int, article: Any, is_download: bool):
+        """Live callback directly capturing newly downloaded files as they finish writing."""
+        if action == "download" and is_download and article:
+            # 1. Resolve filename from index entry or article resolver
+            entry = downloader.indexer.get(getattr(article, "arxiv_id", ""))
+            fname = entry.file_path if entry else downloader._resolve_article_filename(article)
+            target = (downloads_dir / fname).resolve()
+            if target.is_file() and target not in seen_paths:
+                seen_paths.add(target)
+                just_downloaded_paths.append(target)
+
     t0 = time.perf_counter()
-    stats = downloader.run()
+    stats = downloader.run(progress_callback=_on_download_event)
     elapsed = time.perf_counter() - t0
 
-    # Reload index to detect newly registered articles
-    index_obj.load()
-    newly_added_ids = set(index_obj.entries.keys()) - existing_arxiv_ids
-
-    new_pdf_paths: List[Path] = []
+    # Fallback / cross-check against index delta to guarantee no downloads are missed
+    downloader.indexer.load()
+    newly_added_ids = set(downloader.indexer.entries.keys()) - existing_arxiv_ids
     for aid in newly_added_ids:
-        entry = index_obj.get(aid)
+        entry = downloader.indexer.get(aid)
         if entry:
-            rel_file = entry.file_path or entry.file_name
+            rel_file = entry.file_path or getattr(entry, "file_name", None)
             if rel_file:
-                p = downloads_dir / rel_file
-                if p.is_file():
-                    new_pdf_paths.append(p)
+                p = (downloads_dir / rel_file).resolve()
+                if p.is_file() and p not in seen_paths:
+                    seen_paths.add(p)
+                    just_downloaded_paths.append(p)
 
-    # Sort deterministically
-    new_pdf_paths.sort(key=lambda p: p.name)
+    # Strict Validation: verify file exists, size > 0, and has valid PDF magic header (%PDF-)
+    validated_new_files: List[Path] = []
+    for p in just_downloaded_paths:
+        if not p.is_file():
+            continue
+        try:
+            if p.stat().st_size == 0:
+                log_warning(f"Excluding empty downloaded file: {p.name}")
+                continue
+            with open(p, "rb") as f:
+                header = f.read(5)
+            if not header.startswith(b"%PDF"):
+                log_warning(f"Excluding corrupt / non-PDF payload (header: {header!r}): {p.name}")
+                continue
+            validated_new_files.append(p)
+        except Exception as e:
+            log_warning(f"Failed to inspect file {p.name}: {e}")
 
     stats_summary = {
-        "new_downloaded": len(new_pdf_paths),
+        "new_downloaded": len(validated_new_files),
         "total_inspected": stats.total_inspected,
         "already_existing": stats.already_existing,
         "failed": stats.failed,
@@ -169,11 +199,11 @@ def run_download_phase(
     }
 
     log_success(
-        f"Download complete: [bold white]{len(new_pdf_paths)}[/bold white] new articles downloaded "
+        f"Download complete: [bold white]{len(validated_new_files)}[/bold white] verified new articles downloaded "
         f"([dim]{stats.already_existing} already existed, {stats.failed} failed[/dim]) in {elapsed:.1f}s"
     )
 
-    return new_pdf_paths, stats_summary
+    return validated_new_files, stats_summary
 
 
 # ==============================================================================

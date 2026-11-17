@@ -230,8 +230,9 @@ def run_build_graph_phase(
         pp_cmd = [
             "uv", "run", "bookeeper", "postprocess-ideas",
             "--graph-file", str((output_dir / "knowledge_graph.json").resolve()),
-            "--min-occurrences", "9999",  # Fast deterministic JEPA cluster resolution
         ]
+        if config_path:
+            pp_cmd.extend(["--config", str(config_path.resolve())])
         if config_diff:
             pp_cmd.extend(["--config-diff", str(config_diff.resolve())])
         t_pp = time.perf_counter()

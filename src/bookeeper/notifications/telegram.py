@@ -5,7 +5,8 @@ Provides reliable asynchronous-safe reporting for graph building and verificatio
 
 import html
 import logging
-from typing import Any, Dict, Optional
+import threading
+from typing import Any, Dict, Optional, Union
 import httpx
 
 from bookeeper.config import TelegramConfig
@@ -41,6 +42,7 @@ class TelegramNotifier:
     def __init__(self, config: Optional[TelegramConfig] = None):
         self.config = config or TelegramConfig()
         self._last_notified_percent: int = 0
+        self._lock = threading.Lock()
 
     @property
     def is_configured(self) -> bool:
@@ -53,25 +55,28 @@ class TelegramNotifier:
 
     def reset_progress(self) -> None:
         """Reset progress notification tracker."""
-        self._last_notified_percent = 0
+        with self._lock:
+            self._last_notified_percent = 0
 
-    def should_notify_progress(self, completed: int, total: int) -> bool:
+    def should_notify_progress(self, completed: Union[int, float], total: Union[int, float]) -> bool:
         """
         Determine if a progress notification should be dispatched based on
         completed vs total items and progress_step_percent.
+        Supports both integer item counts and fractional chunk/overall progress.
         """
         if total <= 0 or not self.config.notify_build_graph or not self.is_configured:
             return False
 
-        step = max(1, self.config.progress_step_percent)
-        current_percent = int((completed / total) * 100)
+        with self._lock:
+            step = max(1, self.config.progress_step_percent)
+            current_percent = int((float(completed) / float(total)) * 100)
 
-        # Notify if we crossed the next step threshold (e.g. 10%, 20%, 30%...)
-        if current_percent >= self._last_notified_percent + step:
-            self._last_notified_percent = (current_percent // step) * step
-            return True
+            # Notify if we crossed the next step threshold (e.g. 10%, 20%, 30%...)
+            if current_percent >= self._last_notified_percent + step:
+                self._last_notified_percent = (current_percent // step) * step
+                return True
 
-        return False
+            return False
 
     def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
         """
@@ -149,12 +154,14 @@ class TelegramNotifier:
         active_tasks: int = 0,
         assigned_chunks: int = 0,
         skipped_chunks: int = 0,
+        percent: Optional[int] = None,
     ) -> bool:
         """Send milestone progress notification during graph building."""
         if not self.config.notify_build_graph or not self.is_configured:
             return False
 
-        percent = int((completed_books / total_books) * 100) if total_books > 0 else 0
+        if percent is None:
+            percent = int((completed_books / total_books) * 100) if total_books > 0 else 0
         elapsed_str = _format_duration(elapsed_seconds)
         title_line = (
             f"\n📖 <b>Current:</b> <i>{html.escape(current_book_title[:60])}</i>"
@@ -212,6 +219,154 @@ class TelegramNotifier:
             "⚠️ <b>Book Processing Failed</b>\n\n"
             f"📖 <b>Book #{book_id}:</b> <i>{html.escape(title[:60])}</i>\n"
             f"❌ <b>Error:</b> <code>{html.escape(str(error)[:200])}</code>"
+        )
+        return self.send_message(msg)
+
+    # -------------------------------------------------------------------------
+    # Downloader & Synchronization Notifications
+    # -------------------------------------------------------------------------
+
+    def notify_downloader_start(
+        self,
+        category: str = "cs.AI",
+        limit: int = 10,
+        query: Optional[str] = None,
+    ) -> bool:
+        """Send notification when arXiv downloader phase starts."""
+        if not getattr(self.config, "notify_downloader", True) or not self.is_configured:
+            return False
+
+        query_line = f"\n🔍 <b>Search Query:</b> <i>{html.escape(query)}</i>" if query else ""
+        msg = (
+            "📥 <b>arXiv Downloader Started</b>\n\n"
+            f"🏷 <b>Category:</b> <code>{html.escape(category)}</code>\n"
+            f"🎯 <b>Target Quota:</b> {limit} article(s)"
+            f"{query_line}"
+        )
+        return self.send_message(msg)
+
+    def notify_downloader_complete(
+        self,
+        new_downloaded: int,
+        already_existing: int = 0,
+        failed: int = 0,
+        duration_seconds: float = 0.0,
+        category: str = "",
+    ) -> bool:
+        """Send notification when arXiv downloader phase completes."""
+        if not getattr(self.config, "notify_downloader", True) or not self.is_configured:
+            return False
+
+        duration_str = _format_duration(duration_seconds)
+        cat_line = f" ({html.escape(category)})" if category else ""
+        icon = "✅" if failed == 0 else "⚠️"
+        msg = (
+            f"{icon} <b>arXiv Downloader Completed{cat_line}</b>\n\n"
+            f"📥 <b>New Downloaded:</b> {new_downloaded} article(s)\n"
+            f"♻️ <b>Already In Index:</b> {already_existing} article(s)\n"
+            f"❌ <b>Failed:</b> {failed}\n"
+            f"⏱ <b>Duration:</b> {duration_str}"
+        )
+        return self.send_message(msg)
+
+    def notify_incremental_backup_start(
+        self,
+        baseline: str = "neo4j",
+        destination: str = "",
+    ) -> bool:
+        """Send notification when preparing incremental diff backup."""
+        if not getattr(self.config, "notify_sync", True) or not self.is_configured:
+            return False
+
+        dest_line = f"\n📁 <b>Destination:</b> <code>{html.escape(destination)}</code>" if destination else ""
+        msg = (
+            "📦 <b>Preparing Incremental Update Archive</b>\n\n"
+            f"🎯 <b>Baseline:</b> <code>{html.escape(baseline)}</code>"
+            f"{dest_line}"
+        )
+        return self.send_message(msg)
+
+    def notify_incremental_backup_complete(
+        self,
+        archive_name: str,
+        size_mb: float,
+        total_files: int,
+        new_books: int = 0,
+        related_books: int = 0,
+        shared_concepts: int = 0,
+        duration_seconds: float = 0.0,
+    ) -> bool:
+        """Send notification when incremental diff archive is created."""
+        if not getattr(self.config, "notify_sync", True) or not self.is_configured:
+            return False
+
+        duration_str = _format_duration(duration_seconds)
+        msg = (
+            "✅ <b>Incremental Update Packaged</b>\n\n"
+            f"📦 <b>Archive:</b> <code>{html.escape(archive_name)}</code> ({size_mb:.2f} MB)\n"
+            f"📑 <b>Total Files:</b> {total_files:,}\n"
+            f"📚 <b>New Books:</b> {new_books} | <b>Related Books:</b> {related_books}\n"
+            f"💡 <b>Bridging Concepts:</b> {shared_concepts:,}\n"
+            f"⏱ <b>Duration:</b> {duration_str}"
+        )
+        return self.send_message(msg)
+
+    def notify_sync_start(
+        self,
+        server_url: str,
+        archive_name: str,
+        size_mb: float,
+        incremental: bool = True,
+    ) -> bool:
+        """Send notification when remote synchronization begins."""
+        if not getattr(self.config, "notify_sync", True) or not self.is_configured:
+            return False
+
+        mode_str = "Incremental Diff Merge (clean=False)" if incremental else "Full Restore"
+        msg = (
+            "🚀 <b>Remote Server Synchronization Started</b>\n\n"
+            f"🌐 <b>Server:</b> <code>{html.escape(server_url)}</code>\n"
+            f"📦 <b>Package:</b> <code>{html.escape(archive_name)}</code> ({size_mb:.2f} MB)\n"
+            f"🔄 <b>Mode:</b> {mode_str}"
+        )
+        return self.send_message(msg)
+
+    def notify_sync_complete(
+        self,
+        server_url: str,
+        files_restored: int,
+        nodes_upserted: int = 0,
+        edges_upserted: int = 0,
+        duration_seconds: float = 0.0,
+    ) -> bool:
+        """Send notification when remote synchronization succeeds."""
+        if not getattr(self.config, "notify_sync", True) or not self.is_configured:
+            return False
+
+        duration_str = _format_duration(duration_seconds)
+        msg = (
+            "✅ <b>Remote Server Synchronized</b>\n\n"
+            f"🌐 <b>Server:</b> <code>{html.escape(server_url)}</code>\n"
+            f"📂 <b>Files Restored:</b> {files_restored:,}\n"
+            f"🌐 <b>Neo4j Nodes Upserted:</b> +{nodes_upserted:,}\n"
+            f"🔗 <b>Neo4j Edges Upserted:</b> +{edges_upserted:,}\n"
+            f"⏱ <b>Duration:</b> {duration_str}"
+        )
+        return self.send_message(msg)
+
+    def notify_sync_failure(
+        self,
+        server_url: str,
+        error: str,
+    ) -> bool:
+        """Send notification when remote synchronization fails."""
+        if not getattr(self.config, "notify_sync", True) or not self.is_configured:
+            return False
+
+        msg = (
+            "❌ <b>Remote Server Synchronization Failed</b>\n\n"
+            f"🌐 <b>Server:</b> <code>{html.escape(server_url)}</code>\n"
+            f"⚠️ <b>Error:</b> <code>{html.escape(str(error)[:300])}</code>"
         )
         return self.send_message(msg)
 

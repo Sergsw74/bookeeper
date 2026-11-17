@@ -3386,12 +3386,32 @@ def build_graph(
                             f"Embeddings: [bold cyan]{cfg.embedding_model}[/bold cyan]"
                         )
                         curr_fraction = (num_extracted / len(chunks)) if chunks else 0.0
+                        overall_completed = (book_idx - 1) + curr_fraction
                         progress.update(
                             overall_task,
-                            completed=book_idx - 1 + curr_fraction,
+                            completed=overall_completed,
                             description=desc2,
                             eta_str=overall_eta_str,
                         )
+
+                        # Telegram progress milestone notification (every 10%, 20%, etc.)
+                        if notifier.should_notify_progress(completed=overall_completed, total=total_books):
+                            try:
+                                cur_percent = int((overall_completed / total_books) * 100)
+                                elapsed_so_far = time.perf_counter() - pipeline_start_time
+                                notifier.notify_build_progress(
+                                    completed_books=book_idx - 1,
+                                    total_books=total_books,
+                                    current_book_title=btitle,
+                                    elapsed_seconds=elapsed_so_far,
+                                    eta_str=overall_eta_str,
+                                    active_tasks=cur_active,
+                                    assigned_chunks=cur_session_assigned,
+                                    skipped_chunks=cur_session_skipped,
+                                    percent=cur_percent,
+                                )
+                            except Exception as n_err:
+                                logger.debug(f"Telegram progress notification failed: {n_err}")
 
                     _update_progress_description()
 
@@ -9725,6 +9745,8 @@ def sync_command(
         else f"Full Backup (knowledge graph + indexed source books, {format_type.upper()})"
     )
 
+    notifier = TelegramNotifier(cfg.telegram)
+
     console.print(
         Panel.fit(
             f"[bold]Remote Server:[/bold] [bold cyan]{target_server}[/bold cyan]\n"
@@ -9841,6 +9863,15 @@ def sync_command(
         archive_file_to_send = Path(backup_res.get("archive_path") or temp_archive_file)
         archive_bytes = archive_file_to_send.read_bytes()
         boundary = f"----BookkeeperSyncBoundary{int(time.time())}"
+        try:
+            notifier.notify_sync_start(
+                server_url=target_server,
+                archive_name=archive_file_to_send.name,
+                size_mb=arch_size_mb,
+                incremental=incremental,
+            )
+        except Exception:
+            pass
         
         # Build multipart/form-data payload with synchronized clean flag
         body_parts = []
@@ -9894,12 +9925,30 @@ def sync_command(
             f"[bold green]✓ Step 2 Complete: Remote restore and Neo4j synchronization successful![/bold green] "
             f"({restored_files:,} files restored, Neo4j: {nodes_up:,} nodes, {edges_up:,} relationships)\n"
         )
+        try:
+            notifier.notify_sync_complete(
+                server_url=target_server,
+                files_restored=restored_files,
+                nodes_upserted=nodes_up,
+                edges_upserted=edges_up,
+                duration_seconds=time.perf_counter() - t_start,
+            )
+        except Exception:
+            pass
     except urllib.error.HTTPError as e:
         err_detail = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
         console.print(f"[bold red]✗ Step 2 Failed (HTTP {e.code}):[/bold red] {err_detail}")
+        try:
+            notifier.notify_sync_failure(server_url=target_server, error=f"HTTP {e.code}: {err_detail}")
+        except Exception:
+            pass
         raise typer.Exit(1)
     except Exception as e:
         console.print(f"[bold red]✗ Step 2 Failed (REST API):[/bold red] {e}")
+        try:
+            notifier.notify_sync_failure(server_url=target_server, error=str(e))
+        except Exception:
+            pass
         raise typer.Exit(1)
     finally:
         if temp_archive_dir.exists():

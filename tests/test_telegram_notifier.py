@@ -292,3 +292,119 @@ def test_notify_verification_start_and_complete(mock_send):
     assert "Factual Recall:</b> 98.20%" in complete_msg
     assert "Net Semantic Integrity:</b> +0.92" in complete_msg
     assert "Discrepancies:</b> 1" in complete_msg
+
+
+def test_notify_fractional_progress_milestones():
+    """Verify should_notify_progress triggers correctly for continuous chunk/overall progress."""
+    cfg = TelegramConfig(bot_token="tok", chat_id="chat", progress_step_percent=10)
+    notifier = TelegramNotifier(cfg)
+
+    # 1 book with 100 chunks: completed progresses from 0.0 to 1.0
+    total_books = 1.0
+
+    # 5 chunks done (5%) -> False
+    assert notifier.should_notify_progress(completed=0.05, total=total_books) is False
+
+    # 10 chunks done (10%) -> True (10% milestone)
+    assert notifier.should_notify_progress(completed=0.10, total=total_books) is True
+
+    # 15 chunks done (15%) -> False
+    assert notifier.should_notify_progress(completed=0.15, total=total_books) is False
+
+    # 20 chunks done (20%) -> True (20% milestone)
+    assert notifier.should_notify_progress(completed=0.20, total=total_books) is True
+
+    # 55 chunks done (55%) -> True (crosses 30%, 40%, 50% milestone to 50%)
+    assert notifier.should_notify_progress(completed=0.55, total=total_books) is True
+
+
+@patch.object(TelegramNotifier, "send_message")
+def test_notify_downloader_lifecycle(mock_send):
+    mock_send.return_value = True
+    cfg = TelegramConfig(bot_token="tok", chat_id="chat")
+    notifier = TelegramNotifier(cfg)
+
+    # 1. Start
+    assert notifier.notify_downloader_start(category="cs.AI", limit=10, query="world model") is True
+    msg = mock_send.call_args[0][0]
+    assert "arXiv Downloader Started" in msg
+    assert "cs.AI" in msg
+    assert "world model" in msg
+
+    # 2. Complete
+    mock_send.reset_mock()
+    assert notifier.notify_downloader_complete(new_downloaded=5, already_existing=12, failed=0, duration_seconds=4.2, category="cs.AI") is True
+    msg = mock_send.call_args[0][0]
+    assert "arXiv Downloader Completed" in msg
+    assert "5 article(s)" in msg
+    assert "12 article(s)" in msg
+    assert "4s" in msg
+
+
+@patch.object(TelegramNotifier, "send_message")
+def test_notify_incremental_backup_lifecycle(mock_send):
+    mock_send.return_value = True
+    cfg = TelegramConfig(bot_token="tok", chat_id="chat")
+    notifier = TelegramNotifier(cfg)
+
+    # 1. Start
+    assert notifier.notify_incremental_backup_start(baseline="neo4j", destination="incremental_diff.zip") is True
+    msg = mock_send.call_args[0][0]
+    assert "Preparing Incremental Update Archive" in msg
+    assert "neo4j" in msg
+
+    # 2. Complete
+    mock_send.reset_mock()
+    assert notifier.notify_incremental_backup_complete(
+        archive_name="incremental_diff.zip",
+        size_mb=2.45,
+        total_files=18,
+        new_books=5,
+        related_books=2,
+        shared_concepts=14,
+        duration_seconds=3.2,
+    ) is True
+    msg = mock_send.call_args[0][0]
+    assert "Incremental Update Packaged" in msg
+    assert "incremental_diff.zip" in msg
+    assert "2.45 MB" in msg
+    assert "18" in msg
+    assert "New Books:</b> 5" in msg
+    assert "Related Books:</b> 2" in msg
+    assert "Bridging Concepts:</b> 14" in msg
+
+
+@patch.object(TelegramNotifier, "send_message")
+def test_notify_sync_lifecycle(mock_send):
+    mock_send.return_value = True
+    cfg = TelegramConfig(bot_token="tok", chat_id="chat")
+    notifier = TelegramNotifier(cfg)
+
+    # 1. Start
+    assert notifier.notify_sync_start(server_url="http://192.168.50.20:8855", archive_name="inc.zip", size_mb=1.5, incremental=True) is True
+    msg = mock_send.call_args[0][0]
+    assert "Remote Server Synchronization Started" in msg
+    assert "http://192.168.50.20:8855" in msg
+    assert "Incremental Diff Merge" in msg
+
+    # 2. Complete
+    mock_send.reset_mock()
+    assert notifier.notify_sync_complete(
+        server_url="http://192.168.50.20:8855",
+        files_restored=18,
+        nodes_upserted=14,
+        edges_upserted=28,
+        duration_seconds=2.5,
+    ) is True
+    msg = mock_send.call_args[0][0]
+    assert "Remote Server Synchronized" in msg
+    assert "+14" in msg
+    assert "+28" in msg
+
+    # 3. Failure
+    mock_send.reset_mock()
+    assert notifier.notify_sync_failure(server_url="http://192.168.50.20:8855", error="Connection refused") is True
+    msg = mock_send.call_args[0][0]
+    assert "Remote Server Synchronization Failed" in msg
+    assert "Connection refused" in msg
+

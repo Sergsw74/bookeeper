@@ -51,6 +51,8 @@ if str(ARCHIVE_SRC) not in sys.path:
 from archive_downloader.downloader import ArxivDownloader
 from archive_downloader.indexer import DownloadIndex
 from bookeeper.backup import create_incremental_backup
+from bookeeper.notifications import TelegramNotifier
+from bookeeper.config import Settings
 
 try:
     from rich.console import Console
@@ -561,6 +563,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         log_warning("Dry-run requested: No articles will be downloaded, processed, or uploaded.")
         return 0
 
+    # Load configuration & initialize Telegram Notifier
+    cfg = None
+    try:
+        from bookeeper.cli import _get_effective_settings
+        cfg = _get_effective_settings(
+            args.config,
+            None,
+            books_dir=str(downloads_dir),
+            config_diff=args.config_diff,
+        )
+    except Exception:
+        try:
+            cfg = Settings()
+        except Exception:
+            pass
+
+    notifier = TelegramNotifier(cfg.telegram if cfg else None)
+
     # Auto-resolve baseline if requested
     diff_baseline = args.diff_against
     if diff_baseline == "auto":
@@ -575,6 +595,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Phase 1: Downloader
     if not args.skip_download:
+        notifier.notify_downloader_start(
+            category=args.category,
+            limit=args.limit,
+            query=args.query,
+        )
+        t_dl_start = time.perf_counter()
         new_pdf_files, download_stats = run_download_phase(
             downloads_dir=downloads_dir,
             limit=args.limit,
@@ -583,16 +609,26 @@ def main(argv: Optional[List[str]] = None) -> int:
             new_only=args.new_only,
             delay=args.delay,
         )
+        t_dl_dur = time.perf_counter() - t_dl_start
+        notifier.notify_downloader_complete(
+            new_downloaded=len(new_pdf_files),
+            already_existing=download_stats.get("already_existing", 0),
+            failed=download_stats.get("failed", 0),
+            duration_seconds=download_stats.get("duration_seconds", t_dl_dur),
+            category=args.category if not args.query else args.query,
+        )
 
         if not new_pdf_files and not args.force:
             log_success("No new articles published since last run. Everything is up to date!")
             return 0
     else:
         log_step("Phase 1: Downloader Skipped", "Using existing PDFs on disk")
-        # In skip-download mode, locate all PDFs in downloads_dir
-        new_pdf_files = sorted(list(downloads_dir.glob("*.pdf")))[:args.limit]
+        # In skip-download mode, pick most recently modified PDFs
+        existing_pdfs = [p for p in downloads_dir.glob("*.pdf") if p.is_file() and p.stat().st_size > 0]
+        existing_pdfs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        new_pdf_files = existing_pdfs[:args.limit]
 
-    # Phase 2: Build Graph
+    # Phase 2: Build Graph (build-graph automatically handles Telegram milestone progress every N%)
     if not args.skip_build and new_pdf_files:
         run_build_graph_phase(
             new_files=new_pdf_files,
@@ -606,21 +642,62 @@ def main(argv: Optional[List[str]] = None) -> int:
         log_step("Phase 2: Build Graph Skipped", "Packaging existing graph state")
 
     # Phase 3: Prepare Incremental Update
+    notifier.notify_incremental_backup_start(
+        baseline=diff_baseline,
+        destination=str(output_dir / "backups"),
+    )
+    t_inc_start = time.perf_counter()
     inc_archive, backup_meta = run_incremental_backup_phase(
         output_dir=output_dir,
         downloads_dir=downloads_dir,
         baseline=diff_baseline,
         format_type="zip",
     )
+    t_inc_dur = time.perf_counter() - t_inc_start
+
+    diff_sum = backup_meta.get("diff_summary") or {}
+    notifier.notify_incremental_backup_complete(
+        archive_name=inc_archive.name,
+        size_mb=backup_meta.get("compressed_bytes", 0) / (1024 * 1024),
+        total_files=backup_meta.get("total_files", 0),
+        new_books=diff_sum.get("new_books_count", len(new_pdf_files)),
+        related_books=diff_sum.get("related_books_count", 0),
+        shared_concepts=diff_sum.get("shared_concepts_count", 0),
+        duration_seconds=t_inc_dur,
+    )
 
     # Phase 4: Upload to Remote Server
     upload_res = None
     if args.server and not args.skip_upload:
-        upload_res = upload_incremental_backup(
+        arch_size_mb = inc_archive.stat().st_size / (1024 * 1024) if inc_archive.is_file() else 0.0
+        notifier.notify_sync_start(
             server_url=args.server,
-            archive_path=inc_archive,
-            timeout=args.timeout,
+            archive_name=inc_archive.name,
+            size_mb=arch_size_mb,
+            incremental=True,
         )
+        t_sync_start = time.perf_counter()
+        try:
+            upload_res = upload_incremental_backup(
+                server_url=args.server,
+                archive_path=inc_archive,
+                timeout=args.timeout,
+            )
+            t_sync_dur = time.perf_counter() - t_sync_start
+            neo4j_stats = upload_res.get("neo4j_export") or upload_res.get("merge_stats") or {}
+            notifier.notify_sync_complete(
+                server_url=args.server,
+                files_restored=upload_res.get("restored_files", 0),
+                nodes_upserted=neo4j_stats.get("nodes_upserted", neo4j_stats.get("nodes_added", 0)),
+                edges_upserted=neo4j_stats.get("edges_upserted", neo4j_stats.get("edges_added", 0)),
+                duration_seconds=t_sync_dur,
+            )
+        except Exception as sync_err:
+            notifier.notify_sync_failure(
+                server_url=args.server,
+                error=str(sync_err),
+            )
+            raise
     elif not args.server:
         log_step("Phase 4: Remote Upload Skipped", "No remote --server specified.")
         console.print(

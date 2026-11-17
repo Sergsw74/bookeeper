@@ -251,3 +251,76 @@ def test_daily_arxiv_sync_download_validation_and_ordering(tmp_path: Path):
         assert new_files[0].name == "2405.00001 - Paper One.pdf"
         assert stats["new_downloaded"] == 1
 
+
+def test_daily_arxiv_sync_telegram_notifications_end_to_end(tmp_path: Path):
+    """Verify that Telegram notifications are dispatched for all phases of daily sync."""
+    downloads_dir = tmp_path / "downloads"
+    downloads_dir.mkdir()
+    new_paper = downloads_dir / "2405.00001v1.Paper.pdf"
+    new_paper.write_bytes(b"%PDF-1.4 dummy")
+
+    archive_path = tmp_path / "inc.zip"
+    archive_path.write_bytes(b"PK0304")
+
+    with patch("daily_arxiv_sync.run_download_phase") as mock_dl, \
+         patch("daily_arxiv_sync.run_build_graph_phase") as mock_bg, \
+         patch("daily_arxiv_sync.run_incremental_backup_phase") as mock_inc, \
+         patch("daily_arxiv_sync.upload_incremental_backup") as mock_up, \
+         patch.object(daily_arxiv_sync.TelegramNotifier, "send_message") as mock_tg_send:
+
+        mock_dl.return_value = ([new_paper], {"already_existing": 3, "failed": 0, "duration_seconds": 1.5})
+        mock_bg.return_value = {"success": True}
+        mock_inc.return_value = (
+            archive_path,
+            {
+                "compressed_bytes": 1024 * 1024,
+                "total_files": 5,
+                "diff_summary": {
+                    "new_books_count": 1,
+                    "related_books_count": 2,
+                    "shared_concepts_count": 7,
+                },
+            },
+        )
+        mock_up.return_value = {
+            "success": True,
+            "restored_files": 5,
+            "neo4j_export": {"nodes_upserted": 7, "edges_upserted": 12},
+        }
+        mock_tg_send.return_value = True
+
+        # Run with Telegram configured via env
+        with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "bot123:abc", "TELEGRAM_CHAT_ID": "chat99"}):
+            code = daily_arxiv_sync.main([
+                "--server", "http://192.168.50.20:8855",
+                "--books-dir", str(downloads_dir),
+                "--output-dir", str(tmp_path / "output"),
+                "--limit", "5",
+            ])
+            assert code == 0
+
+        # Verify all phase messages were dispatched to Telegram:
+        # 1. Downloader start & complete (2 calls)
+        # 2. Incremental backup start & complete (2 calls)
+        # 3. Remote sync start & complete (2 calls)
+        # Total = 6 calls
+        assert mock_tg_send.call_count == 6
+        all_messages = [call[0][0] for call in mock_tg_send.call_args_list]
+
+        # Phase 1
+        assert any("arXiv Downloader Started" in m for m in all_messages)
+        assert any("arXiv Downloader Completed" in m for m in all_messages)
+        assert any("1 article(s)" in m for m in all_messages)
+
+        # Phase 3
+        assert any("Preparing Incremental Update Archive" in m for m in all_messages)
+        assert any("Incremental Update Packaged" in m for m in all_messages)
+        assert any("New Books:</b> 1" in m for m in all_messages)
+        assert any("Bridging Concepts:</b> 7" in m for m in all_messages)
+
+        # Phase 4
+        assert any("Remote Server Synchronization Started" in m for m in all_messages)
+        assert any("Remote Server Synchronized" in m for m in all_messages)
+        assert any("Neo4j Nodes Upserted:</b> +7" in m for m in all_messages)
+
+

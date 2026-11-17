@@ -20,11 +20,16 @@ Notifications are enabled by default and operate with graceful, non-blocking fai
 - [4. Verification Notifications (`verify` & `verifiers`)](#4-verification-notifications-verify--verifiers)
   - [Audit Start Alert](#audit-start-alert)
   - [Audit Completion Scorecard](#audit-completion-scorecard)
-- [5. Telegram Bot Setup Guide](#5-telegram-bot-setup-guide)
+- [5. Daily arXiv Sync & Server Synchronization Notifications](#5-daily-arxiv-sync--server-synchronization-notifications)
+  - [Phase 1: Downloader Alerts](#phase-1-downloader-alerts)
+  - [Phase 2: Graph Build Updates](#phase-2-graph-build-updates)
+  - [Phase 3: Incremental Diff Alerts](#phase-3-incremental-diff-alerts)
+  - [Phase 4: Remote Synchronization Alerts](#phase-4-remote-synchronization-alerts)
+- [6. Telegram Bot Setup Guide](#6-telegram-bot-setup-guide)
   - [Step 1: Create Bot via @BotFather](#step-1-create-bot-via-botfather)
   - [Step 2: Obtain your Chat ID](#step-2-obtain-your-chat-id)
   - [Step 3 (Optional): Supergroup Topics & Thread IDs](#step-3-optional-supergroup-topics--thread-ids)
-- [6. Fault-Tolerance & Reliability Invariants](#6-fault-tolerance--reliability-invariants)
+- [7. Fault-Tolerance & Reliability Invariants](#7-fault-tolerance--reliability-invariants)
 
 ---
 
@@ -205,7 +210,99 @@ For graph space audits (`--mode graph` / `kg`), coverage and topological diversi
 
 ---
 
-## 5. Telegram Bot Setup Guide
+## 5. Daily arXiv Sync & Server Synchronization Notifications
+
+For autonomous pipelines (`scripts/daily_arxiv_sync.py` and `bookeeper sync`), Telegram notifications provide end-to-end lifecycle visibility across all four operational phases:
+
+### Phase 1: Downloader Alerts
+
+Dispatched when crawling arXiv for new literature:
+
+```html
+📥 arXiv Downloader Started
+
+🏷 Category: cs.AI
+🎯 Target Quota: 10 article(s)
+🔍 Search Query: world model representation
+```
+
+Upon completing the crawl and validation:
+
+```html
+✅ arXiv Downloader Completed (cs.AI)
+
+📥 New Downloaded: 5 article(s)
+♻️ Already In Index: 12 article(s)
+❌ Failed: 0
+⏱ Duration: 4s
+```
+
+### Phase 2: Graph Build Updates
+
+Phase 2 runs `bookeeper build-graph -L <manifest>`, triggering the standard Knowledge Graph build lifecycle described in [Section 3](#3-knowledge-graph-build-notifications-build-graph):
+- **Build Start Alert** with model and target counts.
+- **Continuous Milestone Updates** (every 10% or 20% of library/chunk progress).
+- **Completion Summary** with node/edge counts and chunk stats.
+
+### Phase 3: Incremental Diff Alerts
+
+Dispatched when calculating the conceptual diff and packaging the incremental archive:
+
+```html
+📦 Preparing Incremental Update Archive
+
+🎯 Baseline: neo4j
+📁 Destination: output/backups
+```
+
+Upon packaging completion with basic structural and diff stats:
+
+```html
+✅ Incremental Update Packaged
+
+📦 Archive: incremental_update_20261116_213000.zip (2.45 MB)
+📑 Total Files: 18
+📚 New Books: 5 | Related Books: 2
+💡 Bridging Concepts: 14
+⏱ Duration: 3s
+```
+
+### Phase 4: Remote Synchronization Alerts
+
+Dispatched when transmitting and restoring the incremental archive to a remote server (`POST /api/backup/restore`):
+
+```html
+🚀 Remote Server Synchronization Started
+
+🌐 Server: http://192.168.50.20:8855
+📦 Package: incremental_update_20261116_213000.zip (2.45 MB)
+🔄 Mode: Incremental Diff Merge (clean=False)
+```
+
+Upon successful server restore and Neo4j Cypher `MERGE` ingestion:
+
+```html
+✅ Remote Server Synchronized
+
+🌐 Server: http://192.168.50.20:8855
+📂 Files Restored: 18
+🌐 Neo4j Nodes Upserted: +14
+🔗 Neo4j Edges Upserted: +28
+⏱ Duration: 2s
+```
+
+If the remote server rejects the payload or is unreachable:
+
+```html
+❌ Remote Server Synchronization Failed
+
+🌐 Server: http://192.168.50.20:8855
+⚠️ Error: HTTP 500: Failed to connect to remote Neo4j bolt driver
+```
+
+---
+
+## 6. Telegram Bot Setup Guide
 
 ### Step 1: Create Bot via @BotFather
 1. Open Telegram and search for `@BotFather`.

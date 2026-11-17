@@ -205,6 +205,14 @@ class TelegramConfig(BaseModel):
         default=True,
         description="Send notifications for verification start and completion with summary statistics.",
     )
+    notify_downloader: bool = Field(
+        default=True,
+        description="Send notifications for arXiv downloader start and completion.",
+    )
+    notify_sync: bool = Field(
+        default=True,
+        description="Send notifications for incremental update packaging and remote server synchronization.",
+    )
     progress_step_percent: int = Field(
         default=10,
         description="For graph building, notify progress every N percent (e.g. 10 for every 10%, 20 for every 20%).",
@@ -1498,6 +1506,12 @@ class Settings(BaseSettings):
                 cfg_dict["progress_step_percent"] = int(env_step_str)
             except ValueError:
                 pass
+        env_dl_str = os.environ.get("BOOKEEPER_TELEGRAM_NOTIFY_DOWNLOADER") or os.environ.get("TELEGRAM_NOTIFY_DOWNLOADER")
+        if env_dl_str is not None:
+            cfg_dict["notify_downloader"] = env_dl_str.strip().lower() in ("1", "true", "yes", "on")
+        env_sync_str = os.environ.get("BOOKEEPER_TELEGRAM_NOTIFY_SYNC") or os.environ.get("TELEGRAM_NOTIFY_SYNC")
+        if env_sync_str is not None:
+            cfg_dict["notify_sync"] = env_sync_str.strip().lower() in ("1", "true", "yes", "on")
 
         return TelegramConfig(**cfg_dict)
 

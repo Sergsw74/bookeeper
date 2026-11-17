@@ -174,6 +174,50 @@ bookeeper query "What are the core consensus mechanisms and tradeoffs in Paxos v
 
 ---
 
+## Step 6: Automated Daily arXiv Ingestion & Remote Sync (`scripts/daily_arxiv_sync.py`)
+
+For production deployments, `scripts/daily_arxiv_sync.py` provides an autonomous end-to-end conveyor that keeps your local or remote Bookkeeper instance perpetually up to date with new scientific literature:
+
+```mermaid
+flowchart LR
+    A["1. arXiv Downloader\n(archive_downloader)"] -->|New PDFs| B["2. Build Graph\n(bookeeper build-graph -L)"]
+    B -->|Local KG Updates| C["3. Incremental Diff\n(create_incremental_backup)"]
+    C -->|Diff Archive (.zip)| D["4. Remote Restore API\n(POST /api/backup/restore)"]
+    D -->|MERGE| E[("Remote Neo4j & Storage\nZero Downtime / No Data Loss")]
+```
+
+### Key Capabilities:
+1. **Deduplication & Zero-Compute Guard**: Tracks arXiv IDs via `archive_downloader/downloads/index.json`. If 0 new articles were published, the script exits immediately without invoking LLMs.
+2. **Targeted Extraction (`-L manifest.txt`)**: Processes strictly the newly downloaded articles, appending concepts to the knowledge graph.
+3. **Conceptual Incremental Update**: Packages only the newly added literature, connected existing literature sharing ideas, and the updated subgraph diff.
+4. **Non-Destructive Remote Ingestion**: Streams the incremental archive to `POST {server}/api/backup/restore` with `incremental=true` and `clean=false`, merging new nodes/edges directly into remote Neo4j without wiping historical data.
+
+### CLI Execution Examples:
+
+```bash
+# 1. Download up to 10 latest cs.AI papers, extract graph, and sync to remote server:
+uv run python scripts/daily_arxiv_sync.py --server http://192.168.50.20:8855 --limit 10
+
+# 2. Daily sync for a specific domain (e.g. cs.LG, cs.CL, stat.ML):
+uv run python scripts/daily_arxiv_sync.py --server http://192.168.50.20:8855 --category cs.LG --limit 5
+
+# 3. Topic-focused daily ingestion via arXiv search query:
+uv run python scripts/daily_arxiv_sync.py --server http://192.168.50.20:8855 --query "world model representation" --limit 5
+
+# 4. Dry-run preview without executing writes or network requests:
+uv run python scripts/daily_arxiv_sync.py --server http://192.168.50.20:8855 --dry-run
+```
+
+### Automated Daily Scheduling (Cron):
+
+Add a daily cron job to run the pipeline automatically every morning (e.g. at 06:00):
+
+```bash
+0 6 * * * cd /path/to/bookeeper && uv run python scripts/daily_arxiv_sync.py --server http://192.168.50.20:8855 --limit 10 >> /var/log/bookeeper_daily_sync.log 2>&1
+```
+
+---
+
 ## 📌 Summary Checklist
 
 | Phase | Command | Goal |
@@ -183,6 +227,7 @@ bookeeper query "What are the core consensus mechanisms and tradeoffs in Paxos v
 | **3. Post-Process (Optional)** | `bookeeper postprocess-ideas` | At-most-once synthesis, semantic clustering & concise definitions. |
 | **4. Export** | `bookeeper export --clean --backfill-embeddings` | Export to Obsidian vault, Neo4j, and GraphML. |
 | **5. Query (Optional)** | `bookeeper build-rag && bookeeper query` | Index into LightRAG and query interactively. |
+| **6. Daily Sync** | `python scripts/daily_arxiv_sync.py --server <url>` | End-to-end automated daily arXiv download, graph build & incremental update. |
 
 ---
 

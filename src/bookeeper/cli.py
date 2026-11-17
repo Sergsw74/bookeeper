@@ -9629,6 +9629,17 @@ def sync_command(
         "--clean",
         help="Perform clean restore on remote server (wipe remote artifacts and Neo4j before importing).",
     ),
+    incremental: bool = typer.Option(
+        False,
+        "--incremental",
+        "-inc",
+        help="Package and upload strictly the incremental diff compared to a baseline (default: neo4j).",
+    ),
+    diff_against: Optional[str] = typer.Option(
+        "neo4j",
+        "--diff-against",
+        help="Baseline to diff against for incremental sync: 'neo4j' (default) or path to an archive.",
+    ),
     config_path: Optional[Path] = typer.Option(
         None,
         "--config",
@@ -9689,6 +9700,8 @@ def sync_command(
 
     server = _resolve_opt(server)
     clean = _resolve_opt(clean, False)
+    incremental = _resolve_opt(incremental, False)
+    diff_against = _resolve_opt(diff_against, "neo4j")
     config_path = _resolve_opt(config_path)
     config_diff = _resolve_opt(config_diff)
     books_dir = _resolve_opt(books_dir)
@@ -9706,11 +9719,17 @@ def sync_command(
         target_server = f"http://{target_server}"
     target_server = target_server.rstrip("/")
 
+    sync_type_desc = (
+        f"Incremental Diff Sync (diff against: {diff_against}, {format_type.upper()})"
+        if incremental
+        else f"Full Backup (knowledge graph + indexed source books, {format_type.upper()})"
+    )
+
     console.print(
         Panel.fit(
             f"[bold]Remote Server:[/bold] [bold cyan]{target_server}[/bold cyan]\n"
-            f"[bold]Step 1: Local Backup:[/bold] Full Backup (knowledge graph + indexed source books, {format_type.upper()})\n"
-            f"[bold]Step 2: Remote Restore:[/bold] POST {target_server}/api/backup/restore (clean={clean})\n"
+            f"[bold]Step 1: Local Backup:[/bold] {sync_type_desc}\n"
+            f"[bold]Step 2: Remote Restore:[/bold] POST {target_server}/api/backup/restore (clean={clean}, incremental={incremental})\n"
             f"[bold]Remote Neo4j Update:[/bold] Automatic (server restores graph and updates Neo4j database)\n",
             title="Bookkeeper Sync Plan",
             border_style="cyan",
@@ -9722,7 +9741,8 @@ def sync_command(
     # -------------------------------------------------------------
     # Step 1: Backup Local Books and Knowledge Graph
     # -------------------------------------------------------------
-    console.print("[bold cyan][Step 1/2][/bold cyan] Creating full local backup archive (books + knowledge graph)...")
+    backup_desc = "incremental diff archive" if incremental else "full local backup archive"
+    console.print(f"[bold cyan][Step 1/2][/bold cyan] Creating {backup_desc} (books + knowledge graph)...")
     src_out_dir = Path(output_dir).expanduser().resolve() if output_dir else cfg.resolved_output_dir
     src_books_dir = Path(books_dir).expanduser().resolve() if books_dir else (cfg.resolved_books_dir or Path("archive_downloader/downloads").resolve())
 
@@ -9767,20 +9787,36 @@ def sync_command(
                     description=f"Packaging: [cyan]{short_name}[/cyan]",
                 )
 
-            backup_res = create_backup(
-                source_dir=src_out_dir,
-                destination=temp_archive_file,
-                format_type=format_type,
-                backup_type="full",
-                books_dir=src_books_dir if src_books_dir.is_dir() else None,
-                indexed_only=True,
-                include_chunks=True,
-                include_obsidian=True,
-                include_states=True,
-                include_lightrag=True,
-                custom_dirs=custom_dirs,
-                progress_callback=_on_sync_progress,
-            )
+            if incremental:
+                from bookeeper.backup import create_incremental_backup
+                backup_res = create_incremental_backup(
+                    source_dir=src_out_dir,
+                    baseline=diff_against,
+                    destination=temp_archive_file,
+                    format_type=format_type,
+                    books_dir=src_books_dir if src_books_dir.is_dir() else None,
+                    include_books=True,
+                    include_chunks=True,
+                    include_obsidian=True,
+                    include_states=True,
+                    custom_dirs=custom_dirs,
+                    progress_callback=_on_sync_progress,
+                )
+            else:
+                backup_res = create_backup(
+                    source_dir=src_out_dir,
+                    destination=temp_archive_file,
+                    format_type=format_type,
+                    backup_type="full",
+                    books_dir=src_books_dir if src_books_dir.is_dir() else None,
+                    indexed_only=True,
+                    include_chunks=True,
+                    include_obsidian=True,
+                    include_states=True,
+                    include_lightrag=True,
+                    custom_dirs=custom_dirs,
+                    progress_callback=_on_sync_progress,
+                )
 
         arch_size_mb = backup_res["compressed_bytes"] / (1024 * 1024)
         console.print(
@@ -9802,7 +9838,8 @@ def sync_command(
 
     restore_response_data = None
     try:
-        archive_bytes = temp_archive_file.read_bytes()
+        archive_file_to_send = Path(backup_res.get("archive_path") or temp_archive_file)
+        archive_bytes = archive_file_to_send.read_bytes()
         boundary = f"----BookkeeperSyncBoundary{int(time.time())}"
         
         # Build multipart/form-data payload with synchronized clean flag
@@ -9812,10 +9849,15 @@ def sync_command(
         body_parts.append(b'Content-Disposition: form-data; name="clean"\r\n\r\n')
         body_parts.append(b"true\r\n" if clean else b"false\r\n")
 
-        # 'file' field
-        content_type = "application/x-7z-compressed" if archive_ext == ".7z" else "application/zip"
+        # 'incremental' field
         body_parts.append(f"--{boundary}\r\n".encode("latin1"))
-        body_parts.append(f'Content-Disposition: form-data; name="file"; filename="{temp_archive_file.name}"\r\n'.encode("latin1"))
+        body_parts.append(b'Content-Disposition: form-data; name="incremental"\r\n\r\n')
+        body_parts.append(b"true\r\n" if incremental else b"false\r\n")
+
+        # 'file' field
+        content_type = "application/x-7z-compressed" if archive_file_to_send.suffix.lower() == ".7z" else "application/zip"
+        body_parts.append(f"--{boundary}\r\n".encode("latin1"))
+        body_parts.append(f'Content-Disposition: form-data; name="file"; filename="{archive_file_to_send.name}"\r\n'.encode("latin1"))
         body_parts.append(f"Content-Type: {content_type}\r\n\r\n".encode("latin1"))
         body_parts.append(archive_bytes)
         body_parts.append(b"\r\n")

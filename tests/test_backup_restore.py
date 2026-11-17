@@ -644,6 +644,61 @@ def test_cli_sync_flow_no_clean(tmp_path):
         assert b'name="clean"\r\n\r\nfalse' in req_arg.data
 
 
+def test_cli_sync_flow_incremental(tmp_path):
+    """Test client sync command with --incremental sends incremental=true and calls create_incremental_backup."""
+    from unittest.mock import MagicMock, patch
+    from typer.testing import CliRunner
+    from bookeeper.cli import app
+    import json
+
+    runner = CliRunner(env={"COLUMNS": "200"})
+
+    out_dir = tmp_path / "output"
+    out_dir.mkdir()
+    kg_file = out_dir / "knowledge_graph.json"
+    kg_file.write_text(json.dumps({
+        "nodes": [{"id": "book:1", "type": "Book", "title": "Classical Computing"}],
+        "edges": []
+    }), encoding="utf-8")
+
+    mock_restore_response = MagicMock()
+    mock_restore_response.read.return_value = json.dumps({
+        "success": True,
+        "restored_files": 1,
+        "neo4j_export": {"nodes_upserted": 4, "edges_upserted": 7},
+    }).encode("utf-8")
+    mock_restore_response.__enter__.return_value = mock_restore_response
+
+    books_dir = tmp_path / "books"
+    books_dir.mkdir()
+
+    with patch("urllib.request.urlopen", return_value=mock_restore_response) as mock_urlopen, \
+         patch("bookeeper.backup.create_incremental_backup") as mock_inc_backup:
+        
+        mock_inc_backup.return_value = {
+            "archive_path": tmp_path / "inc.zip",
+            "compressed_bytes": 1024,
+            "total_files": 2,
+        }
+        (tmp_path / "inc.zip").write_bytes(b"PK0304dummy")
+
+        res = runner.invoke(app, [
+            "sync",
+            "http://example.com:8000",
+            "--incremental",
+            "--output-dir", str(out_dir),
+            "--books-dir", str(books_dir),
+        ])
+
+        assert res.exit_code == 0, f"Error: {res.stdout}"
+        mock_urlopen.assert_called_once()
+        req_arg = mock_urlopen.call_args[0][0]
+        assert req_arg.full_url == "http://example.com:8000/api/backup/restore"
+        assert b'name="incremental"\r\n\r\ntrue' in req_arg.data
+        assert b'name="clean"\r\n\r\nfalse' in req_arg.data
+        mock_inc_backup.assert_called_once()
+
+
 def test_incremental_diff_calculation_and_backup_creation(tmp_path: Path):
     """
     Test calculating incremental diff against a baseline and packaging an incremental archive:

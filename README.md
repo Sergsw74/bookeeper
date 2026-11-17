@@ -58,6 +58,7 @@ Bookkeeper provides a rich set of CLI commands. Below is a high-level overview o
 | **`config`** | `bookeeper config` | Displays active settings, resolved server pool, and node capabilities. | [Get Started](docs/get-started.md) |
 | **`backup`** | `bookeeper backup --incremental --diff-against neo4j` | Creates a compressed archive (`.zip` / `.7z`) of the graph, vault, chunks, book states, or packages strictly the incremental diff against Neo4j / previous backups. | [Backup & Restore](docs/backup-restore.md) |
 | **`restore`** | `bookeeper restore backup.zip --incremental` | Restores knowledge graph, vault, chunks, checkpoints, and source books from an archive with safety audits, supporting non-destructive incremental merges into Neo4j. | [Backup & Restore](docs/backup-restore.md) |
+| **`sync`** | `bookeeper sync http://server:8855 --incremental` | Packages local knowledge base (full or incremental diff) and streams it to a remote Bookkeeper server API to update Neo4j without data loss. | [Backup & Restore](docs/backup-restore.md) |
 | **`ab-compare`** | `bookeeper ab-compare backup_a.zip [backup_b.zip]` | Instant comparative A/B evaluation (topology, cross-check NLI, or embedding space) between archived backups or active graph with live performance status. | [A/B Testing](docs/ab-tests.md) |
 
 ---

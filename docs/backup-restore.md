@@ -14,6 +14,7 @@ Bookkeeper includes an enterprise-grade standalone backup and restoration engine
 - [3. CLI Commands & Flags](#3-cli-commands--flags)
   - [`bookeeper backup`](#bookeeper-backup)
   - [`bookeeper restore`](#bookeeper-restore)
+  - [`bookeeper sync`](#bookeeper-sync)
 - [4. Automated Invariant & Integrity Checks](#4-automated-invariant--integrity-checks)
 - [5. Integration with A/B Testing & Evaluation](#5-integration-with-ab-testing--evaluation)
 - [6. Web UI Backup & Restore](#6-web-ui-backup--restore)
@@ -185,6 +186,42 @@ bookeeper restore ./backups/full_archive.zip --books-dir ./restored_books
 
 # 4. Incrementally merge diff archive into active knowledge base and Neo4j:
 bookeeper restore ./backups/incremental_diff.zip --incremental
+```
+
+---
+
+### `bookeeper sync`
+
+```text
+Usage: bookeeper sync [OPTIONS] <server>
+```
+
+Packages the local knowledge graph and literature, streams the archive payload to a remote Bookkeeper server via `POST /api/backup/restore`, and triggers server-side restoration and Neo4j ingestion. Supports both full sync and fast incremental diff sync.
+
+#### Arguments & Options
+
+| Option / Flag | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `<server>` | `STR` | Required | Target remote Bookkeeper server URL (e.g. `http://192.168.50.20:8855`). |
+| `--incremental`, `-inc` | `FLAG` | `False` | Create and transmit an incremental diff archive instead of a full backup. |
+| `--diff-against` | `STR` | `neo4j` | Baseline to diff against for incremental sync: `neo4j` (default) or path to an archive `.zip` / `.7z`. |
+| `--clean` | `FLAG` | `False` | Instruct server to wipe existing data before restoring (incompatible with incremental sync). |
+| `-b`, `--books-dir` | `PATH` | Config `books_dir` | Directory containing source books to package. |
+| `-o`, `--output-dir` | `PATH` | Config `output_dir` | Source directory containing graph artifacts. |
+| `-f`, `--format` | `STR` | `zip` | Compression format: `zip` or `7z`. |
+| `--timeout` | `INT` | `600` | HTTP request timeout in seconds. |
+
+#### Usage Examples
+
+```bash
+# 1. Full sync of local books and knowledge graph to remote server:
+bookeeper sync http://192.168.50.20:8855
+
+# 2. Incremental diff sync against active Neo4j:
+bookeeper sync http://192.168.50.20:8855 --incremental
+
+# 3. Incremental sync against a historical baseline archive:
+bookeeper sync http://192.168.50.20:8855 --incremental --diff-against ./backups/last_checkpoint.zip
 ```
 
 ---
